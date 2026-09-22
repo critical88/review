@@ -108,6 +108,8 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 .judge-drawer-h{position:sticky;top:0;background:var(--bg2);padding:16px 20px;border-bottom:1px solid var(--bd);display:flex;justify-content:space-between;align-items:center;font-weight:700;font-size:15px;z-index:1}
 .judge-drawer-h button{background:none;border:none;cursor:pointer;font-size:20px;color:var(--tx2);padding:0 4px}
 .judge-drawer-h button:hover{color:var(--tx)}
+.judge-drawer-h button.drawer-copy{font-size:12px;font-weight:600;color:var(--ac);border:1px solid var(--bd);background:var(--bg2);padding:3px 10px;border-radius:5px;display:inline-flex;align-items:center;gap:3px;font-family:inherit}
+.judge-drawer-h button.drawer-copy:hover{border-color:var(--ac);background:var(--bg3);color:var(--ac)}
 .judge-drawer .jsum{padding:16px 20px;font-size:13px;line-height:1.7;border-bottom:1px solid var(--bd);background:var(--bg3)}
 .judge-drawer .rg{display:flex;flex-direction:column}
 .judge-drawer .ri{padding:14px 20px;border-bottom:1px solid var(--bd)}.judge-drawer .ri:last-child{border-bottom:none}
@@ -207,6 +209,7 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
             <span class="ff-nav-right">
               <button class="judge-btn" id="rubric-btn-sds" onclick="openDrawer('taskRubric')" title="案例评判标准 (v6.2 中文)">&#9878; Rubric</button>
               <button class="judge-btn" id="smelltype-btn-sds" onclick="openDrawer('smellType')" title="本案例的 Smell Type 界定说明">&#128300; Smell Type</button>
+              <button class="judge-btn" id="diffdesc-btn-sds" onclick="openDrawer('diffDesc')" title="本案例的 Injection 设计说明 (diff_desc.md)" style="display:none">&#128203; diff_desc</button>
               <button class="judge-btn" id="prompt-btn-sds" onclick="openDrawer('prompt')" style="display:none">&#128196; Prompt</button>
             </span>
           </div>
@@ -299,7 +302,7 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 `;document.head.appendChild(s);})();
 
 let root=null,evIds=[],curEv=1,curTrialName=null,curTaskId=null,indexCache={},directEvMode=false,sideOpen=true,curMeta={};
-let judgeFull={},promptMd='',solveRubric={},smellMeta={entries:[],ruleId:'',ruleDesc:''},curEntryIdx=0;
+let judgeFull={},promptMd='',diffDescMd='',solveRubric={},smellMeta={entries:[],ruleId:'',ruleDesc:''},curEntryIdx=0;
 let rubricZh={};
 // evaluator scoring state: evalScores["evId::trial"] = { quality:{dim:n}, difficulty:{dim:n} }
 let evalScores={};
@@ -457,6 +460,10 @@ async function load(){
   solveRubric={};
   try{solveRubric=JSON.parse(await rf(evPath(foundEv,curTrialName,'solve_rubrics.json')));}catch(e){console.warn('No solve_rubrics.json:',e);}
 
+  // diff_desc.md drawer content (Injection design record — describes the modeled smell change)
+  diffDescMd='';
+  try{diffDescMd=await rf(evPath(foundEv,curTrialName,'diff_desc.md'));}catch(e){console.warn('No diff_desc.md:',e);}
+
   // Show/hide buttons (reuse the three drawers)
   const jb=document.getElementById('judge-btn');
   const hasJudge=!!(judgeFull.quality&&judgeFull.quality.dimensions);
@@ -467,6 +474,9 @@ async function load(){
   const pb1=document.getElementById('prompt-btn-ads'),pb2=document.getElementById('prompt-btn-sds');
   if(promptMd){pb1.style.display='inline-block';pb1.classList.add('has-data');pb2.style.display='inline-block';pb2.classList.add('has-data');}
   else{pb1.style.display='none';pb2.style.display='none';pb1.classList.remove('has-data');pb2.classList.remove('has-data');}
+  // diff_desc button (Smell Diff tab, next to Smell Type) — shown only when the case has diff_desc.md
+  const ddb=document.getElementById('diffdesc-btn-sds');
+  if(ddb){if(diffDescMd){ddb.style.display='inline-block';ddb.classList.add('has-data');}else{ddb.style.display='none';ddb.classList.remove('has-data');}}
   // Solve-rubrics button (Agent Diff tab Rubric) is always visible (per-case solver rubric)
   const srb=document.getElementById('rubric-btn-ads');
   if(srb){srb.style.display='inline-block';srb.classList.add('has-data');}
@@ -618,6 +628,10 @@ function openDrawer(type){
   }else if(type==='smellType'){
     header.innerHTML='<span>&#128300; Smell Type</span><button onclick="closeDrawer()">&#10005;</button>';
     renderSmellTypeContent(content);
+  }else if(type==='diffDesc'){
+    const cpBtn=diffDescMd?'<button class="drawer-copy" onclick="copyDiffDesc()">&#128203; 复制</button>':'';
+    header.innerHTML='<span>&#128203; Injection 设计说明 (diff_desc.md)</span><div style="display:flex;gap:6px;align-items:center">'+cpBtn+'<button onclick="closeDrawer()">&#10005;</button></div>';
+    renderDiffDesc(content);
   }else if(type==='judgeRubric'){
     header.innerHTML='<span>&#9878; Rubric</span><button onclick="closeDrawer()">&#10005;</button>';
     renderMdContent(content,'md-judge-rubric');
@@ -660,6 +674,20 @@ function renderJudgeContent(el){
 function renderPromptContent(el){
   if(!promptMd){el.innerHTML='<div style="padding:20px;color:var(--tx2);text-align:center">No prompt available</div>';return;}
   el.innerHTML='<div class="md-body">'+marked.parse(promptMd)+'</div>';
+}
+
+// Render the current case's diff_desc.md (Injection design record) into the diffDesc drawer.
+// The diff_desc.md describes the maintenance motivation + the evolution being modeled.
+function renderDiffDesc(el){
+  if(!diffDescMd){el.innerHTML='<div style="padding:20px;color:var(--tx2);text-align:center">本案例暂无 diff_desc.md</div>';return;}
+  el.innerHTML='<div class="md-body">'+(window.marked?marked.parse(diffDescMd):esc(diffDescMd))+'</div>';
+}
+// Copy the raw diff_desc.md text to the clipboard (button lives in the drawer header).
+function copyDiffDesc(){
+  const t=diffDescMd||'';if(!t)return;
+  const done=()=>{const f=document.createElement('div');f.className='copy-flag';f.textContent='已复制 diff_desc.md';f.style.left='50%';f.style.top='62px';f.style.transform='translateX(-50%)';f.style.display='block';document.body.appendChild(f);setTimeout(()=>{f.style.opacity='0';},900);setTimeout(()=>{if(f.parentNode)f.remove();},1500);};
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(done).catch(()=>fallbackCopy(t,done));}
+  else{fallbackCopy(t,done);}
 }
 
 // Render the full Chinese rubric (from rubric_zh.json) into the Rubric drawer
