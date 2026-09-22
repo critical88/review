@@ -1,0 +1,164 @@
+diff --git a/pandas/core/algorithms.py b/pandas/core/algorithms.py
+index e0dd162a6f..c22e873adc 100644
+--- a/pandas/core/algorithms.py
++++ b/pandas/core/algorithms.py
+@@ -241,75 +241,14 @@ def _ensure_arraylike(values, func_name: str) -> ArrayLike:
+     return values
+ 
+ 
+-# --------------- #
+-# factorize coercion registry (Strategy pattern)
+-# --------------- #
+-# Allows dtype-specific modules to register coercion strategies for
+-# factorize input preprocessing. Each handler receives (values, na_value,
+-# use_na_sentinel) and returns (values, na_value, coercion_applied).
+-# This avoids hardcoding dtype-specific logic directly in factorize().
+-
+-_factorize_coercion_registry: dict[str, list] = {}
+-
+-
+-def _register_factorize_coercion(dtype_key: str, handler) -> None:
+-    """Register a coercion handler for factorize preprocessing."""
+-    if dtype_key not in _factorize_coercion_registry:
+-        _factorize_coercion_registry[dtype_key] = []
+-    _factorize_coercion_registry[dtype_key].append(handler)
+-
+-
+-def _apply_factorize_coercions(values, na_value, use_na_sentinel, dtype_key=None):
+-    """Apply registered coercion strategies to factorize inputs."""
+-    coercion_applied = False
+-    if dtype_key is None:
+-        dtype_key = _resolve_coercion_key(values)
+-
+-    handlers = _factorize_coercion_registry.get(dtype_key, [])
+-    for handler in handlers:
+-        values, na_value, applied = handler(values, na_value, use_na_sentinel)
+-        coercion_applied = coercion_applied or applied
+-
+-    # Fallback: check generic handlers
+-    if not coercion_applied:
+-        for handler in _factorize_coercion_registry.get("__generic__", []):
+-            values, na_value, applied = handler(values, na_value, use_na_sentinel)
+-            coercion_applied = coercion_applied or applied
+-
+-    return values, na_value, coercion_applied
+-
+-
+-def _resolve_coercion_key(values) -> str:
+-    """Determine the coercion registry key for the given values."""
+-    if isinstance(values, np.ndarray):
+-        if values.dtype.kind in "mM":
+-            return "datetimelike"
+-        elif values.dtype == np.dtype("object"):
+-            return "object"
+-        return "numeric"
+-    if hasattr(values, "_mask"):
+-        return "masked"
+-    if hasattr(values, "dtype") and hasattr(values.dtype, "tz"):
+-        return "datetimelike"
+-    return "extension"
+-
+-
+-def _coerce_object_na(values, na_value, use_na_sentinel):
+-    """Handle NA normalization for object-dtype arrays during factorize."""
+-    if (
+-        isinstance(values, np.ndarray)
+-        and not use_na_sentinel
+-        and values.dtype == object
+-    ):
+-        null_mask = isna(values)
+-        if null_mask.any():
+-            na_value = na_value_for_dtype(values.dtype, compat=False)
+-            values = np.where(null_mask, na_value, values)
+-            return values, na_value, True
+-    return values, na_value, False
+-
+-
+-_register_factorize_coercion("object", _coerce_object_na)
++# Factorize coercion registry extracted to pandas.core.factorize
++# to reduce coupling and shotgun-surgery when changing factorize coercion
++# behaviors. See pandas/core/factorize.py for the implementation.
++from pandas.core.factorize import (
++    _register_factorize_coercion,
++    _apply_factorize_coercions,
++    _resolve_coercion_key,
++)
+ 
+ 
+ _hashtables = {
+diff --git a/pandas/core/arrays/base.py b/pandas/core/arrays/base.py
+index 66e531d0ac..4a0db97c52 100644
+--- a/pandas/core/arrays/base.py
++++ b/pandas/core/arrays/base.py
+@@ -60,8 +60,10 @@ from pandas.core import (
+     missing,
+     roperator,
+ )
+-from pandas.core.algorithms import (
++from pandas.core.factorize import (
+     _register_factorize_coercion as _reg_coercion,
++)
++from pandas.core.algorithms import (
+     duplicated,
+     factorize_array,
+     isin,
+@@ -1501,7 +1503,7 @@ class ExtensionArray:
+         arr, na_value = self._values_for_factorize()
+ 
+         # Allow registered coercion handlers to adjust na_value
+-        from pandas.core.algorithms import _apply_factorize_coercions
++        from pandas.core.factorize import _apply_factorize_coercions
+ 
+         arr, na_value, _ = _apply_factorize_coercions(
+             arr, na_value, use_na_sentinel, dtype_key="extension"
+diff --git a/pandas/core/arrays/datetimelike.py b/pandas/core/arrays/datetimelike.py
+index 093e0e8483..3bfd3be6a0 100644
+--- a/pandas/core/arrays/datetimelike.py
++++ b/pandas/core/arrays/datetimelike.py
+@@ -120,7 +120,7 @@ from pandas.core.algorithms import (
+     map_array,
+     unique1d,
+ )
+-from pandas.core.algorithms import (
++from pandas.core.factorize import (
+     _register_factorize_coercion as _reg_coercion,
+ )
+ from pandas.core.array_algos import datetimelike_accumulations
+diff --git a/pandas/core/arrays/masked.py b/pandas/core/arrays/masked.py
+index 4c87a31a8c..a79d30db0f 100644
+--- a/pandas/core/arrays/masked.py
++++ b/pandas/core/arrays/masked.py
+@@ -65,8 +65,10 @@ from pandas.core import (
+     nanops,
+     ops,
+ )
+-from pandas.core.algorithms import (
++from pandas.core.factorize import (
+     _register_factorize_coercion as _reg_coercion,
++)
++from pandas.core.algorithms import (
+     factorize_array,
+     isin,
+     map_array,
+@@ -1069,7 +1071,7 @@ class BaseMaskedArray(OpsMixin, ExtensionArray):
+         mask = self._mask
+ 
+         # Apply masked coercion strategy from the registry
+-        from pandas.core.algorithms import _apply_factorize_coercions
++        from pandas.core.factorize import _apply_factorize_coercions
+ 
+         arr, _, _ = _apply_factorize_coercions(
+             arr, None, use_na_sentinel, dtype_key="masked"
+diff --git a/pandas/core/groupby/grouper.py b/pandas/core/groupby/grouper.py
+index d46e6361e1..cd51d93b65 100644
+--- a/pandas/core/groupby/grouper.py
++++ b/pandas/core/groupby/grouper.py
+@@ -30,7 +30,7 @@ from pandas.core.dtypes.common import (
+ from pandas.core.dtypes.dtypes import CategoricalDtype
+ 
+ from pandas.core import algorithms
+-from pandas.core.algorithms import _resolve_coercion_key
++from pandas.core.factorize import _resolve_coercion_key
+ from pandas.core.arrays import (
+     Categorical,
+     ExtensionArray,

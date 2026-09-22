@@ -1,0 +1,241 @@
+diff --git a/seaborn/_base.py b/seaborn/_base.py
+index e96954c0..c583dcb9 100644
+--- a/seaborn/_base.py
++++ b/seaborn/_base.py
+@@ -1741,6 +1741,17 @@ def unique_markers(n):
+     return markers[:n]
+ 
+ 
++def compute_plot_variables(x_var, y_var, hue_var):
++    """Determine variables needed for data extraction in a bivariate plot."""
++    if x_var == y_var:
++        axes_vars = [x_var]
++    else:
++        axes_vars = [x_var, y_var]
++    if hue_var is not None and hue_var not in axes_vars:
++        axes_vars.append(hue_var)
++    return axes_vars
++
++
+ def categorical_order(vector, order=None):
+     """Return a list of unique data values.
+ 
+diff --git a/seaborn/axisgrid.py b/seaborn/axisgrid.py
+index 17d333bc..259feb2e 100644
+--- a/seaborn/axisgrid.py
++++ b/seaborn/axisgrid.py
+@@ -9,7 +9,7 @@ import pandas as pd
+ import matplotlib as mpl
+ import matplotlib.pyplot as plt
+ 
+-from ._base import VectorPlotter, variable_type, categorical_order
++from ._base import VectorPlotter, variable_type, categorical_order, compute_plot_variables
+ from ._core.data import handle_data_source
+ from ._compat import share_axis, get_legend_handles
+ from . import utils
+@@ -18,9 +18,12 @@ from .utils import (
+     set_hls_values,
+     _check_argument,
+     _draw_figure,
+-    _disable_autolayout
++    _disable_autolayout,
++    is_seaborn_func,
++    resolve_bivariate_data,
++    get_hue_values,
+ )
+-from .palettes import color_palette, blend_palette
++from .palettes import color_palette, blend_palette, build_hue_kwargs
+ from ._docstrings import (
+     DocstringComponents,
+     _core_docs,
+@@ -1488,7 +1491,7 @@ class PairGrid(Grid):
+         for var, ax in zip(self.diag_vars, self.diag_axes):
+ 
+             plot_kwargs = kwargs.copy()
+-            if str(func.__module__).startswith("seaborn"):
++            if is_seaborn_func(func):
+                 plot_kwargs["ax"] = ax
+             else:
+                 plt.sca(ax)
+@@ -1525,7 +1528,7 @@ class PairGrid(Grid):
+             hue_grouped = self.data[var].groupby(self.hue_vals, observed=True)
+ 
+             plot_kwargs = kwargs.copy()
+-            if str(func.__module__).startswith("seaborn"):
++            if is_seaborn_func(func):
+                 plot_kwargs["ax"] = ax
+             else:
+                 plt.sca(ax)
+@@ -1546,7 +1549,7 @@ class PairGrid(Grid):
+                 if self._dropna:
+                     data_k = utils.remove_na(data_k)
+ 
+-                if str(func.__module__).startswith("seaborn"):
++                if is_seaborn_func(func):
+                     func(x=data_k, label=label_k, color=color, **plot_kwargs)
+                 else:
+                     func(data_k, label=label_k, color=color, **plot_kwargs)
+@@ -1565,69 +1568,59 @@ class PairGrid(Grid):
+             self._extract_legend_handles = True
+ 
+         kws = kwargs.copy()  # Use copy as we insert other kwargs
++        hue_var = self._hue_var
++        dropna = self._dropna
+         for i, j in indices:
+             x_var = self.x_vars[j]
+             y_var = self.y_vars[i]
+             ax = self.axes[i, j]
+             if ax is None:  # i.e. we are in corner mode
+                 continue
+-            self._plot_bivariate(x_var, y_var, ax, func, **kws)
++            self._plot_bivariate(x_var, y_var, ax, func,
++                                 hue_var=hue_var, dropna=dropna, **kws)
+         self._add_axis_labels()
+ 
+         if "hue" in signature(func).parameters:
+             self.hue_names = list(self._legend_data)
+ 
+-    def _plot_bivariate(self, x_var, y_var, ax, func, **kwargs):
++    def _plot_bivariate(self, x_var, y_var, ax, func, hue_var, dropna, **kwargs):
+         """Draw a bivariate plot on the specified axes."""
+         if "hue" not in signature(func).parameters:
+-            self._plot_bivariate_iter_hue(x_var, y_var, ax, func, **kwargs)
++            self._plot_bivariate_iter_hue(x_var, y_var, ax, func,
++                                          hue_var=hue_var, dropna=dropna,
++                                          **kwargs)
+             return
+ 
+         kwargs = kwargs.copy()
+-        if str(func.__module__).startswith("seaborn"):
++        if is_seaborn_func(func):
+             kwargs["ax"] = ax
+         else:
+             plt.sca(ax)
+ 
+-        if x_var == y_var:
+-            axes_vars = [x_var]
+-        else:
+-            axes_vars = [x_var, y_var]
+-
+-        if self._hue_var is not None and self._hue_var not in axes_vars:
+-            axes_vars.append(self._hue_var)
+-
+-        data = self.data[axes_vars]
+-        if self._dropna:
+-            data = data.dropna()
+-
+-        x = data[x_var]
+-        y = data[y_var]
+-        if self._hue_var is None:
+-            hue = None
+-        else:
+-            hue = data.get(self._hue_var)
++        axes_vars = compute_plot_variables(x_var, y_var, hue_var)
++        x, y, plot_data = resolve_bivariate_data(
++            self.data, x_var, y_var, axes_vars, dropna
++        )
++        hue = get_hue_values(plot_data, hue_var)
+ 
+         if "hue" not in kwargs:
+-            kwargs.update({
+-                "hue": hue, "hue_order": self._hue_order, "palette": self._orig_palette,
+-            })
++            kwargs.update(build_hue_kwargs(
++                hue, self._hue_order, self._orig_palette
++            ))
+         func(x=x, y=y, **kwargs)
+ 
+         self._update_legend_data(ax)
+ 
+-    def _plot_bivariate_iter_hue(self, x_var, y_var, ax, func, **kwargs):
++    def _plot_bivariate_iter_hue(self, x_var, y_var, ax, func,
++                                  hue_var, dropna, **kwargs):
+         """Draw a bivariate plot while iterating over hue subsets."""
+         kwargs = kwargs.copy()
+-        if str(func.__module__).startswith("seaborn"):
++        if is_seaborn_func(func):
+             kwargs["ax"] = ax
+         else:
+             plt.sca(ax)
+ 
+-        if x_var == y_var:
+-            axes_vars = [x_var]
+-        else:
+-            axes_vars = [x_var, y_var]
++        axes_vars = compute_plot_variables(x_var, y_var, hue_var)
+ 
+         hue_grouped = self.data.groupby(self.hue_vals, observed=True)
+         for k, label_k in enumerate(self._hue_order):
+@@ -1641,7 +1634,7 @@ class PairGrid(Grid):
+                 data_k = pd.DataFrame(columns=axes_vars,
+                                       dtype=float)
+ 
+-            if self._dropna:
++            if dropna:
+                 data_k = data_k[axes_vars].dropna()
+ 
+             x = data_k[x_var]
+@@ -1650,10 +1643,10 @@ class PairGrid(Grid):
+             for kw, val_list in self.hue_kws.items():
+                 kws[kw] = val_list[k]
+             kws.setdefault("color", self.palette[k])
+-            if self._hue_var is not None:
++            if hue_var is not None:
+                 kws["label"] = label_k
+ 
+-            if str(func.__module__).startswith("seaborn"):
++            if is_seaborn_func(func):
+                 func(x=x, y=y, **kws)
+             else:
+                 func(x, y, **kws)
+diff --git a/seaborn/palettes.py b/seaborn/palettes.py
+index f7f42984..9b5503a5 100644
+--- a/seaborn/palettes.py
++++ b/seaborn/palettes.py
+@@ -58,6 +58,15 @@ QUAL_PALETTE_SIZES.update({k: len(v) for k, v in SEABORN_PALETTES.items()})
+ QUAL_PALETTES = list(QUAL_PALETTE_SIZES.keys())
+ 
+ 
++def build_hue_kwargs(hue_data, hue_order, palette):
++    """Construct keyword arguments for hue-mapped plotting calls."""
++    return {
++        "hue": hue_data,
++        "hue_order": hue_order,
++        "palette": palette,
++    }
++
++
+ class _ColorPalette(list):
+     """Set the color palette in a with statement, otherwise be a list."""
+     def __enter__(self):
+diff --git a/seaborn/utils.py b/seaborn/utils.py
+index 98720ba3..0a195369 100644
+--- a/seaborn/utils.py
++++ b/seaborn/utils.py
+@@ -274,6 +274,26 @@ def get_color_cycle():
+     return cycler.by_key()['color'] if 'color' in cycler.keys else [".15"]
+ 
+ 
++def is_seaborn_func(func):
++    """Check if a plotting function is seaborn-native."""
++    return str(func.__module__).startswith("seaborn")
++
++
++def resolve_bivariate_data(data, x_var, y_var, axes_vars, dropna):
++    """Prepare filtered data arrays for a bivariate plot."""
++    plot_data = data[axes_vars]
++    if dropna:
++        plot_data = plot_data.dropna()
++    return plot_data[x_var], plot_data[y_var], plot_data
++
++
++def get_hue_values(plot_data, hue_var):
++    """Extract hue values from prepared plot data."""
++    if hue_var is None:
++        return None
++    return plot_data.get(hue_var)
++
++
+ def despine(fig=None, ax=None, top=True, right=True, left=False,
+             bottom=False, offset=None, trim=False):
+     """Remove the top and right spines from plot(s).

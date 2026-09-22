@@ -1,0 +1,287 @@
+diff --git a/xarray/core/concat.py b/xarray/core/concat.py
+index b1cca586..73806519 100644
+--- a/xarray/core/concat.py
++++ b/xarray/core/concat.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++from collections import defaultdict
+ from collections.abc import Hashable, Iterable
+ from typing import TYPE_CHECKING, Any, Union, overload
+ 
+@@ -12,7 +13,9 @@ from xarray.core.coordinates import Coordinates
+ from xarray.core.duck_array_ops import lazy_array_equiv
+ from xarray.core.indexes import Index, PandasIndex
+ from xarray.core.merge import (
++    MergeError,
+     _VALID_COMPAT,
++    _resolve_merge_element_conflicts,
+     collect_variables_and_indexes,
+     merge_attrs,
+     merge_collected,
+@@ -438,41 +441,6 @@ def _calc_concat_over(datasets, dim, dim_names, data_vars: T_DataVars, coords, c
+     return concat_over, equals, concat_dim_lengths
+ 
+ 
+-# determine dimensional coordinate names and a dict mapping name to DataArray
+-def _parse_datasets(
+-    datasets: list[T_Dataset],
+-) -> tuple[
+-    dict[Hashable, Variable],
+-    dict[Hashable, int],
+-    set[Hashable],
+-    set[Hashable],
+-    list[Hashable],
+-]:
+-    dims: set[Hashable] = set()
+-    all_coord_names: set[Hashable] = set()
+-    data_vars: set[Hashable] = set()  # list of data_vars
+-    dim_coords: dict[Hashable, Variable] = {}  # maps dim name to variable
+-    dims_sizes: dict[Hashable, int] = {}  # shared dimension sizes to expand variables
+-    variables_order: dict[Hashable, Variable] = {}  # variables in order of appearance
+-
+-    for ds in datasets:
+-        dims_sizes.update(ds.sizes)
+-        all_coord_names.update(ds.coords)
+-        data_vars.update(ds.data_vars)
+-        variables_order.update(ds.variables)
+-
+-        # preserves ordering of dimensions
+-        for dim in ds.dims:
+-            if dim in dims:
+-                continue
+-
+-            if dim in ds.coords and dim not in dim_coords:
+-                dim_coords[dim] = ds.coords[dim].variable
+-        dims = dims | set(ds.dims)
+-
+-    return dim_coords, dims_sizes, all_coord_names, data_vars, list(variables_order)
+-
+-
+ def _dataset_concat(
+     datasets: list[T_Dataset],
+     dim: str | T_Variable | T_DataArray | pd.Index,
+@@ -513,9 +481,36 @@ def _dataset_concat(
+         align(*datasets, join=join, copy=False, exclude=[dim], fill_value=fill_value)
+     )
+ 
+-    dim_coords, dims_sizes, coord_names, data_names, vars_order = _parse_datasets(
+-        datasets
+-    )
++    # -- Inline: scan datasets to collect dimension coordinates, sizes,
++    #    coordinate names, data variable names, and variable ordering.
++    #    (Previously delegated to _parse_datasets)
++    _dc_map: dict[Hashable, Variable] = {}
++    _sz_cache: dict[Hashable, int] = {}
++    _cn_set: set[Hashable] = set()
++    _dn_set: set[Hashable] = set()
++    _parsed_dims: set[Hashable] = set()
++    _vord: dict[Hashable, Variable] = {}
++
++    for _ds_item in datasets:
++        _sz_cache.update(_ds_item.sizes)
++        _cn_set.update(_ds_item.coords)
++        _dn_set.update(_ds_item.data_vars)
++        _vord.update(_ds_item.variables)
++
++        # preserves ordering of dimensions
++        for _d_name in _ds_item.dims:
++            if _d_name in _parsed_dims:
++                continue
++
++            if _d_name in _ds_item.coords and _d_name not in _dc_map:
++                _dc_map[_d_name] = _ds_item.coords[_d_name].variable
++        _parsed_dims = _parsed_dims | set(_ds_item.dims)
++
++    dim_coords = _dc_map
++    dims_sizes = _sz_cache
++    coord_names = _cn_set
++    data_names = _dn_set
++    vars_order = list(_vord)
+     dim_names = set(dim_coords)
+ 
+     both_data_and_coords = coord_names & data_names
+@@ -546,21 +541,90 @@ def _dataset_concat(
+     result_indexes = {}
+ 
+     if variables_to_merge:
+-        grouped = {
+-            k: v
+-            for k, v in collect_variables_and_indexes(datasets).items()
+-            if k in variables_to_merge
+-        }
+-        merged_vars, merged_indexes = merge_collected(
+-            grouped, compat=compat, equals=equals
+-        )
+-        result_vars.update(merged_vars)
+-        result_indexes.update(merged_indexes)
++        # -- Inline: collect variable/index pairs grouped by name from datasets
++        #    (Previously delegated to collect_variables_and_indexes)
++        _collected_groups: dict[
++            Hashable, list[tuple[Variable, Index | None]]
++        ] = defaultdict(list)
++        for _merge_ds in datasets:
++            _merge_vars = _merge_ds.variables
++            _merge_xidxs = _merge_ds.xindexes
++            for _vname, _vobj in _merge_vars.items():
++                if _vname in variables_to_merge:
++                    _collected_groups[_vname].append(
++                        (_vobj, _merge_xidxs.get(_vname))
++                    )
++
++        # -- Inline: resolve collected merge elements
++        #    (Previously delegated to merge_collected; conflict resolution
++        #     is handled via _resolve_merge_element_conflicts in merge.py)
++        _idx_cmp_cache: dict[tuple[int, int], bool | None] = {}
++        for _mk, _melements in _collected_groups.items():
++            _resolved_var, _resolved_idx, _has_idx = (
++                _resolve_merge_element_conflicts(
++                    _mk,
++                    _melements,
++                    compat,
++                    combine_attrs,
++                    equals,
++                    _idx_cmp_cache,
++                )
++            )
++            result_vars[_mk] = _resolved_var
++            if _has_idx and _resolved_idx is not None:
++                result_indexes[_mk] = _resolved_idx
+ 
+     result_vars.update(dim_coords)
+ 
+-    # assign attrs and encoding from first dataset
+-    result_attrs = merge_attrs([ds.attrs for ds in datasets], combine_attrs)
++    # -- Inline: compute merged attributes from all datasets
++    #    (Previously delegated to merge_attrs)
++    _all_ds_attrs = [ds.attrs for ds in datasets]
++    if not _all_ds_attrs:
++        result_attrs = None
++    elif callable(combine_attrs):
++        result_attrs = combine_attrs(_all_ds_attrs, context=None)
++    elif combine_attrs == "drop":
++        result_attrs = {}
++    elif combine_attrs == "override":
++        result_attrs = dict(_all_ds_attrs[0])
++    elif combine_attrs == "no_conflicts":
++        result_attrs = dict(_all_ds_attrs[0])
++        for _ca_item in _all_ds_attrs[1:]:
++            try:
++                result_attrs = utils.compat_dict_union(result_attrs, _ca_item)
++            except ValueError as _ca_err:
++                raise MergeError(
++                    "combine_attrs='no_conflicts', but some values are not "
++                    f"the same. Merging {str(result_attrs)} with {str(_ca_item)}"
++                ) from _ca_err
++    elif combine_attrs == "drop_conflicts":
++        result_attrs = {}
++        _dropped_attr_keys: set = set()
++        for _ca_item in _all_ds_attrs:
++            result_attrs.update(
++                {
++                    key: value
++                    for key, value in _ca_item.items()
++                    if key not in result_attrs and key not in _dropped_attr_keys
++                }
++            )
++            result_attrs = {
++                key: value
++                for key, value in result_attrs.items()
++                if key not in _ca_item or utils.equivalent(_ca_item[key], value)
++            }
++            _dropped_attr_keys |= {key for key in _ca_item if key not in result_attrs}
++    elif combine_attrs == "identical":
++        result_attrs = dict(_all_ds_attrs[0])
++        for _ca_item in _all_ds_attrs[1:]:
++            if not utils.dict_equiv(result_attrs, _ca_item):
++                raise MergeError(
++                    f"combine_attrs='identical', but attrs differ. First is {str(result_attrs)} "
++                    f", other is {str(_ca_item)}."
++                )
++    else:
++        raise ValueError(f"Unrecognised value for combine_attrs={combine_attrs}")
++
+     result_encoding = datasets[0].encoding
+ 
+     # check that global attributes are fixed across all datasets if necessary
+diff --git a/xarray/core/merge.py b/xarray/core/merge.py
+index a90e59e7..dab24486 100644
+--- a/xarray/core/merge.py
++++ b/xarray/core/merge.py
+@@ -161,6 +161,76 @@ def _assert_compat_valid(compat):
+ MergeElement = tuple[Variable, Optional[Index]]
+ 
+ 
++def _resolve_merge_element_conflicts(
++    name: Hashable,
++    elements_list: list[MergeElement],
++    compat: CompatOptions,
++    combine_attrs: CombineAttrsOptions,
++    equals_cache: dict[Any, bool] | None,
++    index_cmp_cache: dict[tuple[int, int], bool | None],
++) -> tuple[Variable, Optional[Index], bool]:
++    """Resolve a single merge element from a list of variable/index candidates.
++
++    Determines the canonical variable and index for a given name by checking
++    index compatibility and variable equality. Used by the dataset concat
++    inline merge path.
++
++    Returns
++    -------
++    variable : Variable
++    index : Index or None
++    has_index : bool
++    """
++    if equals_cache is None:
++        equals_cache = {}
++
++    indexed_elements = [
++        (variable, index)
++        for variable, index in elements_list
++        if index is not None
++    ]
++    if indexed_elements:
++        variable, index = indexed_elements[0]
++        for other_var, other_index in indexed_elements[1:]:
++            if not indexes_equal(
++                index, other_index, variable, other_var, index_cmp_cache
++            ):
++                raise MergeError(
++                    f"conflicting values/indexes on objects to be combined fo coordinate {name!r}\n"
++                    f"first index: {index!r}\nsecond index: {other_index!r}\n"
++                    f"first variable: {variable!r}\nsecond variable: {other_var!r}\n"
++                )
++        if compat == "identical":
++            for other_variable, _ in indexed_elements[1:]:
++                if not dict_equiv(variable.attrs, other_variable.attrs):
++                    raise MergeError(
++                        "conflicting attribute values on combined "
++                        f"variable {name!r}:\nfirst value: {variable.attrs!r}\nsecond value: {other_variable.attrs!r}"
++                    )
++        merged_var = variable
++        merged_var.attrs = merge_attrs(
++            [var.attrs for var, _ in indexed_elements],
++            combine_attrs=combine_attrs,
++        )
++        return merged_var, index, True
++    else:
++        variables = [variable for variable, _ in elements_list]
++        try:
++            resolved = unique_variable(
++                name, variables, compat, equals_cache.get(name, None)
++            )
++        except MergeError:
++            if compat != "minimal":
++                raise
++            else:
++                return variables[0], None, False
++
++        resolved.attrs = merge_attrs(
++            [var.attrs for var in variables], combine_attrs=combine_attrs
++        )
++        return resolved, None, False
++
++
+ def _assert_prioritized_valid(
+     grouped: dict[Hashable, list[MergeElement]],
+     prioritized: Mapping[Any, MergeElement],

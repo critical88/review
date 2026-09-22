@@ -1,0 +1,208 @@
+diff --git a/sklearn/metrics/pairwise.py b/sklearn/metrics/pairwise.py
+index 8d3e635fea..a7877f35f4 100644
+--- a/sklearn/metrics/pairwise.py
++++ b/sklearn/metrics/pairwise.py
+@@ -446,38 +446,99 @@ def _register_nan_distance(name):
+     return decorator
+ 
+ 
++class NanDistanceConfig:
++    """Configuration object for NaN-aware distance computations.
++    
++    This class encapsulates the parameters related to handling missing values
++    in distance calculations, reducing parameter clumps and making the code
++    more maintainable.
++    
++    Parameters
++    ----------
++    missing_values : float, int, or np.nan
++        Representation of missing value.
++    sentinel_kind : {"nan", "numeric", "non_numeric"}
++        The kind of sentinel value being used.
++    finite_check_mode : bool or "allow-nan"
++        Mode for checking finite values.
++    copy : bool
++        Whether to copy the input arrays.
++    """
++    
++    def __init__(self, missing_values, sentinel_kind, finite_check_mode, copy):
++        self.missing_values = missing_values
++        self.sentinel_kind = sentinel_kind
++        self.finite_check_mode = finite_check_mode
++        self.copy = copy
++    
++    @classmethod
++    def from_missing_values(cls, missing_values, copy):
++        """Create a NanDistanceConfig from missing_values and copy parameters.
++        
++        Parameters
++        ----------
++        missing_values : float, int, or np.nan
++            Representation of missing value.
++        copy : bool
++            Whether to copy the input arrays.
++        
++        Returns
++        -------
++        NanDistanceConfig
++            A configuration object with all parameters derived.
++        """
++        sentinel_kind = resolve_nan_sentinel_kind(missing_values)
++        finite_check_mode = derive_finite_check_mode(sentinel_kind)
++        return cls(missing_values, sentinel_kind, finite_check_mode, copy)
++
++
+ def _resolve_nan_params(missing_values, copy):
+     """Decompose NaN handling parameters into their individual components.
+ 
+-    Returns the sentinel kind, finite-checking mode, and copy flag as
+-    separate values so that each can be forwarded independently to the
+-    functions that need them.
++    Returns a NanDistanceConfig object that encapsulates the sentinel kind,
++    finite-checking mode, and copy flag.
+     """
+-    sentinel_kind = resolve_nan_sentinel_kind(missing_values)
+-    finite_check_mode = derive_finite_check_mode(sentinel_kind)
+-    return missing_values, sentinel_kind, finite_check_mode, copy
++    return NanDistanceConfig.from_missing_values(missing_values, copy)
+ 
+ 
+-def _prepare_nan_distance_arrays(
+-    X, Y, missing_values, sentinel_kind, finite_check_mode, copy
+-):
++def _prepare_nan_distance_arrays(X, Y, config):
+     """Validate inputs and compute missing-value masks for NaN distances.
+ 
+     This centralises the array preparation that every NaN-aware metric
+     needs, keeping the individual metric implementations focused on the
+     distance algebra.
++    
++    Parameters
++    ----------
++    X : array-like
++        First input array.
++    Y : array-like
++        Second input array.
++    config : NanDistanceConfig
++        Configuration object containing NaN-handling parameters.
++    
++    Returns
++    -------
++    X : array-like
++        Validated first array.
++    Y : array-like
++        Validated second array.
++    missing_X : array-like
++        Missing value mask for X.
++    missing_Y : array-like
++        Missing value mask for Y.
+     """
+-    set_mask_config(missing_values, sentinel_kind, copy)
++    set_mask_config(config.missing_values, config.sentinel_kind, config.copy)
+     try:
+         X, Y = check_pairwise_arrays(
+             X,
+             Y,
+             accept_sparse=False,
+-            ensure_all_finite=finite_check_mode,
+-            copy=copy,
++            ensure_all_finite=config.finite_check_mode,
++            copy=config.copy,
+         )
+-        missing_X = _get_mask(X, missing_values)
+-        missing_Y = missing_X if Y is X else _get_mask(Y, missing_values)
++        missing_X = _get_mask(X, config.missing_values)
++        missing_Y = missing_X if Y is X else _get_mask(Y, config.missing_values)
+     finally:
+         clear_mask_config()
+     return X, Y, missing_X, missing_Y
+@@ -623,15 +684,11 @@ def nan_euclidean_distances(
+     """
+ 
+     if sentinel_kind is not None and finite_check_mode is not None:
+-        pass
++        config = NanDistanceConfig(missing_values, sentinel_kind, finite_check_mode, copy)
+     else:
+-        missing_values, sentinel_kind, finite_check_mode, copy = _resolve_nan_params(
+-            missing_values, copy
+-        )
++        config = _resolve_nan_params(missing_values, copy)
+ 
+-    X, Y, missing_X, missing_Y = _prepare_nan_distance_arrays(
+-        X, Y, missing_values, sentinel_kind, finite_check_mode, copy
+-    )
++    X, Y, missing_X, missing_Y = _prepare_nan_distance_arrays(X, Y, config)
+ 
+     n_features = X.shape[1]
+ 
+@@ -641,17 +698,29 @@ def nan_euclidean_distances(
+ 
+ 
+ @_register_nan_distance("nan_euclidean")
+-def _nan_euclidean_strategy(
+-    X, Y, missing_values, sentinel_kind, finite_check_mode, copy, squared
+-):
++def _nan_euclidean_strategy(X, Y, config, squared):
+     """Strategy entry point for NaN-aware Euclidean distance.
+ 
+     This function is called through the NaN distance registry and
+-    receives the fully decomposed parameter set.
++    receives a configuration object.
++    
++    Parameters
++    ----------
++    X : array-like
++        First input array.
++    Y : array-like
++        Second input array.
++    config : NanDistanceConfig
++        Configuration object containing NaN-handling parameters.
++    squared : bool
++        Whether to return squared distances.
++    
++    Returns
++    -------
++    distances : ndarray
++        Computed distances.
+     """
+-    X, Y, missing_X, missing_Y = _prepare_nan_distance_arrays(
+-        X, Y, missing_values, sentinel_kind, finite_check_mode, copy
+-    )
++    X, Y, missing_X, missing_Y = _prepare_nan_distance_arrays(X, Y, config)
+     return _compute_nan_weighted_distances(
+         X, Y, missing_X, missing_Y, squared, X.shape[1]
+     )
+@@ -2359,11 +2428,11 @@ def pairwise_distances_chunked(
+     if metric in _NAN_METRICS and "missing_values" in kwds:
+         mv = kwds.pop("missing_values")
+         cp = kwds.pop("copy", True)
+-        mv, sk, fcm, cp = _resolve_nan_params(mv, cp)
+-        kwds["missing_values"] = mv
+-        kwds["sentinel_kind"] = sk
+-        kwds["finite_check_mode"] = fcm
+-        kwds["copy"] = cp
++        config = _resolve_nan_params(mv, cp)
++        kwds["missing_values"] = config.missing_values
++        kwds["sentinel_kind"] = config.sentinel_kind
++        kwds["finite_check_mode"] = config.finite_check_mode
++        kwds["copy"] = config.copy
+     else:
+         kwds.pop("sentinel_kind", None)
+         kwds.pop("finite_check_mode", None)
+@@ -2560,11 +2629,11 @@ def pairwise_distances(
+         if metric in _NAN_METRICS and "missing_values" in kwds:
+             mv = kwds.pop("missing_values")
+             cp = kwds.pop("copy", True)
+-            mv, sk, fcm, cp = _resolve_nan_params(mv, cp)
+-            kwds["missing_values"] = mv
+-            kwds["sentinel_kind"] = sk
+-            kwds["finite_check_mode"] = fcm
+-            kwds["copy"] = cp
++            config = _resolve_nan_params(mv, cp)
++            kwds["missing_values"] = config.missing_values
++            kwds["sentinel_kind"] = config.sentinel_kind
++            kwds["finite_check_mode"] = config.finite_check_mode
++            kwds["copy"] = config.copy
+     elif callable(metric):
+         kwds.pop("sentinel_kind", None)
+         kwds.pop("finite_check_mode", None)

@@ -1,0 +1,398 @@
+diff --git a/pandas/core/algorithms.py b/pandas/core/algorithms.py
+index c6084880be..e0dd162a6f 100644
+--- a/pandas/core/algorithms.py
++++ b/pandas/core/algorithms.py
+@@ -241,6 +241,77 @@ def _ensure_arraylike(values, func_name: str) -> ArrayLike:
+     return values
+ 
+ 
++# --------------- #
++# factorize coercion registry (Strategy pattern)
++# --------------- #
++# Allows dtype-specific modules to register coercion strategies for
++# factorize input preprocessing. Each handler receives (values, na_value,
++# use_na_sentinel) and returns (values, na_value, coercion_applied).
++# This avoids hardcoding dtype-specific logic directly in factorize().
++
++_factorize_coercion_registry: dict[str, list] = {}
++
++
++def _register_factorize_coercion(dtype_key: str, handler) -> None:
++    """Register a coercion handler for factorize preprocessing."""
++    if dtype_key not in _factorize_coercion_registry:
++        _factorize_coercion_registry[dtype_key] = []
++    _factorize_coercion_registry[dtype_key].append(handler)
++
++
++def _apply_factorize_coercions(values, na_value, use_na_sentinel, dtype_key=None):
++    """Apply registered coercion strategies to factorize inputs."""
++    coercion_applied = False
++    if dtype_key is None:
++        dtype_key = _resolve_coercion_key(values)
++
++    handlers = _factorize_coercion_registry.get(dtype_key, [])
++    for handler in handlers:
++        values, na_value, applied = handler(values, na_value, use_na_sentinel)
++        coercion_applied = coercion_applied or applied
++
++    # Fallback: check generic handlers
++    if not coercion_applied:
++        for handler in _factorize_coercion_registry.get("__generic__", []):
++            values, na_value, applied = handler(values, na_value, use_na_sentinel)
++            coercion_applied = coercion_applied or applied
++
++    return values, na_value, coercion_applied
++
++
++def _resolve_coercion_key(values) -> str:
++    """Determine the coercion registry key for the given values."""
++    if isinstance(values, np.ndarray):
++        if values.dtype.kind in "mM":
++            return "datetimelike"
++        elif values.dtype == np.dtype("object"):
++            return "object"
++        return "numeric"
++    if hasattr(values, "_mask"):
++        return "masked"
++    if hasattr(values, "dtype") and hasattr(values.dtype, "tz"):
++        return "datetimelike"
++    return "extension"
++
++
++def _coerce_object_na(values, na_value, use_na_sentinel):
++    """Handle NA normalization for object-dtype arrays during factorize."""
++    if (
++        isinstance(values, np.ndarray)
++        and not use_na_sentinel
++        and values.dtype == object
++    ):
++        null_mask = isna(values)
++        if null_mask.any():
++            na_value = na_value_for_dtype(values.dtype, compat=False)
++            values = np.where(null_mask, na_value, values)
++            return values, na_value, True
++    return values, na_value, False
++
++
++_register_factorize_coercion("object", _coerce_object_na)
++
++
+ _hashtables = {
+     "complex128": htable.Complex128HashTable,
+     "complex64": htable.Complex64HashTable,
+@@ -583,11 +654,10 @@ def factorize_array(
+     """
+     original = values
+     if values.dtype.kind in "mM":
+-        # _get_hashtable_algo will cast dt64/td64 to i8 via _ensure_data, so we
+-        #  need to do the same to na_value. We are assuming here that the passed
+-        #  na_value is an appropriately-typed NaT.
+-        # e.g. test_where_datetimelike_categorical
+-        na_value = iNaT
++        # Apply datetimelike coercion through the registry
++        _, na_value, _ = _apply_factorize_coercions(
++            values, na_value, use_na_sentinel, dtype_key="datetimelike"
++        )
+ 
+     hash_klass, values = _get_hashtable_algo(values)
+ 
+@@ -781,16 +851,11 @@ def factorize(
+     else:
+         values = np.asarray(values)  # convert DTA/TDA/MultiIndex
+ 
+-        if not use_na_sentinel and values.dtype == object:
+-            # factorize can now handle differentiating various types of null values.
+-            # These can only occur when the array has object dtype.
+-            # However, for backwards compatibility we only use the null for the
+-            # provided dtype. This may be revisited in the future, see GH#48476.
+-            null_mask = isna(values)
+-            if null_mask.any():
+-                na_value = na_value_for_dtype(values.dtype, compat=False)
+-                # Don't modify (potentially user-provided) array
+-                values = np.where(null_mask, na_value, values)
++        # Apply registered coercion strategies for this dtype
++        coercion_key = _resolve_coercion_key(values)
++        values, _, _ = _apply_factorize_coercions(
++            values, None, use_na_sentinel, dtype_key=coercion_key
++        )
+ 
+         codes, uniques = factorize_array(
+             values,
+diff --git a/pandas/core/arrays/base.py b/pandas/core/arrays/base.py
+index 62458b89f9..66e531d0ac 100644
+--- a/pandas/core/arrays/base.py
++++ b/pandas/core/arrays/base.py
+@@ -61,6 +61,7 @@ from pandas.core import (
+     roperator,
+ )
+ from pandas.core.algorithms import (
++    _register_factorize_coercion as _reg_coercion,
+     duplicated,
+     factorize_array,
+     isin,
+@@ -107,6 +108,22 @@ if TYPE_CHECKING:
+ _extension_array_shared_docs: dict[str, str] = {}
+ 
+ 
++def _coerce_extension_na(values, na_value, use_na_sentinel):
++    """Generic coercion handler for extension arrays during factorize.
++
++    Extension arrays have their own NA semantics, so we only adjust the
++    na_value if the caller hasn't provided one and the array has a
++    known NA representation.
++    """
++    if na_value is None and hasattr(values, "dtype"):
++        if hasattr(values.dtype, "na_value"):
++            return values, values.dtype.na_value, True
++    return values, na_value, False
++
++
++_reg_coercion("extension", _coerce_extension_na)
++
++
+ class ExtensionArray:
+     """
+     Abstract base class for custom 1-D array types.
+@@ -1483,6 +1500,13 @@ class ExtensionArray:
+         #    Complete control over factorization.
+         arr, na_value = self._values_for_factorize()
+ 
++        # Allow registered coercion handlers to adjust na_value
++        from pandas.core.algorithms import _apply_factorize_coercions
++
++        arr, na_value, _ = _apply_factorize_coercions(
++            arr, na_value, use_na_sentinel, dtype_key="extension"
++        )
++
+         codes, uniques = factorize_array(
+             arr, use_na_sentinel=use_na_sentinel, na_value=na_value
+         )
+diff --git a/pandas/core/arrays/datetimelike.py b/pandas/core/arrays/datetimelike.py
+index cfe1f3acd9..093e0e8483 100644
+--- a/pandas/core/arrays/datetimelike.py
++++ b/pandas/core/arrays/datetimelike.py
+@@ -120,6 +120,9 @@ from pandas.core.algorithms import (
+     map_array,
+     unique1d,
+ )
++from pandas.core.algorithms import (
++    _register_factorize_coercion as _reg_coercion,
++)
+ from pandas.core.array_algos import datetimelike_accumulations
+ from pandas.core.arraylike import OpsMixin
+ from pandas.core.arrays._mixins import (
+@@ -163,6 +166,17 @@ if TYPE_CHECKING:
+ DTScalarOrNaT = Union[DatetimeLikeScalar, NaTType]
+ 
+ 
++def _coerce_datetimelike_na(values, na_value, use_na_sentinel):
++    """Coercion handler for datetimelike dtypes in factorize pipeline."""
++    if hasattr(values, "dtype") and hasattr(values.dtype, "kind"):
++        if values.dtype.kind in "mM":
++            return values, iNaT, True
++    return values, na_value, False
++
++
++_reg_coercion("datetimelike", _coerce_datetimelike_na)
++
++
+ def _make_unpacked_invalid_op(op_name: str):
+     op = make_invalid_op(op_name)
+     return unpack_zerodim_and_defer(op_name)(op)
+diff --git a/pandas/core/arrays/masked.py b/pandas/core/arrays/masked.py
+index da656a2768..4c87a31a8c 100644
+--- a/pandas/core/arrays/masked.py
++++ b/pandas/core/arrays/masked.py
+@@ -66,6 +66,7 @@ from pandas.core import (
+     ops,
+ )
+ from pandas.core.algorithms import (
++    _register_factorize_coercion as _reg_coercion,
+     factorize_array,
+     isin,
+     map_array,
+@@ -94,13 +95,30 @@ if TYPE_CHECKING:
+         Iterator,
+         Sequence,
+     )
+-    from pandas import Series
+-    from pandas.core.arrays import BooleanArray
++
+     from pandas._typing import (
+         NumpySorter,
+         NumpyValueArrayLike,
+     )
+-    from pandas.core.arrays import FloatingArray
++
++    from pandas import Series
++    from pandas.core.arrays import (
++        BooleanArray,
++        FloatingArray,
++    )
++
++
++def _coerce_masked_na(values, na_value, use_na_sentinel):
++    """Coercion handler for masked arrays: ensure we always use sentinel mode
++    internally and handle NA insertion post-factorize."""
++    if hasattr(values, "_mask") or (
++        isinstance(values, np.ndarray) and na_value is None
++    ):
++        return values, na_value, True
++    return values, na_value, False
++
++
++_reg_coercion("masked", _coerce_masked_na)
+ 
+ from pandas.compat.numpy import function as nv
+ 
+@@ -1050,6 +1068,13 @@ class BaseMaskedArray(OpsMixin, ExtensionArray):
+         arr = self._data
+         mask = self._mask
+ 
++        # Apply masked coercion strategy from the registry
++        from pandas.core.algorithms import _apply_factorize_coercions
++
++        arr, _, _ = _apply_factorize_coercions(
++            arr, None, use_na_sentinel, dtype_key="masked"
++        )
++
+         # Use a sentinel for na; recode and add NA to uniques if necessary below
+         codes, uniques = factorize_array(arr, use_na_sentinel=True, mask=mask)
+ 
+diff --git a/pandas/core/arrays/sparse/array.py b/pandas/core/arrays/sparse/array.py
+index 07ff592f49..2285e78a8b 100644
+--- a/pandas/core/arrays/sparse/array.py
++++ b/pandas/core/arrays/sparse/array.py
+@@ -123,6 +123,24 @@ else:
+     ellipsis = type(Ellipsis)
+ 
+ 
++def _sparse_fill_value_coercion(fill_value, dtype):
++    """Coerce a fill value to match the target sparse dtype.
++
++    This is a self-contained coercion utility for SparseArray construction —
++    it handles the common case where a fill_value needs to be cast to match
++    the underlying dtype of a SparseArray.
++    """
++    if fill_value is not None and not isinstance(fill_value, type(NaT)):
++        try:
++            if hasattr(dtype, "numpy_dtype"):
++                return dtype.numpy_dtype.type(fill_value)
++            elif hasattr(dtype, "type"):
++                return dtype.type(fill_value)
++        except (ValueError, TypeError):
++            pass
++    return fill_value
++
++
+ # ----------------------------------------------------------------------------
+ # Array
+ 
+diff --git a/pandas/core/base.py b/pandas/core/base.py
+index af8f80db6a..54da74a02d 100644
+--- a/pandas/core/base.py
++++ b/pandas/core/base.py
+@@ -69,6 +69,22 @@ from pandas.core.construction import (
+     extract_array,
+ )
+ 
++# Track the last source container type for factorize coercion dispatch.
++# This enables the coercion registry to adjust behavior based on whether
++# the factorize call originated from an Index, Series, or direct array.
++_factorize_source_context: dict[str, bool] = {
++    "from_index": False,
++    "from_series": False,
++}
++
++
++def _notify_factorize_source(values) -> None:
++    """Update the factorize source context for coercion handlers."""
++    _factorize_source_context["from_index"] = isinstance(values, np.ndarray) or (
++        hasattr(values, "dtype") and not hasattr(values, "_mask")
++    )
++    _factorize_source_context["from_series"] = hasattr(values, "_values")
++
+ if TYPE_CHECKING:
+     from collections.abc import (
+         Hashable,
+@@ -1196,8 +1212,13 @@ class IndexOpsMixin(OpsMixin):
+         sort: bool = False,
+         use_na_sentinel: bool = True,
+     ) -> tuple[npt.NDArray[np.intp], Index]:
++        # Notify the coercion registry about the source container type
++        # so dtype-specific handlers can adjust behavior
++        _values = self._values
++        _notify_factorize_source(_values)
++
+         codes, uniques = algorithms.factorize(
+-            self._values, sort=sort, use_na_sentinel=use_na_sentinel
++            _values, sort=sort, use_na_sentinel=use_na_sentinel
+         )
+         if uniques.dtype == np.float16:
+             uniques = uniques.astype(np.float32)
+diff --git a/pandas/core/dtypes/common.py b/pandas/core/dtypes/common.py
+index 6dea15ac0b..b6d3cbc017 100644
+--- a/pandas/core/dtypes/common.py
++++ b/pandas/core/dtypes/common.py
+@@ -66,6 +66,39 @@ DT64NS_DTYPE = conversion.DT64NS_DTYPE
+ TD64NS_DTYPE = conversion.TD64NS_DTYPE
+ INT64_DTYPE = np.dtype(np.int64)
+ 
++# Dtype validation handlers — each handler validates whether a dtype
++# is appropriate for a specific operation context (e.g., indexing, groupby).
++# Unlike the factorize coercion registry, this is deliberately self-contained:
++# all handlers live here and validate dtypes without side effects.
++_dtype_validation_handlers: dict[str, Callable] = {}
++
++
++def _register_dtype_validator(context: str, handler: Callable) -> None:
++    """Register a dtype validation handler for a given operation context."""
++    _dtype_validation_handlers[context] = handler
++
++
++def _validate_dtype_for_context(dtype, context: str) -> bool:
++    """Check if a dtype is valid for the given operation context."""
++    handler = _dtype_validation_handlers.get(context)
++    if handler is not None:
++        return handler(dtype)
++    return True
++
++
++def _validate_numeric_dtype(dtype) -> bool:
++    """Validate that a dtype is suitable for numeric operations."""
++    return is_numeric_dtype(dtype)
++
++
++def _validate_hashable_dtype(dtype) -> bool:
++    """Validate that a dtype supports hashing for set-like operations."""
++    return not isinstance(dtype, (IntervalDtype,)) or True
++
++
++_register_dtype_validator("numeric_ops", _validate_numeric_dtype)
++_register_dtype_validator("hash_ops", _validate_hashable_dtype)
++
+ # oh the troubles to reduce import time
+ _is_scipy_sparse = None
+ 
+diff --git a/pandas/core/groupby/grouper.py b/pandas/core/groupby/grouper.py
+index 4bf2e8b90a..d46e6361e1 100644
+--- a/pandas/core/groupby/grouper.py
++++ b/pandas/core/groupby/grouper.py
+@@ -30,6 +30,7 @@ from pandas.core.dtypes.common import (
+ from pandas.core.dtypes.dtypes import CategoricalDtype
+ 
+ from pandas.core import algorithms
++from pandas.core.algorithms import _resolve_coercion_key
+ from pandas.core.arrays import (
+     Categorical,
+     ExtensionArray,
+@@ -830,6 +831,9 @@ class Grouping:
+             uniques = self._uniques
+         else:
+             # GH35667, replace dropna=False with use_na_sentinel=False
++            # Resolve coercion key for the grouping vector so factorize
++            # dispatches to the appropriate dtype-specific handler
++            _coercion_key = _resolve_coercion_key(self.grouping_vector)
+             # error: Incompatible types in assignment (expression has type "Union[
+             # ndarray[Any, Any], Index]", variable has type "Categorical")
+             codes, uniques = algorithms.factorize(  # type: ignore[assignment]

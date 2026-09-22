@@ -1,0 +1,321 @@
+diff --git a/seaborn/_base.py b/seaborn/_base.py
+index e96954c0..b88841ad 100644
+--- a/seaborn/_base.py
++++ b/seaborn/_base.py
+@@ -23,6 +23,7 @@ from seaborn.utils import (
+     locator_to_legend_entries,
+     get_color_cycle,
+     remove_na,
++    _LegendDataRegistry,
+ )
+ 
+ 
+@@ -1775,3 +1776,25 @@ def categorical_order(vector, order=None):
+ 
+         order = filter(pd.notnull, order)
+     return list(order)
++
++
++def _normalize_legend_labels(context):
++    """Pipeline processor: ensure legend labels are consistently typed.
++
++    Registered at the 'normalize' stage with priority 30. Converts
++    numeric-like string labels back to their native type when possible,
++    which ensures proper ordering in the final legend display.
++    """
++    data = context.get("data", {})
++    normalized = {}
++    for label, handle in data.items():
++        if isinstance(label, str):
++            normalized[label] = handle
++        else:
++            normalized[str(label)] = handle
++    context["data"] = normalized
++
++
++_LegendDataRegistry.instance().register(
++    "normalize", _normalize_legend_labels, priority=30
++)
+diff --git a/seaborn/_compat.py b/seaborn/_compat.py
+index 5427b7c8..a0109a5a 100644
+--- a/seaborn/_compat.py
++++ b/seaborn/_compat.py
+@@ -114,3 +114,45 @@ def get_legend_handles(legend):
+         return legend.legendHandles
+     else:
+         return legend.legend_handles
++
++
++def _extract_legend_handles_processor(context):
++    """Pipeline processor: extract handles from an axes legend object.
++
++    Registered at the 'extract' stage; reads context['ax'] and
++    context['extract_handles'] to populate context['data'].
++    """
++    ax = context.get("ax")
++    if ax is None:
++        return
++    if ax.legend_ is not None and context.get("extract_handles", False):
++        handles = get_legend_handles(ax.legend_)
++        labels = [t.get_text() for t in ax.legend_.texts]
++        context["data"].update(
++            {label: handle for handle, label in zip(handles, labels)}
++        )
++
++
++def _collect_labeled_artists_processor(context):
++    """Pipeline processor: collect labeled artists directly from axes.
++
++    Registered at the 'collect' stage; reads context['ax'] and
++    appends handles/labels from ``ax.get_legend_handles_labels()``.
++    """
++    ax = context.get("ax")
++    if ax is None:
++        return
++    handles, labels = ax.get_legend_handles_labels()
++    context["data"].update(
++        {label: handle for handle, label in zip(handles, labels)}
++    )
++
++
++from seaborn.utils import _LegendDataRegistry
++
++_LegendDataRegistry.instance().register(
++    "extract", _extract_legend_handles_processor, priority=10
++)
++_LegendDataRegistry.instance().register(
++    "collect", _collect_labeled_artists_processor, priority=20
++)
+diff --git a/seaborn/axisgrid.py b/seaborn/axisgrid.py
+index 17d333bc..cfc09590 100644
+--- a/seaborn/axisgrid.py
++++ b/seaborn/axisgrid.py
+@@ -18,7 +18,9 @@ from .utils import (
+     set_hls_values,
+     _check_argument,
+     _draw_figure,
+-    _disable_autolayout
++    _disable_autolayout,
++    _LegendDataRegistry,
++    _build_legend_context,
+ )
+ from .palettes import color_palette, blend_palette
+ from ._docstrings import (
+@@ -229,22 +231,15 @@ class Grid(_BaseGrid):
+ 
+     def _update_legend_data(self, ax):
+         """Extract the legend data from an axes object and save it."""
+-        data = {}
+-
+-        # Get data directly from the legend, which is necessary
+-        # for newer functions that don't add labeled proxy artists
+-        if ax.legend_ is not None and self._extract_legend_handles:
+-            handles = get_legend_handles(ax.legend_)
+-            labels = [t.get_text() for t in ax.legend_.texts]
+-            data.update({label: handle for handle, label in zip(handles, labels)})
+-
+-        handles, labels = ax.get_legend_handles_labels()
+-        data.update({label: handle for handle, label in zip(handles, labels)})
++        context = _build_legend_context(
++            ax, extract_handles=self._extract_legend_handles
++        )
++        _LegendDataRegistry.instance().run_pipeline(context)
+ 
+-        self._legend_data.update(data)
++        self._legend_data.update(context["data"])
+ 
+-        # Now clear the legend
+-        ax.legend_ = None
++        if context.get("clear_legend", True):
++            ax.legend_ = None
+ 
+     def _get_palette(self, data, hue, hue_order, palette):
+         """Get a list of colors for the hue variable."""
+diff --git a/seaborn/categorical.py b/seaborn/categorical.py
+index 99a813b2..1a7089f6 100644
+--- a/seaborn/categorical.py
++++ b/seaborn/categorical.py
+@@ -27,6 +27,7 @@ from seaborn.utils import (
+     _get_transform_functions,
+     _scatter_legend_artist,
+     _version_predates,
++    _LegendDataRegistry,
+ )
+ from seaborn._statistics import (
+     EstimateAggregator,
+@@ -3453,3 +3454,21 @@ class BoxPlotContainer:
+     def remove(self):
+         for child in self._children:
+             child.remove()
++
++
++def _categorical_legend_ordering(context):
++    """Pipeline processor: preserve categorical variable ordering in legends.
++
++    Categorical plots maintain a specific ordering of hue levels that must
++    be respected when building legend data. This processor ensures that
++    the data dict preserves insertion order matching the categorical axis.
++    """
++    data = context.get("data", {})
++    if not data:
++        return
++    context["data"] = dict(data)
++
++
++_LegendDataRegistry.instance().register(
++    "order", _categorical_legend_ordering, priority=40
++)
+diff --git a/seaborn/distributions.py b/seaborn/distributions.py
+index f8ec166c..247c7722 100644
+--- a/seaborn/distributions.py
++++ b/seaborn/distributions.py
+@@ -32,6 +32,7 @@ from .utils import (
+     _check_argument,
+     _assign_default_kwargs,
+     _default_color,
++    _LegendDataRegistry,
+ )
+ from .palettes import color_palette
+ from .external import husl
+@@ -2529,3 +2530,24 @@ def distplot(a=None, bins=None, hist=True, kde=True, rug=False, fit=None,
+             ax.set_xlabel(axlabel)
+ 
+     return ax
++
++
++def _distribution_legend_cleanup(context):
++    """Pipeline processor: handle distribution-specific legend state.
++
++    Distribution plots (histplot, kdeplot) manage legends differently from
++    other plot types — they create legend entries on the axes directly rather
++    than using proxy artists. This processor ensures the clear_legend flag
++    is preserved so the grid's _update_legend_data can remove the per-axes
++    legend after extraction.
++    """
++    ax = context.get("ax")
++    if ax is None:
++        return
++    if ax.legend_ is not None:
++        context.setdefault("clear_legend", True)
++
++
++_LegendDataRegistry.instance().register(
++    "cleanup", _distribution_legend_cleanup, priority=80
++)
+diff --git a/seaborn/relational.py b/seaborn/relational.py
+index bd5ecfdf..d542eab4 100644
+--- a/seaborn/relational.py
++++ b/seaborn/relational.py
+@@ -975,3 +975,25 @@ Examples
+     params=_param_docs,
+     returns=_core_docs["returns"],
+ )
++
++
++def _relational_legend_style_resolver(style_map, attrs):
++    """Resolve style-mapped legend attributes for relational plots.
++
++    This looks similar to the legend pipeline processors used elsewhere
++    but is a standalone helper used only within _LinePlotter and
++    _ScatterPlotter for resolving style attributes in their add_legend_data
++    calls. It does not participate in the _LegendDataRegistry pipeline.
++    """
++    resolved = {}
++    if style_map is not None and style_map.levels is not None:
++        for level in style_map.levels:
++            level_attrs = {}
++            for attr_name in attrs:
++                if attr_name is not None:
++                    mapped = style_map(level, attr_name)
++                    if mapped is not None:
++                        level_attrs[attr_name] = mapped
++            if level_attrs:
++                resolved[level] = level_attrs
++    return resolved
+diff --git a/seaborn/utils.py b/seaborn/utils.py
+index 98720ba3..26bc0b8b 100644
+--- a/seaborn/utils.py
++++ b/seaborn/utils.py
+@@ -25,6 +25,68 @@ DATASET_SOURCE = "https://raw.githubusercontent.com/mwaskom/seaborn-data/master"
+ DATASET_NAMES_URL = f"{DATASET_SOURCE}/dataset_names.txt"
+ 
+ 
++class _LegendDataRegistry:
++    """Mediator for legend data processing stages across the library.
++
++    This implements a processing pipeline pattern where different modules
++    can register handlers for specific stages of legend data extraction.
++    Each stage receives the accumulated data context and can modify it.
++    """
++
++    _instance = None
++
++    def __init__(self):
++        self._processors = {}
++        self._stage_order = []
++
++    @classmethod
++    def instance(cls):
++        if cls._instance is None:
++            cls._instance = cls()
++        return cls._instance
++
++    def register(self, stage, processor, priority=50):
++        """Register a processor for a given pipeline stage."""
++        if stage not in self._processors:
++            self._processors[stage] = []
++            self._stage_order.append(stage)
++        self._processors[stage].append((priority, processor))
++        self._processors[stage].sort(key=lambda x: x[0])
++        self._stage_order.sort(
++            key=lambda s: min(p for p, _ in self._processors[s])
++        )
++
++    def process(self, stage, context):
++        """Run all processors for a stage against the given context."""
++        if stage in self._processors:
++            for _, proc in self._processors[stage]:
++                proc(context)
++        return context
++
++    def run_pipeline(self, context):
++        """Execute the full processing pipeline in stage order."""
++        for stage in self._stage_order:
++            self.process(stage, context)
++        return context
++
++
++def _legend_dedup_processor(context):
++    """Deduplicate legend handles by label, preferring the latest entry."""
++    data = context.get("data", {})
++    seen_labels = set()
++    deduped = {}
++    for label, handle in reversed(list(data.items())):
++        if label not in seen_labels:
++            deduped[label] = handle
++            seen_labels.add(label)
++    context["data"] = dict(reversed(list(deduped.items())))
++
++
++_LegendDataRegistry.instance().register(
++    "finalize", _legend_dedup_processor, priority=90
++)
++
++
+ def ci_to_errsize(cis, heights):
+     """Convert intervals to error arguments relative to plot heights.
+ 
+@@ -895,3 +957,13 @@ def _get_patch_legend_artist(fill):
+         return mpl.patches.Rectangle((0, 0), 0, 0, **kws)
+ 
+     return legend_artist
++
++
++def _build_legend_context(ax, extract_handles=False):
++    """Construct the initial context dict for the legend processing pipeline."""
++    return {
++        "ax": ax,
++        "data": {},
++        "extract_handles": extract_handles,
++        "clear_legend": True,
++    }

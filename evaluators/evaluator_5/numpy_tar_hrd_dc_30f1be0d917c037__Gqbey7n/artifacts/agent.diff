@@ -1,0 +1,318 @@
+diff --git a/numpy/_core/arrayprint.py b/numpy/_core/arrayprint.py
+index 86b2b08d96..51bae129b7 100644
+--- a/numpy/_core/arrayprint.py
++++ b/numpy/_core/arrayprint.py
+@@ -52,6 +52,7 @@
+ from .overrides import array_function_dispatch, set_module
+ from .printoptions import (
+     format_options,
++    FloatRenderingParams,
+     resolve_float_rendering,
+     resolve_layout,
+     resolve_display_strings,
+@@ -139,7 +140,7 @@ def _resolve_format_params(options):
+     Returns the options dict updated with all resolved values.
+     """
+     ctx = format_options.get()
+-    precision, floatmode, suppress, sign = resolve_float_rendering(
++    float_params = resolve_float_rendering(
+         options.get('precision'), options.get('floatmode'),
+         options.get('suppress'), options.get('sign'),
+     )
+@@ -152,10 +153,10 @@ def _resolve_format_params(options):
+     )
+     resolved = dict(ctx)
+     resolved.update(options)
+-    resolved['precision'] = precision
+-    resolved['floatmode'] = floatmode
+-    resolved['suppress'] = suppress
+-    resolved['sign'] = sign
++    resolved['precision'] = float_params.precision
++    resolved['floatmode'] = float_params.floatmode
++    resolved['suppress'] = float_params.suppress
++    resolved['sign'] = float_params.sign
+     resolved['linewidth'] = linewidth
+     resolved['edgeitems'] = edgeitems
+     resolved['threshold'] = threshold
+@@ -502,29 +503,29 @@ def str_format(x):
+         return str(x.item())
+     return str(x)
+ 
+-def _get_formatdict(data, *, precision, floatmode, suppress, sign, legacy,
++def _get_formatdict(data, *, float_params, legacy,
+                     formatter, nanstr, infstr, **kwargs):
+     # note: extra arguments in kwargs are ignored
+     #
+-    # The float rendering params (precision, floatmode, suppress, sign)
+-    # are passed individually to formatter constructors, allowing each
+-    # formatter to take only the parameters it needs.
+-    effective_prec = get_effective_precision(precision, floatmode)
+-    actual_precision = effective_prec if effective_prec is not None else precision
++    # The float rendering params are now passed as a cohesive object
++    # (FloatRenderingParams) instead of individual parameters, eliminating
++    # the data clumps smell.
++    effective_prec = get_effective_precision(float_params.precision, float_params.floatmode)
++    actual_precision = effective_prec if effective_prec is not None else float_params.precision
+ 
+     # wrapped in lambdas to avoid taking a code path
+     # with the wrong type of data
+     formatdict = {
+         'bool': lambda: BoolFormat(data),
+-        'int': lambda: IntegerFormat(data, sign),
++        'int': lambda: IntegerFormat(data, float_params.sign),
+         'float': lambda: FloatingFormat(
+-            data, actual_precision, floatmode, suppress, sign, legacy=legacy),
++            data, float_params, legacy=legacy),
+         'longfloat': lambda: FloatingFormat(
+-            data, actual_precision, floatmode, suppress, sign, legacy=legacy),
++            data, float_params, legacy=legacy),
+         'complexfloat': lambda: ComplexFloatingFormat(
+-            data, actual_precision, floatmode, suppress, sign, legacy=legacy),
++            data, float_params, legacy=legacy),
+         'longcomplexfloat': lambda: ComplexFloatingFormat(
+-            data, actual_precision, floatmode, suppress, sign, legacy=legacy),
++            data, float_params, legacy=legacy),
+         'datetime': lambda: DatetimeFormat(data, legacy=legacy),
+         'timedelta': lambda: TimedeltaFormat(data),
+         'object': lambda: _object_format,
+@@ -562,20 +563,25 @@ def _get_format_function(data, **options):
+     """
+     find the right formatting function for the dtype_
+ 
+-    The options dict is unpacked so that float rendering parameters
+-    (precision, floatmode, suppress, sign) are forwarded individually
+-    to _get_formatdict. Layout parameters (linewidth, edgeitems, threshold)
+-    and display strings (nanstr, infstr) are also forwarded for formatters
+-    that need them.
++    The options dict contains various formatting parameters. Float rendering
++    parameters are now packaged as a FloatRenderingParams object to eliminate
++    the data clumps smell of passing (precision, floatmode, suppress, sign)
++    individually through multiple call chains.
+     """
+     dtype_ = data.dtype
+     dtypeobj = dtype_.type
+-    formatdict = _get_formatdict(
+-        data,
++    
++    # Create FloatRenderingParams object from individual options
++    float_params = FloatRenderingParams(
+         precision=options['precision'],
+         floatmode=options['floatmode'],
+         suppress=options['suppress'],
+         sign=options['sign'],
++    )
++    
++    formatdict = _get_formatdict(
++        data,
++        float_params=float_params,
+         legacy=options['legacy'],
+         formatter=options.get('formatter'),
+         nanstr=options.get('nanstr', 'nan'),
+@@ -1044,8 +1050,21 @@ def _none_or_positive_arg(x, name):
+ 
+ class FloatingFormat:
+     """ Formatter for subtypes of np.floating """
+-    def __init__(self, data, precision, floatmode, suppress_small, sign=False,
+-                 *, legacy=None):
++    def __init__(self, data, float_params, *, legacy=None):
++        """
++        Initialize FloatingFormat with float rendering parameters.
++        
++        Parameters
++        ----------
++        data : array
++            The data to format
++        float_params : FloatRenderingParams
++            A cohesive object containing all float rendering parameters
++            (precision, floatmode, suppress, sign)
++        legacy : int, optional
++            Legacy formatting mode
++        """
++        sign = float_params.sign
+         # for backcompatibility, accept bools
+         if isinstance(sign, bool):
+             sign = '+' if sign else '-'
+@@ -1056,15 +1075,15 @@ def __init__(self, data, precision, floatmode, suppress_small, sign=False,
+             if data.shape != () and sign == '-':
+                 sign = ' '
+ 
+-        self.floatmode = floatmode
+-        if floatmode == 'unique':
++        self.floatmode = float_params.floatmode
++        if float_params.floatmode == 'unique':
+             self.precision = None
+         else:
+-            self.precision = precision
++            self.precision = float_params.precision
+ 
+         self.precision = _none_or_positive_arg(self.precision, 'precision')
+ 
+-        self.suppress_small = suppress_small
++        self.suppress_small = float_params.suppress
+         self.sign = sign
+         self.exp_format = False
+         self.large_exponent = False
+@@ -1400,24 +1419,49 @@ def __call__(self, x):
+ 
+ class ComplexFloatingFormat:
+     """ Formatter for subtypes of np.complexfloating """
+-    def __init__(self, x, precision, floatmode, suppress_small,
+-                 sign=False, *, legacy=None):
++    def __init__(self, x, float_params, *, legacy=None):
++        """
++        Initialize ComplexFloatingFormat with float rendering parameters.
++        
++        Parameters
++        ----------
++        x : array
++            The data to format
++        float_params : FloatRenderingParams
++            A cohesive object containing all float rendering parameters
++            (precision, floatmode, suppress, sign)
++        legacy : int, optional
++            Legacy formatting mode
++        """
++        sign = float_params.sign
+         # for backcompatibility, accept bools
+         if isinstance(sign, bool):
+             sign = '+' if sign else '-'
+ 
+-        floatmode_real = floatmode_imag = floatmode
++        floatmode_real = floatmode_imag = float_params.floatmode
+         if legacy <= 113:
+             floatmode_real = 'maxprec_equal'
+             floatmode_imag = 'maxprec'
+ 
++        # Create FloatRenderingParams objects for real and imaginary parts
++        real_params = FloatRenderingParams(
++            precision=float_params.precision,
++            floatmode=floatmode_real,
++            suppress=float_params.suppress,
++            sign=sign
++        )
++        imag_params = FloatRenderingParams(
++            precision=float_params.precision,
++            floatmode=floatmode_imag,
++            suppress=float_params.suppress,
++            sign='+'
++        )
++        
+         self.real_format = FloatingFormat(
+-            x.real, precision, floatmode_real, suppress_small,
+-            sign=sign, legacy=legacy
++            x.real, real_params, legacy=legacy
+         )
+         self.imag_format = FloatingFormat(
+-            x.imag, precision, floatmode_imag, suppress_small,
+-            sign='+', legacy=legacy
++            x.imag, imag_params, legacy=legacy
+         )
+ 
+     def __call__(self, x):
+@@ -1538,9 +1582,8 @@ def from_data(cls, data, **options):
+         using the raw data as input. Added to avoid changing
+         the signature of __init__.
+ 
+-        Options are unpacked to pass float rendering parameters
+-        (precision, floatmode, suppress, sign) and layout parameters
+-        (threshold, edgeitems) individually to sub-formatters.
++        Float rendering parameters are now packaged as a FloatRenderingParams
++        object to eliminate the data clumps smell.
+         """
+         precision = options.get('precision', 8)
+         floatmode = options.get('floatmode', 'maxprec')
+diff --git a/numpy/_core/printoptions.py b/numpy/_core/printoptions.py
+index d00d9f5b1c..d2c0044ebf 100644
+--- a/numpy/_core/printoptions.py
++++ b/numpy/_core/printoptions.py
+@@ -17,8 +17,35 @@
+ 
+ import sys
+ from contextvars import ContextVar
++from dataclasses import dataclass
+ 
+-__all__ = ["format_options"]
++__all__ = ["format_options", "FloatRenderingParams"]
++
++
++@dataclass(frozen=True)
++class FloatRenderingParams:
++    """
++    A cohesive structure for float rendering parameters.
++    
++    These parameters always travel together through the call chain
++    and control how floating-point numbers are formatted.
++    
++    Attributes
++    ----------
++    precision : int or None
++        Number of digits of precision for floating point output.
++    floatmode : str
++        Controls interpretation of precision ('fixed', 'unique', 
++        'maxprec', 'maxprec_equal').
++    suppress : bool
++        If True, use fixed point notation for small numbers.
++    sign : str
++        Controls printing of sign ('-', '+', or ' ').
++    """
++    precision: int | None
++    floatmode: str
++    suppress: bool
++    sign: str
+ 
+ default_format_options_dict = {
+     "edgeitems": 3,  # repr N leading and trailing items of each dimension
+@@ -52,13 +79,19 @@
+ 
+ def resolve_float_rendering(precision=None, floatmode=None,
+                             suppress=None, sign=None):
+-    """Resolve float rendering parameters, falling back to context defaults."""
++    """Resolve float rendering parameters, falling back to context defaults.
++    
++    Returns
++    -------
++    FloatRenderingParams
++        A cohesive object containing all float rendering parameters.
++    """
+     opts = format_options.get()
+-    return (
+-        precision if precision is not None else opts['precision'],
+-        floatmode if floatmode is not None else opts['floatmode'],
+-        suppress if suppress is not None else opts['suppress'],
+-        sign if sign is not None else opts['sign'],
++    return FloatRenderingParams(
++        precision=precision if precision is not None else opts['precision'],
++        floatmode=floatmode if floatmode is not None else opts['floatmode'],
++        suppress=suppress if suppress is not None else opts['suppress'],
++        sign=sign if sign is not None else opts['sign'],
+     )
+ 
+ 
+diff --git a/numpy/_core/src/common/pythoncapi-compat b/numpy/_core/src/common/pythoncapi-compat
+index 90c06a4cae..8636bccf29 160000
+--- a/numpy/_core/src/common/pythoncapi-compat
++++ b/numpy/_core/src/common/pythoncapi-compat
+@@ -1 +1 @@
+-Subproject commit 90c06a4cae557bdbfa4f231a781d2b5c1a8f6d1c
++Subproject commit 8636bccf29adfa23463f810b3c2830f7cff1e933
+diff --git a/numpy/_core/src/highway b/numpy/_core/src/highway
+index 37c08e5528..ee36c83712 160000
+--- a/numpy/_core/src/highway
++++ b/numpy/_core/src/highway
+@@ -1 +1 @@
+-Subproject commit 37c08e5528f63ead9c7e4fd99ba454c1b1a3e3f7
++Subproject commit ee36c837129310be19c17c9108c6dc3f6ae06942
+diff --git a/numpy/_core/src/npysort/x86-simd-sort b/numpy/_core/src/npysort/x86-simd-sort
+index 6a7a01da4b..5adb33411f 160000
+--- a/numpy/_core/src/npysort/x86-simd-sort
++++ b/numpy/_core/src/npysort/x86-simd-sort
+@@ -1 +1 @@
+-Subproject commit 6a7a01da4b0dfde108aa626a2364c954e2c50fe1
++Subproject commit 5adb33411f3cea8bdbafa9d91bd75bc4bf19c7dd
+diff --git a/vendored-meson/meson b/vendored-meson/meson
+index e72c717199..5d5a3d478d 160000
+--- a/vendored-meson/meson
++++ b/vendored-meson/meson
+@@ -1 +1 @@
+-Subproject commit e72c717199fa18d34020c7c97f9de3f388c5e055
++Subproject commit 5d5a3d478da115c812be77afa651db2492d52171

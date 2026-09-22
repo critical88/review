@@ -1,0 +1,317 @@
+diff --git a/pandas/core/reshape/merge.py b/pandas/core/reshape/merge.py
+index 7355dc1484..a2aa138e18 100644
+--- a/pandas/core/reshape/merge.py
++++ b/pandas/core/reshape/merge.py
+@@ -3,6 +3,9 @@ SQL-style merge routines
+ """
+ from __future__ import annotations
+ 
++from dataclasses import dataclass
++from typing import Any
++
+ from collections.abc import (
+     Hashable,
+     Sequence,
+@@ -47,6 +50,24 @@ from pandas.util._exceptions import find_stack_level
+ 
+ from pandas.core.dtypes.base import ExtensionDtype
+ from pandas.core.dtypes.cast import find_common_type
++
++
++@dataclass
++class SuffixConfig:
++    """Configuration for column suffixes in merge operations."""
++    left_suffix: str | None
++    right_suffix: str | None
++    check_duplicates: bool
++
++
++@dataclass
++class JoinKeySpec:
++    """Specification for join keys in merge operations."""
++    on: IndexLabel | AnyArrayLike | None
++    left_on: IndexLabel | AnyArrayLike | None
++    right_on: IndexLabel | AnyArrayLike | None
++    left_index: bool
++    right_index: bool
+ from pandas.core.dtypes.common import (
+     ensure_int64,
+     ensure_object,
+@@ -155,7 +176,18 @@ def merge(
+             "Provide 'suffixes' as a tuple instead."
+         )
+     left_suffix, right_suffix = suffixes
+-    suffix_check_dups = True
++    suffix_config = SuffixConfig(
++        left_suffix=left_suffix,
++        right_suffix=right_suffix,
++        check_duplicates=True
++    )
++    join_spec = JoinKeySpec(
++        on=on,
++        left_on=left_on,
++        right_on=right_on,
++        left_index=left_index,
++        right_index=right_index
++    )
+ 
+     left_df = _validate_operand(left)
+     right_df = _validate_operand(right)
+@@ -163,15 +195,9 @@ def merge(
+         return _cross_merge(
+             left_df,
+             right_df,
+-            on=on,
+-            left_on=left_on,
+-            right_on=right_on,
+-            left_index=left_index,
+-            right_index=right_index,
++            join_spec=join_spec,
+             sort=sort,
+-            left_suffix=left_suffix,
+-            right_suffix=right_suffix,
+-            suffix_check_dups=suffix_check_dups,
++            suffix_config=suffix_config,
+             indicator=indicator,
+             validate=validate,
+             copy=copy,
+@@ -181,15 +207,9 @@ def merge(
+             left_df,
+             right_df,
+             how=how,
+-            on=on,
+-            left_on=left_on,
+-            right_on=right_on,
+-            left_index=left_index,
+-            right_index=right_index,
++            join_spec=join_spec,
+             sort=sort,
+-            left_suffix=left_suffix,
+-            right_suffix=right_suffix,
+-            suffix_check_dups=suffix_check_dups,
++            suffix_config=suffix_config,
+             indicator=indicator,
+             validate=validate,
+         )
+@@ -199,15 +219,9 @@ def merge(
+ def _cross_merge(
+     left: DataFrame,
+     right: DataFrame,
+-    on: IndexLabel | AnyArrayLike | None = None,
+-    left_on: IndexLabel | AnyArrayLike | None = None,
+-    right_on: IndexLabel | AnyArrayLike | None = None,
+-    left_index: bool = False,
+-    right_index: bool = False,
++    join_spec: JoinKeySpec,
++    suffix_config: SuffixConfig,
+     sort: bool = False,
+-    left_suffix: str | None = "_x",
+-    right_suffix: str | None = "_y",
+-    suffix_check_dups: bool = True,
+     copy: bool | None = None,
+     indicator: str | bool = False,
+     validate: str | None = None,
+@@ -217,11 +231,11 @@ def _cross_merge(
+     """
+ 
+     if (
+-        left_index
+-        or right_index
+-        or right_on is not None
+-        or left_on is not None
+-        or on is not None
++        join_spec.left_index
++        or join_spec.right_index
++        or join_spec.right_on is not None
++        or join_spec.left_on is not None
++        or join_spec.on is not None
+     ):
+         raise MergeError(
+             "Can not pass on, right_on, left_on or set right_index=True or "
+@@ -238,13 +252,13 @@ def _cross_merge(
+         left,
+         right,
+         how="inner",
+-        on=on,
++        on=join_spec.on,
+         left_on=left_on,
+         right_on=right_on,
+-        left_index=left_index,
+-        right_index=right_index,
++        left_index=join_spec.left_index,
++        right_index=join_spec.right_index,
+         sort=sort,
+-        suffixes=(left_suffix, right_suffix),
++        suffixes=(suffix_config.left_suffix, suffix_config.right_suffix),
+         indicator=indicator,
+         validate=validate,
+         copy=copy,
+@@ -415,19 +429,28 @@ def merge_ordered(
+     """
+ 
+     left_suffix, right_suffix = suffixes
+-    suffix_check_dups = True
++    suffix_config = SuffixConfig(
++        left_suffix=left_suffix,
++        right_suffix=right_suffix,
++        check_duplicates=True
++    )
++    join_spec = JoinKeySpec(
++        on=on,
++        left_on=left_on,
++        right_on=right_on,
++        left_index=False,
++        right_index=False
++    )
+ 
+     def _merger(x, y) -> DataFrame:
+         # perform the ordered merge operation
+         op = _OrderedMerge(
+             x,
+             y,
+-            on=on,
+-            left_on=left_on,
+-            right_on=right_on,
++            join_spec=join_spec,
+             left_suffix=left_suffix,
+             right_suffix=right_suffix,
+-            suffix_check_dups=suffix_check_dups,
++            suffix_check_dups=True,
+             fill_method=fill_method,
+             how=how,
+         )
+@@ -765,15 +788,9 @@ class _MergeOperation:
+         left: DataFrame | Series,
+         right: DataFrame | Series,
+         how: JoinHow | Literal["asof"] = "inner",
+-        on: IndexLabel | AnyArrayLike | None = None,
+-        left_on: IndexLabel | AnyArrayLike | None = None,
+-        right_on: IndexLabel | AnyArrayLike | None = None,
+-        left_index: bool = False,
+-        right_index: bool = False,
++        join_spec: JoinKeySpec | None = None,
+         sort: bool = True,
+-        left_suffix: str | None = "_x",
+-        right_suffix: str | None = "_y",
+-        suffix_check_dups: bool = True,
++        suffix_config: SuffixConfig | None = None,
+         indicator: str | bool = False,
+         validate: str | None = None,
+     ) -> None:
+@@ -783,25 +800,45 @@ class _MergeOperation:
+         self.right = self.orig_right = _right
+         self.how = how
+ 
+-        self.on = com.maybe_make_list(on)
++        # Handle backward compatibility - if join_spec is None, use individual parameters
++        if join_spec is None:
++            # This maintains backward compatibility for internal usage
++            # Set defaults that match the original signature
++            join_spec = JoinKeySpec(
++                on=None,
++                left_on=None,
++                right_on=None,
++                left_index=False,
++                right_index=False
++            )
++        
++        if suffix_config is None:
++            # This maintains backward compatibility for internal usage
++            suffix_config = SuffixConfig(
++                left_suffix="_x",
++                right_suffix="_y",
++                check_duplicates=True
++            )
++
++        self.on = com.maybe_make_list(join_spec.on)
+ 
+-        self.left_suffix = left_suffix
+-        self.right_suffix = right_suffix
+-        self.suffix_check_dups = suffix_check_dups
++        self.left_suffix = suffix_config.left_suffix
++        self.right_suffix = suffix_config.right_suffix
++        self.suffix_check_dups = suffix_config.check_duplicates
+         self.sort = sort or how == "outer"
+ 
+-        self.left_index = left_index
+-        self.right_index = right_index
++        self.left_index = join_spec.left_index
++        self.right_index = join_spec.right_index
+ 
+         self.indicator = indicator
+ 
+-        if not is_bool(left_index):
++        if not is_bool(join_spec.left_index):
+             raise ValueError(
+-                f"left_index parameter must be of type bool, not {type(left_index)}"
++                f"left_index parameter must be of type bool, not {type(join_spec.left_index)}"
+             )
+-        if not is_bool(right_index):
++        if not is_bool(join_spec.right_index):
+             raise ValueError(
+-                f"right_index parameter must be of type bool, not {type(right_index)}"
++                f"right_index parameter must be of type bool, not {type(join_spec.right_index)}"
+             )
+ 
+         # GH 40993: raise when merging between different levels; enforced in 2.0
+@@ -813,7 +850,7 @@ class _MergeOperation:
+             )
+             raise MergeError(msg)
+ 
+-        self.left_on, self.right_on = self._validate_left_right_on(left_on, right_on)
++        self.left_on, self.right_on = self._validate_left_right_on(join_spec.left_on, join_spec.right_on)
+ 
+         (
+             self.left_join_keys,
+@@ -1933,11 +1970,7 @@ class _OrderedMerge(_MergeOperation):
+         self,
+         left: DataFrame | Series,
+         right: DataFrame | Series,
+-        on: IndexLabel | None = None,
+-        left_on: IndexLabel | None = None,
+-        right_on: IndexLabel | None = None,
+-        left_index: bool = False,
+-        right_index: bool = False,
++        join_spec: JoinKeySpec | None = None,
+         left_suffix: str | None = "_x",
+         right_suffix: str | None = "_y",
+         suffix_check_dups: bool = True,
+@@ -1945,19 +1978,30 @@ class _OrderedMerge(_MergeOperation):
+         how: JoinHow | Literal["asof"] = "outer",
+     ) -> None:
+         self.fill_method = fill_method
++        
++        # Handle backward compatibility
++        if join_spec is None:
++            join_spec = JoinKeySpec(
++                on=None,
++                left_on=None,
++                right_on=None,
++                left_index=False,
++                right_index=False
++            )
++        
++        suffix_config = SuffixConfig(
++            left_suffix=left_suffix,
++            right_suffix=right_suffix,
++            check_duplicates=suffix_check_dups
++        )
++        
+         _MergeOperation.__init__(
+             self,
+             left,
+             right,
+-            on=on,
+-            left_on=left_on,
+-            left_index=left_index,
+-            right_index=right_index,
+-            right_on=right_on,
++            join_spec=join_spec,
+             how=how,
+-            left_suffix=left_suffix,
+-            right_suffix=right_suffix,
+-            suffix_check_dups=suffix_check_dups,
++            suffix_config=suffix_config,
+             sort=True,  # factorize sorts
+         )
+ 

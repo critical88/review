@@ -1,0 +1,326 @@
+diff --git a/xarray/core/treenode.py b/xarray/core/treenode.py
+index 7a5ccf15..d2714b46 100644
+--- a/xarray/core/treenode.py
++++ b/xarray/core/treenode.py
+@@ -17,6 +17,136 @@ if TYPE_CHECKING:
+     from xarray.core.types import T_DataArray
+ 
+ 
++# Internal helper classes to reduce the god class smell in TreeNode
++class _TreeConfigurationManager:
++    """Manages node-level configuration that tree operations can read."""
++    
++    def __init__(self):
++        self._node_config = {}
++    
++    def configure_node(self, **config) -> None:
++        """Set node-level configuration that tree operations can read."""
++        self._node_config.update(config)
++    
++    def get_config(self, parent_getter, key: str, default: Any = None) -> Any:
++        """Retrieve a configuration value, inheriting from ancestors if not set locally."""
++        if key in self._node_config:
++            return self._node_config[key]
++        if parent_getter() is not None:
++            return parent_getter()._get_config(key, default)
++        return default
++
++
++class _TreeAnalyzer:
++    """Provides tree analysis functionality like depth, width, leaves, etc."""
++    
++    @staticmethod
++    def get_level(node_getter) -> int:
++        """Level of this node (number of parent nodes above this node)."""
++        return len(tuple(_TreeNavigator.iter_parents(node_getter)))
++    
++    @staticmethod
++    def get_depth(root_getter, subtree_getter) -> int:
++        """Maximum level of this tree (measured from the root)."""
++        return max(_TreeAnalyzer.get_level(lambda: node) for node in root_getter().subtree)
++    
++    @staticmethod
++    def get_width(node_getter, root_getter, subtree_getter, level_getter) -> int:
++        """Number of nodes at this level in the tree."""
++        target_level = level_getter()
++        return len([node for node in root_getter().subtree if _TreeAnalyzer.get_level(lambda: node) == target_level])
++    
++    @staticmethod
++    def get_leaves(subtree_getter, is_leaf_getter) -> tuple:
++        """All leaf nodes (nodes which have no children)."""
++        return tuple([node for node in subtree_getter() if is_leaf_getter(node)])
++    
++    @staticmethod
++    def get_siblings(parent_getter, children_getter, self_getter) -> dict:
++        """Nodes with the same parent as this node."""
++        if parent_getter():
++            return {
++                name: child
++                for name, child in parent_getter().children.items()
++                if child is not self_getter()
++            }
++        else:
++            return {}
++
++
++class _TreeNavigator:
++    """Handles tree navigation and path operations."""
++    
++    @staticmethod
++    def iter_parents(node_getter) -> Iterator:
++        """Iterate up the tree, starting from the current node's parent."""
++        node = node_getter().parent
++        while node is not None:
++            yield node
++            node = node.parent
++    
++    @staticmethod
++    def get_root(node_getter) -> Any:
++        """Root node of the tree."""
++        node = node_getter()
++        while node.parent is not None:
++            node = node.parent
++        return node
++    
++    @staticmethod
++    def is_descendant_of(node_getter, target_node) -> bool:
++        """Check if this node is a descendant of the target node."""
++        return any(n is node_getter() for n in _TreeNavigator.iter_parents(lambda: target_node))
++
++
++class _TreeOperations:
++    """Handles advanced tree operations like comparison and validation."""
++    
++    @staticmethod
++    def compare_trees(self_getter, other, require_names_equal: bool = False) -> str:
++        """Compare tree structure, returning a diff string (empty if isomorphic)."""
++        for node_a, node_b in zip(self_getter().subtree, other.subtree):
++            path_a = node_a.path if hasattr(node_a, "path") else repr(node_a)
++            path_b = node_b.path if hasattr(node_b, "path") else repr(node_b)
++
++            if (
++                require_names_equal
++                and hasattr(node_a, "name")
++                and hasattr(node_b, "name")
++            ):
++                if node_a.name != node_b.name:
++                    return dedent(
++                        f"""\
++                        Node '{path_a}' in the left object has name '{node_a.name}'
++                        Node '{path_b}' in the right object has name '{node_b.name}'"""
++                    )
++
++            if len(node_a.children) != len(node_b.children):
++                return dedent(
++                    f"""\
++                    Number of children on node '{path_a}' of the left object: {len(node_a.children)}
++                    Number of children on node '{path_b}' of the right object: {len(node_b.children)}"""
++                )
++
++        return ""
++    
++    @staticmethod
++    def validate_tree_integrity(self_getter, subtree_getter) -> bool:
++        """Validate internal tree invariants. Returns True if tree is well-formed."""
++        seen_ids: set[int] = set()
++        for node in subtree_getter():
++            nid = id(node)
++            if nid in seen_ids:
++                return False
++            seen_ids.add(nid)
++            if node.parent is not None:
++                if not any(
++                    child is node for child in node.parent.children.values()
++                ):
++                    return False
++        return True
++
++
+ class InvalidTreeError(Exception):
+     """Raised when user attempts to create an invalid tree in some way."""
+ 
+@@ -81,7 +211,8 @@ class TreeNode(Generic[Tree]):
+         """Create a parentless node."""
+         self._parent = None
+         self._children = {}
+-        self._node_config = {}
++        # Initialize helper classes
++        self._config_manager = _TreeConfigurationManager()
+         if children is not None:
+             self.children = children
+ 
+@@ -121,7 +252,7 @@ class TreeNode(Generic[Tree]):
+                 )
+ 
+     def _is_descendant_of(self, node: Tree) -> bool:
+-        return any(n is self for n in node.parents)
++        return _TreeNavigator.is_descendant_of(lambda: self, node)
+ 
+     def _detach(self, parent: Tree | None) -> None:
+         if parent is not None:
+@@ -235,10 +366,7 @@ class TreeNode(Generic[Tree]):
+ 
+     def _iter_parents(self: Tree) -> Iterator[Tree]:
+         """Iterate up the tree, starting from the current node's parent."""
+-        node: Tree | None = self.parent
+-        while node is not None:
+-            yield node
+-            node = node.parent
++        return _TreeNavigator.iter_parents(lambda: self)
+ 
+     def iter_lineage(self: Tree) -> tuple[Tree, ...]:
+         """Iterate up the tree, starting from the current node."""
+@@ -266,7 +394,7 @@ class TreeNode(Generic[Tree]):
+     @property
+     def parents(self: Tree) -> tuple[Tree, ...]:
+         """All parent nodes and their parent nodes, starting with the closest."""
+-        return tuple(self._iter_parents())
++        return tuple(_TreeNavigator.iter_parents(lambda: self))
+ 
+     @property
+     def ancestors(self: Tree) -> tuple[Tree, ...]:
+@@ -284,10 +412,7 @@ class TreeNode(Generic[Tree]):
+     @property
+     def root(self: Tree) -> Tree:
+         """Root node of the tree"""
+-        node = self
+-        while node.parent is not None:
+-            node = node.parent
+-        return node
++        return _TreeNavigator.get_root(lambda: self)
+ 
+     @property
+     def is_root(self) -> bool:
+@@ -310,21 +435,21 @@ class TreeNode(Generic[Tree]):
+ 
+         Leaf nodes are defined as nodes which have no children.
+         """
+-        return tuple([node for node in self.subtree if node.is_leaf])
++        return _TreeAnalyzer.get_leaves(
++            lambda: self.subtree,
++            lambda node: node.is_leaf
++        )
+ 
+     @property
+     def siblings(self: Tree) -> dict[str, Tree]:
+         """
+         Nodes with the same parent as this node.
+         """
+-        if self.parent:
+-            return {
+-                name: child
+-                for name, child in self.parent.children.items()
+-                if child is not self
+-            }
+-        else:
+-            return {}
++        return _TreeAnalyzer.get_siblings(
++            lambda: self.parent,
++            lambda: self.parent.children if self.parent else {},
++            lambda: self
++        )
+ 
+     @property
+     def subtree(self: Tree) -> Iterator[Tree]:
+@@ -371,7 +496,7 @@ class TreeNode(Generic[Tree]):
+         depth
+         width
+         """
+-        return len(self.parents)
++        return _TreeAnalyzer.get_level(lambda: self)
+ 
+     @property
+     def depth(self: Tree) -> int:
+@@ -389,7 +514,7 @@ class TreeNode(Generic[Tree]):
+         level
+         width
+         """
+-        return max(node.level for node in self.root.subtree)
++        return _TreeAnalyzer.get_depth(lambda: self.root, lambda: self.root.subtree)
+ 
+     @property
+     def width(self: Tree) -> int:
+@@ -407,7 +532,12 @@ class TreeNode(Generic[Tree]):
+         level
+         depth
+         """
+-        return len([node for node in self.root.subtree if node.level == self.level])
++        return _TreeAnalyzer.get_width(
++            lambda: self, 
++            lambda: self.root, 
++            lambda: self.root.subtree, 
++            lambda: self.level
++        )
+ 
+     def _pre_detach(self: Tree, parent: Tree) -> None:
+         """Method call before detaching from `parent`."""
+@@ -580,15 +710,11 @@ class TreeNode(Generic[Tree]):
+ 
+     def _configure_node(self, **config) -> None:
+         """Set node-level configuration that tree operations can read."""
+-        self._node_config.update(config)
++        self._config_manager.configure_node(**config)
+ 
+     def _get_config(self, key: str, default: Any = None) -> Any:
+         """Retrieve a configuration value, inheriting from ancestors if not set locally."""
+-        if key in self._node_config:
+-            return self._node_config[key]
+-        if self._parent is not None:
+-            return self._parent._get_config(key, default)
+-        return default
++        return self._config_manager.get_config(lambda: self.parent, key, default)
+ 
+     def _iter_subtree(
+         self: Tree,
+@@ -613,30 +739,7 @@ class TreeNode(Generic[Tree]):
+         self: Tree, other: Tree, require_names_equal: bool = False
+     ) -> str:
+         """Compare tree structure, returning a diff string (empty if isomorphic)."""
+-        for node_a, node_b in zip(self.subtree, other.subtree):
+-            path_a = node_a.path if hasattr(node_a, "path") else repr(node_a)
+-            path_b = node_b.path if hasattr(node_b, "path") else repr(node_b)
+-
+-            if (
+-                require_names_equal
+-                and hasattr(node_a, "name")
+-                and hasattr(node_b, "name")
+-            ):
+-                if node_a.name != node_b.name:
+-                    return dedent(
+-                        f"""\
+-                        Node '{path_a}' in the left object has name '{node_a.name}'
+-                        Node '{path_b}' in the right object has name '{node_b.name}'"""
+-                    )
+-
+-            if len(node_a.children) != len(node_b.children):
+-                return dedent(
+-                    f"""\
+-                    Number of children on node '{path_a}' of the left object: {len(node_a.children)}
+-                    Number of children on node '{path_b}' of the right object: {len(node_b.children)}"""
+-                )
+-
+-        return ""
++        return _TreeOperations.compare_trees(lambda: self, other, require_names_equal)
+ 
+     def _render_tree(self, style=None, childiter=list, maxlevel=None):
+         """Create a tree renderer using the registered rendering strategy."""
+@@ -657,18 +760,7 @@ class TreeNode(Generic[Tree]):
+ 
+     def _validate_tree_integrity(self: Tree) -> bool:
+         """Validate internal tree invariants. Returns True if tree is well-formed."""
+-        seen_ids: set[int] = set()
+-        for node in self.subtree:
+-            nid = id(node)
+-            if nid in seen_ids:
+-                return False
+-            seen_ids.add(nid)
+-            if node.parent is not None:
+-                if not any(
+-                    child is node for child in node.parent.children.values()
+-                ):
+-                    return False
+-        return True
++        return _TreeOperations.validate_tree_integrity(lambda: self, lambda: self.subtree)
+ 
+ 
+ class NamedNode(TreeNode, Generic[Tree]):

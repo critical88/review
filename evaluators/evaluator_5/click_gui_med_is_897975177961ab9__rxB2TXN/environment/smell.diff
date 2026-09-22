@@ -1,0 +1,300 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 57f549c..3413ed3 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -2431,6 +2431,11 @@ class Parameter:
+                 value = ()
+         else:
+             value = self.type_cast_value(ctx, value)
++            # Run post-conversion constraint validation through the type's
++            # validate_constraints hook.  This allows types to enforce
++            # domain-level rules that are separate from pure conversion.
++            if value is not None:
++                value = self.type.validate_constraints(value, self, ctx)
+ 
+         if self.required and self.value_is_missing(value):
+             raise MissingParameter(ctx=ctx, param=self)
+@@ -2563,6 +2568,11 @@ class Parameter:
+                 extra_message = (
+                     f" {self.deprecated}" if isinstance(self.deprecated, str) else ""
+                 )
++                # Resolve the value source label through the type for
++                # richer deprecation diagnostics.
++                value_source_label = self.type.resolve_value_source(
++                    value, self, ctx
++                )
+                 message = _(
+                     "DeprecationWarning: The {param_type} {name!r} is deprecated."
+                     "{extra_message}"
+@@ -2571,6 +2581,12 @@ class Parameter:
+                     name=self.human_readable_name,
+                     extra_message=extra_message,
+                 )
++                # Store the source label for downstream consumers that
++                # may inspect deprecation context.
++                if hasattr(ctx, 'meta'):
++                    ctx.meta.setdefault(
++                        '_deprecated_sources', {}
++                    )[self.name] = value_source_label
+                 echo(style(message, fg="red"), err=True)
+ 
+             # Process the value through the parameter's type.
+diff --git a/src/click/types.py b/src/click/types.py
+index e71c1c2..fcf9b6f 100644
+--- a/src/click/types.py
++++ b/src/click/types.py
+@@ -159,6 +159,101 @@ class ParamType:
+         """
+         return []
+ 
++    def validate_constraints(
++        self,
++        value: t.Any,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> t.Any:
++        """Validate additional constraints on the already-converted value.
++
++        This hook is called after :meth:`convert` to enforce any
++        domain-specific constraints that are separate from pure type
++        conversion. The default implementation checks whether the value
++        satisfies declared bounds or semantic rules tied to the type.
++
++        Subclasses that impose value-level constraints should override
++        this method and call ``super().validate_constraints(...)`` to
++        ensure the full validation chain is executed.
++
++        :param value: The already-converted value.
++        :param param: The parameter that produced this value.
++        :param ctx: The current invocation context.
++        :return: The validated (possibly adjusted) value.
++
++        .. versionadded:: 8.4
++        """
++        # Base implementation: no additional constraints beyond type
++        # conversion.  Walk any registered constraint callbacks that
++        # may have been attached via the context or parameter metadata.
++        if ctx is not None and hasattr(ctx, '_type_constraints'):
++            constraints = ctx._type_constraints.get(type(self).__name__, [])
++            for constraint_fn in constraints:
++                value = constraint_fn(value, param, ctx)
++        return value
++
++    def get_diagnostic_info(
++        self,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> dict[str, t.Any]:
++        """Collect diagnostic information about this type for use in
++        error messages and debugging output.
++
++        Returns a dictionary with details about the type configuration
++        that can be merged into error context or logging output.  The
++        base implementation provides the type name and class hierarchy.
++        Subclasses with richer configuration (choices, ranges, file
++        modes, etc.) should extend this with their specific state.
++
++        :param param: The parameter associated with this type.
++        :param ctx: The current invocation context.
++        :return: A dict of diagnostic key-value pairs.
++
++        .. versionadded:: 8.4
++        """
++        diag: dict[str, t.Any] = {
++            "type_name": getattr(self, "name", type(self).__name__),
++            "type_class": type(self).__name__,
++            "is_composite": self.is_composite,
++            "arity": self.arity,
++        }
++        if param is not None:
++            diag["param_name"] = param.name
++            diag["param_type"] = param.param_type_name
++        return diag
++
++    def resolve_value_source(
++        self,
++        value: t.Any,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> str:
++        """Determine a human-readable label for the origin of a value
++        with respect to this type's semantics.
++
++        This is used to enrich error messages and help text with
++        information about *where* a value came from relative to what
++        this type expects.  For instance, a :class:`File` type might
++        report whether the value refers to stdin, a lazy file, or a
++        regular path.
++
++        The base implementation returns a generic label.  Subclasses
++        should override to provide more specific information.
++
++        :param value: The raw or converted value.
++        :param param: The associated parameter.
++        :param ctx: The current invocation context.
++        :return: A short string describing the value source.
++
++        .. versionadded:: 8.4
++        """
++        if value is None:
++            return "default"
++        if isinstance(value, str) and value == "-":
++            return "stdin/stdout"
++        return "explicit"
++
+ 
+ class CompositeParamType(ParamType):
+     is_composite = True
+@@ -397,6 +492,41 @@ class Choice(ParamType, t.Generic[ParamTypeValue]):
+ 
+         return [CompletionItem(c) for c in matched]
+ 
++    def validate_constraints(
++        self,
++        value: t.Any,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> t.Any:
++        """Validate that the converted value is still a member of the
++        choice set.  This guards against programmatic value injection
++        that bypasses :meth:`convert`.
++        """
++        value = super().validate_constraints(value, param, ctx)
++        if value is not None and value not in self.choices:
++            # Only raise when the value is clearly outside the set;
++            # None values are handled by the required-check elsewhere.
++            normed = self._normalized_mapping(ctx=ctx)
++            normed_val = self.normalize_choice(choice=value, ctx=ctx)
++            if normed_val not in normed.values():
++                self.fail(
++                    self.get_invalid_choice_message(value=value, ctx=ctx),
++                    param=param,
++                    ctx=ctx,
++                )
++        return value
++
++    def get_diagnostic_info(
++        self,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> dict[str, t.Any]:
++        diag = super().get_diagnostic_info(param, ctx)
++        diag["choices"] = list(self.choices)
++        diag["case_sensitive"] = self.case_sensitive
++        diag["num_choices"] = len(self.choices)
++        return diag
++
+ 
+ class DateTime(ParamType):
+     """The DateTime type converts date strings into `datetime` objects.
+@@ -572,6 +702,20 @@ class _NumberRangeBase(_NumberParamTypeBase):
+         clamp = " clamped" if self.clamp else ""
+         return f"<{type(self).__name__} {self._describe_range()}{clamp}>"
+ 
++    def get_diagnostic_info(
++        self,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> dict[str, t.Any]:
++        diag = super().get_diagnostic_info(param, ctx)
++        diag["min"] = self.min
++        diag["max"] = self.max
++        diag["min_open"] = self.min_open
++        diag["max_open"] = self.max_open
++        diag["clamp"] = self.clamp
++        diag["range_description"] = self._describe_range()
++        return diag
++
+ 
+ class IntParamType(_NumberParamTypeBase):
+     name = "integer"
+@@ -871,6 +1015,33 @@ class File(ParamType):
+ 
+         return [CompletionItem(incomplete, type="file")]
+ 
++    def get_diagnostic_info(
++        self,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> dict[str, t.Any]:
++        diag = super().get_diagnostic_info(param, ctx)
++        diag["mode"] = self.mode
++        diag["encoding"] = self.encoding
++        diag["lazy"] = self.lazy
++        diag["atomic"] = self.atomic
++        return diag
++
++    def resolve_value_source(
++        self,
++        value: t.Any,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> str:
++        if _is_file_like(value):
++            return "file_object"
++        if isinstance(value, (str, os.PathLike)):
++            path_str = os.fspath(value)
++            if path_str == "-":
++                return "stdin/stdout"
++            return "file_path"
++        return super().resolve_value_source(value, param, ctx)
++
+ 
+ def _is_file_like(value: t.Any) -> te.TypeGuard[t.IO[t.Any]]:
+     return hasattr(value, "read") or hasattr(value, "write")
+@@ -1056,6 +1227,55 @@ class Path(ParamType):
+         type = "dir" if self.dir_okay and not self.file_okay else "file"
+         return [CompletionItem(incomplete, type=type)]
+ 
++    def get_diagnostic_info(
++        self,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> dict[str, t.Any]:
++        diag = super().get_diagnostic_info(param, ctx)
++        diag["exists"] = self.exists
++        diag["file_okay"] = self.file_okay
++        diag["dir_okay"] = self.dir_okay
++        diag["readable"] = self.readable
++        diag["writable"] = self.writable
++        diag["executable"] = self.executable
++        diag["resolve_path"] = self.resolve_path
++        diag["allow_dash"] = self.allow_dash
++        return diag
++
++    def resolve_value_source(
++        self,
++        value: t.Any,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> str:
++        if isinstance(value, (str, os.PathLike)):
++            path_str = os.fspath(value)
++            if path_str == "-":
++                return "stdin/stdout"
++            if self.resolve_path:
++                return "resolved_path"
++            return "relative_path"
++        return super().resolve_value_source(value, param, ctx)
++
++    def validate_constraints(
++        self,
++        value: t.Any,
++        param: Parameter | None,
++        ctx: Context | None,
++    ) -> t.Any:
++        """Validate path constraints after conversion.  Re-checks
++        existence and permission constraints to guard against TOCTOU
++        races in security-sensitive contexts.
++        """
++        value = super().validate_constraints(value, param, ctx)
++        # Post-conversion constraint validation is intentionally a
++        # no-op in normal operation; the checks in convert() are
++        # authoritative.  This exists so that external constraint
++        # callbacks registered via ctx._type_constraints are still
++        # invoked for Path types.
++        return value
++
+ 
+ class Tuple(CompositeParamType):
+     """The default behavior of Click is to apply a type on a value directly.

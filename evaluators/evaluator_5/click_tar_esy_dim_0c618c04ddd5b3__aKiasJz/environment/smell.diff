@@ -1,0 +1,96 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 57f549c..0e9b218 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -38,6 +38,7 @@ from .termui import confirm
+ from .termui import prompt
+ from .termui import style
+ from .utils import _detect_program_name
++from .utils import _resolve_module_name
+ from .utils import _expand_args
+ from .utils import echo
+ from .utils import make_default_short_help
+@@ -1394,11 +1395,37 @@ class Command:
+         else:
+             args = list(args)
+ 
++        # -- Resolve the display name for this program (inlined detection) --
+         if prog_name is None:
+-            prog_name = _detect_program_name()
++            _main_mod = sys.modules["__main__"]
++            _argv_path = sys.argv[0]
++
++            _pkg_attr = getattr(_main_mod, "__package__", None)
++            if _pkg_attr in {None, ""} or (
++                os.name == "nt"
++                and _main_mod.__package__ == ""
++                and not os.path.exists(_argv_path)
++                and os.path.exists(f"{_argv_path}.exe")
++            ):
++                prog_name = os.path.basename(_argv_path)
++            else:
++                prog_name = _resolve_module_name(_argv_path, _main_mod)
++
++        # -- Handle shell completion requests and exit early (inlined) --
++        _completion_env_var = complete_var
++        if _completion_env_var is None:
++            _sanitized_name = prog_name.replace("-", "_").replace(".", "_")
++            _completion_env_var = f"_{_sanitized_name}_COMPLETE".upper()
+ 
+-        # Process shell completion requests and exit early.
+-        self._main_shell_completion(extra, prog_name, complete_var)
++        _shell_instruction = os.environ.get(_completion_env_var)
++
++        if _shell_instruction:
++            from .shell_completion import shell_complete
++
++            _completion_result = shell_complete(
++                self, extra, prog_name, _completion_env_var, _shell_instruction
++            )
++            sys.exit(_completion_result)
+ 
+         try:
+             try:
+diff --git a/src/click/utils.py b/src/click/utils.py
+index beae26f..fcc905e 100644
+--- a/src/click/utils.py
++++ b/src/click/utils.py
+@@ -520,6 +520,22 @@ class PacifyFlushWrapper:
+         return getattr(self.wrapped, attr)
+ 
+ 
++def _resolve_module_name(path: str, _main: ModuleType) -> str:
++    """Given a path and the ``__main__`` module, construct the
++    ``python -m <module>`` style name for module invocations.
++
++    :meta private:
++    """
++    py_module = t.cast(str, _main.__package__)
++    base_name = os.path.splitext(os.path.basename(path))[0]
++
++    # A submodule like "example.cli".
++    if base_name != "__main__":
++        py_module = f"{py_module}.{base_name}"
++
++    return f"python -m {py_module.lstrip('.')}"
++
++
+ def _detect_program_name(
+     path: str | None = None, _main: ModuleType | None = None
+ ) -> str:
+@@ -565,14 +581,7 @@ def _detect_program_name(
+     # Executed a module, like "python -m example".
+     # Rewritten by Python from "-m script" to "/path/to/script.py".
+     # Need to look at main module to determine how it was executed.
+-    py_module = t.cast(str, _main.__package__)
+-    name = os.path.splitext(os.path.basename(path))[0]
+-
+-    # A submodule like "example.cli".
+-    if name != "__main__":
+-        py_module = f"{py_module}.{name}"
+-
+-    return f"python -m {py_module.lstrip('.')}"
++    return _resolve_module_name(path, _main)
+ 
+ 
+ def _expand_args(

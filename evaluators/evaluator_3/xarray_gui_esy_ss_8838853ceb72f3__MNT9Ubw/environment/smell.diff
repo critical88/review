@@ -1,0 +1,104 @@
+diff --git a/xarray/core/alignment.py b/xarray/core/alignment.py
+index 13e3400d..7b9390c6 100644
+--- a/xarray/core/alignment.py
++++ b/xarray/core/alignment.py
+@@ -561,6 +561,22 @@ class Aligner(Generic[T_Alignable]):
+             )
+         )
+ 
++    def _resolve_result_mode(self) -> str:
++        """Resolve the alignment result mode by consulting each aligned object.
++
++        Each object contributes its preferred mode based on the current join
++        strategy and copy semantics. Returns one of "override", "passthrough",
++        or "reindex".
++        """
++        modes: set[str] = set()
++        for obj in self.objects:
++            mode = obj._preferred_align_result_mode(self.join, self.copy)
++            modes.add(mode)
++        if len(modes) == 1:
++            return modes.pop()
++        # heterogeneous preferences fall back to full reindex
++        return "reindex"
++
+     def align(self) -> None:
+         if not self.indexes and len(self.objects) == 1:
+             # fast path for the trivial case
+@@ -574,9 +590,10 @@ class Aligner(Generic[T_Alignable]):
+         self.align_indexes()
+         self.assert_unindexed_dim_sizes_equal()
+ 
+-        if self.join == "override":
++        result_mode = self._resolve_result_mode()
++        if result_mode == "override":
+             self.override_indexes()
+-        elif self.join == "exact" and not self.copy:
++        elif result_mode == "passthrough":
+             self.results = self.objects
+         else:
+             self.reindex_all()
+diff --git a/xarray/core/coordinates.py b/xarray/core/coordinates.py
+index 251edd1f..0bb22d26 100644
+--- a/xarray/core/coordinates.py
++++ b/xarray/core/coordinates.py
+@@ -629,6 +629,13 @@ class Coordinates(AbstractCoordinates):
+         # and DataArrayCoordinates (i.e., Dataset and DataArray encapsulate Coordinates)
+         return cast(Self, results.coords)
+ 
++    def _preferred_align_result_mode(self, join: str, copy: bool) -> str:
++        """Return the preferred alignment result mode for these coordinates.
++
++        Delegates to the underlying dataset implementation.
++        """
++        return self.to_dataset()._preferred_align_result_mode(join, copy)
++
+     def _reindex_callback(
+         self,
+         aligner: Aligner,
+diff --git a/xarray/core/dataarray.py b/xarray/core/dataarray.py
+index 4dc897c1..e843577a 100644
+--- a/xarray/core/dataarray.py
++++ b/xarray/core/dataarray.py
+@@ -1867,6 +1867,18 @@ class DataArray(
+ 
+         return _broadcast_helper(args[1], exclude, dims_map, common_coords)
+ 
++    def _preferred_align_result_mode(self, join: str, copy: bool) -> str:
++        """Return the preferred alignment result mode for this data array.
++
++        Called by ``Aligner._resolve_result_mode`` to collaboratively determine
++        how alignment results should be produced.
++        """
++        if join == "override":
++            return "override"
++        elif join == "exact" and not copy:
++            return "passthrough"
++        return "reindex"
++
+     def _reindex_callback(
+         self,
+         aligner: alignment.Aligner,
+diff --git a/xarray/core/dataset.py b/xarray/core/dataset.py
+index 09597670..ad6dd5fe 100644
+--- a/xarray/core/dataset.py
++++ b/xarray/core/dataset.py
+@@ -3431,6 +3431,18 @@ class Dataset(
+ 
+         return _broadcast_helper(args[1], exclude, dims_map, common_coords)
+ 
++    def _preferred_align_result_mode(self, join: str, copy: bool) -> str:
++        """Return the preferred alignment result mode for this dataset.
++
++        Called by ``Aligner._resolve_result_mode`` to collaboratively determine
++        how alignment results should be produced.
++        """
++        if join == "override":
++            return "override"
++        elif join == "exact" and not copy:
++            return "passthrough"
++        return "reindex"
++
+     def _reindex_callback(
+         self,
+         aligner: alignment.Aligner,

@@ -1,0 +1,175 @@
+diff --git a/numpy/_core/arrayprint.py b/numpy/_core/arrayprint.py
+index 86b2b08d96..5675391877 100644
+--- a/numpy/_core/arrayprint.py
++++ b/numpy/_core/arrayprint.py
+@@ -60,6 +60,15 @@
+ from .umath import absolute, isfinite, isinf, isnat
+ 
+ 
++class FloatRenderOptions:
++    """Encapsulates the float rendering parameters to eliminate data clumps."""
++    def __init__(self, precision=None, floatmode=None, suppress=None, sign=None):
++        self.precision = precision
++        self.floatmode = floatmode
++        self.suppress = suppress
++        self.sign = sign
++
++
+ def _make_options_dict(precision=None, threshold=None, edgeitems=None,
+                        linewidth=None, suppress=None, nanstr=None, infstr=None,
+                        sign=None, formatter=None, floatmode=None, legacy=None,
+@@ -72,8 +81,10 @@ def _make_options_dict(precision=None, threshold=None, edgeitems=None,
+     concern (float rendering, layout, display strings, control) to allow
+     independent resolution at call sites.
+     """
+-
+-    options = {k: v for k, v in list(locals().items()) if v is not None}
++    # Consolidate float rendering parameters
++    float_options = FloatRenderOptions(precision, floatmode, suppress, sign)
++    
++    options = {k: v for k, v in list(locals().items()) if v is not None and k != 'float_options'}
+ 
+     if suppress is not None:
+         options['suppress'] = bool(suppress)
+@@ -139,10 +150,21 @@ def _resolve_format_params(options):
+     Returns the options dict updated with all resolved values.
+     """
+     ctx = format_options.get()
+-    precision, floatmode, suppress, sign = resolve_float_rendering(
+-        options.get('precision'), options.get('floatmode'),
+-        options.get('suppress'), options.get('sign'),
+-    )
++    
++    # Handle both old dict format and new FloatRenderOptions format
++    if isinstance(options, FloatRenderOptions):
++        # Extract parameters for resolution
++        precision = options.precision
++        floatmode = options.floatmode
++        suppress = options.suppress
++        sign = options.sign
++    else:
++        # Old dict format
++        precision, floatmode, suppress, sign = resolve_float_rendering(
++            options.get('precision'), options.get('floatmode'),
++            options.get('suppress'), options.get('sign'),
++        )
++    
+     linewidth, edgeitems, threshold = resolve_layout(
+         options.get('linewidth'), options.get('edgeitems'),
+         options.get('threshold'),
+@@ -152,10 +174,19 @@ def _resolve_format_params(options):
+     )
+     resolved = dict(ctx)
+     resolved.update(options)
+-    resolved['precision'] = precision
+-    resolved['floatmode'] = floatmode
+-    resolved['suppress'] = suppress
+-    resolved['sign'] = sign
++    # Only set float parameters if they were actually resolved
++    if isinstance(options, FloatRenderOptions):
++        # They were already resolved in the constructor but we'll do the
++        # assignment just to maintain consistency with the function signature
++        resolved['precision'] = precision 
++        resolved['floatmode'] = floatmode
++        resolved['suppress'] = suppress
++        resolved['sign'] = sign
++    else:
++        resolved['precision'] = precision
++        resolved['floatmode'] = floatmode
++        resolved['suppress'] = suppress
++        resolved['sign'] = sign
+     resolved['linewidth'] = linewidth
+     resolved['edgeitems'] = edgeitems
+     resolved['threshold'] = threshold
+@@ -357,6 +388,9 @@ def _set_printoptions(precision=None, threshold=None, edgeitems=None,
+                       linewidth=None, suppress=None, nanstr=None,
+                       infstr=None, formatter=None, sign=None, floatmode=None,
+                       *, legacy=None, override_repr=None):
++    # Create FloatRenderOptions for consistency and to consolidate parameters
++    float_options = FloatRenderOptions(precision, floatmode, suppress, sign)
++    
+     new_opt = _make_options_dict(precision, threshold, edgeitems, linewidth,
+                                  suppress, nanstr, infstr, sign, formatter,
+                                  floatmode, legacy)
+@@ -608,7 +642,14 @@ def _get_format_function(data, **options):
+         return formatdict['object']()
+     elif issubclass(dtypeobj, _nt.void):
+         if dtype_.names is not None:
+-            return StructuredVoidFormat.from_data(data, **options)
++            # Create a temporary FloatRenderOptions for the sub-formatters
++            float_render_options = FloatRenderOptions(
++                options.get('precision', 8), 
++                options.get('floatmode', 'maxprec'), 
++                options.get('suppress', False), 
++                options.get('sign', '-')
++            )
++            return StructuredVoidFormat.from_data(data, float_render_options)
+         else:
+             return formatdict['void']()
+     else:
+@@ -846,6 +887,9 @@ def array2string(a, max_line_width=None, precision=None,
+     overrides = _make_options_dict(precision, threshold, edgeitems,
+                                    max_line_width, suppress_small, None, None,
+                                    sign, formatter, floatmode, legacy)
++    # Create FloatRenderOptions for consistency
++    float_options = FloatRenderOptions(precision, floatmode, suppress_small, sign)
++    # Pass as dict for compatibility but make sure we create the right structure
+     options = _resolve_format_params(overrides)
+ 
+     if options['legacy'] <= 113:
+@@ -1542,10 +1586,23 @@ def from_data(cls, data, **options):
+         (precision, floatmode, suppress, sign) and layout parameters
+         (threshold, edgeitems) individually to sub-formatters.
+         """
+-        precision = options.get('precision', 8)
+-        floatmode = options.get('floatmode', 'maxprec')
+-        suppress = options.get('suppress', False)
+-        sign = options.get('sign', '-')
++        # Extract float rendering options 
++        if isinstance(options, FloatRenderOptions):
++            # Already wrapped as FloatRenderOptions
++            float_options = options
++        else:
++            # Create FloatRenderOptions from individual parameters  
++            float_options = FloatRenderOptions(
++                options.get('precision', 8),
++                options.get('floatmode', 'maxprec'),
++                options.get('suppress', False), 
++                options.get('sign', '-')
++            )
++            
++        precision = float_options.precision
++        floatmode = float_options.floatmode
++        suppress = float_options.suppress
++        sign = float_options.sign
+         legacy = options.get('legacy', sys.maxsize)
+         formatter = options.get('formatter')
+         threshold = options.get('threshold', 1000)
+diff --git a/numpy/_core/src/common/pythoncapi-compat b/numpy/_core/src/common/pythoncapi-compat
+index 90c06a4cae..8636bccf29 160000
+--- a/numpy/_core/src/common/pythoncapi-compat
++++ b/numpy/_core/src/common/pythoncapi-compat
+@@ -1 +1 @@
+-Subproject commit 90c06a4cae557bdbfa4f231a781d2b5c1a8f6d1c
++Subproject commit 8636bccf29adfa23463f810b3c2830f7cff1e933
+diff --git a/numpy/_core/src/highway b/numpy/_core/src/highway
+index 37c08e5528..ee36c83712 160000
+--- a/numpy/_core/src/highway
++++ b/numpy/_core/src/highway
+@@ -1 +1 @@
+-Subproject commit 37c08e5528f63ead9c7e4fd99ba454c1b1a3e3f7
++Subproject commit ee36c837129310be19c17c9108c6dc3f6ae06942
+diff --git a/numpy/_core/src/npysort/x86-simd-sort b/numpy/_core/src/npysort/x86-simd-sort
+index 6a7a01da4b..5adb33411f 160000
+--- a/numpy/_core/src/npysort/x86-simd-sort
++++ b/numpy/_core/src/npysort/x86-simd-sort
+@@ -1 +1 @@
+-Subproject commit 6a7a01da4b0dfde108aa626a2364c954e2c50fe1
++Subproject commit 5adb33411f3cea8bdbafa9d91bd75bc4bf19c7dd
+diff --git a/vendored-meson/meson b/vendored-meson/meson
+index e72c717199..5d5a3d478d 160000
+--- a/vendored-meson/meson
++++ b/vendored-meson/meson
+@@ -1 +1 @@
+-Subproject commit e72c717199fa18d34020c7c97f9de3f388c5e055
++Subproject commit 5d5a3d478da115c812be77afa651db2492d52171

@@ -1,0 +1,269 @@
+diff --git a/xarray/core/datatree.py b/xarray/core/datatree.py
+index 5737cdcb..8ae8bf7b 100644
+--- a/xarray/core/datatree.py
++++ b/xarray/core/datatree.py
+@@ -348,6 +348,7 @@ class DataTree(
+         "_name",
+         "_parent",
+         "_children",
++        "_node_config",
+         "_attrs",
+         "_cache",
+         "_coord_names",
+diff --git a/xarray/core/datatree_mapping.py b/xarray/core/datatree_mapping.py
+index 6e5aae15..75bfa013 100644
+--- a/xarray/core/datatree_mapping.py
++++ b/xarray/core/datatree_mapping.py
+@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING, Callable
+ 
+ from xarray.core.dataarray import DataArray
+ from xarray.core.dataset import Dataset
+-from xarray.core.formatting import diff_treestructure
+ from xarray.core.treenode import NodePath, TreeNode
+ 
+ if TYPE_CHECKING:
+@@ -65,7 +64,7 @@ def check_isomorphic(
+         a = a.root
+         b = b.root
+ 
+-    diff = diff_treestructure(a, b, require_names_equal=require_names_equal)
++    diff = a._compare_trees(b, require_names_equal=require_names_equal)
+ 
+     if diff:
+         raise TreeIsomorphismError("DataTree objects are not isomorphic:\n" + diff)
+diff --git a/xarray/core/datatree_render.py b/xarray/core/datatree_render.py
+index d0690714..6fdb24e9 100644
+--- a/xarray/core/datatree_render.py
++++ b/xarray/core/datatree_render.py
+@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
+ if TYPE_CHECKING:
+     from xarray.core.datatree import DataTree
+ 
++from xarray.core.treenode import TreeNode
++
+ Row = namedtuple("Row", ("pre", "fill", "node"))
+ 
+ 
+@@ -152,6 +154,10 @@ class RenderDataTree:
+         """
+         if not isinstance(style, AbstractStyle):
+             style = style()
++        if hasattr(node, "_get_config"):
++            config_maxlevel = node._get_config("max_render_depth")
++            if config_maxlevel is not None and maxlevel is None:
++                maxlevel = config_maxlevel
+         self.node = node
+         self.style = style
+         self.childiter = childiter
+@@ -264,3 +270,6 @@ def _is_last(iterable: Iterable) -> Iterator[tuple[DataTree, bool]]:
+                 yield nextitem, True
+                 break
+             item = nextitem
++
++
++TreeNode.register_operation("tree_renderer", RenderDataTree)
+diff --git a/xarray/core/formatting.py b/xarray/core/formatting.py
+index ad65a44d..caa88fe9 100644
+--- a/xarray/core/formatting.py
++++ b/xarray/core/formatting.py
+@@ -935,30 +935,7 @@ def diff_treestructure(a: DataTree, b: DataTree, require_names_equal: bool) -> s
+     Return a summary of why two trees are not isomorphic.
+     If they are isomorphic return an empty string.
+     """
+-
+-    # Walking nodes in "level-order" fashion means walking down from the root breadth-first.
+-    # Checking for isomorphism by walking in this way implicitly assumes that the tree is an ordered tree
+-    # (which it is so long as children are stored in a tuple or list rather than in a set).
+-    for node_a, node_b in zip(LevelOrderIter(a), LevelOrderIter(b)):
+-        path_a, path_b = node_a.path, node_b.path
+-
+-        if require_names_equal and node_a.name != node_b.name:
+-            diff = dedent(
+-                f"""\
+-                Node '{path_a}' in the left object has name '{node_a.name}'
+-                Node '{path_b}' in the right object has name '{node_b.name}'"""
+-            )
+-            return diff
+-
+-        if len(node_a.children) != len(node_b.children):
+-            diff = dedent(
+-                f"""\
+-                Number of children on node '{path_a}' of the left object: {len(node_a.children)}
+-                Number of children on node '{path_b}' of the right object: {len(node_b.children)}"""
+-            )
+-            return diff
+-
+-    return ""
++    return a._compare_trees(b, require_names_equal=require_names_equal)
+ 
+ 
+ def diff_dataset_repr(a, b, compat):
+diff --git a/xarray/core/iterators.py b/xarray/core/iterators.py
+index dd5fa7ee..4d026e1d 100644
+--- a/xarray/core/iterators.py
++++ b/xarray/core/iterators.py
+@@ -3,7 +3,7 @@ from __future__ import annotations
+ from collections.abc import Iterator
+ from typing import Callable
+ 
+-from xarray.core.treenode import Tree
++from xarray.core.treenode import Tree, TreeNode
+ 
+ """These iterators are copied from anytree.iterators, with minor modifications."""
+ 
+@@ -128,3 +128,6 @@ class LevelOrderIter(Iterator):
+             level += 1
+             if LevelOrderIter._abort_at_level(level, maxlevel):
+                 break
++
++
++TreeNode.register_operation("level_order_iter", LevelOrderIter)
+diff --git a/xarray/core/treenode.py b/xarray/core/treenode.py
+index 6f51e1ff..7a5ccf15 100644
+--- a/xarray/core/treenode.py
++++ b/xarray/core/treenode.py
+@@ -3,8 +3,10 @@ from __future__ import annotations
+ import sys
+ from collections.abc import Iterator, Mapping
+ from pathlib import PurePosixPath
++from textwrap import dedent
+ from typing import (
+     TYPE_CHECKING,
++    Any,
+     Generic,
+     TypeVar,
+ )
+@@ -73,11 +75,13 @@ class TreeNode(Generic[Tree]):
+ 
+     _parent: Tree | None
+     _children: dict[str, Tree]
++    _ops_registry: dict[str, Any] = {}
+ 
+     def __init__(self, children: Mapping[str, Tree] | None = None):
+         """Create a parentless node."""
+         self._parent = None
+         self._children = {}
++        self._node_config = {}
+         if children is not None:
+             self.children = children
+ 
+@@ -333,9 +337,7 @@ class TreeNode(Generic[Tree]):
+         --------
+         DataTree.descendants
+         """
+-        from xarray.core.iterators import LevelOrderIter
+-
+-        return LevelOrderIter(self)
++        return self._iter_subtree()
+ 
+     @property
+     def descendants(self: Tree) -> tuple[Tree, ...]:
+@@ -566,6 +568,108 @@ class TreeNode(Generic[Tree]):
+         """True if other node is in the same tree as this node."""
+         return self.root is other.root
+ 
++    @classmethod
++    def register_operation(cls, name: str, handler: Any) -> None:
++        """Register a handler for a tree coordination operation."""
++        cls._ops_registry[name] = handler
++
++    @classmethod
++    def _resolve_operation(cls, op_name: str) -> Any | None:
++        """Resolve a registered tree operation by name."""
++        return cls._ops_registry.get(op_name)
++
++    def _configure_node(self, **config) -> None:
++        """Set node-level configuration that tree operations can read."""
++        self._node_config.update(config)
++
++    def _get_config(self, key: str, default: Any = None) -> Any:
++        """Retrieve a configuration value, inheriting from ancestors if not set locally."""
++        if key in self._node_config:
++            return self._node_config[key]
++        if self._parent is not None:
++            return self._parent._get_config(key, default)
++        return default
++
++    def _iter_subtree(
++        self: Tree,
++        filter_=None,
++        stop=None,
++        maxlevel=None,
++    ) -> Iterator[Tree]:
++        """Create a subtree iterator using the registered iteration strategy."""
++        iter_cls = self._resolve_operation("level_order_iter")
++        if iter_cls is not None:
++            effective_maxlevel = maxlevel
++            if effective_maxlevel is None:
++                effective_maxlevel = self._get_config("max_iter_depth")
++            return iter_cls(
++                self, filter_=filter_, stop=stop, maxlevel=effective_maxlevel
++            )
++        from xarray.core.iterators import LevelOrderIter
++
++        return LevelOrderIter(self, filter_=filter_, stop=stop, maxlevel=maxlevel)
++
++    def _compare_trees(
++        self: Tree, other: Tree, require_names_equal: bool = False
++    ) -> str:
++        """Compare tree structure, returning a diff string (empty if isomorphic)."""
++        for node_a, node_b in zip(self.subtree, other.subtree):
++            path_a = node_a.path if hasattr(node_a, "path") else repr(node_a)
++            path_b = node_b.path if hasattr(node_b, "path") else repr(node_b)
++
++            if (
++                require_names_equal
++                and hasattr(node_a, "name")
++                and hasattr(node_b, "name")
++            ):
++                if node_a.name != node_b.name:
++                    return dedent(
++                        f"""\
++                        Node '{path_a}' in the left object has name '{node_a.name}'
++                        Node '{path_b}' in the right object has name '{node_b.name}'"""
++                    )
++
++            if len(node_a.children) != len(node_b.children):
++                return dedent(
++                    f"""\
++                    Number of children on node '{path_a}' of the left object: {len(node_a.children)}
++                    Number of children on node '{path_b}' of the right object: {len(node_b.children)}"""
++                )
++
++        return ""
++
++    def _render_tree(self, style=None, childiter=list, maxlevel=None):
++        """Create a tree renderer using the registered rendering strategy."""
++        renderer_cls = self._resolve_operation("tree_renderer")
++        if renderer_cls is not None:
++            config_style = self._get_config("render_style")
++            effective_style = style if style is not None else config_style
++            kwargs = {"childiter": childiter, "maxlevel": maxlevel}
++            if effective_style is not None:
++                kwargs["style"] = effective_style
++            return renderer_cls(self, **kwargs)
++        return None
++
++    @property
++    def node_count(self: Tree) -> int:
++        """Total number of nodes in the subtree rooted at this node."""
++        return sum(1 for _ in self.subtree)
++
++    def _validate_tree_integrity(self: Tree) -> bool:
++        """Validate internal tree invariants. Returns True if tree is well-formed."""
++        seen_ids: set[int] = set()
++        for node in self.subtree:
++            nid = id(node)
++            if nid in seen_ids:
++                return False
++            seen_ids.add(nid)
++            if node.parent is not None:
++                if not any(
++                    child is node for child in node.parent.children.values()
++                ):
++                    return False
++        return True
++
+ 
+ class NamedNode(TreeNode, Generic[Tree]):
+     """

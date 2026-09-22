@@ -1,0 +1,171 @@
+diff --git a/src/jinja2/bccache.py b/src/jinja2/bccache.py
+index ada8b099..a20a0e74 100644
+--- a/src/jinja2/bccache.py
++++ b/src/jinja2/bccache.py
+@@ -14,6 +14,7 @@ import pickle
+ import stat
+ import sys
+ import tempfile
++import time
+ import typing as t
+ from hashlib import sha1
+ from io import BytesIO
+@@ -149,16 +150,61 @@ class BytecodeCache:
+         by a particular environment.
+         """
+ 
++    def check_cache_freshness(
++        self, bucket: Bucket, source_hint: t.Optional[str] = None
++    ) -> bool:
++        """Verify that a cached bucket is still consistent with the
++        expected state.  Returns ``True`` if the bucket can be trusted.
++
++        The default implementation considers a bucket fresh when it holds
++        compiled code.  Subclasses that store metadata alongside the
++        bytecode (e.g. filesystem timestamps or remote TTLs) should
++        override this to perform deeper validation.
++        """
++        if bucket.code is None:
++            return False
++        if source_hint is not None:
++            expected = sha1(source_hint.encode("utf-8")).hexdigest()
++            return bucket.checksum == expected
++        return True
++
++    def get_cache_stats(self) -> t.Dict[str, t.Any]:
++        """Return a dictionary of cache statistics.
++
++        The returned dictionary always contains at least ``backend``
++        (a human-readable name) and ``last_access`` (a float epoch
++        timestamp, or ``0.0`` if unknown).  Backends that track richer
++        metrics should extend the dictionary rather than replace it.
++        """
++        return {
++            "backend": type(self).__name__,
++            "last_access": getattr(self, "_last_access_ts", 0.0),
++        }
++
++    def supports_expiration(self) -> bool:
++        """Return whether this cache backend supports automatic
++        expiration of entries.  The default is ``False``; backends
++        that use a TTL mechanism should override this.
++        """
++        return False
++
++    def record_access(self, bucket_key: str) -> None:
++        """Record that a cache entry was accessed.  The default
++        implementation updates an internal timestamp used by
++        :meth:`get_cache_stats`.
++        """
++        self._last_access_ts: float = time.time()
++
+     def get_cache_key(
+         self, name: str, filename: t.Optional[t.Union[str]] = None
+     ) -> str:
+         """Returns the unique hash key for this template name."""
+-        hash = sha1(name.encode("utf-8"))
++        key_hash = sha1(name.encode("utf-8"))
+ 
+         if filename is not None:
+-            hash.update(f"|{filename}".encode())
++            key_hash.update(f"|{filename}".encode())
+ 
+-        return hash.hexdigest()
++        return key_hash.hexdigest()
+ 
+     def get_source_checksum(self, source: str) -> str:
+         """Returns a checksum for the source."""
+@@ -178,11 +224,13 @@ class BytecodeCache:
+         checksum = self.get_source_checksum(source)
+         bucket = Bucket(environment, key, checksum)
+         self.load_bytecode(bucket)
++        self.record_access(key)
+         return bucket
+ 
+     def set_bucket(self, bucket: Bucket) -> None:
+         """Put the bucket into the cache."""
+         self.dump_bytecode(bucket)
++        self.record_access(bucket.key)
+ 
+ 
+ class FileSystemBytecodeCache(BytecodeCache):
+@@ -261,6 +309,43 @@ class FileSystemBytecodeCache(BytecodeCache):
+     def _get_cache_filename(self, bucket: Bucket) -> str:
+         return os.path.join(self.directory, self.pattern % (bucket.key,))
+ 
++    def check_cache_freshness(
++        self, bucket: Bucket, source_hint: t.Optional[str] = None
++    ) -> bool:
++        cache_path = self._get_cache_filename(bucket)
++        if not os.path.isfile(cache_path):
++            return False
++        if source_hint is not None:
++            expected = sha1(source_hint.encode("utf-8")).hexdigest()
++            return bucket.checksum == expected
++        try:
++            st = os.stat(cache_path)
++            return st.st_size > 0
++        except OSError:
++            return False
++
++    def get_cache_stats(self) -> t.Dict[str, t.Any]:
++        base_stats = super().get_cache_stats()
++        try:
++            cached_files = fnmatch.filter(
++                os.listdir(self.directory), self.pattern % ("*",)
++            )
++            total_bytes = 0
++            for fname in cached_files:
++                try:
++                    total_bytes += os.path.getsize(
++                        os.path.join(self.directory, fname)
++                    )
++                except OSError:
++                    pass
++            base_stats["cached_templates"] = len(cached_files)
++            base_stats["total_bytes"] = total_bytes
++            base_stats["directory"] = self.directory
++        except OSError:
++            base_stats["cached_templates"] = 0
++            base_stats["total_bytes"] = 0
++        return base_stats
++
+     def load_bytecode(self, bucket: Bucket) -> None:
+         filename = self._get_cache_filename(bucket)
+ 
+@@ -385,6 +470,17 @@ class MemcachedBytecodeCache(BytecodeCache):
+         self.timeout = timeout
+         self.ignore_memcache_errors = ignore_memcache_errors
+ 
++    def supports_expiration(self) -> bool:
++        return self.timeout is not None
++
++    def get_cache_stats(self) -> t.Dict[str, t.Any]:
++        base_stats = super().get_cache_stats()
++        base_stats["prefix"] = self.prefix
++        if self.timeout is not None:
++            base_stats["ttl"] = self.timeout
++        base_stats["ignore_errors"] = self.ignore_memcache_errors
++        return base_stats
++
+     def load_bytecode(self, bucket: Bucket) -> None:
+         try:
+             code = self.client.get(self.prefix + bucket.key)
+diff --git a/src/jinja2/loaders.py b/src/jinja2/loaders.py
+index 3913ee51..245ae348 100644
+--- a/src/jinja2/loaders.py
++++ b/src/jinja2/loaders.py
+@@ -132,6 +132,13 @@ class BaseLoader:
+             bucket = bcc.get_bucket(environment, name, filename, source)
+             code = bucket.code
+ 
++            # For backends that support cache freshness checks, verify
++            # the loaded bytecode is still valid before using it.
++            if code is not None and not bcc.check_cache_freshness(
++                bucket, source
++            ):
++                code = None
++
+         # if we don't have code so far (not cached, no longer up to
+         # date) etc. we compile the template
+         if code is None:

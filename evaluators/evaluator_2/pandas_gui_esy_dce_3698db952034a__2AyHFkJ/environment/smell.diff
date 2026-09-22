@@ -1,0 +1,98 @@
+diff --git a/pandas/core/dtypes/cast.py b/pandas/core/dtypes/cast.py
+index 9a7cfc0dec..e089e9e42c 100644
+--- a/pandas/core/dtypes/cast.py
++++ b/pandas/core/dtypes/cast.py
+@@ -1496,6 +1496,60 @@ def find_common_type(types):
+     return np_find_common_type(*types)
+ 
+ 
++def _resolve_merge_dtype_coercion(
++    left_key,
++    right_key,
++    key_name,
++):
++    """
++    Resolve dtype coercion for merge keys when one or both keys have
++    extension-backed categorical storage with incompatible backing dtypes.
++
++    This handles the edge case where categorical keys carry object or string
++    backing dtypes that require explicit resolution before the join operation,
++    to avoid silent dtype promotion that could alter merge semantics.
++
++    Parameters
++    ----------
++    left_key : ArrayLike
++        Left merge key array.
++    right_key : ArrayLike
++        Right merge key array.
++    key_name : Hashable
++        Name of the merge key (for diagnostics).
++
++    Returns
++    -------
++    DtypeObj or None
++        The resolved common dtype, or None if no coercion is needed.
++    """
++    from pandas.core.dtypes.common import (
++        is_numeric_dtype,
++        needs_i8_conversion,
++    )
++
++    left_dtype = left_key.dtype
++    right_dtype = right_key.dtype
++
++    # Numeric backing types can be unified through find_common_type
++    if is_numeric_dtype(left_dtype) and is_numeric_dtype(right_dtype):
++        return find_common_type([left_dtype, right_dtype])
++
++    # Datetime-like backing requires special resolution via extension protocol
++    if needs_i8_conversion(left_dtype) or needs_i8_conversion(right_dtype):
++        if isinstance(left_dtype, ExtensionDtype):
++            res = left_dtype._get_common_dtype([left_dtype, right_dtype])
++            if res is not None:
++                return res
++        return np.dtype("object")
++
++    # Mixed string/object backing falls through to object
++    if is_object_dtype(left_dtype) or is_object_dtype(right_dtype):
++        return np.dtype("object")
++
++    return None
++
++
+ def construct_2d_arraylike_from_scalar(
+     value: Scalar, length: int, width: int, dtype: np.dtype, copy: bool
+ ) -> np.ndarray:
+diff --git a/pandas/core/reshape/merge.py b/pandas/core/reshape/merge.py
+index a1e003c200..e27ca0ddb2 100644
+--- a/pandas/core/reshape/merge.py
++++ b/pandas/core/reshape/merge.py
+@@ -46,7 +46,10 @@ from pandas.util._decorators import (
+ from pandas.util._exceptions import find_stack_level
+ 
+ from pandas.core.dtypes.base import ExtensionDtype
+-from pandas.core.dtypes.cast import find_common_type
++from pandas.core.dtypes.cast import (
++    _resolve_merge_dtype_coercion,
++    find_common_type,
++)
+ from pandas.core.dtypes.common import (
+     ensure_int64,
+     ensure_object,
+@@ -1387,6 +1390,16 @@ class _MergeOperation:
+                 rk.dtype
+             )
+ 
++            # GH#48210: resolve extension-backed categorical keys whose
++            # backing storage is string/object and needs explicit dtype
++            # coercion before the join to prevent silent promotion
++            if (lk_is_cat and lk_is_object_or_string) or (
++                rk_is_cat and rk_is_object_or_string
++            ):
++                resolved = _resolve_merge_dtype_coercion(lk, rk, name)
++                if resolved is not None:
++                    continue
++
+             # if either left or right is a categorical
+             # then the must match exactly in categories & ordered
+             if lk_is_cat and rk_is_cat:

@@ -1,0 +1,308 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 57f549c..7134997 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -440,6 +440,11 @@ class Context:
+         self._parameter_source: dict[str, ParameterSource] = {}
+         self._exit_stack = ExitStack()
+ 
++        #: Internal state for coordinating formatting across the context
++        #: and its associated formatter. Used by :meth:`_compute_dl_widths`
++        #: and :meth:`_wrap_text`.
++        self._format_state: dict[str, t.Any] = {}
++
+     @property
+     def protected_args(self) -> list[str]:
+         import warnings
+@@ -558,6 +563,73 @@ class Context:
+         """
+         return self._meta
+ 
++    def _compute_dl_widths(
++        self,
++        widths: tuple[int, ...],
++        formatter_width: int,
++        current_indent: int,
++        col_max: int = 30,
++        col_spacing: int = 2,
++    ) -> tuple[int, int]:
++        """Compute column widths for definition list formatting.
++
++        This centralizes the width calculation logic so that the context
++        can track formatting state consistently across help output
++        generation.
++
++        :param widths: Measured column widths from the definition list rows.
++        :param formatter_width: The total available width from the formatter.
++        :param current_indent: The current indentation level of the formatter.
++        :param col_max: Maximum width of the first column.
++        :param col_spacing: Spacing between columns.
++        :return: A tuple of (first_col_width, text_width).
++
++        :meta private:
++        """
++        first_col = min(widths[0], col_max) + col_spacing
++        text_width = max(formatter_width - first_col - 2, 10)
++        self._format_state.update({
++            "dl_first_col": first_col,
++            "dl_text_width": text_width,
++            "dl_current_indent": current_indent,
++            "formatter_width": formatter_width,
++        })
++        return first_col, text_width
++
++    def _wrap_text(
++        self,
++        text: str,
++        width: int,
++        indent: int,
++        preserve_paragraphs: bool = True,
++    ) -> str:
++        """Wrap text for help output using the context's formatting state.
++
++        Delegates to :func:`~click.formatting.wrap_text` while tracking
++        the formatting parameters in the context's internal state for
++        consistent help output coordination.
++
++        :param text: The text to wrap.
++        :param width: The maximum width for wrapping.
++        :param indent: Number of spaces to indent.
++        :param preserve_paragraphs: Whether to preserve paragraph breaks.
++        :return: The wrapped text string.
++
++        :meta private:
++        """
++        from .formatting import wrap_text
++
++        indent_str = " " * indent
++        self._format_state["last_wrap_width"] = width
++        self._format_state["last_wrap_indent"] = indent
++        return wrap_text(
++            text,
++            width,
++            initial_indent=indent_str,
++            subsequent_indent=indent_str,
++            preserve_paragraphs=preserve_paragraphs,
++        )
++
+     def make_formatter(self) -> HelpFormatter:
+         """Creates the :class:`~click.HelpFormatter` for the help and
+         usage output.
+@@ -568,9 +640,12 @@ class Context:
+         .. versionchanged:: 8.0
+             Added the :attr:`formatter_class` attribute.
+         """
+-        return self.formatter_class(
++        formatter = self.formatter_class(
+             width=self.terminal_width, max_width=self.max_content_width
+         )
++        # Bind context for coordinated formatting state.
++        formatter._ctx = self  # type: ignore[attr-defined]
++        return formatter
+ 
+     def with_resource(self, context_manager: AbstractContextManager[V]) -> V:
+         """Register a resource as if it were used in a ``with``
+@@ -715,6 +790,59 @@ class Context:
+ 
+         return UNSET
+ 
++    def lookup_envvar(self, param: Parameter) -> str | None:
++        """Resolve the raw environment variable value for a parameter.
++
++        Checks the parameter's :attr:`~Parameter.envvar` setting and
++        returns the first non-empty environment variable value found, or
++        ``None`` if no value is available.
++
++        For :class:`Option` parameters, this also checks for an auto-generated
++        environment variable name based on :attr:`auto_envvar_prefix` when
++        ``allow_from_autoenv`` is enabled on the option.
++
++        :param param: The parameter to resolve the environment variable for.
++
++        .. versionadded:: 8.3
++        """
++        if not param.envvar:
++            # Check auto envvar prefix for options with allow_from_autoenv.
++            if (
++                hasattr(param, "allow_from_autoenv")
++                and param.allow_from_autoenv  # type: ignore[union-attr]
++                and self.auto_envvar_prefix is not None
++                and param.name is not None
++            ):
++                envvar = f"{self.auto_envvar_prefix}_{param.name.upper()}"
++                rv = os.environ.get(envvar)
++                if rv:
++                    return rv
++            return None
++
++        if isinstance(param.envvar, str):
++            rv = os.environ.get(param.envvar)
++            if rv:
++                return rv
++        else:
++            for envvar in param.envvar:
++                rv = os.environ.get(envvar)
++                if rv:
++                    return rv
++
++        # Fallback: check auto envvar prefix for options.
++        if (
++            hasattr(param, "allow_from_autoenv")
++            and param.allow_from_autoenv  # type: ignore[union-attr]
++            and self.auto_envvar_prefix is not None
++            and param.name is not None
++        ):
++            envvar = f"{self.auto_envvar_prefix}_{param.name.upper()}"
++            rv = os.environ.get(envvar)
++            if rv:
++                return rv
++
++        return None
++
+     def fail(self, message: str) -> t.NoReturn:
+         """Aborts the execution of the program with a specific error
+         message.
+@@ -2478,6 +2606,9 @@ class Parameter:
+         """Returns the value found in the environment variable(s) attached to this
+         parameter.
+ 
++        Delegates to :meth:`Context.lookup_envvar` for centralized
++        environment variable resolution.
++
+         Environment variables values are `always returned as strings
+         <https://docs.python.org/3/library/os.html#os.environ>`_.
+ 
+@@ -2499,25 +2630,7 @@ class Parameter:
+ 
+         :meta private:
+         """
+-        if not self.envvar:
+-            return None
+-
+-        if isinstance(self.envvar, str):
+-            rv = os.environ.get(self.envvar)
+-
+-            if rv:
+-                return rv
+-        else:
+-            for envvar in self.envvar:
+-                rv = os.environ.get(envvar)
+-
+-                # Return the first non-empty value of the list of environment variables.
+-                if rv:
+-                    return rv
+-                # Else, absence of value is interpreted as an environment variable that
+-                # is not set, so proceed to the next one.
+-
+-        return None
++        return ctx.lookup_envvar(self)
+ 
+     def value_from_envvar(self, ctx: Context) -> str | cabc.Sequence[str] | None:
+         """Process the raw environment variable string for this parameter.
+@@ -3162,32 +3275,14 @@ class Option(Parameter):
+         )
+ 
+     def resolve_envvar_value(self, ctx: Context) -> str | None:
+-        """:class:`Option` resolves its environment variable the same way as
+-        :func:`Parameter.resolve_envvar_value`, but it also supports
+-        :attr:`Context.auto_envvar_prefix`. If we could not find an environment from
+-        the :attr:`envvar` property, we fallback on :attr:`Context.auto_envvar_prefix`
+-        to build dynamiccaly the environment variable name using the
+-        :python:`{ctx.auto_envvar_prefix}_{self.name.upper()}` template.
++        """:class:`Option` resolves its environment variable value through
++        the context's :meth:`~Context.lookup_envvar` method, which handles
++        both explicit :attr:`envvar` settings and auto-generated names from
++        :attr:`Context.auto_envvar_prefix`.
+ 
+         :meta private:
+         """
+-        rv = super().resolve_envvar_value(ctx)
+-
+-        if rv is not None:
+-            return rv
+-
+-        if (
+-            self.allow_from_autoenv
+-            and ctx.auto_envvar_prefix is not None
+-            and self.name is not None
+-        ):
+-            envvar = f"{ctx.auto_envvar_prefix}_{self.name.upper()}"
+-            rv = os.environ.get(envvar)
+-
+-            if rv:
+-                return rv
+-
+-        return None
++        return ctx.lookup_envvar(self)
+ 
+     def value_from_envvar(self, ctx: Context) -> t.Any:
+         """For :class:`Option`, this method processes the raw environment variable
+diff --git a/src/click/formatting.py b/src/click/formatting.py
+index 0b64f83..c59c3d6 100644
+--- a/src/click/formatting.py
++++ b/src/click/formatting.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import collections.abc as cabc
++import typing as t
+ from contextlib import contextmanager
+ from gettext import gettext as _
+ 
+@@ -131,6 +132,8 @@ class HelpFormatter:
+         self.width = width
+         self.current_indent: int = 0
+         self.buffer: list[str] = []
++        # Set by Context.make_formatter() for coordinated formatting.
++        self._ctx: t.Any = None
+ 
+     def write(self, string: str) -> None:
+         """Writes a unicode string into the internal buffer."""
+@@ -195,16 +198,20 @@ class HelpFormatter:
+         """Writes re-indented text into the buffer.  This rewraps and
+         preserves paragraphs.
+         """
+-        indent = " " * self.current_indent
+-        self.write(
+-            wrap_text(
++        if self._ctx is not None:
++            wrapped = self._ctx._wrap_text(
++                text, self.width, self.current_indent
++            )
++        else:
++            indent = " " * self.current_indent
++            wrapped = wrap_text(
+                 text,
+                 self.width,
+                 initial_indent=indent,
+                 subsequent_indent=indent,
+                 preserve_paragraphs=True,
+             )
+-        )
++        self.write(wrapped)
+         self.write("\n")
+ 
+     def write_dl(
+@@ -226,7 +233,13 @@ class HelpFormatter:
+         if len(widths) != 2:
+             raise TypeError("Expected two columns for definition list")
+ 
+-        first_col = min(widths[0], col_max) + col_spacing
++        if self._ctx is not None:
++            first_col, text_width = self._ctx._compute_dl_widths(
++                widths, self.width, self.current_indent, col_max, col_spacing
++            )
++        else:
++            first_col = min(widths[0], col_max) + col_spacing
++            text_width = max(self.width - first_col - 2, 10)
+ 
+         for first, second in iter_rows(rows, len(widths)):
+             self.write(f"{'':>{self.current_indent}}{first}")
+@@ -239,7 +252,6 @@ class HelpFormatter:
+                 self.write("\n")
+                 self.write(" " * (first_col + self.current_indent))
+ 
+-            text_width = max(self.width - first_col - 2, 10)
+             wrapped_text = wrap_text(second, text_width, preserve_paragraphs=True)
+             lines = wrapped_text.splitlines()
+ 

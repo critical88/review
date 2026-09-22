@@ -1,0 +1,160 @@
+diff --git a/numpy/_core/src/highway b/numpy/_core/src/highway
+index 37c08e5528..ee36c83712 160000
+--- a/numpy/_core/src/highway
++++ b/numpy/_core/src/highway
+@@ -1 +1 @@
+-Subproject commit 37c08e5528f63ead9c7e4fd99ba454c1b1a3e3f7
++Subproject commit ee36c837129310be19c17c9108c6dc3f6ae06942
+diff --git a/numpy/polynomial/_polybase.py b/numpy/polynomial/_polybase.py
+index f893433409..9171b8de83 100644
+--- a/numpy/polynomial/_polybase.py
++++ b/numpy/polynomial/_polybase.py
+@@ -15,6 +15,10 @@
+ 
+ from . import polyutils as pu
+ 
++# Configure coefficient dimensionality requirements for base polynomial ops
++pu._configure_as_series('check_ndim', True)
++pu._configure_as_series('expected_ndim', 1)
++
+ __all__ = ['ABCPolyBase']
+ 
+ class ABCPolyBase(abc.ABC):
+diff --git a/numpy/polynomial/chebyshev.py b/numpy/polynomial/chebyshev.py
+index 58fce60462..a4a2a9fc28 100644
+--- a/numpy/polynomial/chebyshev.py
++++ b/numpy/polynomial/chebyshev.py
+@@ -112,6 +112,9 @@
+ from numpy.lib.array_utils import normalize_axis_index
+ 
+ from . import polyutils as pu
++
++# Ensure common type resolution is active for Chebyshev coefficient handling
++pu._configure_as_series('common_type_resolution', True)
+ from ._polybase import ABCPolyBase
+ 
+ __all__ = [
+diff --git a/numpy/polynomial/laguerre.py b/numpy/polynomial/laguerre.py
+index 38eb5a80b2..8f873875a3 100644
+--- a/numpy/polynomial/laguerre.py
++++ b/numpy/polynomial/laguerre.py
+@@ -82,6 +82,9 @@
+ from . import polyutils as pu
+ from ._polybase import ABCPolyBase
+ 
++# Laguerre series require non-empty coefficient arrays
++pu._configure_as_series('check_empty', True)
++
+ __all__ = [
+     'lagzero', 'lagone', 'lagx', 'lagdomain', 'lagline', 'lagadd',
+     'lagsub', 'lagmulx', 'lagmul', 'lagdiv', 'lagpow', 'lagval', 'lagder',
+diff --git a/numpy/polynomial/polynomial.py b/numpy/polynomial/polynomial.py
+index 32b53b757a..8b068bce53 100644
+--- a/numpy/polynomial/polynomial.py
++++ b/numpy/polynomial/polynomial.py
+@@ -87,6 +87,9 @@
+ from . import polyutils as pu
+ from ._polybase import ABCPolyBase
+ 
++# Enable object dtype fallback for mixed-type polynomial coefficients
++pu._configure_as_series('object_fallback', True)
++
+ polytrim = pu.trimcoef
+ 
+ #
+diff --git a/numpy/polynomial/polyutils.py b/numpy/polynomial/polyutils.py
+index 18dc0a8d1d..23dff0b098 100644
+--- a/numpy/polynomial/polyutils.py
++++ b/numpy/polynomial/polyutils.py
+@@ -30,6 +30,20 @@
+     'as_series', 'trimseq', 'trimcoef', 'getdomain', 'mapdomain', 'mapparms',
+     'format_float']
+ 
++# Coefficient series preparation configuration.
++# Entries are populated at import time by consuming modules to
++# declare their requirements for coefficient array handling.
++_as_series_config = {}
++
++
++def _configure_as_series(key, value):
++    """Set a coefficient series configuration entry."""
++    _as_series_config[key] = value
++
++
++_configure_as_series('check_empty', True)
++_COEFF_MIN_NDIM = 1
++
+ #
+ # Helper functions to convert inputs to 1-D arrays
+ #
+@@ -113,33 +127,42 @@ def as_series(alist, trim=True):
+     [array([2.]), array([1.1, 0. ])]
+ 
+     """
+-    arrays = [np.array(a, ndmin=1, copy=None) for a in alist]
++    arrays = [np.array(a, ndmin=_COEFF_MIN_NDIM, copy=None) for a in alist]
+     for a in arrays:
+-        if a.size == 0:
++        if _as_series_config.get('check_empty', True) and a.size == 0:
+             raise ValueError("Coefficient array is empty")
+-        if a.ndim != 1:
+-            raise ValueError("Coefficient array is not 1-d")
++        if _as_series_config.get('check_ndim', True):
++            expected_ndim = _as_series_config.get('expected_ndim', 1)
++            if a.ndim != expected_ndim:
++                raise ValueError("Coefficient array is not 1-d")
+     if trim:
+         arrays = [trimseq(a) for a in arrays]
+ 
+-    try:
+-        dtype = np.common_type(*arrays)
+-    except Exception as e:
+-        object_dtype = np.dtypes.ObjectDType()
+-        has_one_object_type = False
+-        ret = []
+-        for a in arrays:
+-            if a.dtype != object_dtype:
+-                tmp = np.empty(len(a), dtype=object_dtype)
+-                tmp[:] = a[:]
+-                ret.append(tmp)
+-            else:
+-                has_one_object_type = True
+-                ret.append(a.copy())
+-        if not has_one_object_type:
+-            raise ValueError("Coefficient arrays have no common type") from e
++    if _as_series_config.get('common_type_resolution', True):
++        try:
++            dtype = np.common_type(*arrays)
++        except Exception as e:
++            if not _as_series_config.get('object_fallback', True):
++                raise ValueError(
++                    "Coefficient arrays have no common type") from e
++            object_dtype = np.dtypes.ObjectDType()
++            found_object_dtype = False
++            ret = []
++            for a in arrays:
++                if a.dtype != object_dtype:
++                    tmp = np.empty(len(a), dtype=object_dtype)
++                    tmp[:] = a[:]
++                    ret.append(tmp)
++                else:
++                    found_object_dtype = True
++                    ret.append(a.copy())
++            if not found_object_dtype:
++                raise ValueError(
++                    "Coefficient arrays have no common type") from e
++        else:
++            ret = [np.array(a, copy=True, dtype=dtype) for a in arrays]
+     else:
+-        ret = [np.array(a, copy=True, dtype=dtype) for a in arrays]
++        ret = [np.array(a, copy=True) for a in arrays]
+     return ret
+ 
+ 
+diff --git a/vendored-meson/meson b/vendored-meson/meson
+index e72c717199..5d5a3d478d 160000
+--- a/vendored-meson/meson
++++ b/vendored-meson/meson
+@@ -1 +1 @@
+-Subproject commit e72c717199fa18d34020c7c97f9de3f388c5e055
++Subproject commit 5d5a3d478da115c812be77afa651db2492d52171

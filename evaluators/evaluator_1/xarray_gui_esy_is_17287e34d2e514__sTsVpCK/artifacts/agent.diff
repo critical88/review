@@ -1,0 +1,225 @@
+diff --git a/xarray/backends/__init__.py b/xarray/backends/__init__.py
+index 550b9e29..70572746 100644
+--- a/xarray/backends/__init__.py
++++ b/xarray/backends/__init__.py
+@@ -4,7 +4,7 @@ DataStores provide a uniform interface for saving and loading data in different
+ formats. They should not be used directly, but rather through Dataset objects.
+ """
+ 
+-from xarray.backends.common import AbstractDataStore, BackendArray, BackendEntrypoint
++from xarray.backends.common import AbstractReadonlyDataStore, AbstractWritableDataStore, BackendArray, BackendEntrypoint
+ from xarray.backends.file_manager import (
+     CachingFileManager,
+     DummyFileManager,
+@@ -20,7 +20,8 @@ from xarray.backends.store import StoreBackendEntrypoint
+ from xarray.backends.zarr import ZarrBackendEntrypoint, ZarrStore
+ 
+ __all__ = [
+-    "AbstractDataStore",
++    "AbstractReadonlyDataStore",
++    "AbstractWritableDataStore",
+     "BackendArray",
+     "BackendEntrypoint",
+     "FileManager",
+diff --git a/xarray/backends/api.py b/xarray/backends/api.py
+index 76fcac62..42981d40 100644
+--- a/xarray/backends/api.py
++++ b/xarray/backends/api.py
+@@ -21,7 +21,7 @@ import numpy as np
+ from xarray import backends, conventions
+ from xarray.backends import plugins
+ from xarray.backends.common import (
+-    AbstractDataStore,
++    AbstractReadonlyDataStore,
+     ArrayWriter,
+     _find_absolute_paths,
+     _normalize_path,
+@@ -48,7 +48,7 @@ if TYPE_CHECKING:
+         Delayed = None  # type: ignore
+     from io import BufferedIOBase
+ 
+-    from xarray.backends.common import BackendEntrypoint
++    from xarray.backends.common import AbstractReadonlyDataStore, BackendEntrypoint
+     from xarray.core.types import (
+         CombineAttrsOptions,
+         CompatOptions,
+@@ -62,6 +62,7 @@ if TYPE_CHECKING:
+         T_NetcdfEngine,
+         Literal["pydap", "zarr"],
+         type[BackendEntrypoint],
++        type[AbstractReadonlyDataStore],
+         str,  # no nice typing support for custom backends
+         None,
+     ]
+@@ -389,7 +390,7 @@ def _dataset_from_backend_dataset(
+ 
+ 
+ def open_dataset(
+-    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadonlyDataStore,
+     *,
+     engine: T_Engine = None,
+     chunks: T_Chunks = None,
+@@ -592,7 +593,7 @@ def open_dataset(
+ 
+ 
+ def open_dataarray(
+-    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadonlyDataStore,
+     *,
+     engine: T_Engine | None = None,
+     chunks: T_Chunks | None = None,
+diff --git a/xarray/backends/common.py b/xarray/backends/common.py
+index 3754ca98..7096ad3a 100644
+--- a/xarray/backends/common.py
++++ b/xarray/backends/common.py
+@@ -133,7 +133,7 @@ def _decode_variable_name(name):
+ 
+ def _open_datatree_netcdf(
+     ncDataset: ncDataset | ncDatasetLegacyH5,
+-    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadonlyDataStore,
+     **kwargs,
+ ) -> DataTree:
+     from xarray.backends.api import open_dataset
+@@ -211,7 +211,7 @@ class BackendArray(NdimSizeLenMixin, indexing.ExplicitlyIndexed):
+         return self[key]  # type: ignore [index]
+ 
+ 
+-class AbstractDataStore:
++class AbstractReadonlyDataStore:
+     __slots__ = ()
+ 
+     def get_dimensions(self):  # pragma: no cover
+@@ -234,10 +234,10 @@ class AbstractDataStore:
+ 
+         For example::
+ 
+-            class SuffixAppendingDataStore(AbstractDataStore):
++            class SuffixAppendingDataStore(AbstractReadonlyDataStore):
+ 
+                 def load(self):
+-                    variables, attributes = AbstractDataStore.load(self)
++                    variables, attributes = AbstractReadonlyDataStore.load(self)
+                     variables = {'%s_suffix' % k: v
+                                  for k, v in variables.items()}
+                     attributes = {'%s_suffix' % k: v
+@@ -291,6 +291,10 @@ class AbstractDataStore:
+         """encode one attribute"""
+         return a
+ 
++
++class AbstractWritableDataStore(AbstractReadonlyDataStore):
++    __slots__ = ()
++
+     def set_dimension(self, dim, length):  # pragma: no cover
+         raise NotImplementedError()
+ 
+@@ -469,7 +473,7 @@ class ArrayWriter:
+             return delayed_store
+ 
+ 
+-class AbstractWritableDataStore(AbstractDataStore):
++class AbstractWritableDataStore(AbstractReadonlyDataStore):
+     __slots__ = ()
+ 
+ 
+diff --git a/xarray/backends/pydap_.py b/xarray/backends/pydap_.py
+index 27b335be..10e392cf 100644
+--- a/xarray/backends/pydap_.py
++++ b/xarray/backends/pydap_.py
+@@ -7,7 +7,7 @@ import numpy as np
+ 
+ from xarray.backends.common import (
+     BACKEND_ENTRYPOINTS,
+-    AbstractDataStore,
++    AbstractReadonlyDataStore,
+     BackendArray,
+     BackendEntrypoint,
+     robust_getitem,
+@@ -81,7 +81,7 @@ def _fix_attributes(attributes):
+     return attributes
+ 
+ 
+-class PydapDataStore(AbstractDataStore):
++class PydapDataStore(AbstractReadonlyDataStore):
+     """Store for accessing OpenDAP datasets with pydap.
+ 
+     This store provides an alternative way to access OpenDAP datasets that may
+@@ -185,13 +185,13 @@ class PydapBackendEntrypoint(BackendEntrypoint):
+ 
+     def guess_can_open(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadonlyDataStore,
+     ) -> bool:
+         return isinstance(filename_or_obj, str) and is_remote_uri(filename_or_obj)
+ 
+     def open_dataset(  # type: ignore[override]  # allow LSP violation, not supporting **kwargs
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadonlyDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+diff --git a/xarray/backends/store.py b/xarray/backends/store.py
+index a507ee37..b7cd83ae 100644
+--- a/xarray/backends/store.py
++++ b/xarray/backends/store.py
+@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
+ from xarray import conventions
+ from xarray.backends.common import (
+     BACKEND_ENTRYPOINTS,
+-    AbstractDataStore,
++    AbstractReadonlyDataStore,
+     BackendEntrypoint,
+ )
+ from xarray.core.dataset import Dataset
+@@ -22,13 +22,13 @@ class StoreBackendEntrypoint(BackendEntrypoint):
+ 
+     def guess_can_open(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadonlyDataStore,
+     ) -> bool:
+-        return isinstance(filename_or_obj, AbstractDataStore)
++        return isinstance(filename_or_obj, AbstractReadonlyDataStore)
+ 
+     def open_dataset(  # type: ignore[override]  # allow LSP violation, not supporting **kwargs
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadonlyDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+diff --git a/xarray/conventions.py b/xarray/conventions.py
+index 6eff45c5..d3c64b26 100644
+--- a/xarray/conventions.py
++++ b/xarray/conventions.py
+@@ -37,7 +37,7 @@ CF_RELATED_DATA_NEEDS_PARSING = (
+ 
+ 
+ if TYPE_CHECKING:
+-    from xarray.backends.common import AbstractDataStore
++    from xarray.backends.common import AbstractReadonlyDataStore
+     from xarray.core.dataset import Dataset
+ 
+     T_VarTuple = tuple[tuple[Hashable, ...], Any, dict, dict]
+@@ -45,7 +45,7 @@ if TYPE_CHECKING:
+     T_Variables = Mapping[Any, Variable]
+     T_Attrs = MutableMapping[Any, Any]
+     T_DropVariables = Union[str, Iterable[Hashable], None]
+-    T_DatasetOrAbstractstore = Union[Dataset, AbstractDataStore]
++    T_DatasetOrAbstractstore = Union[Dataset, AbstractReadonlyDataStore]
+ 
+ 
+ def _infer_dtype(array, name=None):
+@@ -559,7 +559,7 @@ def decode_cf(
+     -------
+     decoded : Dataset
+     """
+-    from xarray.backends.common import AbstractDataStore
++    from xarray.backends.common import AbstractReadonlyDataStore
+     from xarray.core.dataset import Dataset
+ 
+     vars: T_Variables

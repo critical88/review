@@ -1,0 +1,88 @@
+{
+  "schema_version": "smellbench.solve_rubrics.v3",
+  "execution_mode": "one_independent_call_per_rubric",
+  "aggregation": "macro_average_by_category",
+  "rubrics": [
+    {
+      "id": "R1",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the refactor no production function definition keeps the per-column MAX, MEAN and MIN tail aggregate arrays as three separate pointer-to-double (or double[]) parameters: the formerly recurring triple of update-stage signatures in the statistics framework and of the tail-selection helper on the print side all receive the aggregates through a single owner-based abstraction (one bundle/owner parameter, or aggregate access through the module record).",
+      "rationale": "This is the central semantic outcome of the task: the recurring per-column aggregate group must stop being passed member-by-member everywhere it appeared, in both real responsibilities (live per-interval update and history tail output), not only in the most visible helper."
+    },
+    {
+      "id": "R2",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The per-interval aggregate maintenance semantics are preserved through the new abstraction: on the first retained record every column's MAX, MEAN and MIN are seeded with the interval value (including the existing multiply-by-1.0), and on later records the running maximum updates when new_val - current_max > 0.1, the running minimum updates when current_min - new_val > 0.1 and new_val >= 0, the mean stays ((n_record - 1) * mean + st_val) / n_record for st_val >= 0, with the extreme update still preceding the mean update.",
+      "rationale": "The tail aggregates are live state the history renderer exposes; these exact comparisons and ordering are the observable behavior of this case and ship in both the update-stage bodies and their ordering at the call site, so a refactor that loses any of them produces silently different MAX/MEAN/MIN sections.",
+      "note": "Answerable from the diff against the injected statistics-update cluster: seeding/extreme/mean stages and the first-record-versus-later branch at the single producing call site."
+    },
+    {
+      "id": "R3",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The print side still selects the correct aggregate per tail mode: the MAX section reads per-column maxima, the MEAN section the means, the MIN section the minima, for every enabled module row, and an unrecognized tail selection produces no array and no section output instead of printing something.",
+      "rationale": "The selection helper introduced on the print side is the consumer half of the same aggregate group; this rubric verifies the refactor kept the mode-to-array mapping and the silent-fallback intact rather than flattening or re-guessing it."
+    },
+    {
+      "id": "R4",
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not leave the recurring aggregate triple in one of the two responsibilities while migrating the other: neither the statistics-update function family in the framework translation unit nor the tail-print selection in the output translation unit still reconstructs or accepts the three aggregates as separate parameters.",
+      "rationale": "A plausible incomplete fix migrates the first helpers a developer finds and leaves the second translation unit (or a renamed variant of a stage) still threading the triple, which keeps the smell relation alive in exactly one production path."
+    },
+    {
+      "id": "R5",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "If the repair introduces a type to carry the aggregate group, that type is defined once and shared by both affected translation units through the existing header graph (no duplicated re-declaration of the same layout in each file), and every reference to it type-checks against the same definition.",
+      "rationale": "The two clusters live in different translation units that share include/framework.h; duplicating the new aggregate type per file would preserve the smell at the type level (two hand-kept copies of the same grouping) even though the parameter lists look clean."
+    },
+    {
+      "id": "R6",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Call sites obtain the owner/bundle for the aggregates at the natural record boundary (once per module record or per record iteration) instead of reassembling the three aggregates argument-by-argument at each helper invocation or copying whole arrays by value.",
+      "rationale": "The injected call sites rebuilt the triple member-by-member before each stage call; a complete repair moves the grouping decision to where the module record is already in hand, and pointer-level aliasing must be kept so updates remain visible to the module record."
+    },
+    {
+      "id": "R7",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The refactor does not change struct module's existing field layout or the module plugin contract: the existing module record members keep their order and types, and the register_mod_fields / data_collect / set_st_record callback shapes used by the dlopen'ed module sources stay compatible (the loaded module set and their registration still work).",
+      "rationale": "The aggregate arrays are siblings inside struct module, so an owner-cleanup may be tempted to re-nest or reorder them; that changes the shared record layout that every plugin module is compiled against and breaks the dlopen interface even though tsar itself would still build."
+    },
+    {
+      "id": "R8",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The refactor does not 'simplify' the aggregate arithmetic while moving it: the 0.1 margins, the st_val >= 0 guard around the mean update, the multiply-by-1.0 seed promotion, and the min-only-lowered / max-only-raised comparison directions are all retained unchanged (not 'cleaned up', reordered, or unified into approximate equivalents).",
+      "rationale": "The odd-looking epsilon margins and guards are the existing tolerance behavior for counter-driven per-column statistics; this case is about parameter ownership, and 'tidying' those constants while extracting the group is the most plausible silent history-value regression."
+    },
+    {
+      "id": "R9",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The observable tail output layout is unchanged: the MAX, MEAN and MIN section headers and their order, the per-module row iteration over enabled modules, and the printed selection fallback all render exactly as before the refactor.",
+      "rationale": "The print-side call site sits inside a heavily formatted output function; a repair that restructures selection must not disturb the surrounding printf/flow that external tail consumers (and monitoring scripts parsing the sections) depend on."
+    },
+    {
+      "id": "R10",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No obsolete intermediate machinery survives the refactor: no static helper, declaration or comment block left over from the separate-pointer threading is left defined but unreferenced, and the code does not coexist in half-migrated form (e.g. an abandoned stage helper still defined while call sites use the new owner).",
+      "rationale": "A repair that adds the owner-based abstraction but leaves an old aggregate-threading helper behind (even unused) keeps the deprecated grouping around and makes the production code carry dead pre-refactor structure specific to this case."
+    }
+  ]
+}

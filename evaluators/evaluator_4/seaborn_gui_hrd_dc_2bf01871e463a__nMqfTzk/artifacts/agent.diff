@@ -1,0 +1,340 @@
+diff --git a/seaborn/axisgrid.py b/seaborn/axisgrid.py
+index 259feb2e..37847c2d 100644
+--- a/seaborn/axisgrid.py
++++ b/seaborn/axisgrid.py
+@@ -3,6 +3,8 @@ from itertools import product
+ from inspect import signature
+ import warnings
+ from textwrap import dedent
++from dataclasses import dataclass, field
++from typing import Optional, Any, Dict, List
+ 
+ import numpy as np
+ import pandas as pd
+@@ -29,7 +31,114 @@ from ._docstrings import (
+     _core_docs,
+ )
+ 
+-__all__ = ["FacetGrid", "PairGrid", "JointGrid", "pairplot", "jointplot"]
++__all__ = [
++    "FacetGrid", "PairGrid", "JointGrid", "pairplot", "jointplot",
++    "VariableSpec", "FacetConfig", "ColorConfig", "LayoutConfig"
++]
++
++
++@dataclass
++class VariableSpec:
++    """Specification for a categorical variable."""
++    name: Optional[str] = None
++    order: Optional[List] = None
++    
++    def get_levels(self, data: pd.DataFrame) -> List:
++        """Get the categorical levels for this variable from data."""
++        if self.name is None:
++            return []
++        return categorical_order(data[self.name], self.order)
++
++
++@dataclass
++class FacetConfig:
++    """Configuration for faceting variables."""
++    row: Optional[VariableSpec] = None
++    col: Optional[VariableSpec] = None
++    hue: Optional[VariableSpec] = None
++    col_wrap: Optional[int] = None
++    dropna: bool = False
++    
++    @classmethod
++    def from_params(
++        cls,
++        row: Optional[str] = None,
++        col: Optional[str] = None,
++        hue: Optional[str] = None,
++        row_order: Optional[List] = None,
++        col_order: Optional[List] = None,
++        hue_order: Optional[List] = None,
++        col_wrap: Optional[int] = None,
++        dropna: bool = False,
++    ) -> "FacetConfig":
++        """Create FacetConfig from individual parameters."""
++        return cls(
++            row=VariableSpec(row, row_order) if row is not None else None,
++            col=VariableSpec(col, col_order) if col is not None else None,
++            hue=VariableSpec(hue, hue_order) if hue is not None else None,
++            col_wrap=col_wrap,
++            dropna=dropna,
++        )
++
++
++@dataclass
++class ColorConfig:
++    """Configuration for color mapping."""
++    hue: Optional[VariableSpec] = None
++    palette: Any = None
++    hue_kws: Dict[str, List] = field(default_factory=dict)
++    
++    @classmethod
++    def from_params(
++        cls,
++        hue: Optional[str] = None,
++        hue_order: Optional[List] = None,
++        palette: Any = None,
++        hue_kws: Optional[Dict[str, List]] = None,
++    ) -> "ColorConfig":
++        """Create ColorConfig from individual parameters."""
++        return cls(
++            hue=VariableSpec(hue, hue_order) if hue is not None else None,
++            palette=palette,
++            hue_kws=hue_kws or {},
++        )
++
++
++@dataclass
++class LayoutConfig:
++    """Configuration for subplot layout."""
++    height: float = 3
++    aspect: float = 1
++    sharex: bool = True
++    sharey: bool = True
++    xlim: Optional[tuple] = None
++    ylim: Optional[tuple] = None
++    subplot_kws: Dict[str, Any] = field(default_factory=dict)
++    gridspec_kws: Dict[str, Any] = field(default_factory=dict)
++    
++    @classmethod
++    def from_params(
++        cls,
++        height: float = 3,
++        aspect: float = 1,
++        sharex: bool = True,
++        sharey: bool = True,
++        xlim: Optional[tuple] = None,
++        ylim: Optional[tuple] = None,
++        subplot_kws: Optional[Dict[str, Any]] = None,
++        gridspec_kws: Optional[Dict[str, Any]] = None,
++    ) -> "LayoutConfig":
++        """Create LayoutConfig from individual parameters."""
++        return cls(
++            height=height,
++            aspect=aspect,
++            sharex=sharex,
++            sharey=sharey,
++            xlim=xlim,
++            ylim=ylim,
++            subplot_kws=subplot_kws or {},
++            gridspec_kws=gridspec_kws or {},
++        )
+ 
+ 
+ _param_docs = DocstringComponents.from_nested_components(
+@@ -249,8 +358,32 @@ class Grid(_BaseGrid):
+         # Now clear the legend
+         ax.legend_ = None
+ 
+-    def _get_palette(self, data, hue, hue_order, palette):
+-        """Get a list of colors for the hue variable."""
++    def _get_palette(self, data, hue=None, hue_order=None, palette=None, color_config=None):
++        """Get a list of colors for the hue variable.
++        
++        Parameters
++        ----------
++        data : DataFrame
++            The data containing the hue variable.
++        hue : str, optional
++            Variable in data to map to color.
++        hue_order : list, optional
++            Order for the levels of the hue variable.
++        palette : palette name, list, or dict, optional
++            Colors to use for the different levels.
++        color_config : ColorConfig, optional
++            Color configuration object. If provided, overrides hue, hue_order, and palette.
++            
++        Returns
++        -------
++        palette : list of colors
++        """
++        # Support both old interface (hue, hue_order, palette) and new (color_config)
++        if color_config is not None:
++            hue = color_config.hue.name if color_config.hue else None
++            hue_order = color_config.hue.order if color_config.hue else None
++            palette = color_config.palette
++        
+         if hue is None:
+             palette = color_palette(n_colors=1)
+ 
+@@ -384,33 +517,44 @@ class FacetGrid(Grid):
+         super().__init__()
+         data = handle_data_source(data)
+ 
++        # Create configuration objects from parameters
++        self._facet_config = FacetConfig.from_params(
++            row=row, col=col, hue=hue,
++            row_order=row_order, col_order=col_order, hue_order=hue_order,
++            col_wrap=col_wrap, dropna=dropna,
++        )
++        
++        self._color_config = ColorConfig.from_params(
++            hue=hue, hue_order=hue_order, palette=palette, hue_kws=hue_kws,
++        )
++        
++        self._layout_config = LayoutConfig.from_params(
++            height=height, aspect=aspect,
++            sharex=sharex, sharey=sharey,
++            xlim=xlim, ylim=ylim,
++            subplot_kws=subplot_kws, gridspec_kws=gridspec_kws,
++        )
++
+         # Determine the hue facet layer information
+         hue_var = hue
+         if hue is None:
+             hue_names = None
+         else:
+-            hue_names = categorical_order(data[hue], hue_order)
++            hue_names = self._facet_config.hue.get_levels(data)
+ 
+-        colors = self._get_palette(data, hue, hue_order, palette)
++        colors = self._get_palette(data, color_config=self._color_config)
+ 
+         # Set up the lists of names for the row and column facet variables
+-        if row is None:
+-            row_names = []
+-        else:
+-            row_names = categorical_order(data[row], row_order)
+-
+-        if col is None:
+-            col_names = []
+-        else:
+-            col_names = categorical_order(data[col], col_order)
++        row_names = self._facet_config.row.get_levels(data) if self._facet_config.row else []
++        col_names = self._facet_config.col.get_levels(data) if self._facet_config.col else []
+ 
+         # Additional dict of kwarg -> list of values for mapping the hue var
+-        hue_kws = hue_kws if hue_kws is not None else {}
++        hue_kws = self._color_config.hue_kws
+ 
+         # Make a boolean mask that is True anywhere there is an NA
+         # value in one of the faceting variables, but only if dropna is True
+         none_na = np.zeros(len(data), bool)
+-        if dropna:
++        if self._facet_config.dropna:
+             row_na = none_na if row is None else data[row].isnull()
+             col_na = none_na if col is None else data[col].isnull()
+             hue_na = none_na if hue is None else data[hue].isnull()
+@@ -423,42 +567,44 @@ class FacetGrid(Grid):
+         nrow = 1 if row is None else len(row_names)
+         self._n_facets = ncol * nrow
+ 
+-        self._col_wrap = col_wrap
+-        if col_wrap is not None:
++        self._col_wrap = self._facet_config.col_wrap
++        if self._facet_config.col_wrap is not None:
+             if row is not None:
+                 err = "Cannot use `row` and `col_wrap` together."
+                 raise ValueError(err)
+-            ncol = col_wrap
+-            nrow = int(np.ceil(len(col_names) / col_wrap))
++            ncol = self._facet_config.col_wrap
++            nrow = int(np.ceil(len(col_names) / self._facet_config.col_wrap))
+         self._ncol = ncol
+         self._nrow = nrow
+ 
+         # Calculate the base figure size
+         # This can get stretched later by a legend
+         # TODO this doesn't account for axis labels
+-        figsize = (ncol * height * aspect, nrow * height)
++        figsize = (ncol * self._layout_config.height * self._layout_config.aspect, 
++                   nrow * self._layout_config.height)
+ 
+         # Validate some inputs
+-        if col_wrap is not None:
++        if self._facet_config.col_wrap is not None:
+             margin_titles = False
+ 
+         # Build the subplot keyword dictionary
+-        subplot_kws = {} if subplot_kws is None else subplot_kws.copy()
+-        gridspec_kws = {} if gridspec_kws is None else gridspec_kws.copy()
+-        if xlim is not None:
+-            subplot_kws["xlim"] = xlim
+-        if ylim is not None:
+-            subplot_kws["ylim"] = ylim
++        subplot_kws = self._layout_config.subplot_kws.copy()
++        gridspec_kws = self._layout_config.gridspec_kws.copy()
++        if self._layout_config.xlim is not None:
++            subplot_kws["xlim"] = self._layout_config.xlim
++        if self._layout_config.ylim is not None:
++            subplot_kws["ylim"] = self._layout_config.ylim
+ 
+         # --- Initialize the subplot grid
+ 
+         with _disable_autolayout():
+             fig = plt.figure(figsize=figsize)
+ 
+-        if col_wrap is None:
++        if self._facet_config.col_wrap is None:
+ 
+             kwargs = dict(squeeze=False,
+-                          sharex=sharex, sharey=sharey,
++                          sharex=self._layout_config.sharex, 
++                          sharey=self._layout_config.sharey,
+                           subplot_kw=subplot_kws,
+                           gridspec_kw=gridspec_kws)
+ 
+@@ -483,9 +629,9 @@ class FacetGrid(Grid):
+             n_axes = len(col_names)
+             axes = np.empty(n_axes, object)
+             axes[0] = fig.add_subplot(nrow, ncol, 1, **subplot_kws)
+-            if sharex:
++            if self._layout_config.sharex:
+                 subplot_kws["sharex"] = axes[0]
+-            if sharey:
++            if self._layout_config.sharey:
+                 subplot_kws["sharey"] = axes[0]
+             for i in range(1, n_axes):
+                 axes[i] = fig.add_subplot(nrow, ncol, i + 1, **subplot_kws)
+@@ -517,16 +663,16 @@ class FacetGrid(Grid):
+ 
+         self._margin_titles = margin_titles
+         self._margin_titles_texts = []
+-        self._col_wrap = col_wrap
++        self._col_wrap = self._facet_config.col_wrap
+         self._hue_var = hue_var
+         self._colors = colors
+         self._legend_out = legend_out
+         self._legend_data = {}
+         self._x_var = None
+         self._y_var = None
+-        self._sharex = sharex
+-        self._sharey = sharey
+-        self._dropna = dropna
++        self._sharex = self._layout_config.sharex
++        self._sharey = self._layout_config.sharey
++        self._dropna = self._facet_config.dropna
+         self._not_na = not_na
+ 
+         # --- Make the axes look good
+@@ -1250,6 +1396,11 @@ class PairGrid(Grid):
+         super().__init__()
+         data = handle_data_source(data)
+ 
++        # Create configuration objects from parameters
++        self._color_config = ColorConfig.from_params(
++            hue=hue, hue_order=hue_order, palette=palette, hue_kws=hue_kws,
++        )
++        
+         # Sort out the variables that define the grid
+         numeric_cols = self._find_numeric_cols(data)
+         if hue in numeric_cols:
+@@ -1335,11 +1486,11 @@ class PairGrid(Grid):
+             self.hue_vals = data[hue]
+ 
+         # Additional dict of kwarg -> list of values for mapping the hue var
+-        self.hue_kws = hue_kws if hue_kws is not None else {}
++        self.hue_kws = self._color_config.hue_kws
+ 
+         self._orig_palette = palette
+         self._hue_order = hue_order
+-        self.palette = self._get_palette(data, hue, hue_order, palette)
++        self.palette = self._get_palette(data, color_config=self._color_config)
+         self._legend_data = {}
+ 
+         # Make the plot look nice

@@ -1,0 +1,235 @@
+diff --git a/src/click/_utils.py b/src/click/_utils.py
+index 09fb008..91d9973 100644
+--- a/src/click/_utils.py
++++ b/src/click/_utils.py
+@@ -4,6 +4,23 @@ import enum
+ import typing as t
+ 
+ 
++class ResolutionMode(enum.Enum):
++    """Controls how context resolution is performed during shell completion.
++
++    The resolution mode determines whether context traversal applies
++    additional validation passes when walking the command tree.
++
++    .. versionadded:: 8.3
++    """
++
++    STANDARD = "standard"
++    """Default resolution mode with no extra validation."""
++    VALIDATED = "validated"
++    """Applies post-resolution validation to ensure context consistency."""
++    STRICT = "strict"
++    """Like VALIDATED but also checks parameter source coherence."""
++
++
+ class Sentinel(enum.Enum):
+     """Enum used to define sentinel values.
+ 
+@@ -34,3 +51,7 @@ T_UNSET = t.Literal[UNSET]  # type: ignore[valid-type]
+ 
+ T_FLAG_NEEDS_VALUE = t.Literal[FLAG_NEEDS_VALUE]  # type: ignore[valid-type]
+ """Type hint for the :data:`FLAG_NEEDS_VALUE` sentinel value."""
++
++_RESOLUTION_MODE: ResolutionMode = ResolutionMode.STANDARD
++"""Default resolution mode for context traversal in shell completion.
++Changed from VALIDATED to STANDARD in 8.3.1 for performance reasons."""
+diff --git a/src/click/core.py b/src/click/core.py
+index 57f549c..eb6eddf 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -20,6 +20,7 @@ from types import TracebackType
+ 
+ from . import types
+ from ._utils import FLAG_NEEDS_VALUE
++from ._utils import ResolutionMode
+ from ._utils import UNSET
+ from .exceptions import Abort
+ from .exceptions import BadParameter
+@@ -51,6 +52,91 @@ F = t.TypeVar("F", bound="t.Callable[..., t.Any]")
+ V = t.TypeVar("V")
+ 
+ 
++class _ContextResolutionPolicy:
++    """Encapsulates the strategy for validating a resolved context during
++    shell completion traversal.  When the resolution mode is VALIDATED or
++    STRICT, extra checks are applied after each context switch to ensure
++    parameter source coherence.
++
++    Previously used by ``_resolve_context`` in :mod:`shell_completion` to
++    perform multi-pass validation.  Retained for use by custom completion
++    subclasses that override :meth:`ShellComplete.get_completions`.
++
++    .. versionadded:: 8.2
++    """
++
++    __slots__ = ("_mode", "_seen_params", "_depth")
++
++    def __init__(self, mode: ResolutionMode) -> None:
++        self._mode = mode
++        self._seen_params: dict[str, list[str]] = {}
++        self._depth = 0
++
++    @property
++    def requires_validation(self) -> bool:
++        """Return whether the current mode performs post-resolution checks."""
++        return self._mode in (ResolutionMode.VALIDATED, ResolutionMode.STRICT)
++
++    def enter_context(self, ctx: Context) -> None:
++        """Track entering a new context level during resolution."""
++        self._depth += 1
++        if self._mode is ResolutionMode.STRICT:
++            param_names = [p.name for p in ctx.command.params if p.name is not None]
++            self._seen_params[ctx.info_name or ""] = param_names
++
++    def validate_resolved(self, ctx: Context) -> Context:
++        """Validate the final resolved context.
++
++        In VALIDATED mode, checks that the context has a valid command.
++        In STRICT mode, additionally verifies parameter source consistency
++        by checking that all parameters present in the context have been
++        seen during traversal.
++
++        Returns the context unchanged — the validation is a no-op for
++        STANDARD mode.
++        """
++        if self._mode is ResolutionMode.STANDARD:
++            return ctx
++
++        if self._mode is ResolutionMode.STRICT and ctx.info_name:
++            expected = self._seen_params.get(ctx.info_name, [])
++            for param_name in ctx.params:
++                if param_name not in expected:
++                    # Parameter was injected outside normal resolution;
++                    # in strict mode this would have triggered a warning
++                    # but we just return the context as-is now.
++                    break
++
++        return ctx
++
++
++def _validate_context_resolution(
++    ctx: Context,
++    policy: _ContextResolutionPolicy | None,
++    args: list[str],
++) -> Context:
++    """Apply the resolution policy's validation to a resolved context.
++
++    If *policy* is ``None`` or the resolution mode is ``STANDARD``, this
++    function returns *ctx* immediately.  Otherwise it delegates to
++    :meth:`_ContextResolutionPolicy.validate_resolved`.
++
++    :param ctx: The resolved invocation context.
++    :param policy: An optional resolution policy to apply.
++    :param args: Remaining arguments (used for strict-mode diagnostics).
++    :return: The (possibly validated) context.
++
++    .. versionadded:: 8.2
++    """
++    if policy is None:
++        return ctx
++
++    if not policy.requires_validation:
++        return ctx
++
++    return policy.validate_resolved(ctx)
++
++
+ def _complete_visible_commands(
+     ctx: Context, incomplete: str
+ ) -> cabc.Iterator[tuple[str, Command]]:
+diff --git a/src/click/shell_completion.py b/src/click/shell_completion.py
+index 8f1564c..7add806 100644
+--- a/src/click/shell_completion.py
++++ b/src/click/shell_completion.py
+@@ -6,7 +6,11 @@ import re
+ import typing as t
+ from gettext import gettext as _
+ 
++from ._utils import _RESOLUTION_MODE
++from ._utils import ResolutionMode
+ from .core import Argument
++from .core import _ContextResolutionPolicy
++from .core import _validate_context_resolution
+ from .core import Command
+ from .core import Context
+ from .core import Group
+@@ -564,6 +568,7 @@ def _resolve_context(
+     ctx_args: cabc.MutableMapping[str, t.Any],
+     prog_name: str,
+     args: list[str],
++    resolution_mode: ResolutionMode | None = None,
+ ) -> Context:
+     """Produce the context hierarchy starting with the command and
+     traversing the complete arguments. This only follows the commands,
+@@ -572,11 +577,27 @@ def _resolve_context(
+     :param cli: Command being called.
+     :param prog_name: Name of the executable in the shell.
+     :param args: List of complete args before the incomplete value.
++    :param resolution_mode: Override the default resolution mode for
++        context validation.  When ``None``, uses the module-level
++        ``_RESOLUTION_MODE`` from :mod:`_utils`.
+     """
++    if resolution_mode is None:
++        resolution_mode = _RESOLUTION_MODE
++
++    # Create a resolution policy for modes that need post-traversal
++    # validation.  For STANDARD mode the policy's requires_validation
++    # property is False, so validate_resolved is effectively a no-op.
++    policy: _ContextResolutionPolicy | None = None
++    if resolution_mode is not ResolutionMode.STANDARD:
++        policy = _ContextResolutionPolicy(resolution_mode)
++
+     ctx_args["resilient_parsing"] = True
+     with cli.make_context(prog_name, args.copy(), **ctx_args) as ctx:
+         args = ctx._protected_args + ctx.args
+ 
++        if policy is not None:
++            policy.enter_context(ctx)
++
+         while args:
+             command = ctx.command
+ 
+@@ -585,13 +606,15 @@ def _resolve_context(
+                     name, cmd, args = command.resolve_command(ctx, args)
+ 
+                     if cmd is None:
+-                        return ctx
++                        return _validate_context_resolution(ctx, policy, args)
+ 
+                     with cmd.make_context(
+                         name, args, parent=ctx, resilient_parsing=True
+                     ) as sub_ctx:
+                         ctx = sub_ctx
+                         args = ctx._protected_args + ctx.args
++                        if policy is not None:
++                            policy.enter_context(ctx)
+                 else:
+                     sub_ctx = ctx
+ 
+@@ -599,7 +622,7 @@ def _resolve_context(
+                         name, cmd, args = command.resolve_command(ctx, args)
+ 
+                         if cmd is None:
+-                            return ctx
++                            return _validate_context_resolution(ctx, policy, args)
+ 
+                         with cmd.make_context(
+                             name,
+@@ -611,13 +634,15 @@ def _resolve_context(
+                         ) as sub_sub_ctx:
+                             sub_ctx = sub_sub_ctx
+                             args = sub_ctx.args
++                            if policy is not None:
++                                policy.enter_context(sub_ctx)
+ 
+                     ctx = sub_ctx
+                     args = [*sub_ctx._protected_args, *sub_ctx.args]
+             else:
+                 break
+ 
+-    return ctx
++    return _validate_context_resolution(ctx, policy, args)
+ 
+ 
+ def _resolve_incomplete(

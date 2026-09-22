@@ -1,0 +1,313 @@
+diff --git a/seaborn/_core/plot.py b/seaborn/_core/plot.py
+index 6197798f..509a3dc8 100644
+--- a/seaborn/_core/plot.py
++++ b/seaborn/_core/plot.py
+@@ -1432,130 +1432,196 @@ class Plotter:
+                 if var not in "xy" and var in scales:
+                     return getattr(scales[var], "order", None)
+ 
+-            if orient in df:
+-                width = pd.Series(index=df.index, dtype=float)
+-                for view in subplots:
+-                    view_idx = self._get_subplot_data(
+-                        df, orient, view, p._shares.get(orient)
+-                    ).index
+-                    view_df = df.loc[view_idx]
+-                    if "width" in mark._mappable_props:
+-                        view_width = mark._resolve(view_df, "width", None)
+-                    elif "width" in df:
+-                        view_width = view_df["width"]
+-                    else:
+-                        view_width = 0.8
+-                    spacing = scales[orient]._spacing(view_df.loc[view_idx, orient])
+-                    width.loc[view_idx] = view_width * spacing
+-                df["width"] = width
+-
+-            if "baseline" in mark._mappable_props:
+-                baseline = mark._resolve(df, "baseline", None)
+-            else:
+-                baseline = 0 if "baseline" not in df else df["baseline"]
+-            df["baseline"] = baseline
+-
+-            if move is not None:
+-                moves = move if isinstance(move, list) else [move]
+-                for move_step in moves:
+-                    move_by = getattr(move_step, "by", None)
+-                    if move_by is None:
+-                        move_by = grouping_properties
+-                    move_groupers = [*move_by, *default_grouping_vars]
+-                    if move_step.group_by_orient:
+-                        move_groupers.insert(0, orient)
+-                    order = {var: get_order(var) for var in move_groupers}
+-                    groupby = GroupBy(order)
+-                    df = move_step(df, groupby, orient, scales)
+-
+-            # Coordinate inversion: transform scaled coordinates back to data space
+-            coord_cols = [c for c in df if re.match(r"^[xy]\D*$", str(c))]
+-            unscaled_df = (
+-                df
+-                .drop(coord_cols, axis=1)
+-                .reindex(df.columns, axis=1)
+-                .copy(deep=False)
++            df = self._resolve_orient_width(
++                df, orient, mark, subplots, scales, p._shares.get(orient)
++            )
++            df = self._resolve_baseline(df, mark)
++            df = self._apply_move_transformations(
++                df,
++                move,
++                orient,
++                scales,
++                grouping_properties,
++                default_grouping_vars,
++                get_order,
+             )
++            df = self._invert_coordinates(df, subplots)
+ 
+-            for view in subplots:
+-                filtered_view_df = filter_subplot_rows(df, view)
+-                axes_values = filtered_view_df[coord_cols]
+-                for var, values in axes_values.items():
+-                    axis = getattr(view["ax"], f"{str(var)[0]}axis")
+-                    transform = axis.get_transform().inverted().transform
+-                    inverted = transform(values)
+-                    unscaled_df.loc[values.index, str(var)] = inverted
+-
+-            df = unscaled_df
+-
+-            # Prepare split generator for mark rendering
+-            grouping_vars = mark._grouping_props + default_grouping_vars
+-            active_grouping_vars = [
+-                v for v in grouping_vars if v in df and v not in ["col", "row"]
+-            ]
+-            grouping_keys = []
+-            for gv in active_grouping_vars:
+-                key_order = getattr(self._scales[gv], "order", None)
+-                if key_order is None:
+-                    key_order = categorical_order(df[gv])
+-                grouping_keys.append(key_order)
+-
+-            split_df = df
+-            split_subplots = subplots
+-
+-            def split_generator(keep_na=False) -> Generator:
+-
+-                for view in split_subplots:
+-
+-                    axes_df = filter_subplot_rows(split_df, view)
+-
+-                    masked_df = mask_inf_values(axes_df)
+-                    if keep_na:
+-                        present = masked_df.notna().all(axis=1)
+-                        nulled = {}
+-                        for axis in "xy":
+-                            if axis in axes_df:
+-                                nulled[axis] = axes_df[axis].where(present)
+-                        axes_df = masked_df.assign(**nulled)
+-                    else:
+-                        axes_df = masked_df.dropna()
+-
+-                    subplot_keys = resolve_split_keys(view)
+-
+-                    if not active_grouping_vars or not any(grouping_keys):
+-                        if not axes_df.empty:
+-                            yield subplot_keys, axes_df.copy(), view["ax"]
+-                        continue
++            active_grouping_vars, grouping_keys = self._prepare_grouping_data(
++                df, mark, default_grouping_vars
++            )
++            split_generator = self._create_split_generator(
++                df, subplots, active_grouping_vars, grouping_keys
++            )
++            mark._plot(split_generator, scales, orient)
+ 
+-                    grouped_df = axes_df.groupby(
+-                        active_grouping_vars, sort=False,
+-                        as_index=False, observed=False,
+-                    )
++        for view in self._subplots:
++            view["ax"].autoscale_view()
+ 
+-                    for key in itertools.product(*grouping_keys):
++        if layer["legend"]:
++            self._update_legend_contents(p, mark, data, scales, layer["label"])
+ 
+-                        pd_key = key[0] if len(key) == 1 else key
++    def _resolve_orient_width(
++        self,
++        df: DataFrame,
++        orient: str,
++        mark: Mark,
++        subplots: list[dict],
++        scales: dict[str, Scale],
++        share_state: str | None,
++    ) -> DataFrame:
++        """Calculate width values for orientation axis."""
++        if orient not in df:
++            return df
++        
++        width = pd.Series(index=df.index, dtype=float)
++        for view in subplots:
++            view_idx = self._get_subplot_data(df, orient, view, share_state).index
++            view_df = df.loc[view_idx]
++            if "width" in mark._mappable_props:
++                view_width = mark._resolve(view_df, "width", None)
++            elif "width" in df:
++                view_width = view_df["width"]
++            else:
++                view_width = 0.8
++            spacing = scales[orient]._spacing(view_df.loc[view_idx, orient])
++            width.loc[view_idx] = view_width * spacing
++        df["width"] = width
++        return df
++
++    def _resolve_baseline(self, df: DataFrame, mark: Mark) -> DataFrame:
++        """Resolve baseline values for the mark."""
++        if "baseline" in mark._mappable_props:
++            baseline = mark._resolve(df, "baseline", None)
++        else:
++            baseline = 0 if "baseline" not in df else df["baseline"]
++        df["baseline"] = baseline
++        return df
+ 
+-                        try:
+-                            df_subset = grouped_df.get_group(pd_key)
+-                        except KeyError:
+-                            df_subset = axes_df.loc[[]]
++    def _apply_move_transformations(
++        self,
++        df: DataFrame,
++        move: Move | list[Move] | None,
++        orient: str,
++        scales: dict[str, Scale],
++        grouping_properties: list[str],
++        default_grouping_vars: list[str],
++        get_order: Callable,
++    ) -> DataFrame:
++        """Apply move transformations to the data."""
++        if move is None:
++            return df
++        
++        moves = move if isinstance(move, list) else [move]
++        for move_step in moves:
++            move_by = getattr(move_step, "by", None)
++            if move_by is None:
++                move_by = grouping_properties
++            move_groupers = [*move_by, *default_grouping_vars]
++            if move_step.group_by_orient:
++                move_groupers.insert(0, orient)
++            order = {var: get_order(var) for var in move_groupers}
++            groupby = GroupBy(order)
++            df = move_step(df, groupby, orient, scales)
++        return df
++
++    def _invert_coordinates(
++        self, df: DataFrame, subplots: list[dict]
++    ) -> DataFrame:
++        """Transform scaled coordinates back to data space."""
++        coord_cols = [c for c in df if re.match(r"^[xy]\D*$", str(c))]
++        unscaled_df = (
++            df
++            .drop(coord_cols, axis=1)
++            .reindex(df.columns, axis=1)
++            .copy(deep=False)
++        )
+ 
+-                        if df_subset.empty:
+-                            continue
++        for view in subplots:
++            filtered_view_df = filter_subplot_rows(df, view)
++            axes_values = filtered_view_df[coord_cols]
++            for var, values in axes_values.items():
++                axis = getattr(view["ax"], f"{str(var)[0]}axis")
++                transform = axis.get_transform().inverted().transform
++                inverted = transform(values)
++                unscaled_df.loc[values.index, str(var)] = inverted
+ 
+-                        sub_vars = dict(zip(active_grouping_vars, key))
+-                        sub_vars.update(subplot_keys)
++        return unscaled_df
+ 
+-                        yield sub_vars, df_subset.copy(), view["ax"]
++    def _prepare_grouping_data(
++        self, df: DataFrame, mark: Mark, default_grouping_vars: list[str]
++    ) -> tuple[list[str], list[list]]:
++        """Prepare grouping variables and keys for mark rendering."""
++        grouping_vars = mark._grouping_props + default_grouping_vars
++        active_grouping_vars = [
++            v for v in grouping_vars if v in df and v not in ["col", "row"]
++        ]
++        grouping_keys = []
++        for gv in active_grouping_vars:
++            key_order = getattr(self._scales[gv], "order", None)
++            if key_order is None:
++                key_order = categorical_order(df[gv])
++            grouping_keys.append(key_order)
++        return active_grouping_vars, grouping_keys
++
++    def _create_split_generator(
++        self,
++        df: DataFrame,
++        subplots: list[dict],
++        active_grouping_vars: list[str],
++        grouping_keys: list[list],
++    ) -> Callable:
++        """Create a split generator function for mark rendering."""
++        split_df = df
++        split_subplots = subplots
+ 
+-            mark._plot(split_generator, scales, orient)
++        def split_generator(keep_na=False) -> Generator:
+ 
+-        for view in self._subplots:
+-            view["ax"].autoscale_view()
++            for view in split_subplots:
+ 
+-        if layer["legend"]:
+-            self._update_legend_contents(p, mark, data, scales, layer["label"])
++                axes_df = filter_subplot_rows(split_df, view)
++
++                masked_df = mask_inf_values(axes_df)
++                if keep_na:
++                    present = masked_df.notna().all(axis=1)
++                    nulled = {}
++                    for axis in "xy":
++                        if axis in axes_df:
++                            nulled[axis] = axes_df[axis].where(present)
++                    axes_df = masked_df.assign(**nulled)
++                else:
++                    axes_df = masked_df.dropna()
++
++                subplot_keys = resolve_split_keys(view)
++
++                if not active_grouping_vars or not any(grouping_keys):
++                    if not axes_df.empty:
++                        yield subplot_keys, axes_df.copy(), view["ax"]
++                    continue
++
++                grouped_df = axes_df.groupby(
++                    active_grouping_vars, sort=False,
++                    as_index=False, observed=False,
++                )
++
++                for key in itertools.product(*grouping_keys):
++
++                    pd_key = key[0] if len(key) == 1 else key
++
++                    try:
++                        df_subset = grouped_df.get_group(pd_key)
++                    except KeyError:
++                        df_subset = axes_df.loc[[]]
++
++                    if df_subset.empty:
++                        continue
++
++                    sub_vars = dict(zip(active_grouping_vars, key))
++                    sub_vars.update(subplot_keys)
++
++                    yield sub_vars, df_subset.copy(), view["ax"]
++
++        return split_generator
+ 
+     def _unscale_coords(
+         self, subplots: list[dict], df: DataFrame, orient: str,

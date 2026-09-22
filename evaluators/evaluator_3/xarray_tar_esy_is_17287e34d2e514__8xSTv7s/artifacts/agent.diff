@@ -1,0 +1,350 @@
+diff --git a/xarray/backends/__init__.py b/xarray/backends/__init__.py
+index 550b9e29..9953fbb0 100644
+--- a/xarray/backends/__init__.py
++++ b/xarray/backends/__init__.py
+@@ -4,7 +4,12 @@ DataStores provide a uniform interface for saving and loading data in different
+ formats. They should not be used directly, but rather through Dataset objects.
+ """
+ 
+-from xarray.backends.common import AbstractDataStore, BackendArray, BackendEntrypoint
++from xarray.backends.common import (
++    AbstractDataStore,
++    AbstractReadableDataStore,
++    BackendArray,
++    BackendEntrypoint,
++)
+ from xarray.backends.file_manager import (
+     CachingFileManager,
+     DummyFileManager,
+@@ -21,6 +26,7 @@ from xarray.backends.zarr import ZarrBackendEntrypoint, ZarrStore
+ 
+ __all__ = [
+     "AbstractDataStore",
++    "AbstractReadableDataStore",
+     "BackendArray",
+     "BackendEntrypoint",
+     "FileManager",
+diff --git a/xarray/backends/api.py b/xarray/backends/api.py
+index 76fcac62..31beb12f 100644
+--- a/xarray/backends/api.py
++++ b/xarray/backends/api.py
+@@ -22,6 +22,7 @@ from xarray import backends, conventions
+ from xarray.backends import plugins
+ from xarray.backends.common import (
+     AbstractDataStore,
++    AbstractReadableDataStore,
+     ArrayWriter,
+     _find_absolute_paths,
+     _normalize_path,
+@@ -389,7 +390,7 @@ def _dataset_from_backend_dataset(
+ 
+ 
+ def open_dataset(
+-    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+     *,
+     engine: T_Engine = None,
+     chunks: T_Chunks = None,
+diff --git a/xarray/backends/common.py b/xarray/backends/common.py
+index 3754ca98..87e3044c 100644
+--- a/xarray/backends/common.py
++++ b/xarray/backends/common.py
+@@ -133,7 +133,7 @@ def _decode_variable_name(name):
+ 
+ def _open_datatree_netcdf(
+     ncDataset: ncDataset | ncDatasetLegacyH5,
+-    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++    filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+     **kwargs,
+ ) -> DataTree:
+     from xarray.backends.api import open_dataset
+@@ -211,7 +211,14 @@ class BackendArray(NdimSizeLenMixin, indexing.ExplicitlyIndexed):
+         return self[key]  # type: ignore [index]
+ 
+ 
+-class AbstractDataStore:
++class AbstractReadableDataStore:
++    """
++    Abstract base class for read-only data stores.
++    
++    This class defines the interface for reading data from a store,
++    including dimensions, variables, and attributes. It follows the
++    Interface Segregation Principle by only requiring read operations.
++    """
+     __slots__ = ()
+ 
+     def get_dimensions(self):  # pragma: no cover
+@@ -234,10 +241,10 @@ class AbstractDataStore:
+ 
+         For example::
+ 
+-            class SuffixAppendingDataStore(AbstractDataStore):
++            class SuffixAppendingDataStore(AbstractReadableDataStore):
+ 
+                 def load(self):
+-                    variables, attributes = AbstractDataStore.load(self)
++                    variables, attributes = AbstractReadableDataStore.load(self)
+                     variables = {'%s_suffix' % k: v
+                                  for k, v in variables.items()}
+                     attributes = {'%s_suffix' % k: v
+@@ -291,6 +298,17 @@ class AbstractDataStore:
+         """encode one attribute"""
+         return a
+ 
++
++class AbstractDataStore(AbstractReadableDataStore):
++    """
++    Abstract base class for read-write data stores.
++    
++    This class extends AbstractReadableDataStore with write operations,
++    allowing data stores that support both reading and writing operations.
++    For read-only stores, use AbstractReadableDataStore instead.
++    """
++    __slots__ = ()
++
+     def set_dimension(self, dim, length):  # pragma: no cover
+         raise NotImplementedError()
+ 
+@@ -533,7 +551,7 @@ class BackendEntrypoint:
+ 
+     def open_dataset(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+         *,
+         drop_variables: str | Iterable[str] | None = None,
+         **kwargs: Any,
+@@ -546,7 +564,7 @@ class BackendEntrypoint:
+ 
+     def guess_can_open(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+     ) -> bool:
+         """
+         Backend open_dataset method used by Xarray in :py:func:`~xarray.open_dataset`.
+@@ -556,7 +574,7 @@ class BackendEntrypoint:
+ 
+     def open_datatree(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+         **kwargs: Any,
+     ) -> DataTree:
+         """
+diff --git a/xarray/backends/h5netcdf_.py b/xarray/backends/h5netcdf_.py
+index 71463193..c7003534 100644
+--- a/xarray/backends/h5netcdf_.py
++++ b/xarray/backends/h5netcdf_.py
+@@ -38,7 +38,7 @@ from xarray.core.variable import Variable
+ if TYPE_CHECKING:
+     from io import BufferedIOBase
+ 
+-    from xarray.backends.common import AbstractDataStore
++    from xarray.backends.common import AbstractReadableDataStore
+     from xarray.core.dataset import Dataset
+     from xarray.core.datatree import DataTree
+ 
+@@ -369,7 +369,7 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+ 
+     def guess_can_open(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+     ) -> bool:
+         magic_number = try_read_magic_number_from_file_or_path(filename_or_obj)
+         if magic_number is not None:
+@@ -383,7 +383,7 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_dataset(  # type: ignore[override]  # allow LSP violation, not supporting **kwargs
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -430,7 +430,7 @@ class H5netcdfBackendEntrypoint(BackendEntrypoint):
+ 
+     def open_datatree(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+         **kwargs,
+     ) -> DataTree:
+         from h5netcdf.legacyapi import Dataset as ncDataset
+diff --git a/xarray/backends/netCDF4_.py b/xarray/backends/netCDF4_.py
+index ae86c4ce..4c6906f2 100644
+--- a/xarray/backends/netCDF4_.py
++++ b/xarray/backends/netCDF4_.py
+@@ -43,7 +43,7 @@ from xarray.core.variable import Variable
+ if TYPE_CHECKING:
+     from io import BufferedIOBase
+ 
+-    from xarray.backends.common import AbstractDataStore
++    from xarray.backends.common import AbstractReadableDataStore
+     from xarray.core.dataset import Dataset
+     from xarray.core.datatree import DataTree
+ 
+diff --git a/xarray/backends/plugins.py b/xarray/backends/plugins.py
+index a62ca6c9..5fa0ec6b 100644
+--- a/xarray/backends/plugins.py
++++ b/xarray/backends/plugins.py
+@@ -21,7 +21,7 @@ if TYPE_CHECKING:
+         EntryPoints = list[EntryPoint]
+     from io import BufferedIOBase
+ 
+-    from xarray.backends.common import AbstractDataStore
++    from xarray.backends.common import AbstractReadableDataStore
+ 
+ STANDARD_BACKENDS_ORDER = ["netcdf4", "h5netcdf", "scipy"]
+ 
+diff --git a/xarray/backends/pydap_.py b/xarray/backends/pydap_.py
+index 27b335be..f726680f 100644
+--- a/xarray/backends/pydap_.py
++++ b/xarray/backends/pydap_.py
+@@ -7,7 +7,7 @@ import numpy as np
+ 
+ from xarray.backends.common import (
+     BACKEND_ENTRYPOINTS,
+-    AbstractDataStore,
++    AbstractReadableDataStore,
+     BackendArray,
+     BackendEntrypoint,
+     robust_getitem,
+@@ -81,7 +81,7 @@ def _fix_attributes(attributes):
+     return attributes
+ 
+ 
+-class PydapDataStore(AbstractDataStore):
++class PydapDataStore(AbstractReadableDataStore):
+     """Store for accessing OpenDAP datasets with pydap.
+ 
+     This store provides an alternative way to access OpenDAP datasets that may
+@@ -144,24 +144,6 @@ class PydapDataStore(AbstractDataStore):
+     def get_dimensions(self):
+         return Frozen(self.ds.dimensions)
+ 
+-    def encode(self, variables, attributes):
+-        # Pydap provides read-only access; encoding is a no-op pass-through
+-        return variables, attributes
+-
+-    def encode_variable(self, v):
+-        return v
+-
+-    def encode_attribute(self, a):
+-        return a
+-
+-    def set_dimension(self, dim, length, is_unlimited=False):
+-        pass
+-
+-    def set_attribute(self, k, v):
+-        pass
+-
+-    def prepare_variable(self, k, v, *args, **kwargs):
+-        pass
+ 
+ 
+ class PydapBackendEntrypoint(BackendEntrypoint):
+@@ -185,13 +167,13 @@ class PydapBackendEntrypoint(BackendEntrypoint):
+ 
+     def guess_can_open(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+     ) -> bool:
+         return isinstance(filename_or_obj, str) and is_remote_uri(filename_or_obj)
+ 
+     def open_dataset(  # type: ignore[override]  # allow LSP violation, not supporting **kwargs
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+diff --git a/xarray/backends/scipy_.py b/xarray/backends/scipy_.py
+index f8c486e5..2f7363b5 100644
+--- a/xarray/backends/scipy_.py
++++ b/xarray/backends/scipy_.py
+@@ -36,7 +36,7 @@ from xarray.core.variable import Variable
+ if TYPE_CHECKING:
+     from io import BufferedIOBase
+ 
+-    from xarray.backends.common import AbstractDataStore
++    from xarray.backends.common import AbstractReadableDataStore
+     from xarray.core.dataset import Dataset
+ 
+ 
+diff --git a/xarray/backends/store.py b/xarray/backends/store.py
+index a507ee37..9665af65 100644
+--- a/xarray/backends/store.py
++++ b/xarray/backends/store.py
+@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
+ from xarray import conventions
+ from xarray.backends.common import (
+     BACKEND_ENTRYPOINTS,
+-    AbstractDataStore,
++    AbstractReadableDataStore,
+     BackendEntrypoint,
+ )
+ from xarray.core.dataset import Dataset
+@@ -22,13 +22,13 @@ class StoreBackendEntrypoint(BackendEntrypoint):
+ 
+     def guess_can_open(
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+     ) -> bool:
+-        return isinstance(filename_or_obj, AbstractDataStore)
++        return isinstance(filename_or_obj, AbstractReadableDataStore)
+ 
+     def open_dataset(  # type: ignore[override]  # allow LSP violation, not supporting **kwargs
+         self,
+-        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractDataStore,
++        filename_or_obj: str | os.PathLike[Any] | BufferedIOBase | AbstractReadableDataStore,
+         *,
+         mask_and_scale=True,
+         decode_times=True,
+@@ -38,7 +38,7 @@ class StoreBackendEntrypoint(BackendEntrypoint):
+         use_cftime=None,
+         decode_timedelta=None,
+     ) -> Dataset:
+-        assert isinstance(filename_or_obj, AbstractDataStore)
++        assert isinstance(filename_or_obj, AbstractReadableDataStore)
+ 
+         vars, attrs = filename_or_obj.load()
+         encoding = filename_or_obj.get_encoding()
+diff --git a/xarray/backends/zarr.py b/xarray/backends/zarr.py
+index 0377d8db..a170d841 100644
+--- a/xarray/backends/zarr.py
++++ b/xarray/backends/zarr.py
+@@ -33,7 +33,7 @@ from xarray.namedarray.pycompat import integer_types
+ if TYPE_CHECKING:
+     from io import BufferedIOBase
+ 
+-    from xarray.backends.common import AbstractDataStore
++    from xarray.backends.common import AbstractReadableDataStore
+     from xarray.core.dataset import Dataset
+     from xarray.core.datatree import DataTree
+ 
+diff --git a/xarray/conventions.py b/xarray/conventions.py
+index 6eff45c5..19213623 100644
+--- a/xarray/conventions.py
++++ b/xarray/conventions.py
+@@ -559,7 +559,7 @@ def decode_cf(
+     -------
+     decoded : Dataset
+     """
+-    from xarray.backends.common import AbstractDataStore
++    from xarray.backends.common import AbstractReadableDataStore
+     from xarray.core.dataset import Dataset
+ 
+     vars: T_Variables
+@@ -570,7 +570,7 @@ def decode_cf(
+         extra_coords = set(obj.coords)
+         close = obj._close
+         encoding = obj.encoding
+-    elif isinstance(obj, AbstractDataStore):
++    elif isinstance(obj, AbstractReadableDataStore):
+         vars, attrs = obj.load()
+         extra_coords = set()
+         close = obj.close

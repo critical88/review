@@ -1,0 +1,166 @@
+diff --git a/pandas/api/extensions/__init__.py b/pandas/api/extensions/__init__.py
+index ea5f1ba926..8cf977c619 100644
+--- a/pandas/api/extensions/__init__.py
++++ b/pandas/api/extensions/__init__.py
+@@ -6,6 +6,7 @@ from pandas._libs.lib import no_default
+ 
+ from pandas.core.dtypes.base import (
+     ExtensionDtype,
++    ExtensionDtypeCastingMixin,
+     register_extension_dtype,
+ )
+ 
+@@ -23,6 +24,7 @@ from pandas.core.arrays import (
+ __all__ = [
+     "no_default",
+     "ExtensionDtype",
++    "ExtensionDtypeCastingMixin",
+     "register_extension_dtype",
+     "register_dataframe_accessor",
+     "register_index_accessor",
+diff --git a/pandas/core/dtypes/base.py b/pandas/core/dtypes/base.py
+index d13e0ce474..95e421d185 100644
+--- a/pandas/core/dtypes/base.py
++++ b/pandas/core/dtypes/base.py
+@@ -445,6 +445,25 @@ class ExtensionDtype:
+         """
+         return False
+ 
++
++class ExtensionDtypeCastingMixin:
++    """
++    Mixin providing casting and type promotion functionality for ExtensionDtype.
++
++    This mixin segregates casting-related methods from the core ExtensionDtype
++    interface, following the Interface Segregation Principle. Only dtypes that
++    participate in type promotion and casting operations need to inherit this.
++
++    Methods
++    -------
++    _dtype_affinity : property
++        Returns the affinity group for type promotion purposes.
++    _validate_cast_integrity : method
++        Checks if a cast would preserve data integrity.
++    _get_cast_promotion_rules : method
++        Returns rules for type promotion behavior.
++    """
++
+     @property
+     def _dtype_affinity(self) -> str:
+         """
+@@ -458,9 +477,10 @@ class ExtensionDtype:
+         Returns one of: "numeric", "temporal", "boolean", "textual",
+         "structured", "object".
+         """
+-        if self._is_numeric:
++        # Default implementation for ExtensionDtype subclasses
++        if hasattr(self, "_is_numeric") and self._is_numeric:
+             return "numeric"
+-        if self._is_boolean:
++        if hasattr(self, "_is_boolean") and self._is_boolean:
+             return "boolean"
+         return "object"
+ 
+@@ -484,10 +504,10 @@ class ExtensionDtype:
+         """
+         if isinstance(target, type(self)):
+             return True
+-        if isinstance(target, ExtensionDtype):
++        if isinstance(target, ExtensionDtypeCastingMixin):
+             return self._dtype_affinity == target._dtype_affinity
+         # For numpy dtypes, check kind compatibility
+-        if hasattr(target, "kind"):
++        if hasattr(target, "kind") and hasattr(self, "kind"):
+             return target.kind == "O" or self.kind == target.kind
+         return False
+ 
+@@ -511,7 +531,7 @@ class ExtensionDtype:
+         return {
+             "can_upcast": False,
+             "affinity": self._dtype_affinity,
+-            "preserves_na": self._can_hold_na,
++            "preserves_na": getattr(self, "_can_hold_na", True),
+             "promotion_priority": 100,
+         }
+ 
+diff --git a/pandas/core/dtypes/cast.py b/pandas/core/dtypes/cast.py
+index 94f3623caf..0649f2a473 100644
+--- a/pandas/core/dtypes/cast.py
++++ b/pandas/core/dtypes/cast.py
+@@ -1439,25 +1439,32 @@ def _pre_validate_type_promotion(types: list[DtypeObj]) -> DtypeObj | None:
+     if len(ext_types) < 2:
+         return None
+ 
++    # Filter to only types that support casting operations
++    casting_types = [
++        t for t in ext_types if hasattr(t, "_dtype_affinity") and hasattr(t, "_get_cast_promotion_rules")
++    ]
++    if len(casting_types) < 2:
++        return None
++
+     # Check if all extension types share a common affinity
+-    affinities = {t._dtype_affinity for t in ext_types}
++    affinities = {t._dtype_affinity for t in casting_types}
+     if len(affinities) != 1:
+         return None
+ 
+     # Homogeneous affinity — verify promotion rules are compatible
+-    rules = [t._get_cast_promotion_rules() for t in ext_types]
++    rules = [t._get_cast_promotion_rules() for t in casting_types]
+     if not all(r["preserves_na"] == rules[0]["preserves_na"] for r in rules):
+         return None
+ 
+     # Check pairwise cast integrity for the highest-priority type
+     sorted_types = sorted(
+-        ext_types,
++        casting_types,
+         key=lambda t: t._get_cast_promotion_rules()["promotion_priority"],
+     )
+     candidate = sorted_types[0]
+     if all(
+-        t._validate_cast_integrity(candidate)
+-        for t in ext_types
++        hasattr(t, "_validate_cast_integrity") and t._validate_cast_integrity(candidate)
++        for t in casting_types
+         if t is not candidate
+     ):
+         # All types can safely cast to the candidate — but defer to the
+diff --git a/pandas/core/dtypes/dtypes.py b/pandas/core/dtypes/dtypes.py
+index d18c6c4722..003ba051cf 100644
+--- a/pandas/core/dtypes/dtypes.py
++++ b/pandas/core/dtypes/dtypes.py
+@@ -49,6 +49,7 @@ from pandas.util._exceptions import find_stack_level
+ 
+ from pandas.core.dtypes.base import (
+     ExtensionDtype,
++    ExtensionDtypeCastingMixin,
+     StorageExtensionDtype,
+     register_extension_dtype,
+ )
+@@ -104,7 +105,7 @@ if TYPE_CHECKING:
+ str_type = str
+ 
+ 
+-class PandasExtensionDtype(ExtensionDtype):
++class PandasExtensionDtype(ExtensionDtypeCastingMixin, ExtensionDtype):
+     """
+     A np.dtype duck-typed class, suitable for holding a custom dtype.
+ 
+@@ -1553,7 +1554,7 @@ class NumpyEADtype(ExtensionDtype):
+         return self._dtype.itemsize
+ 
+ 
+-class BaseMaskedDtype(ExtensionDtype):
++class BaseMaskedDtype(ExtensionDtypeCastingMixin, ExtensionDtype):
+     """
+     Base class for dtypes for BaseMaskedArray subclasses.
+     """
+@@ -1654,7 +1655,7 @@ class BaseMaskedDtype(ExtensionDtype):
+ 
+ 
+ @register_extension_dtype
+-class SparseDtype(ExtensionDtype):
++class SparseDtype(ExtensionDtypeCastingMixin, ExtensionDtype):
+     """
+     Dtype for data stored in :class:`SparseArray`.
+ 

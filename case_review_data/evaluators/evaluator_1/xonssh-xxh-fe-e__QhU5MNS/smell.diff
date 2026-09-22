@@ -1,0 +1,155 @@
+diff --git a/xxh/xxh_xxh/hostinfo.py b/xxh/xxh_xxh/hostinfo.py
+new file mode 100644
+index 0000000..093db94
+--- /dev/null
++++ b/xxh/xxh_xxh/hostinfo.py
+@@ -0,0 +1,29 @@
++"""Structured host probe result.
++
++``xxh.get_host_info`` used to return a bare ``key=value`` mapping. This module
++introduces a :class:`HostInfo` value object so host-decision helpers can talk
++about named fields (``host_info.version``) while the legacy dictionary access
++(``host_info['xxh_version']``) still works during the migration.
++"""
++
++
++class HostInfo(dict):
++    """A host probe result that is both a mapping and an attribute container."""
++
++    def __getattr__(self, name):
++        key = 'xxh_' + name if ('xxh_' + name) in self else name
++        if key in self:
++            return self[key]
++        raise AttributeError(name)
++
++    @classmethod
++    def from_probe_output(cls, raw):
++        parsed = {}
++        for line in raw.replace('\r', '').split('\n'):
++            if line.strip() == '' or '=' not in line or '|' in line:
++                continue
++            key, value = line.split('=', 1)
++            if value[:1] == "'" and value[-1:] == "'":
++                value = value[1:-1]
++            parsed[key] = value
++        return cls(parsed)
+diff --git a/xxh/xxh_xxh/xxh.py b/xxh/xxh_xxh/xxh.py
+index 64986bf..e483346 100644
+--- a/xxh/xxh_xxh/xxh.py
++++ b/xxh/xxh_xxh/xxh.py
+@@ -7,6 +7,7 @@ from urllib.parse import urlparse
+ from base64 import b64encode
+ from signal import signal, SIGINT
+ from .shell import *
++from .hostinfo import HostInfo
+ 
+ def sigint_handler(signal_received, frame):
+     sys.exit(0)
+@@ -362,11 +363,45 @@ class xxh:
+             self.eeprint('Empty answer from host when getting first info. Often this is a connection error.\n'
+                     + 'Check your connection parameters using the same command but with ssh.')
+ 
+-        r = dict([l.split('=') for l in r.replace('\r','').split('\n') if l.strip() != '' and '=' in l and '|' not in l])
+-        r = {k: (v[1:-1] if v[:1] == "'" and v[-1:] == "'" else v) for k, v in r.items()}
++        r = HostInfo.from_probe_output(r)
+ 
+         return r
+ 
++    def host_is_incomplete(self, host_info):
++        home = self.host_xxh_home
++        if host_info.home_realpath == '':
++            self.eeprint(f'Unknown answer from host when getting realpath for directory {home}. Try to get more info with +v or +vv arguments.')
++        if host_info.version == '':
++            self.eeprint(f'Unknown answer from host when getting version for directory {home}. Try to get more info with +v or +vv arguments.')
++        return host_info.home_realpath, host_info.version
++
++    def host_writability(self, host_info, host, host_xxh_home):
++        if host_info.home_writable == '0' and host_info.parent_home_writable == '0':
++            yn = input(f"{host}:{host_xxh_home} is not writable. Continue? [y/n] ").strip().lower()
++            if yn != 'y':
++                self.eeprint('Stopped')
++        if not self.local and host_info.scp == '' and host_info.rsync == '':
++            self.eeprint(f"There are no rsync or scp on target host. Sad but files can't be uploaded.")
++
++    def host_install_pending(self, host_info, opt):
++        return (host_info.version in ['dir_not_found', 'dir_empty'] or host_info.shell_exists == '0') \
++            and opt.install is False and opt.install_force is False and opt.install_force_full is False \
++            and not self.quiet
++
++    def resolve_destination(self, url, opt):
++        host = self.hostname
++        if not host:
++            self.eeprint(f"Wrong destination '{host}'")
++        if url.port:
++            opt.ssh_port = url.port
++        if url.username:
++            opt.ssh_login = url.username
++        if opt.ssh_login:
++            username = opt.ssh_login
++        else:
++            username = getpass.getuser()
++        return username, host
++
+     def prepare_env_args(self, envs, to_base64=True):
+         env_args=[]
+         if envs:
+@@ -739,16 +774,7 @@ class xxh:
+         else:
+             self.short_shell_name = self.shell
+ 
+-        username = getpass.getuser()
+-        host = self.hostname
+-        if not host:
+-            self.eeprint(f"Wrong destination '{host}'")
+-        if url.port:
+-            opt.ssh_port = url.port
+-        if url.username:
+-            opt.ssh_login = url.username
+-        if opt.ssh_login:
+-            username = opt.ssh_login
++        username, host = self.resolve_destination(url, opt)
+ 
+         self.ssh_command = opt.ssh_command
+         if self.ssh_command == 'et':
+@@ -838,15 +864,8 @@ class xxh:
+         if not host_info:
+             self.eeprint(f'Unknown answer from host when getting info. Try to get more info with +v or +vv arguments.')
+ 
+-        if 'xxh_home_realpath' not in host_info or host_info['xxh_home_realpath'] == '':
+-            self.eeprint(f'Unknown answer from host when getting realpath for directory {self.host_xxh_home}. Try to get more info with +v or +vv arguments.')
+-
+-        if 'xxh_version' not in host_info or host_info['xxh_version'] == '':
+-            self.eeprint(f'Unknown answer from host when getting version for directory {self.host_xxh_home}. Try to get more info with +v or +vv arguments.')
+-
+-        host_xxh_home = host_info['xxh_home_realpath']
+-        host_xxh_home = p(f"{host_xxh_home}")
+-        host_xxh_version = host_info['xxh_version']
++        home_realpath, host_xxh_version = self.host_is_incomplete(host_info)
++        host_xxh_home = p(f"{home_realpath}")
+ 
+         if self.local and host_xxh_version in ['dir_not_found', 'dir_empty', 'version_not_found'] and not opt.quiet and not opt.install_force and not opt.install_force_full:
+             self.eprint('The `xxh local` feature is experimental and will be more portable in the next releases.')
+@@ -859,13 +878,7 @@ class xxh:
+             if yn == 'n':
+                 self.eeprint('Stopped')
+ 
+-        if host_info['xxh_home_writable'] == '0' and host_info['xxh_parent_home_writable'] == '0':
+-            yn = input(f"{host}:{host_xxh_home} is not writable. Continue? [y/n] ").strip().lower()
+-            if yn != 'y':
+-                self.eeprint('Stopped')
+-
+-        if not self.local and host_info['scp'] == '' and host_info['rsync'] == '':
+-            self.eeprint(f"There are no rsync or scp on target host. Sad but files can't be uploaded.")
++        self.host_writability(host_info, host, host_xxh_home)
+ 
+         if self.local:
+             ssh_pipe_command = 'bash'
+@@ -924,7 +937,7 @@ class xxh:
+                 else:
+                     self.eeprint('Unknown answer')
+ 
+-        if (host_xxh_version in ['dir_not_found', 'dir_empty'] or host_info['xxh_shell_exists'] == '0') and opt.install is False and opt.install_force is False and opt.install_force_full is False and not self.quiet:
++        if self.host_install_pending(host_info, opt):
+             yn = input(f"{host}:{host_xxh_home}/.xxh/shells/{self.shell} not found. Install {self.shell}? [Y/n] ").strip().lower()
+             if yn == 'y' or yn == '':
+                 opt.install = True

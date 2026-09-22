@@ -1,0 +1,129 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0fc6e5be..fabb6de0 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -361,12 +361,27 @@ class Environment:
+         # configurable policies
+         self.policies = DEFAULT_POLICIES.copy()
+ 
++        # output coercion callbacks allow extensions and downstream code
++        # to customize how block output is post-processed (e.g. escaping).
++        self._output_coerce_callbacks: t.Dict[
++            str, t.Callable[..., str]
++        ] = {}
++
+         # load extensions
+         self.extensions = load_extensions(self, extensions)
+ 
+         self.is_async = enable_async
+         _environment_config_check(self)
+ 
++    def get_block_output_processor(
++        self, mode: str
++    ) -> t.Optional[t.Callable[..., str]]:
++        local_cb = self._output_coerce_callbacks.get(mode)
++        if local_cb is not None:
++            return local_cb
++        from .utils import get_block_renderer
++        return get_block_renderer(mode)
++
+     def add_extension(self, extension: t.Union[str, t.Type["Extension"]]) -> None:
+         """Adds an extension after the environment was created.
+ 
+diff --git a/src/jinja2/nodes.py b/src/jinja2/nodes.py
+index 2f93b90e..6df8c326 100644
+--- a/src/jinja2/nodes.py
++++ b/src/jinja2/nodes.py
+@@ -83,6 +83,12 @@ class EvalContext:
+             self.autoescape = environment.autoescape
+         self.volatile = False
+ 
++    @property
++    def output_coerce_mode(self) -> str:
++        if self.autoescape:
++            return "escape"
++        return "raw"
++
+     def save(self) -> t.Mapping[str, t.Any]:
+         return self.__dict__.copy()
+ 
+diff --git a/src/jinja2/runtime.py b/src/jinja2/runtime.py
+index 09119e2a..be007358 100644
+--- a/src/jinja2/runtime.py
++++ b/src/jinja2/runtime.py
+@@ -371,8 +371,12 @@ class BlockReference:
+             [x async for x in self._stack[self._depth](self._context)]  # type: ignore
+         )
+ 
+-        if self._context.eval_ctx.autoescape:
+-            return Markup(rv)
++        coerce_mode = self._context.eval_ctx.output_coerce_mode
++        processor = self._context.environment.get_block_output_processor(
++            coerce_mode
++        )
++        if processor is not None and coerce_mode == "escape":
++            return processor(rv, Markup)
+ 
+         return rv
+ 
+@@ -385,8 +389,12 @@ class BlockReference:
+             self._stack[self._depth](self._context)
+         )
+ 
+-        if self._context.eval_ctx.autoescape:
+-            return Markup(rv)
++        coerce_mode = self._context.eval_ctx.output_coerce_mode
++        processor = self._context.environment.get_block_output_processor(
++            coerce_mode
++        )
++        if processor is not None and coerce_mode == "escape":
++            return processor(rv, Markup)
+ 
+         return rv
+ 
+@@ -769,6 +777,10 @@ class Macro:
+ 
+         return self._invoke(arguments, autoescape)
+ 
++    def _resolve_output_format(self, autoescape: bool) -> t.Optional[t.Callable[..., str]]:
++        mode = "escape" if autoescape else "raw"
++        return self._environment.get_block_output_processor(mode)
++
+     async def _async_invoke(self, arguments: t.List[t.Any], autoescape: bool) -> str:
+         rv = await self._func(*arguments)  # type: ignore
+ 
+diff --git a/src/jinja2/utils.py b/src/jinja2/utils.py
+index 7c922629..571aa261 100644
+--- a/src/jinja2/utils.py
++++ b/src/jinja2/utils.py
+@@ -95,6 +95,30 @@ class _PassArg(enum.Enum):
+         return None
+ 
+ 
++_block_render_registry: t.Dict[str, t.Callable[..., str]] = {}
++
++
++def register_block_renderer(mode: str) -> t.Callable[[F], F]:
++    def decorator(fn: F) -> F:
++        _block_render_registry[mode] = fn
++        return fn
++    return decorator
++
++
++def get_block_renderer(mode: str) -> t.Optional[t.Callable[..., str]]:
++    return _block_render_registry.get(mode)
++
++
++@register_block_renderer("escape")
++def _block_render_escape(value: str, markup_cls: t.Any) -> str:
++    return markup_cls(value)
++
++
++@register_block_renderer("raw")
++def _block_render_raw(value: str, markup_cls: t.Any) -> str:
++    return value
++
++
+ def internalcode(f: F) -> F:
+     """Marks the function as internally used"""
+     internal_code.add(f.__code__)

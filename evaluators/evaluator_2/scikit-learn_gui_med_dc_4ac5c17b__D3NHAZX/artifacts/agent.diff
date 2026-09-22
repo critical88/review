@@ -1,0 +1,259 @@
+diff --git a/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py b/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
+index 19d46cf825..09005f7afa 100644
+--- a/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
++++ b/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
+@@ -59,6 +59,27 @@ from sklearn.utils.validation import (
+     validate_data,
+ )
+ 
++# Data classes for encapsulating related data
++from dataclasses import dataclass
++from typing import Optional, Any
++
++@dataclass
++class TrainingData:
++    """Encapsulate training data for a dataset split."""
++    X: Any
++    y: Any
++    sample_weight: Optional[Any] = None
++
++@dataclass
++class EarlyStoppingData:
++    """Encapsulate data needed for early stopping evaluation."""
++    train_data: TrainingData
++    val_data: Optional[TrainingData] = None
++    raw_predictions_train: Optional[Any] = None
++    raw_predictions_val: Optional[Any] = None
++    apply_class_mapping: bool = False
++    class_labels: Optional[Any] = None
++
+ _LOSSES = _LOSSES.copy()
+ 
+ _SMALL_TRAINSET_SUBSAMPLE_SIZE = 10_000
+@@ -801,15 +822,21 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+                     # raw_predictions (as it's needed for training anyway) for
+                     # evaluating the training loss.
+ 
+-                    self._check_early_stopping_loss(
+-                        raw_predictions=raw_predictions,
+-                        y_train=y_train,
+-                        sample_weight_train=sample_weight_train,
++                    early_stopping_data = EarlyStoppingData(
++                        train_data=TrainingData(
++                            X=None,  # Not used for loss calculation
++                            y=y_train,
++                            sample_weight=sample_weight_train
++                        ),
++                        val_data=TrainingData(
++                            X=None,  # Not used for loss calculation
++                            y=y_val,
++                            sample_weight=sample_weight_val
++                        ) if self._use_validation_data else None,
++                        raw_predictions_train=raw_predictions,
+                         raw_predictions_val=raw_predictions_val,
+-                        y_val=y_val,
+-                        sample_weight_val=sample_weight_val,
+-                        n_threads=n_threads,
+                     )
++                    self._check_early_stopping_loss(early_stopping_data, n_threads=n_threads)
+                 else:
+                     self._scorer = check_scoring(self, self.scoring)
+                     # _scorer is a callable with signature (est, X, y) and
+@@ -842,18 +869,24 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+                     else:
+                         raw_predictions_small_train = None
+ 
+-                    self._check_early_stopping_scorer(
+-                        X_binned_small_train,
+-                        y_small_train,
+-                        sample_weight_small_train,
+-                        X_binned_val,
+-                        y_val,
+-                        sample_weight_val,
+-                        raw_predictions_small_train=raw_predictions_small_train,
++                    early_stopping_data = EarlyStoppingData(
++                        train_data=TrainingData(
++                            X_binned_small_train,
++                            y_small_train,
++                            sample_weight_small_train
++                        ),
++                        val_data=TrainingData(
++                            X_binned_val,
++                            y_val,
++                            sample_weight_val
++                        ) if self._use_validation_data else None,
++                        raw_predictions_train=raw_predictions_small_train,
+                         raw_predictions_val=raw_predictions_val,
+                         apply_class_mapping=is_classifier(self),
+                         class_labels=getattr(self, "classes_", None),
+                     )
++                    
++                    self._check_early_stopping_scorer(early_stopping_data)
+             begin_at_stage = 0
+ 
+         # warm start: this is not the first time fit was called
+@@ -1001,14 +1034,22 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+                         )
+ 
+                 if self.scoring == "loss":
+-                    should_early_stop = self._check_early_stopping_loss(
+-                        raw_predictions=raw_predictions,
+-                        y_train=y_train,
+-                        sample_weight_train=sample_weight_train,
++                    early_stopping_data = EarlyStoppingData(
++                        train_data=TrainingData(
++                            X=None,  # Not used for loss calculation
++                            y=y_train,
++                            sample_weight=sample_weight_train
++                        ),
++                        val_data=TrainingData(
++                            X=None,  # Not used for loss calculation
++                            y=y_val,
++                            sample_weight=sample_weight_val
++                        ) if self._use_validation_data else None,
++                        raw_predictions_train=raw_predictions,
+                         raw_predictions_val=raw_predictions_val,
+-                        y_val=y_val,
+-                        sample_weight_val=sample_weight_val,
+-                        n_threads=n_threads,
++                    )
++                    should_early_stop = self._check_early_stopping_loss(
++                        early_stopping_data, n_threads=n_threads
+                     )
+ 
+                 else:
+@@ -1021,19 +1062,25 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+                     else:
+                         raw_predictions_small_train = None
+ 
+-                    should_early_stop = self._check_early_stopping_scorer(
+-                        X_binned_small_train,
+-                        y_small_train,
+-                        sample_weight_small_train,
+-                        X_binned_val,
+-                        y_val,
+-                        sample_weight_val,
+-                        raw_predictions_small_train=raw_predictions_small_train,
++                    early_stopping_data = EarlyStoppingData(
++                        train_data=TrainingData(
++                            X_binned_small_train,
++                            y_small_train,
++                            sample_weight_small_train
++                        ),
++                        val_data=TrainingData(
++                            X_binned_val,
++                            y_val,
++                            sample_weight_val
++                        ) if self._use_validation_data else None,
++                        raw_predictions_train=raw_predictions_small_train,
+                         raw_predictions_val=raw_predictions_val,
+                         apply_class_mapping=is_classifier(self),
+                         class_labels=getattr(self, "classes_", None),
+                     )
+ 
++                    should_early_stop = self._check_early_stopping_scorer(early_stopping_data)
++
+             if self.verbose >= 2:
+                 self._print_iteration_stats(iteration_start_time)
+ 
+@@ -1126,41 +1173,38 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+ 
+     def _check_early_stopping_scorer(
+         self,
+-        X_binned_small_train,
+-        y_small_train,
+-        sample_weight_small_train,
+-        X_binned_val,
+-        y_val,
+-        sample_weight_val,
+-        raw_predictions_small_train=None,
+-        raw_predictions_val=None,
+-        apply_class_mapping=False,
+-        class_labels=None,
++        early_stopping_data,
+     ):
+         """Check if fitting should be early-stopped based on scorer.
+ 
+         Scores are computed on validation data or on training data.
+         """
++        # Unpack training data
++        train_data = early_stopping_data.train_data
+         y_small_train = prepare_scoring_labels(
+-            y_small_train, apply_class_mapping, class_labels=class_labels
++            train_data.y, early_stopping_data.apply_class_mapping, 
++            class_labels=early_stopping_data.class_labels
+         )
+ 
+         self.train_score_.append(
+             self._score_with_raw_predictions(
+-                X_binned_small_train,
++                train_data.X,
+                 y_small_train,
+-                sample_weight_small_train,
+-                raw_predictions_small_train,
++                train_data.sample_weight,
++                early_stopping_data.raw_predictions_train,
+             )
+         )
+ 
+-        if self._use_validation_data:
++        if self._use_validation_data and early_stopping_data.val_data is not None:
++            val_data = early_stopping_data.val_data
+             y_val = prepare_scoring_labels(
+-                y_val, apply_class_mapping, class_labels=class_labels
++                val_data.y, early_stopping_data.apply_class_mapping,
++                class_labels=early_stopping_data.class_labels
+             )
+             self.validation_score_.append(
+                 self._score_with_raw_predictions(
+-                    X_binned_val, y_val, sample_weight_val, raw_predictions_val
++                    val_data.X, y_val, val_data.sample_weight, 
++                    early_stopping_data.raw_predictions_val
+                 )
+             )
+             return self._should_stop(self.validation_score_)
+@@ -1180,33 +1224,31 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+ 
+     def _check_early_stopping_loss(
+         self,
+-        raw_predictions,
+-        y_train,
+-        sample_weight_train,
+-        raw_predictions_val,
+-        y_val,
+-        sample_weight_val,
++        early_stopping_data,
+         n_threads=1,
+     ):
+         """Check if fitting should be early-stopped based on loss.
+ 
+         Scores are computed on validation data or on training data.
+         """
++        # Unpack training data
++        train_data = early_stopping_data.train_data
+         self.train_score_.append(
+             -self._loss(
+-                y_true=y_train,
+-                raw_prediction=raw_predictions,
+-                sample_weight=sample_weight_train,
++                y_true=train_data.y,
++                raw_prediction=early_stopping_data.raw_predictions_train,
++                sample_weight=train_data.sample_weight,
+                 n_threads=n_threads,
+             )
+         )
+ 
+-        if self._use_validation_data:
++        if self._use_validation_data and early_stopping_data.val_data is not None:
++            val_data = early_stopping_data.val_data
+             self.validation_score_.append(
+                 -self._loss(
+-                    y_true=y_val,
+-                    raw_prediction=raw_predictions_val,
+-                    sample_weight=sample_weight_val,
++                    y_true=val_data.y,
++                    raw_prediction=early_stopping_data.raw_predictions_val,
++                    sample_weight=val_data.sample_weight,
+                     n_threads=n_threads,
+                 )
+             )

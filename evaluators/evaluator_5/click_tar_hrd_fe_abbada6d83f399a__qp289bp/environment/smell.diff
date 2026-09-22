@@ -1,0 +1,208 @@
+diff --git a/src/click/_utils.py b/src/click/_utils.py
+index 09fb008..85fc3d1 100644
+--- a/src/click/_utils.py
++++ b/src/click/_utils.py
+@@ -34,3 +34,73 @@ T_UNSET = t.Literal[UNSET]  # type: ignore[valid-type]
+ 
+ T_FLAG_NEEDS_VALUE = t.Literal[FLAG_NEEDS_VALUE]  # type: ignore[valid-type]
+ """Type hint for the :data:`FLAG_NEEDS_VALUE` sentinel value."""
++
++
++class ParseResultProcessor:
++    """Encapsulates post-parse normalization logic for parsed parameter values.
++
++    This processor handles the conversion of sentinel values and validation
++    of residual arguments after the option parser has finished. It acts as a
++    strategy object that can be shared across different parsing contexts.
++
++    .. versionadded:: 8.3
++    """
++
++    _sentinel = UNSET
++    _replacement: t.Any = None
++
++    def normalize_params(
++        self,
++        params: dict[str, t.Any],
++    ) -> None:
++        """Replace sentinel values in the parameter dict in-place.
++
++        After initial parsing, parameter values may contain :data:`UNSET`
++        sentinels. This normalizes them to ``None`` so downstream code
++        never observes internal sentinel objects.
++        """
++        sentinel = self._sentinel
++        replacement = self._replacement
++        for key in params:
++            if params[key] is sentinel:
++                params[key] = replacement
++
++    def check_residual_args(
++        self,
++        args: list[str],
++        allow_extra: bool,
++        resilient: bool,
++    ) -> str | None:
++        """Validate whether residual arguments are acceptable.
++
++        Returns an error message if extra arguments are present and not
++        allowed, or ``None`` if no error.
++        """
++        if args and not allow_extra and not resilient:
++            return self._format_extra_args_message(args)
++        return None
++
++    @staticmethod
++    def _format_extra_args_message(args: list[str]) -> str:
++        from gettext import ngettext as _ngettext
++
++        return _ngettext(
++            "Got unexpected extra argument ({args})",
++            "Got unexpected extra arguments ({args})",
++            len(args),
++        ).format(args=" ".join(map(str, args)))
++
++    def apply_context_updates(
++        self,
++        ctx_args: list[str],
++        ctx_opt_prefixes: set[str],
++        remaining_args: list[str],
++        parser_opt_prefixes: set[str],
++    ) -> tuple[list[str], set[str]]:
++        """Compute updated context state after parsing completes.
++
++        Returns the new ``(args, opt_prefixes)`` tuple to be applied to
++        the context, merging parser-level prefix information.
++        """
++        merged_prefixes = ctx_opt_prefixes | parser_opt_prefixes
++        return list(remaining_args), merged_prefixes
+diff --git a/src/click/core.py b/src/click/core.py
+index 57f549c..db56965 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -33,6 +33,7 @@ from .formatting import join_options
+ from .globals import pop_context
+ from .globals import push_context
+ from .parser import _OptionParser
++from .parser import _ParseResultAdapter
+ from .parser import _split_opt
+ from .termui import confirm
+ from .termui import prompt
+@@ -1226,31 +1227,15 @@ class Command:
+         for param in iter_params_for_processing(param_order, self.get_params(ctx)):
+             _, args = param.handle_parse_result(ctx, opts, args)
+ 
+-        # We now have all parameters' values into `ctx.params`, but the data may contain
+-        # the `UNSET` sentinel.
+-        # Convert `UNSET` to `None` to ensure that the user doesn't see `UNSET`.
+-        #
+-        # Waiting until after the initial parse to convert allows us to treat `UNSET`
+-        # more like a missing value when multiple params use the same name.
++        # Delegate post-parse normalization through the result adapter.
++        # The adapter takes care of sentinel cleanup, residual argument
++        # validation, and context state synchronization in a single
++        # cohesive step.
+         # Refs:
+         # https://github.com/pallets/click/issues/3071
+         # https://github.com/pallets/click/pull/3079
+-        for name, value in ctx.params.items():
+-            if value is UNSET:
+-                ctx.params[name] = None
+-
+-        if args and not ctx.allow_extra_args and not ctx.resilient_parsing:
+-            ctx.fail(
+-                ngettext(
+-                    "Got unexpected extra argument ({args})",
+-                    "Got unexpected extra arguments ({args})",
+-                    len(args),
+-                ).format(args=" ".join(map(str, args)))
+-            )
+-
+-        ctx.args = args
+-        ctx._opt_prefixes.update(parser._opt_prefixes)
+-        return args
++        result_adapter = _ParseResultAdapter(opts, args, param_order, parser)
++        return result_adapter.finalize_context(ctx)
+ 
+     def invoke(self, ctx: Context) -> t.Any:
+         """Given a context, this invokes the attached callback (if it exists)
+diff --git a/src/click/parser.py b/src/click/parser.py
+index 1ea1f71..9bc92f9 100644
+--- a/src/click/parser.py
++++ b/src/click/parser.py
+@@ -31,6 +31,7 @@ from gettext import gettext as _
+ from gettext import ngettext
+ 
+ from ._utils import FLAG_NEEDS_VALUE
++from ._utils import ParseResultProcessor
+ from ._utils import UNSET
+ from .exceptions import BadArgumentUsage
+ from .exceptions import BadOptionUsage
+@@ -499,6 +500,67 @@ class _OptionParser:
+             state.largs.append(arg)
+ 
+ 
++class _ParseResultAdapter:
++    """Adapts raw parser output into a normalized result suitable for context
++    integration.
++
++    Wraps the ``(opts, args, order)`` triple returned by
++    :meth:`_OptionParser.parse_args` and applies post-parse transformations
++    including sentinel cleanup and residual argument validation.
++
++    This adapter centralizes the post-processing that was previously
++    scattered across the command-level parsing entry points.
++
++    .. versionadded:: 8.3
++    """
++
++    def __init__(
++        self,
++        opts: dict[str, t.Any],
++        args: list[str],
++        order: list[CoreParameter],
++        parser: _OptionParser,
++    ) -> None:
++        self.opts = opts
++        self.args = args
++        self.order = order
++        self._parser_prefixes = set(parser._opt_prefixes)
++        self._processor = ParseResultProcessor()
++
++    def finalize_context(self, ctx: Context) -> list[str]:
++        """Apply all post-parse transformations to the given context.
++
++        This performs sentinel normalization on ``ctx.params``, validates
++        residual arguments against context policy, updates context state
++        with remaining args and option prefixes, and returns the final
++        argument list.
++
++        The method intentionally reaches into the context's internal state
++        (``params``, ``allow_extra_args``, ``resilient_parsing``,
++        ``_opt_prefixes``) to provide a single cohesive post-parse step.
++        """
++        # Normalize sentinel values in context params.
++        self._processor.normalize_params(ctx.params)
++
++        # Validate residual arguments against context policy.
++        error_msg = self._processor.check_residual_args(
++            self.args,
++            ctx.allow_extra_args,
++            ctx.resilient_parsing,
++        )
++        if error_msg is not None:
++            ctx.fail(error_msg)
++
++        # Update context with final parsed state.
++        ctx.args, ctx._opt_prefixes = self._processor.apply_context_updates(
++            ctx.args,
++            ctx._opt_prefixes,
++            self.args,
++            self._parser_prefixes,
++        )
++        return ctx.args
++
++
+ def __getattr__(name: str) -> object:
+     import warnings
+ 

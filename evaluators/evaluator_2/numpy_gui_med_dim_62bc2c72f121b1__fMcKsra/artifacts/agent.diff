@@ -1,0 +1,460 @@
+diff --git a/numpy/_core/einsumfunc.py b/numpy/_core/einsumfunc.py
+index a821c374f7..c0839d35ee 100644
+--- a/numpy/_core/einsumfunc.py
++++ b/numpy/_core/einsumfunc.py
+@@ -741,118 +741,11 @@ def _einsum_path_dispatcher(*operands, optimize=None, einsum_call=None):
+     return operands
+ 
+ 
+-@array_function_dispatch(_einsum_path_dispatcher, module='numpy')
+-def einsum_path(*operands, optimize='greedy', einsum_call=False):
+-    """
+-    einsum_path(subscripts, *operands, optimize='greedy')
+-
+-    Evaluates the lowest cost contraction order for an einsum expression by
+-    considering the creation of intermediate arrays.
+-
+-    Parameters
+-    ----------
+-    subscripts : str
+-        Specifies the subscripts for summation.
+-    *operands : list of array_like
+-        These are the arrays for the operation.
+-    optimize : {bool, list, tuple, 'greedy', 'optimal'}
+-        Choose the type of path. If a tuple is provided, the second argument is
+-        assumed to be the maximum intermediate size created. If only a single
+-        argument is provided the largest input or output array size is used
+-        as a maximum intermediate size.
+-
+-        * if a list is given that starts with ``einsum_path``, uses this as the
+-          contraction path
+-        * if False no optimization is taken
+-        * if True defaults to the 'greedy' algorithm
+-        * 'optimal' An algorithm that combinatorially explores all possible
+-          ways of contracting the listed tensors and chooses the least costly
+-          path. Scales exponentially with the number of terms in the
+-          contraction.
+-        * 'greedy' An algorithm that chooses the best pair contraction
+-          at each step. Effectively, this algorithm searches the largest inner,
+-          Hadamard, and then outer products at each step. Scales cubically with
+-          the number of terms in the contraction. Equivalent to the 'optimal'
+-          path for most contractions.
+-
+-        Default is 'greedy'.
+-
+-    Returns
+-    -------
+-    path : list of tuples
+-        A list representation of the einsum path.
+-    string_repr : str
+-        A printable representation of the einsum path.
+-
+-    Notes
+-    -----
+-    The resulting path indicates which terms of the input contraction should be
+-    contracted first, the result of this contraction is then appended to the
+-    end of the contraction list. This list can then be iterated over until all
+-    intermediate contractions are complete.
+-
+-    See Also
+-    --------
+-    einsum, linalg.multi_dot
+-
+-    Examples
+-    --------
+-
+-    We can begin with a chain dot example. In this case, it is optimal to
+-    contract the ``b`` and ``c`` tensors first as represented by the first
+-    element of the path ``(1, 2)``. The resulting tensor is added to the end
+-    of the contraction and the remaining contraction ``(0, 1)`` is then
+-    completed.
+-
+-    >>> np.random.seed(123)
+-    >>> a = np.random.rand(2, 2)
+-    >>> b = np.random.rand(2, 5)
+-    >>> c = np.random.rand(5, 2)
+-    >>> path_info = np.einsum_path('ij,jk,kl->il', a, b, c, optimize='greedy')
+-    >>> print(path_info[0])
+-    ['einsum_path', (1, 2), (0, 1)]
+-    >>> print(path_info[1])
+-      Complete contraction:  ij,jk,kl->il # may vary
+-             Naive scaling:  4
+-         Optimized scaling:  3
+-          Naive FLOP count:  1.600e+02
+-      Optimized FLOP count:  5.600e+01
+-       Theoretical speedup:  2.857
+-      Largest intermediate:  4.000e+00 elements
+-    -------------------------------------------------------------------------
+-    scaling                  current                                remaining
+-    -------------------------------------------------------------------------
+-       3                   kl,jk->jl                                ij,jl->il
+-       3                   jl,ij->il                                   il->il
+-
+-
+-    A more complex index transformation example.
+-
+-    >>> I = np.random.rand(10, 10, 10, 10)
+-    >>> C = np.random.rand(10, 10)
+-    >>> path_info = np.einsum_path('ea,fb,abcd,gc,hd->efgh', C, C, I, C, C,
+-    ...                            optimize='greedy')
+ 
+-    >>> print(path_info[0])
+-    ['einsum_path', (0, 2), (0, 3), (0, 2), (0, 1)]
+-    >>> print(path_info[1])
+-      Complete contraction:  ea,fb,abcd,gc,hd->efgh # may vary
+-             Naive scaling:  8
+-         Optimized scaling:  5
+-          Naive FLOP count:  8.000e+08
+-      Optimized FLOP count:  8.000e+05
+-       Theoretical speedup:  1000.000
+-      Largest intermediate:  1.000e+04 elements
+-    --------------------------------------------------------------------------
+-    scaling                  current                                remaining
+-    --------------------------------------------------------------------------
+-       5               abcd,ea->bcde                      fb,gc,hd,bcde->efgh
+-       5               bcde,fb->cdef                         gc,hd,cdef->efgh
+-       5               cdef,gc->defg                            hd,defg->efgh
+-       5               defg,hd->efgh                               efgh->efgh
++def _parse_einsum_optimize(optimize, einsum_call):
++    """
++    Parses the `optimize` argument for einsum_path.
+     """
+-
+-    # Figure out what the path really is
+     path_type = optimize
+     if path_type is True:
+         path_type = 'greedy'
+@@ -881,19 +774,27 @@ def einsum_path(*operands, optimize='greedy', einsum_call=False):
+ 
+     # Hidden option, only einsum should call this
+     einsum_call_arg = einsum_call
++    return path_type, explicit_einsum_path, memory_limit, einsum_call_arg
+ 
+-    # Python side parsing
++
++
++def _parse_and_build_einsum_inputs(operands):
+     input_subscripts, output_subscript, operands = (
+         _parse_einsum_input(operands)
+     )
+ 
+-    # Build a few useful list and sets
+     input_list = input_subscripts.split(',')
+     input_sets = [set(x) for x in input_list]
+     output_set = set(output_subscript)
+     indices = set(input_subscripts.replace(',', ''))
+ 
+-    # Get length of each unique dimension and ensure all dimensions are correct
++    return input_subscripts, output_subscript, operands, input_list, input_sets, output_set, indices
++
++
++def _build_dimension_info(input_list, input_subscripts, operands):
++    """
++    Builds the dimension dictionary and broadcast indices.
++    """
+     dimension_dict = {}
+     broadcast_indices = [[] for x in range(len(input_list))]
+     for term_idx, term in enumerate(input_list):
+@@ -922,24 +823,13 @@ def einsum_path(*operands, optimize='greedy', einsum_call=False):
+ 
+     # Convert broadcast inds to sets
+     broadcast_indices = [set(x) for x in broadcast_indices]
++    return dimension_dict, broadcast_indices
+ 
+-    # Compute size of each input array plus the output array
+-    size_list = []
+-    for term in input_list:
+-        sz = 1
+-        for i in term:
+-            sz *= dimension_dict[i]
+-        size_list.append(sz)
+-    size_list.append(_accumulate_index_product(output_subscript, dimension_dict))
+-    max_size = max(size_list)
+-
+-    if memory_limit is None:
+-        memory_arg = max_size
+-    else:
+-        memory_arg = memory_limit
+ 
+-    # Compute naive cost
+-    # This isn't quite right, need to look into exactly how einsum does this
++def _calculate_naive_cost(input_sets, indices, dimension_dict, input_list):
++    """
++    Calculates the naive cost of the einsum expression.
++    """
+     inner_product = (sum(len(x) for x in input_sets) - len(indices)) > 0
+     naive_overall_size = 1
+     for i in indices:
+@@ -948,28 +838,12 @@ def einsum_path(*operands, optimize='greedy', einsum_call=False):
+     if inner_product:
+         naive_op_factor += 1
+     naive_cost = naive_overall_size * naive_op_factor
++    return naive_cost
+ 
+-    # Compute the path
+-    if explicit_einsum_path:
+-        path = path_type[1:]
+-    elif (
+-        (path_type is False)
+-        or (len(input_list) in [1, 2])
+-        or (indices == output_set)
+-    ):
+-        # Nothing to be optimized, leave it to einsum
+-        path = [tuple(range(len(input_list)))]
+-    elif path_type == "greedy":
+-        path = _greedy_path(
+-            input_sets, output_set, dimension_dict, memory_arg
+-        )
+-    elif path_type == "optimal":
+-        path = _optimal_path(
+-            input_sets, output_set, dimension_dict, memory_arg
+-        )
+-    else:
+-        raise KeyError("Path name %s not found", path_type)
+ 
++def _build_contraction_list(
++    path, input_sets, output_set, dimension_dict, input_list, broadcast_indices, output_subscript
++):
+     cost_list, scale_list, size_list, contraction_list = [], [], [], []
+ 
+     # Build contraction tuple (positions, gemm, einsum_str, remaining)
+@@ -1065,6 +939,171 @@ def einsum_path(*operands, optimize='greedy', einsum_call=False):
+             contract_inds, idx_removed, einsum_str, input_list[:], do_blas
+         )
+         contraction_list.append(contraction)
++    return cost_list, scale_list, size_list, contraction_list
++
++
++@array_function_dispatch(_einsum_path_dispatcher, module='numpy')
++def einsum_path(*operands, optimize='greedy', einsum_call=False):
++    """
++    einsum_path(subscripts, *operands, optimize='greedy')
++
++    Evaluates the lowest cost contraction order for an einsum expression by
++    considering the creation of intermediate arrays.
++
++    Parameters
++    ----------
++    subscripts : str
++        Specifies the subscripts for summation.
++    *operands : list of array_like
++        These are the arrays for the operation.
++    optimize : {bool, list, tuple, 'greedy', 'optimal'}
++        Choose the type of path. If a tuple is provided, the second argument is
++        assumed to be the maximum intermediate size created. If only a single
++        argument is provided the largest input or output array size is used
++        as a maximum intermediate size.
++
++        * if a list is given that starts with ``einsum_path``, uses this as the
++          contraction path
++        * if False no optimization is taken
++        * if True defaults to the 'greedy' algorithm
++        * 'optimal' An algorithm that combinatorially explores all possible
++          ways of contracting the listed tensors and chooses the least costly
++          path. Scales exponentially with the number of terms in the
++          contraction.
++        * 'greedy' An algorithm that chooses the best pair contraction
++          at each step. Effectively, this algorithm searches the largest inner,
++          Hadamard, and then outer products at each step. Scales cubically with
++          the number of terms in the contraction. Equivalent to the 'optimal'
++          path for most contractions.
++
++        Default is 'greedy'.
++
++    Returns
++    -------
++    path : list of tuples
++        A list representation of the einsum path.
++    string_repr : str
++        A printable representation of the einsum path.
++
++    Notes
++    -----
++    The resulting path indicates which terms of the input contraction should be
++    contracted first, the result of this contraction is then appended to the
++    end of the contraction list. This list can then be iterated over until all
++    intermediate contractions are complete.
++
++    See Also
++    --------
++    einsum, linalg.multi_dot
++
++    Examples
++    --------
++
++    We can begin with a chain dot example. In this case, it is optimal to
++    contract the ``b`` and ``c`` tensors first as represented by the first
++    element of the path ``(1, 2)``. The resulting tensor is added to the end
++    of the contraction and the remaining contraction ``(0, 1)`` is then
++    completed.
++
++    >>> np.random.seed(123)
++    >>> a = np.random.rand(2, 2)
++    >>> b = np.random.rand(2, 5)
++    >>> c = np.random.rand(5, 2)
++    >>> path_info = np.einsum_path('ij,jk,kl->il', a, b, c, optimize='greedy')
++    >>> print(path_info[0])
++    ['einsum_path', (1, 2), (0, 1)]
++    >>> print(path_info[1])
++      Complete contraction:  ij,jk,kl->il # may vary
++             Naive scaling:  4
++         Optimized scaling:  3
++          Naive FLOP count:  1.600e+02
++      Optimized FLOP count:  5.600e+01
++       Theoretical speedup:  2.857
++      Largest intermediate:  4.000e+00 elements
++    -------------------------------------------------------------------------
++    scaling                  current                                remaining
++    -------------------------------------------------------------------------
++       3                   kl,jk->jl                                ij,jl->il
++       3                   jl,ij->il                                   il->il
++
++
++    A more complex index transformation example.
++
++    >>> I = np.random.rand(10, 10, 10, 10)
++    >>> C = np.random.rand(10, 10)
++    >>> path_info = np.einsum_path('ea,fb,abcd,gc,hd->efgh', C, C, I, C, C,
++    ...                            optimize='greedy')
++
++    >>> print(path_info[0])
++    ['einsum_path', (0, 2), (0, 3), (0, 2), (0, 1)]
++    >>> print(path_info[1])
++      Complete contraction:  ea,fb,abcd,gc,hd->efgh # may vary
++             Naive scaling:  8
++         Optimized scaling:  5
++          Naive FLOP count:  8.000e+08
++      Optimized FLOP count:  8.000e+05
++       Theoretical speedup:  1000.000
++      Largest intermediate:  1.000e+04 elements
++    --------------------------------------------------------------------------
++    scaling                  current                                remaining
++    --------------------------------------------------------------------------
++       5               abcd,ea->bcde                      fb,gc,hd,bcde->efgh
++       5               bcde,fb->cdef                         gc,hd,cdef->efgh
++       5               cdef,gc->defg                            hd,defg->efgh
++       5               defg,hd->efgh                               efgh->efgh
++    """
++
++    explicit_einsum_path = False
++    memory_limit = None
++    path_type, explicit_einsum_path, memory_limit, einsum_call_arg = \
++        _parse_einsum_optimize(optimize, einsum_call)
++
++    input_subscripts, output_subscript, operands, input_list, input_sets, output_set, indices = \
++        _parse_and_build_einsum_inputs(operands)
++
++    dimension_dict, broadcast_indices = _build_dimension_info(input_list, input_subscripts, operands)
++
++    # Compute size of each input array plus the output array
++    size_list = []
++    for term in input_list:
++        sz = 1
++        for i in term:
++            sz *= dimension_dict[i]
++        size_list.append(sz)
++    size_list.append(_accumulate_index_product(output_subscript, dimension_dict))
++    max_size = max(size_list)
++
++    if memory_limit is None:
++        memory_arg = max_size
++    else:
++        memory_arg = memory_limit
++
++    naive_cost = _calculate_naive_cost(input_sets, indices, dimension_dict, input_list)
++
++    # Compute the path
++    if explicit_einsum_path:
++        path = path_type[1:]
++    elif (
++        (path_type is False)
++        or (len(input_list) in [1, 2])
++        or (indices == output_set)
++    ):
++        # Nothing to be optimized, leave it to einsum
++        path = [tuple(range(len(input_list)))]
++    elif path_type == "greedy":
++        path = _greedy_path(
++            input_sets, output_set, dimension_dict, memory_arg
++        )
++    elif path_type == "optimal":
++        path = _optimal_path(
++            input_sets, output_set, dimension_dict, memory_arg
++        )
++    else:
++        raise KeyError("Path name %s not found", path_type)
++
++    cost_list, scale_list, size_list, contraction_list = _build_contraction_list(
++        path, input_sets, output_set, dimension_dict, input_list, broadcast_indices, output_subscript
++    )
+ 
+     opt_cost = sum(cost_list) + 1
+ 
+@@ -1078,12 +1117,26 @@ def einsum_path(*operands, optimize='greedy', einsum_call=False):
+     if einsum_call_arg:
+         return (operands, contraction_list)
+ 
+-    # Return the path along with a nice string representation
++    path_print = _build_path_output_string(
++        input_subscripts, output_subscript, indices, naive_cost, opt_cost,
++        scale_list, max_i, contraction_list
++    )
++
++    path = ['einsum_path'] + path
++    return (path, path_print)
++
++
++def _build_path_output_string(
++    input_subscripts, output_subscript, indices, naive_cost, opt_cost,
++    scale_list, max_i, contraction_list
++):
++    """
++    Builds the formatted output string for einsum_path.
++    """
+     overall_contraction = input_subscripts + "->" + output_subscript
+     header = ("scaling", "current", "remaining")
+ 
+     speedup = naive_cost / opt_cost
+-    max_i = max(size_list)
+ 
+     path_print = f"  Complete contraction:  {overall_contraction}\n"
+     path_print += f"         Naive scaling:  {len(indices)}\n"
+@@ -1101,9 +1154,7 @@ def einsum_path(*operands, optimize='greedy', einsum_call=False):
+         remaining_str = ",".join(remaining) + "->" + output_subscript
+         path_run = (scale_list[n], einsum_str, remaining_str)
+         path_print += "\n%4d    %24s %40s" % path_run
+-
+-    path = ['einsum_path'] + path
+-    return (path, path_print)
++    return path_print
+ 
+ 
+ def _einsum_dispatcher(*operands, out=None, optimize=None, **kwargs):
+diff --git a/numpy/_core/src/common/pythoncapi-compat b/numpy/_core/src/common/pythoncapi-compat
+index 90c06a4cae..8636bccf29 160000
+--- a/numpy/_core/src/common/pythoncapi-compat
++++ b/numpy/_core/src/common/pythoncapi-compat
+@@ -1 +1 @@
+-Subproject commit 90c06a4cae557bdbfa4f231a781d2b5c1a8f6d1c
++Subproject commit 8636bccf29adfa23463f810b3c2830f7cff1e933
+diff --git a/numpy/_core/src/highway b/numpy/_core/src/highway
+index 37c08e5528..ee36c83712 160000
+--- a/numpy/_core/src/highway
++++ b/numpy/_core/src/highway
+@@ -1 +1 @@
+-Subproject commit 37c08e5528f63ead9c7e4fd99ba454c1b1a3e3f7
++Subproject commit ee36c837129310be19c17c9108c6dc3f6ae06942
+diff --git a/numpy/_core/src/npysort/x86-simd-sort b/numpy/_core/src/npysort/x86-simd-sort
+index 6a7a01da4b..5adb33411f 160000
+--- a/numpy/_core/src/npysort/x86-simd-sort
++++ b/numpy/_core/src/npysort/x86-simd-sort
+@@ -1 +1 @@
+-Subproject commit 6a7a01da4b0dfde108aa626a2364c954e2c50fe1
++Subproject commit 5adb33411f3cea8bdbafa9d91bd75bc4bf19c7dd
+diff --git a/vendored-meson/meson b/vendored-meson/meson
+index e72c717199..5d5a3d478d 160000
+--- a/vendored-meson/meson
++++ b/vendored-meson/meson
+@@ -1 +1 @@
+-Subproject commit e72c717199fa18d34020c7c97f9de3f388c5e055
++Subproject commit 5d5a3d478da115c812be77afa651db2492d52171

@@ -1,0 +1,283 @@
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0fc6e5be..6580e9f1 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -141,6 +141,45 @@ def _environment_config_check(environment: _env_bound) -> _env_bound:
+     return environment
+ 
+ 
++class TemplateRenderCoordinator:
++    """Coordinates rendering pipeline stages for template execution.
++
++    This follows the Mediator pattern to decouple template compilation
++    from rendering by providing a single coordination point for the
++    parse-compile-render pipeline.  Each stage is delegated to the
++    environment's own facilities rather than duplicating logic.
++    """
++
++    def __init__(self, environment: "Environment") -> None:
++        self._environment = environment
++
++    def prepare_source(
++        self, source: str, name: t.Optional[str], filename: t.Optional[str]
++    ) -> str:
++        return self._environment.preprocess(source, name, filename)
++
++    def compile_source(
++        self,
++        source: str,
++        name: t.Optional[str] = None,
++        filename: t.Optional[str] = None,
++    ) -> t.Any:
++        return self._environment.compile(source, name, filename)
++
++    def create_render_context(
++        self, template: "Template", vars: t.Optional[t.Dict[str, t.Any]] = None
++    ) -> Context:
++        return template.new_context(vars)
++
++    def render(
++        self, template: "Template", vars: t.Optional[t.Dict[str, t.Any]] = None
++    ) -> str:
++        ctx = self.create_render_context(template, vars)
++        return self._environment.concat(
++            template.root_render_func(ctx)
++        )
++
++
+ class Environment:
+     r"""The core component of Jinja is the `Environment`.  It contains
+     important shared variables like configuration, filters, tests,
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 2bcba4fb..264bef50 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -70,7 +70,7 @@ def make_attrgetter(
+ 
+     def attrgetter(item: t.Any) -> t.Any:
+         for part in parts:
+-            item = environment.getitem(item, part)
++            item = _resolve_item_attribute(environment, item, part)
+ 
+             if default is not None and isinstance(item, Undefined):
+                 item = default
+@@ -83,6 +83,18 @@ def make_attrgetter(
+     return attrgetter
+ 
+ 
++def _resolve_item_attribute(
++    environment: "Environment", item: t.Any, part: t.Union[str, int]
++) -> t.Any:
++    from .runtime import Context
++
++    if hasattr(Context, '_attr_resolution_handler'):
++        handler = Context._attr_resolution_handler
++        if handler is not None:
++            return handler(environment, item, part)
++    return environment.getitem(item, part)
++
++
+ def make_multi_attrgetter(
+     environment: "Environment",
+     attribute: t.Optional[t.Union[str, int]],
+diff --git a/src/jinja2/nodes.py b/src/jinja2/nodes.py
+index 2f93b90e..74085d37 100644
+--- a/src/jinja2/nodes.py
++++ b/src/jinja2/nodes.py
+@@ -73,6 +73,8 @@ class EvalContext:
+     to it in extensions.
+     """
+ 
++    _context_notify_callback: t.Optional[t.Callable[["EvalContext"], None]] = None
++
+     def __init__(
+         self, environment: "Environment", template_name: t.Optional[str] = None
+     ) -> None:
+@@ -89,6 +91,13 @@ class EvalContext:
+     def revert(self, old: t.Mapping[str, t.Any]) -> None:
+         self.__dict__.clear()
+         self.__dict__.update(old)
++        if self._context_notify_callback is not None:
++            self._context_notify_callback(self)
++
++    def bind_context_notify(
++        self, callback: t.Callable[["EvalContext"], None]
++    ) -> None:
++        self._context_notify_callback = callback
+ 
+ 
+ def get_eval_context(node: "Node", ctx: t.Optional[EvalContext]) -> EvalContext:
+diff --git a/src/jinja2/runtime.py b/src/jinja2/runtime.py
+index 09119e2a..43e76679 100644
+--- a/src/jinja2/runtime.py
++++ b/src/jinja2/runtime.py
+@@ -18,11 +18,13 @@ from .exceptions import UndefinedError
+ from .nodes import EvalContext
+ from .utils import _PassArg
+ from .utils import concat
++from .utils import get_pass_arg_handler
+ from .utils import internalcode
+ from .utils import missing
+ from .utils import Namespace  # noqa: F401
+ from .utils import object_type_repr
+ from .utils import pass_eval_context
++from .utils import register_pass_arg_handler
+ 
+ V = t.TypeVar("V")
+ F = t.TypeVar("F", bound=t.Callable[..., t.Any])
+@@ -160,8 +162,18 @@ class Context:
+     `__getitem__`, `__contains__`).  Additionally there is a :meth:`resolve`
+     method that doesn't fail with a `KeyError` but returns an
+     :class:`Undefined` object for missing variables.
++
++    Acts as a mediator between template execution and environment services,
++    coordinating filter invocation, test evaluation, and attribute resolution
++    through a unified dispatch interface.
+     """
+ 
++    _attr_resolution_handler: t.ClassVar[
++        t.Optional[t.Callable[..., t.Any]]
++    ] = None
++
++    _filter_test_cache: t.ClassVar[t.Dict[str, t.Any]] = {}
++
+     def __init__(
+         self,
+         environment: "Environment",
+@@ -177,12 +189,93 @@ class Context:
+         self.exported_vars: t.Set[str] = set()
+         self.name = name
+         self.globals_keys = set() if globals is None else set(globals)
++        self._eval_ctx_autoescape = self.eval_ctx.autoescape
+ 
+         # create the initial mapping of blocks.  Whenever template inheritance
+         # takes place the runtime will update this mapping with the new blocks
+         # from the template.
+         self.blocks = {k: [v] for k, v in blocks.items()}
+ 
++        self.eval_ctx.bind_context_notify(self._on_eval_ctx_changed)
++
++        self._register_dispatch_handlers()
++
++    def _on_eval_ctx_changed(self, eval_ctx: "EvalContext") -> None:
++        self._eval_ctx_autoescape = eval_ctx.autoescape
++
++    @classmethod
++    def _register_dispatch_handlers(cls) -> None:
++        if cls._attr_resolution_handler is None:
++            cls._attr_resolution_handler = cls._default_attr_resolve
++        if not get_pass_arg_handler("context"):
++            register_pass_arg_handler("context", cls._dispatch_pass_context)
++            register_pass_arg_handler("eval_context", cls._dispatch_pass_eval_context)
++            register_pass_arg_handler("environment", cls._dispatch_pass_environment)
++
++    @staticmethod
++    def _default_attr_resolve(
++        environment: "Environment", item: t.Any, part: t.Union[str, int]
++    ) -> t.Any:
++        return environment.getitem(item, part)
++
++    @staticmethod
++    def _dispatch_pass_context(
++        context: "Context", args: t.List[t.Any]
++    ) -> t.List[t.Any]:
++        args.insert(0, context)
++        return args
++
++    @staticmethod
++    def _dispatch_pass_eval_context(
++        context: "Context", args: t.List[t.Any]
++    ) -> t.List[t.Any]:
++        args.insert(0, context.eval_ctx)
++        return args
++
++    @staticmethod
++    def _dispatch_pass_environment(
++        context: "Context", args: t.List[t.Any]
++    ) -> t.List[t.Any]:
++        args.insert(0, context.environment)
++        return args
++
++    def invoke_filter(
++        self,
++        name: str,
++        value: t.Any,
++        args: t.Optional[t.Sequence[t.Any]] = None,
++        kwargs: t.Optional[t.Mapping[str, t.Any]] = None,
++    ) -> t.Any:
++        return self.environment.call_filter(
++            name, value, args, kwargs, self, self.eval_ctx
++        )
++
++    def invoke_test(
++        self,
++        name: str,
++        value: t.Any,
++        args: t.Optional[t.Sequence[t.Any]] = None,
++        kwargs: t.Optional[t.Mapping[str, t.Any]] = None,
++    ) -> t.Any:
++        return self.environment.call_test(
++            name, value, args, kwargs, self, self.eval_ctx
++        )
++
++    @classmethod
++    def create(
++        cls,
++        environment: "Environment",
++        template_name: t.Optional[str],
++        blocks: t.Dict[str, t.Callable[["Context"], t.Iterator[str]]],
++        vars: t.Optional[t.Dict[str, t.Any]] = None,
++        shared: bool = False,
++        globals: t.Optional[t.MutableMapping[str, t.Any]] = None,
++        locals: t.Optional[t.Mapping[str, t.Any]] = None,
++    ) -> "Context":
++        return new_context(
++            environment, template_name, blocks, vars, shared, globals, locals
++        )
++
+     def super(
+         self, name: str, current: t.Callable[["Context"], t.Iterator[str]]
+     ) -> t.Union["BlockReference", "Undefined"]:
+@@ -319,6 +412,14 @@ class Context:
+         context.blocks.update((k, list(v)) for k, v in self.blocks.items())
+         return context
+ 
++    def resolve_attribute(
++        self, obj: t.Any, attribute: t.Union[str, int]
++    ) -> t.Any:
++        return self.environment.getitem(obj, attribute)
++
++    def is_autoescape_active(self) -> bool:
++        return self._eval_ctx_autoescape
++
+     keys = _dict_method_all(dict.keys)
+     values = _dict_method_all(dict.values)
+     items = _dict_method_all(dict.items)
+diff --git a/src/jinja2/utils.py b/src/jinja2/utils.py
+index 7c922629..af7cf29e 100644
+--- a/src/jinja2/utils.py
++++ b/src/jinja2/utils.py
+@@ -95,6 +95,23 @@ class _PassArg(enum.Enum):
+         return None
+ 
+ 
++_pass_arg_dispatch_registry: t.Dict[
++    str, t.Callable[..., t.Tuple[t.Any, ...]]
++] = {}
++
++
++def register_pass_arg_handler(
++    key: str, handler: t.Callable[..., t.Tuple[t.Any, ...]]
++) -> None:
++    _pass_arg_dispatch_registry[key] = handler
++
++
++def get_pass_arg_handler(
++    key: str,
++) -> t.Optional[t.Callable[..., t.Tuple[t.Any, ...]]]:
++    return _pass_arg_dispatch_registry.get(key)
++
++
+ def internalcode(f: F) -> F:
+     """Marks the function as internally used"""
+     internal_code.add(f.__code__)

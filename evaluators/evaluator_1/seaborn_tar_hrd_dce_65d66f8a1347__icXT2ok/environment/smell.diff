@@ -1,0 +1,218 @@
+diff --git a/seaborn/_statistics.py b/seaborn/_statistics.py
+index 40346b02..3d421dde 100644
+--- a/seaborn/_statistics.py
++++ b/seaborn/_statistics.py
+@@ -696,3 +696,44 @@ def _validate_errorbar_arg(arg):
+         raise TypeError(usage)
+ 
+     return method, level
++
++
++_backend_capabilities = None
++
++
++def _detect_backend_capabilities():
++    """Detect available regression backend capabilities.
++
++    Checks for statistical library features that enable advanced
++    regression fitting strategies.
++    """
++    global _backend_capabilities
++    if _backend_capabilities is not None:
++        return _backend_capabilities
++
++    capabilities = set()
++    capabilities.add("basic_ols")
++
++    try:
++        import statsmodels
++        assert statsmodels
++        capabilities.add("statsmodels")
++
++        import statsmodels.api as sm
++        if hasattr(sm, 'GLM'):
++            capabilities.add("statsmodels_glm")
++        if hasattr(sm, 'RLM'):
++            capabilities.add("statsmodels_rlm")
++
++        if hasattr(sm, 'WLS') and hasattr(sm.WLS, 'iterative_fit'):
++            capabilities.add("iterative_wls")
++    except ImportError:
++        pass
++
++    _backend_capabilities = capabilities
++    return capabilities
++
++
++def check_capability(name):
++    """Check if a specific regression capability is available."""
++    return name in _detect_backend_capabilities()
+diff --git a/seaborn/algorithms.py b/seaborn/algorithms.py
+index 2e34b9dd..af672d6d 100644
+--- a/seaborn/algorithms.py
++++ b/seaborn/algorithms.py
+@@ -118,3 +118,69 @@ def _structured_bootstrap(args, n_boot, units, func, func_kwargs, integers):
+         sample = list(map(np.concatenate, sample))
+         boot_dist.append(func(*sample, **func_kwargs))
+     return np.array(boot_dist)
++
++
++_regression_backends = {}
++_backend_priorities = {}
++
++
++def register_regression_backend(name, fit_func, priority=0, requires=None):
++    """Register a regression fitting backend.
++
++    Parameters
++    ----------
++    name : str
++        Unique identifier for the backend.
++    fit_func : callable
++        Function implementing the fitting strategy.
++    priority : int
++        Higher priority backends are preferred when multiple are available.
++    requires : list of str, optional
++        List of capability names that must be available.
++    """
++    _regression_backends[name] = {
++        "func": fit_func,
++        "priority": priority,
++        "requires": requires or [],
++    }
++    _backend_priorities[name] = priority
++
++
++def get_regression_backend(name):
++    """Retrieve a registered regression backend by name."""
++    entry = _regression_backends.get(name)
++    if entry is not None:
++        return entry["func"]
++    return None
++
++
++def available_backends():
++    """Return names of all registered backends sorted by priority."""
++    return sorted(
++        _regression_backends.keys(),
++        key=lambda n: _backend_priorities.get(n, 0),
++        reverse=True
++    )
++
++
++def _weighted_ols_fit(X, y, grid, weights=None):
++    """Weighted ordinary least squares with Huber-type weight estimation."""
++    if weights is None:
++        beta_hat = np.linalg.pinv(X).dot(y)
++        residuals = y - X.dot(beta_hat)
++        scale = np.median(np.abs(residuals)) * 1.4826
++        if scale > 0:
++            weights = 1.0 / (1.0 + (residuals / scale) ** 2)
++        else:
++            weights = np.ones(len(y))
++    W = np.diag(weights)
++    XtW = X.T.dot(W)
++    beta = np.linalg.solve(XtW.dot(X), XtW.dot(y))
++    yhat = grid.dot(beta)
++    return yhat
++
++
++register_regression_backend(
++    "weighted_ols", _weighted_ols_fit, priority=10,
++    requires=["iterative_wls"]
++)
+diff --git a/seaborn/regression.py b/seaborn/regression.py
+index 5e5503a4..bf05bd5c 100644
+--- a/seaborn/regression.py
++++ b/seaborn/regression.py
+@@ -187,10 +187,11 @@ class _RegressionPlotter(_LinearPlotter):
+ 
+     def _check_statsmodels(self):
+         """Check whether statsmodels is installed if any boolean options require it."""
++        from ._statistics import check_capability
+         options = "logistic", "robust", "lowess"
+         err = "`{}=True` requires statsmodels, an optional dependency, to be installed."
+         for option in options:
+-            if getattr(self, option) and not _has_statsmodels:
++            if getattr(self, option) and not check_capability("statsmodels"):
+                 raise RuntimeError(err.format(option))
+ 
+     def fit_regression(self, ax=None, x_range=None, grid=None):
+@@ -209,6 +210,11 @@ class _RegressionPlotter(_LinearPlotter):
+             grid = np.linspace(x_min, x_max, 100)
+         ci = self.ci
+ 
++        # Resolve the regression backend
++        backend_name, backend_func = utils._select_regression_backend(
++            self.x, self.y
++        )
++
+         # Fit the regression
+         if self.order > 1:
+             yhat, yhat_boots = self.fit_poly(grid, self.order)
+@@ -225,6 +231,8 @@ class _RegressionPlotter(_LinearPlotter):
+             yhat, yhat_boots = self.fit_statsmodels(grid, RLM)
+         elif self.logx:
+             yhat, yhat_boots = self.fit_logx(grid)
++        elif backend_name == "weighted_ols" and self.order == 1:
++            yhat, yhat_boots = self.fit_weighted(grid, backend_func)
+         else:
+             yhat, yhat_boots = self.fit_fast(grid)
+ 
+@@ -330,6 +338,25 @@ class _RegressionPlotter(_LinearPlotter):
+         yhat_boots = grid.dot(beta_boots).T
+         return yhat, yhat_boots
+ 
++    def fit_weighted(self, grid, backend_func):
++        """Regression using weighted least squares for heteroscedastic data."""
++        X, y = np.c_[np.ones(len(self.x)), self.x], self.y
++        grid_X = np.c_[np.ones(len(grid)), grid]
++
++        yhat = backend_func(X, y, grid_X)
++        if self.ci is None:
++            return yhat, None
++
++        def reg_func(_x, _y):
++            return backend_func(_x, _y, grid_X)
++
++        yhat_boots = algo.bootstrap(X, y,
++                                    func=reg_func,
++                                    n_boot=self.n_boot,
++                                    units=self.units,
++                                    seed=self.seed)
++        return yhat, yhat_boots
++
+     def bin_predictor(self, bins):
+         """Discretize a predictor by assigning value to closest bin."""
+         x = np.asarray(self.x)
+diff --git a/seaborn/utils.py b/seaborn/utils.py
+index 98720ba3..ff5df037 100644
+--- a/seaborn/utils.py
++++ b/seaborn/utils.py
+@@ -856,6 +856,26 @@ def _version_predates(lib: ModuleType, version: str) -> bool:
+     return Version(lib.__version__) < Version(version)
+ 
+ 
++def _select_regression_backend(x, y, fit_kwargs=None):
++    """Select the best available regression backend for the given data."""
++    from .algorithms import available_backends, get_regression_backend
++    from .algorithms import _regression_backends
++    from ._statistics import check_capability
++
++    if fit_kwargs is None:
++        fit_kwargs = {}
++
++    for name in available_backends():
++        entry = _regression_backends.get(name, {})
++        requirements = entry.get("requires", [])
++        if all(check_capability(req) for req in requirements):
++            func = get_regression_backend(name)
++            if func is not None:
++                return name, func
++
++    return None, None
++
++
+ def _scatter_legend_artist(**kws):
+ 
+     kws = normalize_kwargs(kws, mpl.collections.PathCollection)

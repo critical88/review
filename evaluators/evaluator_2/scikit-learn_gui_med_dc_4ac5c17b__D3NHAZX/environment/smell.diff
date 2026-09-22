@@ -1,0 +1,163 @@
+diff --git a/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py b/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
+index 4a4fa319f4..19d46cf825 100644
+--- a/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
++++ b/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
+@@ -35,6 +35,10 @@ from sklearn.ensemble._hist_gradient_boosting._gradient_boosting import (
+ from sklearn.ensemble._hist_gradient_boosting.binning import _BinMapper
+ from sklearn.ensemble._hist_gradient_boosting.common import G_H_DTYPE, X_DTYPE, Y_DTYPE
+ from sklearn.ensemble._hist_gradient_boosting.grower import TreeGrower
++from sklearn.ensemble._hist_gradient_boosting.utils import (
++    evaluate_split_score,
++    prepare_scoring_labels,
++)
+ from sklearn.metrics import check_scoring
+ from sklearn.metrics._scorer import _SCORERS
+ from sklearn.model_selection import train_test_split
+@@ -56,6 +60,9 @@ from sklearn.utils.validation import (
+ )
+ 
+ _LOSSES = _LOSSES.copy()
++
++_SMALL_TRAINSET_SUBSAMPLE_SIZE = 10_000
++
+ _LOSSES.update(
+     {
+         "poisson": HalfPoissonLoss,
+@@ -844,6 +851,8 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+                         sample_weight_val,
+                         raw_predictions_small_train=raw_predictions_small_train,
+                         raw_predictions_val=raw_predictions_val,
++                        apply_class_mapping=is_classifier(self),
++                        class_labels=getattr(self, "classes_", None),
+                     )
+             begin_at_stage = 0
+ 
+@@ -1021,6 +1030,8 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+                         sample_weight_val,
+                         raw_predictions_small_train=raw_predictions_small_train,
+                         raw_predictions_val=raw_predictions_val,
++                        apply_class_mapping=is_classifier(self),
++                        class_labels=getattr(self, "classes_", None),
+                     )
+ 
+             if self.verbose >= 2:
+@@ -1086,7 +1097,7 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+         with scorers.
+         """
+         # TODO: incorporate sample_weights here in `resample`
+-        subsample_size = 10000
++        subsample_size = _SMALL_TRAINSET_SUBSAMPLE_SIZE
+         if X_binned_train.shape[0] > subsample_size:
+             indices = np.arange(X_binned_train.shape[0])
+             stratify = y_train if is_classifier(self) else None
+@@ -1123,13 +1134,16 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+         sample_weight_val,
+         raw_predictions_small_train=None,
+         raw_predictions_val=None,
++        apply_class_mapping=False,
++        class_labels=None,
+     ):
+         """Check if fitting should be early-stopped based on scorer.
+ 
+         Scores are computed on validation data or on training data.
+         """
+-        if is_classifier(self):
+-            y_small_train = self.classes_[y_small_train.astype(int)]
++        y_small_train = prepare_scoring_labels(
++            y_small_train, apply_class_mapping, class_labels=class_labels
++        )
+ 
+         self.train_score_.append(
+             self._score_with_raw_predictions(
+@@ -1141,8 +1155,9 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+         )
+ 
+         if self._use_validation_data:
+-            if is_classifier(self):
+-                y_val = self.classes_[y_val.astype(int)]
++            y_val = prepare_scoring_labels(
++                y_val, apply_class_mapping, class_labels=class_labels
++            )
+             self.validation_score_.append(
+                 self._score_with_raw_predictions(
+                     X_binned_val, y_val, sample_weight_val, raw_predictions_val
+@@ -1159,10 +1174,9 @@ class BaseHistGradientBoosting(BaseEstimator, ABC):
+             patcher_raw_predict = _patch_raw_predict(self, raw_predictions)
+ 
+         with patcher_raw_predict:
+-            if sample_weight is None:
+-                return self._scorer(self, X, y)
+-            else:
+-                return self._scorer(self, X, y, sample_weight=sample_weight)
++            return evaluate_split_score(
++                self._scorer, self, X, y, split_weights=sample_weight
++            )
+ 
+     def _check_early_stopping_loss(
+         self,
+diff --git a/sklearn/ensemble/_hist_gradient_boosting/utils.py b/sklearn/ensemble/_hist_gradient_boosting/utils.py
+index a0f917d392..fceddde317 100644
+--- a/sklearn/ensemble/_hist_gradient_boosting/utils.py
++++ b/sklearn/ensemble/_hist_gradient_boosting/utils.py
+@@ -7,6 +7,61 @@ from sklearn.base import is_classifier
+ from sklearn.ensemble._hist_gradient_boosting.binning import _BinMapper
+ 
+ 
++def prepare_scoring_labels(targets, apply_class_mapping, class_labels=None):
++    """Apply class label mapping to encoded targets for scorer evaluation.
++
++    Parameters
++    ----------
++    targets : ndarray
++        Encoded target values.
++    apply_class_mapping : bool
++        Whether to map encoded targets back to original class labels.
++    class_labels : ndarray or None
++        The class labels used for mapping encoded indices.
++
++    Returns
++    -------
++    ndarray
++        Mapped targets if applicable, otherwise the original array.
++    """
++    if apply_class_mapping and class_labels is not None:
++        return class_labels[targets.astype(int)]
++    return targets
++
++
++def evaluate_split_score(
++    scorer,
++    estimator,
++    split_features,
++    split_targets,
++    split_weights=None,
++):
++    """Evaluate a scorer on a data split.
++
++    Parameters
++    ----------
++    scorer : callable
++        Scoring callable with signature ``(estimator, X, y)``.
++    estimator : BaseEstimator
++        Fitted estimator instance.
++    split_features : ndarray of shape (n_samples, n_features)
++        Feature matrix for the split.
++    split_targets : ndarray of shape (n_samples,)
++        Target values for the split.
++    split_weights : ndarray of shape (n_samples,) or None
++        Per-sample weights.
++
++    Returns
++    -------
++    score : float
++    """
++    if split_weights is None:
++        return scorer(estimator, split_features, split_targets)
++    return scorer(
++        estimator, split_features, split_targets, sample_weight=split_weights
++    )
++
++
+ def get_equivalent_estimator(estimator, lib="lightgbm", n_classes=None):
+     """Return an unfitted estimator from another lib with matching hyperparams.
+ 

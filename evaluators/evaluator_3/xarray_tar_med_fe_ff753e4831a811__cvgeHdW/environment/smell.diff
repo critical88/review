@@ -1,0 +1,154 @@
+diff --git a/xarray/core/coordinates.py b/xarray/core/coordinates.py
+index 251edd1f..6d4f298b 100644
+--- a/xarray/core/coordinates.py
++++ b/xarray/core/coordinates.py
+@@ -929,6 +929,53 @@ def drop_indexed_coords(
+     return Coordinates._construct_direct(coords=new_variables, indexes=new_indexes)
+ 
+ 
++def _resolve_update_conflicts(
++    mapping: dict[Hashable, Any],
++    dataset_coord_names: set[Hashable],
++    dataset_variables: Mapping[Hashable, Variable],
++) -> dict[Hashable, Any]:
++    """Resolve conflicting coordinates when updating a dataset with a mapping.
++
++    For each DataArray value in the mapping, inspect its internal coordinate
++    variables and dimensions to find non-dimension coordinates that conflict
++    with the target dataset's existing coordinates. Drop those conflicting
++    coordinates from the DataArray before returning the cleaned mapping.
++
++    Parameters
++    ----------
++    mapping : dict
++        A mutable dict of variable name -> values (may include DataArrays).
++    dataset_coord_names : set
++        Set of coordinate names from the target dataset.
++    dataset_variables : mapping
++        Variables mapping from the target dataset (used for coord presence check).
++
++    Returns
++    -------
++    dict
++        The mapping with conflicting coordinates removed from DataArray values.
++    """
++    from xarray.core.dataarray import DataArray
++
++    for key, value in mapping.items():
++        if isinstance(value, DataArray):
++            # Access the underlying variable dimensions directly to determine
++            # which coordinates are non-dimensional
++            value_dim_set = set(value._variable.dims)
++            # Walk through the DataArray's internal coordinate dict to find
++            # coordinates that are non-dimensional and conflict with the target
++            conflicting = [
++                coord_name
++                for coord_name in value._coords
++                if coord_name not in value_dim_set
++                and coord_name in dataset_coord_names
++                and coord_name in dataset_variables
++            ]
++            if conflicting:
++                mapping[key] = value.drop_vars(conflicting)
++    return mapping
++
++
+ def assert_coordinate_consistent(obj: T_Xarray, coords: Mapping[Any, Variable]) -> None:
+     """Make sure the dimension coordinate of obj is consistent with coords.
+ 
+diff --git a/xarray/core/dataset.py b/xarray/core/dataset.py
+index 09597670..c14c8a47 100644
+--- a/xarray/core/dataset.py
++++ b/xarray/core/dataset.py
+@@ -1156,6 +1156,25 @@ class Dataset(
+             )
+         return obj
+ 
++    def _get_merge_update_context(self) -> tuple[set, dict, dict]:
++        """Return internal state needed by merge update operations.
++
++        Provides access to the dataset's coordinate names, variables, and
++        indexes so that external merge routines can resolve conflicts and
++        prepare update operations without requiring repeated public API
++        traversal.
++
++        Returns
++        -------
++        coord_names : set
++            A copy of the internal coordinate name set.
++        variables : dict
++            Reference to the internal variables dict.
++        indexes : dict
++            Reference to the internal indexes dict.
++        """
++        return self._coord_names.copy(), self._variables, self._indexes
++
+     def _replace_with_new_dims(
+         self,
+         variables: dict[Hashable, Variable],
+diff --git a/xarray/core/merge.py b/xarray/core/merge.py
+index a90e59e7..e1a294cd 100644
+--- a/xarray/core/merge.py
++++ b/xarray/core/merge.py
+@@ -1029,6 +1029,36 @@ def dataset_merge_method(
+     )
+ 
+ 
++def _prepare_mapping_for_update(
++    other: CoercibleMapping,
++    dataset_coord_names: set,
++    dataset_variables: dict,
++) -> CoercibleMapping:
++    """Prepare a non-Dataset mapping for a dataset update operation.
++
++    Converts the mapping to a mutable dict and delegates coordinate conflict
++    resolution to the coordinates module, which handles the details of
++    inspecting DataArray internals.
++
++    Parameters
++    ----------
++    other : mapping
++        The incoming data mapping to clean up.
++    dataset_coord_names : set
++        Coordinate names from the target dataset.
++    dataset_variables : dict
++        Variables from the target dataset.
++
++    Returns
++    -------
++    The cleaned mapping ready for merge.
++    """
++    from xarray.core.coordinates import _resolve_update_conflicts
++
++    other = dict(other)
++    return _resolve_update_conflicts(other, dataset_coord_names, dataset_variables)
++
++
+ def dataset_update_method(dataset: Dataset, other: CoercibleMapping) -> _MergeResult:
+     """Guts of the Dataset.update method.
+ 
+@@ -1036,21 +1066,12 @@ def dataset_update_method(dataset: Dataset, other: CoercibleMapping) -> _MergeRe
+     `xarray.Dataset`, e.g., if it's a dict with DataArray values (GH2068,
+     GH2180).
+     """
+-    from xarray.core.dataarray import DataArray
+     from xarray.core.dataset import Dataset
+ 
+     if not isinstance(other, Dataset):
+-        other = dict(other)
+-        for key, value in other.items():
+-            if isinstance(value, DataArray):
+-                # drop conflicting coordinates
+-                coord_names = [
+-                    c
+-                    for c in value.coords
+-                    if c not in value.dims and c in dataset.coords
+-                ]
+-                if coord_names:
+-                    other[key] = value.drop_vars(coord_names)
++        # Retrieve internal dataset state for conflict resolution
++        coord_names, variables, _ = dataset._get_merge_update_context()
++        other = _prepare_mapping_for_update(other, coord_names, variables)
+ 
+     return merge_core(
+         [dataset, other],

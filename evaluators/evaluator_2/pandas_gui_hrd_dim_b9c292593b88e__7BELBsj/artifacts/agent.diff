@@ -1,0 +1,227 @@
+diff --git a/pandas/core/arrays/datetimes.py b/pandas/core/arrays/datetimes.py
+index c85b459d86..fc93f846fc 100644
+--- a/pandas/core/arrays/datetimes.py
++++ b/pandas/core/arrays/datetimes.py
+@@ -406,6 +406,120 @@ class DatetimeArray(dtl.TimelikeOps, dtl.DatelikeOps):  # type: ignore[misc]
+         result._maybe_pin_freq(freq, validate_kwds)
+         return result
+ 
++    @staticmethod
++    def _generate_regular_range_with_bounds(
++        start: Timestamp | None,
++        end: Timestamp | None,
++        periods: int | None,
++        freq: BaseOffset,
++        unit: str,
++        rctx: RangeResolutionContext,
++    ) -> np.ndarray:
++        """
++        Generate regular range with bounds calculation for Tick frequencies.
++        """
++        _istart = start._value if start is not None else None
++        _iend = end._value if end is not None else None
++        _stride = rctx.resolve_stride(freq)
++
++        # Resolve range bounds - three cases.
++        if periods is None and _istart is not None and _iend is not None:
++            _b = _istart
++            _e = (
++                _b
++                + (_iend - _b) // _stride * _stride
++                + _stride // 2
++                + 1
++            )
++        elif _istart is not None and periods is not None:
++            _b = _istart
++            _e = rctx.compute_overflow_safe_end(
++                _b, periods, _stride, side="start"
++            )
++        elif _iend is not None and periods is not None:
++            _e = _iend + _stride
++            _b = rctx.compute_overflow_safe_end(
++                _e, periods, _stride, side="end"
++            )
++        else:
++            raise ValueError(
++                "at least 'start' or 'end' should be specified if a "
++                "'period' is given."
++            )
++
++        # Use np.arange with FloatingPointError fallback.
++        with np.errstate(over="raise"):
++            try:
++                i8values = np.arange(_b, _e, _stride, dtype=np.int64)
++            except FloatingPointError:
++                _xdr = [_b]
++                while _xdr[-1] != _e:
++                    _xdr.append(_xdr[-1] + _stride)
++                i8values = np.array(_xdr[:-1], dtype=np.int64)
++        return i8values
++
++    @staticmethod
++    def _generate_range_with_offset(
++        start: Timestamp | None,
++        end: Timestamp | None,
++        periods: int | None,
++        freq: BaseOffset,
++        unit: str,
++    ) -> np.ndarray:
++        """
++        Generate range using offset-based approach for non-Tick frequencies.
++        """
++        # Rebuild cursors with guard clauses rather than recursion.
++        _ofs = to_offset(freq)
++        _s = Timestamp(start)
++        _s = _s.as_unit(unit) if _s is not NaT else None
++        _e_ts = Timestamp(end)
++        _e_ts = _e_ts.as_unit(unit) if _e_ts is not NaT else None
++
++        if _s and not _ofs.is_on_offset(_s):
++            _s = _ofs.rollforward(_s)
++        elif _e_ts and not _ofs.is_on_offset(_e_ts):
++            _e_ts = _ofs.rollback(_e_ts)
++
++        _local_periods = periods
++        if _local_periods is None and _e_ts < _s and _ofs.n >= 0:
++            _e_ts = None
++            _local_periods = 0
++
++        if _e_ts is None:
++            _e_ts = _s + (_local_periods - 1) * _ofs
++        if _s is None:
++            _s = _e_ts - (_local_periods - 1) * _ofs
++
++        _s = cast(Timestamp, _s)
++        _e_ts = cast(Timestamp, _e_ts)
++
++        # Walk the offset forward/backward — structurally a single
++        # loop with sign-dispatched comparison, replacing the
++        # original two-arm while structure.
++        _forward = _ofs.n >= 0
++        _cursor = _s
++        _collected: list = []
++        while (_forward and _cursor <= _e_ts) or (
++            not _forward and _cursor >= _e_ts
++        ):
++            _collected.append(_cursor)
++            if _cursor == _e_ts:
++                break
++            _next = _ofs._apply(_cursor).as_unit(unit)
++            if _forward and _next <= _cursor:
++                raise ValueError(
++                    f"Offset {_ofs} did not increment date"
++                )
++            if (not _forward) and _next >= _cursor:
++                raise ValueError(
++                    f"Offset {_ofs} did not decrement date"
++                )
++            _cursor = _next
++        return np.array(
++            [x._value for x in _collected], dtype=np.int64
++        )
++
+     @classmethod
+     def _generate_range(
+         cls,
+@@ -520,96 +634,12 @@ class DatetimeArray(dtl.TimelikeOps, dtl.DatelikeOps):  # type: ignore[misc]
+                     end = end.tz_localize(None)
+ 
+             if isinstance(freq, Tick):
+-                # --- Inlined generate_regular_range (+ overflow-safe bound calc) -
+-                _istart = start._value if start is not None else None
+-                _iend = end._value if end is not None else None
+-                _stride = _rctx.resolve_stride(freq)
+-
+-                # Inlined resolve_range_bounds branch matrix — three cases.
+-                if periods is None and _istart is not None and _iend is not None:
+-                    _b = _istart
+-                    _e = (
+-                        _b
+-                        + (_iend - _b) // _stride * _stride
+-                        + _stride // 2
+-                        + 1
+-                    )
+-                elif _istart is not None and periods is not None:
+-                    _b = _istart
+-                    _e = _rctx.compute_overflow_safe_end(
+-                        _b, periods, _stride, side="start"
+-                    )
+-                elif _iend is not None and periods is not None:
+-                    _e = _iend + _stride
+-                    _b = _rctx.compute_overflow_safe_end(
+-                        _e, periods, _stride, side="end"
+-                    )
+-                else:
+-                    raise ValueError(
+-                        "at least 'start' or 'end' should be specified if a "
+-                        "'period' is given."
+-                    )
+-
+-                # Inlined np.arange with FloatingPointError fallback.
+-                with np.errstate(over="raise"):
+-                    try:
+-                        i8values = np.arange(_b, _e, _stride, dtype=np.int64)
+-                    except FloatingPointError:
+-                        _xdr = [_b]
+-                        while _xdr[-1] != _e:
+-                            _xdr.append(_xdr[-1] + _stride)
+-                        i8values = np.array(_xdr[:-1], dtype=np.int64)
++                i8values = cls._generate_regular_range_with_bounds(
++                    start, end, periods, freq, unit, _rctx
++                )
+             else:
+-                # --- Inlined module-level _generate_range (offset-apply loop) ----
+-                # Rebuild cursors with guard clauses rather than recursion.
+-                _ofs = to_offset(freq)
+-                _s = Timestamp(start)
+-                _s = _s.as_unit(unit) if _s is not NaT else None
+-                _e_ts = Timestamp(end)
+-                _e_ts = _e_ts.as_unit(unit) if _e_ts is not NaT else None
+-
+-                if _s and not _ofs.is_on_offset(_s):
+-                    _s = _ofs.rollforward(_s)
+-                elif _e_ts and not _ofs.is_on_offset(_e_ts):
+-                    _e_ts = _ofs.rollback(_e_ts)
+-
+-                _local_periods = periods
+-                if _local_periods is None and _e_ts < _s and _ofs.n >= 0:
+-                    _e_ts = None
+-                    _local_periods = 0
+-
+-                if _e_ts is None:
+-                    _e_ts = _s + (_local_periods - 1) * _ofs
+-                if _s is None:
+-                    _s = _e_ts - (_local_periods - 1) * _ofs
+-
+-                _s = cast(Timestamp, _s)
+-                _e_ts = cast(Timestamp, _e_ts)
+-
+-                # Walk the offset forward/backward — structurally a single
+-                # loop with sign-dispatched comparison, replacing the
+-                # original two-arm while structure.
+-                _forward = _ofs.n >= 0
+-                _cursor = _s
+-                _collected: list = []
+-                while (_forward and _cursor <= _e_ts) or (
+-                    not _forward and _cursor >= _e_ts
+-                ):
+-                    _collected.append(_cursor)
+-                    if _cursor == _e_ts:
+-                        break
+-                    _next = _ofs._apply(_cursor).as_unit(unit)
+-                    if _forward and _next <= _cursor:
+-                        raise ValueError(
+-                            f"Offset {_ofs} did not increment date"
+-                        )
+-                    if (not _forward) and _next >= _cursor:
+-                        raise ValueError(
+-                            f"Offset {_ofs} did not decrement date"
+-                        )
+-                    _cursor = _next
+-                i8values = np.array(
+-                    [x._value for x in _collected], dtype=np.int64
++                i8values = cls._generate_range_with_offset(
++                    start, end, periods, freq, unit
+                 )
+ 
+             endpoint_tz = start.tz if start is not None else end.tz

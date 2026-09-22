@@ -1,0 +1,377 @@
+diff --git a/src/jinja2/compiler.py b/src/jinja2/compiler.py
+index a4ff6a1b..86a8e6b6 100644
+--- a/src/jinja2/compiler.py
++++ b/src/jinja2/compiler.py
+@@ -20,6 +20,7 @@ from .idtracking import VAR_LOAD_UNDEFINED
+ from .nodes import EvalContext
+ from .optimizer import Optimizer
+ from .utils import _PassArg
++from .utils import _middleware_registry
+ from .utils import concat
+ from .visitor import NodeVisitor
+ 
+@@ -1791,6 +1792,33 @@ class CodeGenerator(NodeVisitor):
+             self.write(":")
+             self.visit(node.step, frame)
+ 
++    def _resolve_filter_func(
++        self,
++        node: t.Union[nodes.Filter, nodes.Test],
++        is_filter: bool,
++    ) -> t.Optional[t.Callable[..., t.Any]]:
++        """Resolve the callable for a filter or test node.
++
++        When the ``filter_test.middleware_mode`` policy is active,
++        middleware interception is checked so the compiler can account
++        for potential runtime dispatch through the middleware chain.
++        """
++        if is_filter:
++            func = self.environment.filters.get(node.name)
++        else:
++            func = self.environment.tests.get(node.name)
++
++        mw_mode = self.environment.policies.get(
++            "filter_test.middleware_mode", "passive"
++        )
++        if mw_mode != "passive":
++            mw_key = "filter" if is_filter else "test"
++            for mw in _middleware_registry.get(mw_key, []):
++                if mw.should_intercept(node.name, is_filter):
++                    return func
++
++        return func
++
+     @contextmanager
+     def _filter_test_common(
+         self, node: t.Union[nodes.Filter, nodes.Test], frame: Frame, is_filter: bool
+@@ -1800,10 +1828,10 @@ class CodeGenerator(NodeVisitor):
+ 
+         if is_filter:
+             self.write(f"{self.filters[node.name]}(")
+-            func = self.environment.filters.get(node.name)
+         else:
+             self.write(f"{self.tests[node.name]}(")
+-            func = self.environment.tests.get(node.name)
++
++        func = self._resolve_filter_func(node, is_filter)
+ 
+         # When inside an If or CondExpr frame, allow the filter to be
+         # undefined at compile time and only raise an error if it's
+diff --git a/src/jinja2/defaults.py b/src/jinja2/defaults.py
+index 638cad3d..18b52494 100644
+--- a/src/jinja2/defaults.py
++++ b/src/jinja2/defaults.py
+@@ -35,14 +35,27 @@ DEFAULT_NAMESPACE = {
+     "namespace": Namespace,
+ }
+ 
++def _validate_policy_defaults(policies: t.Dict[str, t.Any]) -> t.Dict[str, t.Any]:
++    """Validate policy values at import time to catch configuration errors."""
++    for key, value in policies.items():
++        if key.endswith("_mode") and not isinstance(value, str):
++            raise TypeError(
++                f"Policy {key!r} must be a string, got {type(value).__name__}"
++            )
++    return policies
++
++
+ # default policies
+-DEFAULT_POLICIES: t.Dict[str, t.Any] = {
+-    "compiler.ascii_str": True,
+-    "urlize.rel": "noopener",
+-    "urlize.target": None,
+-    "urlize.extra_schemes": None,
+-    "truncate.leeway": 5,
+-    "json.dumps_function": None,
+-    "json.dumps_kwargs": {"sort_keys": True},
+-    "ext.i18n.trimmed": False,
+-}
++DEFAULT_POLICIES: t.Dict[str, t.Any] = _validate_policy_defaults(
++    {
++        "compiler.ascii_str": True,
++        "urlize.rel": "noopener",
++        "urlize.target": None,
++        "urlize.extra_schemes": None,
++        "truncate.leeway": 5,
++        "json.dumps_function": None,
++        "json.dumps_kwargs": {"sort_keys": True},
++        "ext.i18n.trimmed": False,
++        "filter_test.middleware_mode": "passive",
++    }
++)
+diff --git a/src/jinja2/environment.py b/src/jinja2/environment.py
+index 0fc6e5be..e585d9bf 100644
+--- a/src/jinja2/environment.py
++++ b/src/jinja2/environment.py
+@@ -47,6 +47,7 @@ from .runtime import Context
+ from .runtime import new_context
+ from .runtime import Undefined
+ from .utils import _PassArg
++from .utils import _middleware_registry
+ from .utils import concat
+ from .utils import consume
+ from .utils import import_string
+@@ -495,6 +496,21 @@ class Environment:
+         except (TypeError, LookupError, AttributeError):
+             return self.undefined(obj=obj, name=attribute)
+ 
++    @staticmethod
++    def _prepare_call_args(
++        value: t.Any,
++        args: t.Optional[t.Sequence[t.Any]],
++        kwargs: t.Optional[t.Mapping[str, t.Any]],
++    ) -> t.Tuple[t.List[t.Any], t.Dict[str, t.Any]]:
++        """Normalize filter/test call arguments into mutable containers.
++
++        This ensures both the direct invocation path and the middleware
++        dispatch path operate on consistent, mutable argument types.
++        """
++        call_args = [value, *(args if args is not None else ())]
++        call_kwargs = dict(kwargs) if kwargs is not None else {}
++        return call_args, call_kwargs
++
+     def _filter_test_common(
+         self,
+         name: t.Union[str, Undefined],
+@@ -525,8 +541,7 @@ class Environment:
+ 
+             raise TemplateRuntimeError(msg)
+ 
+-        args = [value, *(args if args is not None else ())]
+-        kwargs = kwargs if kwargs is not None else {}
++        call_args, call_kwargs = self._prepare_call_args(value, args, kwargs)
+         pass_arg = _PassArg.from_obj(func)
+ 
+         if pass_arg is _PassArg.context:
+@@ -535,7 +550,7 @@ class Environment:
+                     f"Attempted to invoke a context {type_name} without context."
+                 )
+ 
+-            args.insert(0, context)
++            call_args.insert(0, context)
+         elif pass_arg is _PassArg.eval_context:
+             if eval_ctx is None:
+                 if context is not None:
+@@ -543,11 +558,55 @@ class Environment:
+                 else:
+                     eval_ctx = EvalContext(self)
+ 
+-            args.insert(0, eval_ctx)
++            call_args.insert(0, eval_ctx)
+         elif pass_arg is _PassArg.environment:
+-            args.insert(0, self)
++            call_args.insert(0, self)
++
++        middleware_mode = self.policies.get(
++            "filter_test.middleware_mode", "passive"
++        )
++        if middleware_mode != "passive":
++            return self._invoke_with_middleware(
++                func, name, type_name, is_filter, call_args, call_kwargs
++            )
++
++        return func(*call_args, **call_kwargs)
++
++    def _invoke_with_middleware(
++        self,
++        func: t.Callable[..., t.Any],
++        name: t.Union[str, "Undefined"],
++        type_name: str,
++        is_filter: bool,
++        call_args: t.List[t.Any],
++        call_kwargs: t.Dict[str, t.Any],
++    ) -> t.Any:
++        """Apply the registered middleware chain to a filter/test call.
++
++        Middleware instances are consulted in priority order.  Each
++        middleware's :meth:`pre_invoke` may transform the arguments, and
++        :meth:`post_invoke` may transform the result.  Only middleware
++        whose :meth:`should_intercept` returns ``True`` for the given
++        *name* participates.
++        """
++        middlewares = _middleware_registry.get(type_name, [])
++        active = [
++            mw
++            for mw in middlewares
++            if mw.should_intercept(str(name), is_filter)
++        ]
++
++        for mw in active:
++            call_args, call_kwargs = mw.pre_invoke(
++                str(name), call_args, call_kwargs
++            )
++
++        result = func(*call_args, **call_kwargs)
++
++        for mw in reversed(active):
++            result = mw.post_invoke(str(name), result)
+ 
+-        return func(*args, **kwargs)
++        return result
+ 
+     def call_filter(
+         self,
+diff --git a/src/jinja2/filters.py b/src/jinja2/filters.py
+index 2bcba4fb..c38fd74a 100644
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -27,6 +27,8 @@ from .utils import pass_eval_context
+ from .utils import pformat
+ from .utils import url_quote
+ from .utils import urlize
++from .utils import _FilterTestMiddleware
++from .utils import register_middleware
+ 
+ if t.TYPE_CHECKING:
+     import typing_extensions as te
+@@ -1815,6 +1817,34 @@ async def async_select_or_reject(
+                 yield item
+ 
+ 
++_NORMALIZABLE_FILTERS = frozenset(
++    {"default", "d", "truncate", "wordwrap", "batch", "slice"}
++)
++
++
++class _FilterArgNormalizer(_FilterTestMiddleware):
++    """Middleware that normalizes keyword arguments for filters that
++    accept optional parameters.  Strips ``None``-valued keyword
++    arguments so that the filter's own defaults take effect, avoiding
++    subtle overrides when templates pass explicit ``None``.
++    """
++
++    def should_intercept(self, name: str, is_filter: bool) -> bool:
++        return is_filter and name in _NORMALIZABLE_FILTERS
++
++    def pre_invoke(
++        self,
++        name: str,
++        args: t.List[t.Any],
++        kwargs: t.Dict[str, t.Any],
++    ) -> t.Tuple[t.List[t.Any], t.Dict[str, t.Any]]:
++        cleaned = {k: v for k, v in kwargs.items() if v is not None}
++        return args, cleaned
++
++
++register_middleware("filter", _FilterArgNormalizer("filter_arg_normalizer", priority=10))
++
++
+ FILTERS = {
+     "abs": abs,
+     "attr": do_attr,
+diff --git a/src/jinja2/tests.py b/src/jinja2/tests.py
+index 1a59e370..cf2b55d8 100644
+--- a/src/jinja2/tests.py
++++ b/src/jinja2/tests.py
+@@ -7,6 +7,8 @@ from numbers import Number
+ 
+ from .runtime import Undefined
+ from .utils import pass_environment
++from .utils import _FilterTestMiddleware
++from .utils import register_middleware
+ 
+ if t.TYPE_CHECKING:
+     from .environment import Environment
+@@ -213,6 +215,29 @@ def test_in(value: t.Any, seq: t.Container[t.Any]) -> bool:
+     return value in seq
+ 
+ 
++class _TestResultCoercer(_FilterTestMiddleware):
++    """Middleware that coerces test results to strict boolean values.
++
++    Operator-based tests (``eq``, ``gt``, etc.) may return non-bool
++    truthy values when used with objects that override comparison
++    operators.  This middleware ensures consistent ``bool`` results.
++    """
++
++    _OPERATOR_TESTS = frozenset(
++        {"==", "eq", "equalto", "!=", "ne", ">", "gt", "greaterthan",
++         "ge", ">=", "<", "lt", "lessthan", "<=", "le"}
++    )
++
++    def should_intercept(self, name: str, is_filter: bool) -> bool:
++        return not is_filter and name in self._OPERATOR_TESTS
++
++    def post_invoke(self, name: str, result: t.Any) -> t.Any:
++        return bool(result)
++
++
++register_middleware("test", _TestResultCoercer("test_result_coercer", priority=20))
++
++
+ TESTS = {
+     "odd": test_odd,
+     "even": test_even,
+diff --git a/src/jinja2/utils.py b/src/jinja2/utils.py
+index 7c922629..fdb23dae 100644
+--- a/src/jinja2/utils.py
++++ b/src/jinja2/utils.py
+@@ -90,11 +90,67 @@ class _PassArg(enum.Enum):
+     @classmethod
+     def from_obj(cls, obj: F) -> t.Optional["_PassArg"]:
+         if hasattr(obj, "jinja_pass_arg"):
+-            return obj.jinja_pass_arg  # type: ignore
++            value = obj.jinja_pass_arg  # type: ignore
++            if isinstance(value, cls):
++                return value
+ 
+         return None
+ 
+ 
++class _FilterTestMiddleware:
++    """Base class for filter/test invocation middleware.
++
++    Subclasses can intercept and transform filter/test calls by
++    implementing :meth:`pre_invoke` and :meth:`post_invoke`. Middleware
++    instances are registered via :func:`register_middleware` and
++    dispatched in priority order by the environment when the
++    ``filter_test.middleware_mode`` policy is set to ``"active"``.
++    """
++
++    __slots__ = ("_name", "_priority")
++
++    def __init__(self, name: str, priority: int = 0) -> None:
++        self._name = name
++        self._priority = priority
++
++    def should_intercept(self, name: str, is_filter: bool) -> bool:
++        """Return ``True`` if this middleware should process the given
++        filter or test invocation."""
++        return True
++
++    def pre_invoke(
++        self,
++        name: str,
++        args: t.List[t.Any],
++        kwargs: t.Dict[str, t.Any],
++    ) -> t.Tuple[t.List[t.Any], t.Dict[str, t.Any]]:
++        """Transform arguments before the filter/test is called."""
++        return args, kwargs
++
++    def post_invoke(self, name: str, result: t.Any) -> t.Any:
++        """Transform the result after the filter/test is called."""
++        return result
++
++
++_middleware_registry: t.Dict[str, t.List[_FilterTestMiddleware]] = {
++    "filter": [],
++    "test": [],
++}
++
++
++def register_middleware(
++    category: str, middleware: _FilterTestMiddleware
++) -> None:
++    """Register a middleware instance for filter or test processing.
++
++    :param category: ``"filter"`` or ``"test"``.
++    :param middleware: The middleware instance to register.
++    """
++    if category in _middleware_registry:
++        _middleware_registry[category].append(middleware)
++        _middleware_registry[category].sort(key=lambda m: m._priority)
++
++
+ def internalcode(f: F) -> F:
+     """Marks the function as internally used"""
+     internal_code.add(f.__code__)

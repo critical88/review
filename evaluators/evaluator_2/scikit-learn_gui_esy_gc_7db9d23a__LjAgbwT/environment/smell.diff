@@ -1,0 +1,137 @@
+diff --git a/sklearn/feature_extraction/text.py b/sklearn/feature_extraction/text.py
+index b6da01063d..ca64c61411 100644
+--- a/sklearn/feature_extraction/text.py
++++ b/sklearn/feature_extraction/text.py
+@@ -1485,6 +1485,79 @@ class CountVectorizer(_VectorizerMixin, BaseEstimator):
+             dtype=object,
+         )
+ 
++    @staticmethod
++    def _compute_idf_weights(X, smooth_idf=True):
++        """Compute inverse document frequency weights from a count matrix.
++
++        Parameters
++        ----------
++        X : sparse matrix of shape (n_samples, n_features)
++            A matrix of term/token counts.
++
++        smooth_idf : bool, default=True
++            Smooth idf weights by adding one to document frequencies.
++
++        Returns
++        -------
++        idf : ndarray of shape (n_features,)
++            The inverse document frequency vector.
++        """
++        if not sp.issparse(X):
++            X = sp.csr_matrix(X)
++        dtype = X.dtype if X.dtype in (np.float64, np.float32) else np.float64
++
++        n_samples, _ = X.shape
++        df = _document_frequency(X)
++        df = df.astype(dtype, copy=False)
++
++        df += float(smooth_idf)
++        n_samples += int(smooth_idf)
++
++        idf = np.full_like(df, fill_value=n_samples, dtype=dtype)
++        idf /= df
++        np.log(idf, out=idf)
++        idf += 1.0
++
++        return idf
++
++    @staticmethod
++    def _apply_tfidf_weighting(X, idf=None, sublinear_tf=False, norm="l2"):
++        """Apply TF-IDF weighting to a term-frequency matrix.
++
++        Parameters
++        ----------
++        X : sparse matrix of shape (n_samples, n_features)
++            A matrix of term/token counts or frequencies (CSR format).
++
++        idf : ndarray of shape (n_features,), default=None
++            Precomputed IDF weights. If None, no IDF weighting is applied.
++
++        sublinear_tf : bool, default=False
++            Apply sublinear tf scaling, i.e. replace tf with 1 + log(tf).
++
++        norm : {'l1', 'l2'} or None, default='l2'
++            Norm used to normalize term vectors.
++
++        Returns
++        -------
++        X : sparse matrix of shape (n_samples, n_features)
++            The TF-IDF weighted matrix.
++        """
++        if not sp.issparse(X):
++            X = sp.csr_matrix(X, dtype=X.dtype)
++
++        if sublinear_tf:
++            np.log(X.data, X.data)
++            X.data += 1.0
++
++        if idf is not None:
++            X.data *= idf[X.indices]
++
++        if norm is not None:
++            X = normalize(X, norm=norm, copy=False)
++
++        return X
++
+     def __sklearn_tags__(self):
+         tags = super().__sklearn_tags__()
+         tags.input_tags.string = True
+@@ -1666,26 +1739,9 @@ class TfidfTransformer(
+         )
+         if not sp.issparse(X):
+             X = sp.csr_matrix(X)
+-        dtype = X.dtype if X.dtype in (np.float64, np.float32) else np.float64
+ 
+         if self.use_idf:
+-            n_samples, _ = X.shape
+-            df = _document_frequency(X)
+-            df = df.astype(dtype, copy=False)
+-
+-            # perform idf smoothing if required
+-            df += float(self.smooth_idf)
+-            n_samples += int(self.smooth_idf)
+-
+-            # log+1 instead of log makes sure terms with zero idf don't get
+-            # suppressed entirely.
+-            # Force the dtype of `idf_` to be the same as `df`. In NumPy < 2, the dtype
+-            # was depending on the value of `n_samples`.
+-            self.idf_ = np.full_like(df, fill_value=n_samples, dtype=dtype)
+-            self.idf_ /= df
+-            # `np.log` preserves the dtype of `df` and thus `dtype`.
+-            np.log(self.idf_, out=self.idf_)
+-            self.idf_ += 1.0
++            self.idf_ = CountVectorizer._compute_idf_weights(X, self.smooth_idf)
+ 
+         return self
+ 
+@@ -1715,20 +1771,11 @@ class TfidfTransformer(
+             copy=copy,
+             reset=False,
+         )
+-        if not sp.issparse(X):
+-            X = sp.csr_matrix(X, dtype=X.dtype)
+-
+-        if self.sublinear_tf:
+-            np.log(X.data, X.data)
+-            X.data += 1.0
+-
+-        if hasattr(self, "idf_"):
+-            # the columns of X (CSR matrix) can be accessed with `X.indices `and
+-            # multiplied with the corresponding `idf` value
+-            X.data *= self.idf_[X.indices]
+ 
+-        if self.norm is not None:
+-            X = normalize(X, norm=self.norm, copy=False)
++        idf = self.idf_ if hasattr(self, "idf_") else None
++        X = CountVectorizer._apply_tfidf_weighting(
++            X, idf=idf, sublinear_tf=self.sublinear_tf, norm=self.norm
++        )
+ 
+         return X
+ 

@@ -1,0 +1,177 @@
+diff --git a/sklearn/discriminant_analysis.py b/sklearn/discriminant_analysis.py
+index 92a8648a59..218246762b 100644
+--- a/sklearn/discriminant_analysis.py
++++ b/sklearn/discriminant_analysis.py
+@@ -635,6 +635,172 @@ class LinearDiscriminantAnalysis(
+         self.coef_ = coef @ self.scalings_.T
+         self.intercept_ -= self.xbar_ @ self.coef_.T
+ 
++    def _compute_class_statistics(self, X, y):
++        """Compute class means and priors for all classes."""
++        # Pre-compute boolean membership masks to amortize indexing cost
++        # across scatter accumulation and data centering phases.
++        class_masks = _precompute_class_membership(y, self.classes_)
++
++        # Compute class centroid vectors via inverse-index aggregation
++        xp_stats, is_array_api = get_namespace(X)
++        stat_classes, y_encoded = xp_stats.unique_inverse(y)
++        centroid_matrix = xp_stats.zeros(
++            (stat_classes.shape[0], X.shape[1]),
++            device=device(X),
++            dtype=X.dtype,
++        )
++        if is_array_api:
++            for ci in range(stat_classes.shape[0]):
++                centroid_matrix[ci, :] = xp_stats.mean(
++                    X[y_encoded == ci], axis=0
++                )
++        else:
++            class_counts = np.bincount(y_encoded)
++            np.add.at(centroid_matrix, y_encoded, X)
++            centroid_matrix /= class_counts[:, None]
++        self.means_ = centroid_matrix
++        self._class_masks = class_masks  # Save for use in solvers
++
++    def _compute_within_class_scatter(self, X, y):
++        """Compute within-class scatter matrix for the 'lsqr' and 'eigen' solvers."""
++        # Accumulate weighted within-class scatter matrix with
++        # per-class covariance estimation and regularization dispatch
++        scatter_accumulator = np.zeros(shape=(self.n_features_in_, self.n_features_in_))
++        shrinkage_mode = self.shrinkage
++        cov_estimator_ref = self.covariance_estimator
++        class_masks = self._class_masks
++
++        for lsqr_idx in range(len(self.classes_)):
++            Xg_class = X[class_masks[lsqr_idx], :]
++
++            # Dispatch covariance estimation strategy for this group
++            if cov_estimator_ref is None:
++                effective_shrinkage = (
++                    "empirical"
++                    if shrinkage_mode is None
++                    else shrinkage_mode
++                )
++                if isinstance(effective_shrinkage, str):
++                    if effective_shrinkage == "auto":
++                        sc = StandardScaler()
++                        Xg_std = sc.fit_transform(Xg_class)
++                        class_scatter = _ledoit_wolf_rescaled(
++                            Xg_std, sc.scale_
++                        )
++                    elif effective_shrinkage == "empirical":
++                        class_scatter = _fast_mle_covariance(Xg_class)
++                elif isinstance(effective_shrinkage, Real):
++                    raw_scatter = _fast_mle_covariance(Xg_class)
++                    class_scatter = _direct_shrinkage(
++                        raw_scatter, effective_shrinkage
++                    )
++            else:
++                if shrinkage_mode is not None and shrinkage_mode != 0:
++                    raise ValueError(
++                        "covariance_estimator and shrinkage parameters "
++                        "are not None. Only one of the two can be set."
++                    )
++                cov_estimator_ref.fit(Xg_class)
++                if not hasattr(cov_estimator_ref, "covariance_"):
++                    raise ValueError(
++                        "%s does not have a covariance_ attribute"
++                        % cov_estimator_ref.__class__.__name__
++                    )
++                class_scatter = cov_estimator_ref.covariance_
++
++            scatter_accumulator += self.priors_[lsqr_idx] * np.atleast_2d(
++                class_scatter
++            )
++        return scatter_accumulator
++
++    def _compute_with_class_scatter_eigen(self, X, y):
++        """Compute within class scatter matrix for the 'eigen' solver."""
++        # Within-class scatter computation with regularization
++        within_scatter_eigen = np.zeros(shape=(self.n_features_in_, self.n_features_in_))
++        shrinkage_param = self.shrinkage
++        cov_est = self.covariance_estimator
++        class_masks = self._class_masks
++
++        for eigen_idx in range(len(self.classes_)):
++            Xg_e = X[class_masks[eigen_idx], :]
++
++            if cov_est is None:
++                eff_shrink = (
++                    "empirical"
++                    if shrinkage_param is None
++                    else shrinkage_param
++                )
++                if isinstance(eff_shrink, str):
++                    if eff_shrink == "auto":
++                        sc_e = StandardScaler()
++                        Xg_e_std = sc_e.fit_transform(Xg_e)
++                        cls_cov_e = _ledoit_wolf_rescaled(
++                            Xg_e_std, sc_e.scale_
++                        )
++                    elif eff_shrink == "empirical":
++                        cls_cov_e = _fast_mle_covariance(Xg_e)
++                elif isinstance(eff_shrink, Real):
++                    raw_e = _fast_mle_covariance(Xg_e)
++                    cls_cov_e = _direct_shrinkage(raw_e, eff_shrink)
++            else:
++                if shrinkage_param is not None and shrinkage_param != 0:
++                    raise ValueError(
++                        "covariance_estimator and shrinkage parameters "
++                        "are not None. Only one of the two can be set."
++                    )
++                cov_est.fit(Xg_e)
++                if not hasattr(cov_est, "covariance_"):
++                    raise ValueError(
++                        "%s does not have a covariance_ attribute"
++                        % cov_est.__class__.__name__
++                    )
++                cls_cov_e = cov_est.covariance_
++
++            within_scatter_eigen += self.priors_[
++                eigen_idx
++            ] * np.atleast_2d(cls_cov_e)
++        return within_scatter_eigen
++
++    def _compute_total_scatter(self, X):
++        """Compute total scatter matrix for the 'eigen' solver."""
++        shrinkage_param = self.shrinkage
++        cov_est = self.covariance_estimator
++
++        if cov_est is None:
++            total_shrink = (
++                "empirical"
++                if shrinkage_param is None
++                else shrinkage_param
++            )
++            if isinstance(total_shrink, str):
++                if total_shrink == "auto":
++                    sc_total = StandardScaler()
++                    X_total_std = sc_total.fit_transform(X)
++                    total_scatter = _ledoit_wolf_rescaled(
++                        X_total_std, sc_total.scale_
++                    )
++                elif total_shrink == "empirical":
++                    total_scatter = _fast_mle_covariance(X)
++            elif isinstance(total_shrink, Real):
++                raw_total = _fast_mle_covariance(X)
++                total_scatter = _direct_shrinkage(
++                    raw_total, total_shrink
++                )
++        else:
++            if shrinkage_param is not None and shrinkage_param != 0:
++                raise ValueError(
++                    "covariance_estimator and shrinkage parameters "
++                    "are not None. Only one of the two can be set."
++                )
++            cov_est.fit(X)
++            if not hasattr(cov_est, "covariance_"):
++                raise ValueError(
++                    "%s does not have a covariance_ attribute"
++                    % cov_est.__class__.__name__
++                )
++            total_scatter = cov_est.covariance_
++        return total_scatter
++
+     @_fit_context(
+         # LinearDiscriminantAnalysis.covariance_estimator is not validated yet
+         prefer_skip_nested_validation=False

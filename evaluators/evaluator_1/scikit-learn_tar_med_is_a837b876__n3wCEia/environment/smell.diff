@@ -1,0 +1,202 @@
+diff --git a/sklearn/gaussian_process/_gpr.py b/sklearn/gaussian_process/_gpr.py
+index 40b0bd84ae..4f5e861bfe 100644
+--- a/sklearn/gaussian_process/_gpr.py
++++ b/sklearn/gaussian_process/_gpr.py
+@@ -368,6 +368,14 @@ class GaussianProcessRegressor(MultiOutputMixin, RegressorMixin, BaseEstimator):
+             self.y_train_,
+             check_finite=False,
+         )
++
++        self._kernel_characteristic_scale_ = (
++            self.kernel_.characteristic_length_scale(self.X_train_)
++        )
++        self._regularization_hint_ = self.kernel_.suggested_regularization(
++            self.X_train_
++        )
++
+         return self
+ 
+     def predict(self, X, return_std=False, return_cov=False):
+diff --git a/sklearn/gaussian_process/kernels.py b/sklearn/gaussian_process/kernels.py
+index 8b4a16cb76..f5f953a456 100644
+--- a/sklearn/gaussian_process/kernels.py
++++ b/sklearn/gaussian_process/kernels.py
+@@ -275,12 +275,12 @@ class Kernel(metaclass=ABCMeta):
+     @property
+     def hyperparameters(self):
+         """Returns a list of all hyperparameter specifications."""
+-        r = [
++        result = [
+             getattr(self, attr)
+             for attr in dir(self)
+             if attr.startswith("hyperparameter_")
+         ]
+-        return r
++        return result
+ 
+     @property
+     def theta(self):
+@@ -458,6 +458,74 @@ class Kernel(metaclass=ABCMeta):
+                     )
+                 idx += 1
+ 
++    def characteristic_length_scale(self, X=None):
++        """Returns the characteristic length scale of the kernel.
++
++        For kernels with explicit length-scale parameters, returns the
++        actual length scale. For others, estimates a characteristic scale
++        from the hyperparameters or kernel diagonal.
++
++        Parameters
++        ----------
++        X : array-like of shape (n_samples, n_features), default=None
++            Input data used for estimation when no explicit length-scale
++            parameter is available.
++
++        Returns
++        -------
++        length_scale : float
++            The characteristic length scale of the kernel.
++        """
++        params = self.get_params()
++        for name, value in params.items():
++            if "length_scale" in name and not name.endswith("_bounds"):
++                return float(np.mean(np.atleast_1d(value)))
++        if X is not None:
++            diag_values = self.diag(X)
++            return float(np.sqrt(np.mean(np.abs(diag_values)) + 1e-12))
++        return 1.0
++
++    def smoothness_order(self):
++        """Returns the smoothness order of the kernel.
++
++        The smoothness order characterizes the mean-square differentiability
++        of the GP sample paths induced by this kernel. Higher values indicate
++        smoother functions. Returns np.inf for infinitely smooth kernels,
++        a positive float for finite smoothness, and 0 for non-smooth kernels.
++
++        Returns
++        -------
++        smoothness : float
++            The smoothness order.
++        """
++        if self.is_stationary():
++            return 2.0
++        return 0.0
++
++    def suggested_regularization(self, X):
++        """Suggests a regularization value based on kernel matrix properties.
++
++        Computes a heuristic regularization value (alpha) suitable for
++        numerical stability during Cholesky decomposition of the kernel
++        matrix. This is based on the kernel diagonal variance and the
++        characteristic length scale.
++
++        Parameters
++        ----------
++        X : array-like of shape (n_samples, n_features)
++            Input data for computing the kernel diagnostic.
++
++        Returns
++        -------
++        alpha : float
++            Suggested regularization value.
++        """
++        K_diag = self.diag(X)
++        n_samples = _num_samples(X)
++        diag_range = float(np.max(K_diag) - np.min(K_diag))
++        scale = self.characteristic_length_scale(X)
++        return (diag_range + 1e-10) / (n_samples * scale**2 + 1.0)
++
+ 
+ class NormalizedKernelMixin:
+     """Mixin for kernels which are normalized: k(X, X)=1.
+@@ -672,6 +740,19 @@ class CompoundKernel(Kernel):
+         """
+         return np.vstack([kernel.diag(X) for kernel in self.kernels]).T
+ 
++    def characteristic_length_scale(self, X=None):
++        """Returns the mean characteristic length scale across sub-kernels."""
++        scales = [k.characteristic_length_scale(X) for k in self.kernels]
++        return float(np.mean(scales))
++
++    def smoothness_order(self):
++        """Returns the minimum smoothness order across sub-kernels."""
++        return float(min(k.smoothness_order() for k in self.kernels))
++
++    def suggested_regularization(self, X):
++        """Returns the maximum suggested regularization across sub-kernels."""
++        return float(max(k.suggested_regularization(X) for k in self.kernels))
++
+ 
+ class KernelOperator(Kernel):
+     """Base class for all kernel operators.
+@@ -790,6 +871,22 @@ class KernelOperator(Kernel):
+         """Returns whether the kernel is stationary."""
+         return self.k1.requires_vector_input or self.k2.requires_vector_input
+ 
++    def characteristic_length_scale(self, X=None):
++        """Returns the geometric mean of sub-kernel characteristic scales."""
++        scale_k1 = self.k1.characteristic_length_scale(X)
++        scale_k2 = self.k2.characteristic_length_scale(X)
++        return float(np.sqrt(scale_k1 * scale_k2))
++
++    def smoothness_order(self):
++        """Returns the minimum smoothness of the two sub-kernels."""
++        return min(self.k1.smoothness_order(), self.k2.smoothness_order())
++
++    def suggested_regularization(self, X):
++        """Returns the maximum suggested regularization of sub-kernels."""
++        reg_k1 = self.k1.suggested_regularization(X)
++        reg_k2 = self.k2.suggested_regularization(X)
++        return float(max(reg_k1, reg_k2))
++
+ 
+ class Sum(KernelOperator):
+     """The `Sum` kernel takes two kernels :math:`k_1` and :math:`k_2`
+@@ -1178,6 +1275,19 @@ class Exponentiation(Kernel):
+         """Returns whether the kernel is defined on discrete structures."""
+         return self.kernel.requires_vector_input
+ 
++    def characteristic_length_scale(self, X=None):
++        """Returns the characteristic length scale of the base kernel."""
++        return self.kernel.characteristic_length_scale(X)
++
++    def smoothness_order(self):
++        """Returns the smoothness order of the base kernel."""
++        return self.kernel.smoothness_order()
++
++    def suggested_regularization(self, X):
++        """Returns regularization from base kernel, adjusted for exponent."""
++        base_reg = self.kernel.suggested_regularization(X)
++        return float(base_reg * abs(self.exponent))
++
+ 
+ class ConstantKernel(StationaryKernelMixin, GenericKernelMixin, Kernel):
+     """Constant kernel.
+@@ -1592,6 +1702,14 @@ class RBF(StationaryKernelMixin, NormalizedKernelMixin, Kernel):
+                 self.__class__.__name__, np.ravel(self.length_scale)[0]
+             )
+ 
++    def characteristic_length_scale(self, X=None):
++        """Returns the actual length scale parameter."""
++        return float(np.mean(np.atleast_1d(self.length_scale)))
++
++    def smoothness_order(self):
++        """RBF kernel is infinitely differentiable."""
++        return np.inf
++
+ 
+ class Matern(RBF):
+     """Matern kernel.
+@@ -1792,6 +1910,10 @@ class Matern(RBF):
+                 self.__class__.__name__, np.ravel(self.length_scale)[0], self.nu
+             )
+ 
++    def smoothness_order(self):
++        """Matern smoothness is controlled by the nu parameter."""
++        return self.nu
++
+ 
+ class RationalQuadratic(StationaryKernelMixin, NormalizedKernelMixin, Kernel):
+     """Rational Quadratic kernel.

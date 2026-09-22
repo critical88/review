@@ -1,0 +1,137 @@
+diff --git a/src/click/_utils.py b/src/click/_utils.py
+index 09fb008..e54a388 100644
+--- a/src/click/_utils.py
++++ b/src/click/_utils.py
+@@ -34,3 +34,57 @@ T_UNSET = t.Literal[UNSET]  # type: ignore[valid-type]
+ 
+ T_FLAG_NEEDS_VALUE = t.Literal[FLAG_NEEDS_VALUE]  # type: ignore[valid-type]
+ """Type hint for the :data:`FLAG_NEEDS_VALUE` sentinel value."""
++
++
++class _TokenStream:
++    """Manages sequential token access with classification support
++    for the option parser's argument processing loop.
++
++    Wraps a mutable token list and provides classification of each
++    token via an optional context reference, supporting the parser's
++    dispatch logic without duplicating prefix-checking code.
++    """
++
++    __slots__ = ("_tokens", "_opt_prefixes", "_ctx")
++
++    def __init__(
++        self,
++        tokens: list[str],
++        opt_prefixes: set[str],
++        ctx: t.Any = None,
++    ) -> None:
++        self._tokens = tokens
++        self._opt_prefixes = opt_prefixes
++        self._ctx = ctx
++
++    @property
++    def has_pending(self) -> bool:
++        """Whether there are remaining tokens to process."""
++        return bool(self._tokens)
++
++    def pop_token(self) -> str:
++        """Remove and return the next token from the front."""
++        return self._tokens.pop(0)
++
++    def push_token(self, token: str) -> None:
++        """Push a token back to the front of the stream."""
++        self._tokens.insert(0, token)
++
++    def classify_current(self, token: str) -> str:
++        """Classify a token for option-processing dispatch.
++
++        Returns one of ``'separator'``, ``'option'``, or
++        ``'positional'``, indicating how the parser should handle
++        the token.
++
++        When a context is available, delegates prefix-based
++        classification to ensure consistent token handling across
++        the parsing pipeline.
++        """
++        if token == "--":
++            return "separator"
++        if self._ctx is not None:
++            return self._ctx._classify_arg_token(token, self._opt_prefixes)
++        if token[:1] in self._opt_prefixes and len(token) > 1:
++            return "option"
++        return "positional"
+diff --git a/src/click/core.py b/src/click/core.py
+index 57f549c..0168f72 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -473,6 +473,22 @@ class Context:
+             "auto_envvar_prefix": self.auto_envvar_prefix,
+         }
+ 
++    def _classify_arg_token(
++        self, token: str, opt_prefixes: set[str]
++    ) -> str:
++        """Classify an argument token for option parsing dispatch.
++
++        Determines whether a token should be treated as an option
++        based on its prefix and length.  Used by the parsing token
++        stream to support consistent classification across the
++        parsing pipeline.
++
++        :meta private:
++        """
++        if token[:1] in opt_prefixes and len(token) > 1:
++            return "option"
++        return "positional"
++
+     def __enter__(self) -> Context:
+         self._depth += 1
+         push_context(self)
+diff --git a/src/click/parser.py b/src/click/parser.py
+index 1ea1f71..2e529e5 100644
+--- a/src/click/parser.py
++++ b/src/click/parser.py
+@@ -30,6 +30,7 @@ from collections import deque
+ from gettext import gettext as _
+ from gettext import ngettext
+ 
++from ._utils import _TokenStream
+ from ._utils import FLAG_NEEDS_VALUE
+ from ._utils import UNSET
+ from .exceptions import BadArgumentUsage
+@@ -320,20 +321,29 @@ class _OptionParser:
+         state.largs = args
+         state.rargs = []
+ 
++    def _build_token_stream(self, state: _ParsingState) -> _TokenStream:
++        """Create a token stream for the argument processing loop.
++
++        The stream wraps the state's remaining arguments and provides
++        token classification via the parser's context.
++        """
++        return _TokenStream(state.rargs, self._opt_prefixes, self.ctx)
++
+     def _process_args_for_options(self, state: _ParsingState) -> None:
+-        while state.rargs:
+-            arg = state.rargs.pop(0)
+-            arglen = len(arg)
++        stream = self._build_token_stream(state)
++        while stream.has_pending:
++            arg = stream.pop_token()
++            token_kind = stream.classify_current(arg)
+             # Double dashes always handled explicitly regardless of what
+             # prefixes are valid.
+-            if arg == "--":
++            if token_kind == "separator":
+                 return
+-            elif arg[:1] in self._opt_prefixes and arglen > 1:
++            elif token_kind == "option":
+                 self._process_opts(arg, state)
+             elif self.allow_interspersed_args:
+                 state.largs.append(arg)
+             else:
+-                state.rargs.insert(0, arg)
++                stream.push_token(arg)
+                 return
+ 
+         # Say this is the original argument list:

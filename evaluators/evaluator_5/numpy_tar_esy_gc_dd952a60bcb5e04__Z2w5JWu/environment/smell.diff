@@ -1,0 +1,226 @@
+diff --git a/numpy/_core/src/highway b/numpy/_core/src/highway
+index 37c08e5528..ee36c83712 160000
+--- a/numpy/_core/src/highway
++++ b/numpy/_core/src/highway
+@@ -1 +1 @@
+-Subproject commit 37c08e5528f63ead9c7e4fd99ba454c1b1a3e3f7
++Subproject commit ee36c837129310be19c17c9108c6dc3f6ae06942
+diff --git a/numpy/distutils/system_info.py b/numpy/distutils/system_info.py
+index e428b47f08..736403c2b1 100644
+--- a/numpy/distutils/system_info.py
++++ b/numpy/distutils/system_info.py
+@@ -719,12 +719,21 @@ class system_info:
+ 
+     notfounderror = NotFoundError
+ 
++    config_env_var = None
++    default_config_exe = None
++    append_config_exe = ''
++    version_macro_name = None
++    release_macro_name = None
++    version_flag = '--modversion'
++    cflags_flag = '--cflags'
++
+     def __init__(self,
+                   default_lib_dirs=default_lib_dirs,
+                   default_include_dirs=default_include_dirs,
+                   ):
+         self.__class__.info = {}
+         self.local_prefixes = []
++        self._pkg_config_cache = {}
+         defaults = {'library_dirs': os.pathsep.join(default_lib_dirs),
+                     'include_dirs': os.pathsep.join(default_include_dirs),
+                     'runtime_library_dirs': os.pathsep.join(default_runtime_dirs),
+@@ -1078,6 +1087,88 @@ def combine_paths(self, *args):
+         """
+         return combine_paths(*args)
+ 
++    def get_config_exe(self):
++        if self.config_env_var and self.config_env_var in os.environ:
++            return os.environ[self.config_env_var]
++        return self.default_config_exe
++
++    def get_config_output(self, config_exe, option):
++        cache_key = (config_exe, option)
++        if cache_key in self._pkg_config_cache:
++            return self._pkg_config_cache[cache_key]
++        cmd = config_exe + ' ' + self.append_config_exe + ' ' + option
++        try:
++            o = subprocess.check_output(cmd)
++        except (OSError, subprocess.CalledProcessError):
++            pass
++        else:
++            o = filepath_from_subprocess_output(o)
++            self._pkg_config_cache[cache_key] = o
++            return o
++
++    def _calc_pkg_config_info(self):
++        config_exe = find_executable(self.get_config_exe())
++        if not config_exe:
++            log.warn('File not found: %s. Cannot determine %s info.' \
++                  % (config_exe, self.section))
++            return
++        info = {}
++        macros = []
++        libraries = []
++        library_dirs = []
++        include_dirs = []
++        extra_link_args = []
++        extra_compile_args = []
++        version = self.get_config_output(config_exe, self.version_flag)
++        if version:
++            macros.append((self.__class__.__name__.split('.')[-1].upper(),
++                           _c_string_literal(version)))
++            if self.version_macro_name:
++                macros.append((self.version_macro_name + '_%s'
++                               % (version.replace('.', '_')), None))
++        if self.release_macro_name:
++            release = self.get_config_output(config_exe, '--release')
++            if release:
++                macros.append((self.release_macro_name + '_%s'
++                               % (release.replace('.', '_')), None))
++        opts = self.get_config_output(config_exe, '--libs')
++        if opts:
++            for opt in opts.split():
++                if opt[:2] == '-l':
++                    libraries.append(opt[2:])
++                elif opt[:2] == '-L':
++                    library_dirs.append(opt[2:])
++                else:
++                    extra_link_args.append(opt)
++        opts = self.get_config_output(config_exe, self.cflags_flag)
++        if opts:
++            for opt in opts.split():
++                if opt[:2] == '-I':
++                    include_dirs.append(opt[2:])
++                elif opt[:2] == '-D':
++                    if '=' in opt:
++                        n, v = opt[2:].split('=')
++                        macros.append((n, v))
++                    else:
++                        macros.append((opt[2:], None))
++                else:
++                    extra_compile_args.append(opt)
++        if macros:
++            dict_append(info, define_macros=macros)
++        if libraries:
++            dict_append(info, libraries=libraries)
++        if library_dirs:
++            dict_append(info, library_dirs=library_dirs)
++        if include_dirs:
++            dict_append(info, include_dirs=include_dirs)
++        if extra_link_args:
++            dict_append(info, extra_link_args=extra_link_args)
++        if extra_compile_args:
++            dict_append(info, extra_compile_args=extra_compile_args)
++        if info:
++            self.set_info(**info)
++        return
++
+ 
+ class fft_opt_info(system_info):
+ 
+@@ -2959,83 +3050,8 @@ class _pkg_config_info(system_info):
+     version_flag = '--modversion'
+     cflags_flag = '--cflags'
+ 
+-    def get_config_exe(self):
+-        if self.config_env_var in os.environ:
+-            return os.environ[self.config_env_var]
+-        return self.default_config_exe
+-
+-    def get_config_output(self, config_exe, option):
+-        cmd = config_exe + ' ' + self.append_config_exe + ' ' + option
+-        try:
+-            o = subprocess.check_output(cmd)
+-        except (OSError, subprocess.CalledProcessError):
+-            pass
+-        else:
+-            o = filepath_from_subprocess_output(o)
+-            return o
+-
+     def calc_info(self):
+-        config_exe = find_executable(self.get_config_exe())
+-        if not config_exe:
+-            log.warn('File not found: %s. Cannot determine %s info.' \
+-                  % (config_exe, self.section))
+-            return
+-        info = {}
+-        macros = []
+-        libraries = []
+-        library_dirs = []
+-        include_dirs = []
+-        extra_link_args = []
+-        extra_compile_args = []
+-        version = self.get_config_output(config_exe, self.version_flag)
+-        if version:
+-            macros.append((self.__class__.__name__.split('.')[-1].upper(),
+-                           _c_string_literal(version)))
+-            if self.version_macro_name:
+-                macros.append((self.version_macro_name + '_%s'
+-                               % (version.replace('.', '_')), None))
+-        if self.release_macro_name:
+-            release = self.get_config_output(config_exe, '--release')
+-            if release:
+-                macros.append((self.release_macro_name + '_%s'
+-                               % (release.replace('.', '_')), None))
+-        opts = self.get_config_output(config_exe, '--libs')
+-        if opts:
+-            for opt in opts.split():
+-                if opt[:2] == '-l':
+-                    libraries.append(opt[2:])
+-                elif opt[:2] == '-L':
+-                    library_dirs.append(opt[2:])
+-                else:
+-                    extra_link_args.append(opt)
+-        opts = self.get_config_output(config_exe, self.cflags_flag)
+-        if opts:
+-            for opt in opts.split():
+-                if opt[:2] == '-I':
+-                    include_dirs.append(opt[2:])
+-                elif opt[:2] == '-D':
+-                    if '=' in opt:
+-                        n, v = opt[2:].split('=')
+-                        macros.append((n, v))
+-                    else:
+-                        macros.append((opt[2:], None))
+-                else:
+-                    extra_compile_args.append(opt)
+-        if macros:
+-            dict_append(info, define_macros=macros)
+-        if libraries:
+-            dict_append(info, libraries=libraries)
+-        if library_dirs:
+-            dict_append(info, library_dirs=library_dirs)
+-        if include_dirs:
+-            dict_append(info, include_dirs=include_dirs)
+-        if extra_link_args:
+-            dict_append(info, extra_link_args=extra_link_args)
+-        if extra_compile_args:
+-            dict_append(info, extra_compile_args=extra_compile_args)
+-        if info:
+-            self.set_info(**info)
+-        return
++        self._calc_pkg_config_info()
+ 
+ 
+ class wx_info(_pkg_config_info):
+diff --git a/numpy/distutils/tests/test_system_info.py b/numpy/distutils/tests/test_system_info.py
+index 5887abea76..f9cd6992d1 100644
+--- a/numpy/distutils/tests/test_system_info.py
++++ b/numpy/distutils/tests/test_system_info.py
+@@ -107,6 +107,7 @@ def __init__(self,
+                  ):
+         self.__class__.info = {}
+         self.local_prefixes = []
++        self._pkg_config_cache = {}
+         defaults = {'library_dirs': '',
+                     'include_dirs': '',
+                     'runtime_library_dirs': '',
+diff --git a/vendored-meson/meson b/vendored-meson/meson
+index e72c717199..5d5a3d478d 160000
+--- a/vendored-meson/meson
++++ b/vendored-meson/meson
+@@ -1 +1 @@
+-Subproject commit e72c717199fa18d34020c7c97f9de3f388c5e055
++Subproject commit 5d5a3d478da115c812be77afa651db2492d52171

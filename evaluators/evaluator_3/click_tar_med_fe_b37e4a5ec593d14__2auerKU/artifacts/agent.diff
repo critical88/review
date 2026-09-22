@@ -1,0 +1,88 @@
+diff --git a/src/click/parser.py b/src/click/parser.py
+index 2e529e5..1438447 100644
+--- a/src/click/parser.py
++++ b/src/click/parser.py
+@@ -216,6 +216,28 @@ class _ParsingState:
+         self.largs: list[str] = []
+         self.rargs = rargs
+         self.order: list[CoreParameter] = []
++    
++    def add_positional_arg(self, arg: str) -> None:
++        """Add a positional argument to largs."""
++        self.largs.append(arg)
++    
++    def process_token_with_parser(self, token: str, token_kind: str, parser: _OptionParser) -> bool:
++        """Process a token using the parser.
++        
++        Returns True if processing should continue, False if it should stop.
++        """
++        # Double dashes always handled explicitly regardless of what
++        # prefixes are valid.
++        if token_kind == "separator":
++            return False
++        elif token_kind == "option":
++            parser._process_opts(token, self)
++            return True
++        elif parser.allow_interspersed_args:
++            self.add_positional_arg(token)
++            return True
++        else:
++            return False
+ 
+ 
+ class _OptionParser:
+@@ -330,21 +352,25 @@ class _OptionParser:
+         return _TokenStream(state.rargs, self._opt_prefixes, self.ctx)
+ 
+     def _process_args_for_options(self, state: _ParsingState) -> None:
++        """Process command line arguments for options.
++        
++        This method iterates through the arguments, processing options
++        and collecting positional arguments based on parsing rules.
++        """
++        self._process_token_stream(state)
++
++    def _process_token_stream(self, state: _ParsingState) -> None:
++        """Process tokens from a stream, handling options and positional arguments."""
+         stream = self._build_token_stream(state)
+         while stream.has_pending:
+             arg = stream.pop_token()
+             token_kind = stream.classify_current(arg)
+-            # Double dashes always handled explicitly regardless of what
+-            # prefixes are valid.
+-            if token_kind == "separator":
+-                return
+-            elif token_kind == "option":
+-                self._process_opts(arg, state)
+-            elif self.allow_interspersed_args:
+-                state.largs.append(arg)
+-            else:
+-                stream.push_token(arg)
+-                return
++            should_continue = state.process_token_with_parser(arg, token_kind, self)
++            if not should_continue:
++                # Push token back if processing should stop (e.g., separator or non-option with interspersed_args=False)
++                if token_kind != "separator" and not self.allow_interspersed_args:
++                    stream.push_token(arg)
++                break
+ 
+         # Say this is the original argument list:
+         # [arg0, arg1, ..., arg(i-1), arg(i), arg(i+1), ..., arg(N-1)]
+@@ -434,7 +460,7 @@ class _OptionParser:
+         # to the state as new larg.  This way there is basic combinatorics
+         # that can be achieved while still ignoring unknown arguments.
+         if self.ignore_unknown_options and unknown_options:
+-            state.largs.append(f"{prefix}{''.join(unknown_options)}")
++            state.add_positional_arg(f"{prefix}{''.join(unknown_options)}")
+ 
+     def _get_value_from_state(
+         self, option_name: str, option: _Option, state: _ParsingState
+@@ -506,7 +532,7 @@ class _OptionParser:
+             if not self.ignore_unknown_options:
+                 raise
+ 
+-            state.largs.append(arg)
++            state.add_positional_arg(arg)
+ 
+ 
+ def __getattr__(name: str) -> object:

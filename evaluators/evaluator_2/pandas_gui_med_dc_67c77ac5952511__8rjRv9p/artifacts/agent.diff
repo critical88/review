@@ -1,0 +1,313 @@
+diff --git a/pandas/plotting/_matplotlib/core.py b/pandas/plotting/_matplotlib/core.py
+index dafb5b328c..f77abbc3bd 100644
+--- a/pandas/plotting/_matplotlib/core.py
++++ b/pandas/plotting/_matplotlib/core.py
+@@ -10,6 +10,7 @@ from collections.abc import (
+     Iterator,
+     Sequence,
+ )
++from dataclasses import dataclass
+ from typing import (
+     TYPE_CHECKING,
+     Any,
+@@ -96,6 +97,52 @@ if TYPE_CHECKING:
+     from pandas import Series
+ 
+ 
++@dataclass
++class AxisDisplayConfig:
++    """
++    Encapsulates axis display configuration parameters.
++
++    Parameters
++    ----------
++    xticks : array-like, optional
++        Tick positions for the x-axis
++    yticks : array-like, optional
++        Tick positions for the y-axis
++    xlim : tuple, optional
++        Limits for the x-axis (min, max)
++    ylim : tuple, optional
++        Limits for the y-axis (min, max)
++    xlabel : Hashable, optional
++        Label for the x-axis
++    ylabel : Hashable, optional
++        Label for the y-axis
++    """
++
++    xticks: Any = None
++    yticks: Any = None
++    xlim: Any = None
++    ylim: Any = None
++    xlabel: Hashable | None = None
++    ylabel: Hashable | None = None
++
++
++@dataclass
++class AxisStyleConfig:
++    """
++    Encapsulates axis styling configuration parameters.
++
++    Parameters
++    ----------
++    rot : int, optional
++        Rotation angle for axis tick labels
++    fontsize : int, optional
++        Font size for axis tick labels
++    """
++
++    rot: int | None = None
++    fontsize: int | None = None
++
++
+ def _color_in_style(style: str) -> bool:
+     """
+     Check if there is a color letter in the style string.
+@@ -213,17 +260,25 @@ class MPLPlot(ABC):
+         self.title = title
+         self.use_index = use_index
+ 
+-        self._init_axis_display(
++        # Initialize axis display configuration
++        self.axis_display = AxisDisplayConfig(
+             xticks=xticks,
+             yticks=yticks,
+             xlim=xlim,
+             ylim=ylim,
+             xlabel=xlabel,
+             ylabel=ylabel,
+-            fontsize=fontsize,
+-            rot=rot,
+         )
+ 
++        # Initialize axis style configuration
++        if rot is not None:
++            self._rot_set = True
++        else:
++            self._rot_set = False
++            rot = self._default_rot
++
++        self.axis_style = AxisStyleConfig(rot=rot, fontsize=fontsize)
++
+         if grid is None:
+             grid = False if secondary_y else plt.rcParams["axes.grid"]
+ 
+@@ -279,39 +334,38 @@ class MPLPlot(ABC):
+ 
+         self.data = self._ensure_frame(self.data)
+ 
+-    def _init_axis_display(
+-        self,
+-        xticks=None,
+-        yticks=None,
+-        xlim=None,
+-        ylim=None,
+-        xlabel=None,
+-        ylabel=None,
+-        fontsize=None,
+-        rot=None,
+-    ) -> None:
+-        """
+-        Initialize axis display settings from individual parameters.
++    # Properties for backward compatibility
++    @property
++    def xticks(self):
++        return self.axis_display.xticks
+ 
+-        Handles tick positions, axis limits, axis labels, font size,
+-        and rotation for the plot axes.
+-        """
+-        self.xticks = xticks
+-        self.yticks = yticks
+-        self.xlim = xlim
+-        self.ylim = ylim
+-        self.xlabel = xlabel
+-        self.ylabel = ylabel
+-        self.fontsize = fontsize
++    @property
++    def yticks(self):
++        return self.axis_display.yticks
+ 
+-        if rot is not None:
+-            self.rot = rot
+-            # need to know for format_date_labels since it's rotated to 30 by
+-            # default
+-            self._rot_set = True
+-        else:
+-            self._rot_set = False
+-            self.rot = self._default_rot
++    @property
++    def xlim(self):
++        return self.axis_display.xlim
++
++    @property
++    def ylim(self):
++        return self.axis_display.ylim
++
++    @property
++    def xlabel(self):
++        return self.axis_display.xlabel
++
++    @property
++    def ylabel(self):
++        return self.axis_display.ylabel
++
++    @property
++    def rot(self):
++        return self.axis_style.rot
++
++    @property
++    def fontsize(self):
++        return self.axis_style.fontsize
+ 
+     @final
+     @staticmethod
+@@ -745,25 +799,29 @@ class MPLPlot(ABC):
+     def _post_plot_logic_common(self, ax: Axes) -> None:
+         """Common post process for each axes"""
+         if self.orientation == "vertical" or self.orientation is None:
++            type(self)._apply_axis_properties(ax.xaxis, axis_style=self.axis_style)
+             type(self)._apply_axis_properties(
+-                ax.xaxis, rot=self.rot, fontsize=self.fontsize
++                ax.yaxis,
++                axis_style=AxisStyleConfig(fontsize=self.axis_style.fontsize),
+             )
+-            type(self)._apply_axis_properties(ax.yaxis, fontsize=self.fontsize)
+ 
+             if hasattr(ax, "right_ax"):
+                 type(self)._apply_axis_properties(
+-                    ax.right_ax.yaxis, fontsize=self.fontsize
++                    ax.right_ax.yaxis,
++                    axis_style=AxisStyleConfig(fontsize=self.axis_style.fontsize),
+                 )
+ 
+         elif self.orientation == "horizontal":
++            type(self)._apply_axis_properties(ax.yaxis, axis_style=self.axis_style)
+             type(self)._apply_axis_properties(
+-                ax.yaxis, rot=self.rot, fontsize=self.fontsize
++                ax.xaxis,
++                axis_style=AxisStyleConfig(fontsize=self.axis_style.fontsize),
+             )
+-            type(self)._apply_axis_properties(ax.xaxis, fontsize=self.fontsize)
+ 
+             if hasattr(ax, "right_ax"):
+                 type(self)._apply_axis_properties(
+-                    ax.right_ax.yaxis, fontsize=self.fontsize
++                    ax.right_ax.yaxis,
++                    axis_style=AxisStyleConfig(fontsize=self.axis_style.fontsize),
+                 )
+         else:  # pragma no cover
+             raise ValueError
+@@ -776,37 +834,41 @@ class MPLPlot(ABC):
+     @staticmethod
+     def _decorate_axis(
+         ax,
+-        axis_xticks=None,
+-        axis_yticks=None,
+-        axis_xlim=None,
+-        axis_ylim=None,
+-        axis_ylabel=None,
+-        axis_grid=True,
++        axis_display: AxisDisplayConfig,
++        axis_grid: bool = True,
+     ) -> None:
+         """
+         Apply tick, limit, label, and grid settings to a single axes object.
+ 
+         Configures the visual decoration of an individual matplotlib axes
+-        based on the provided tick positions, axis limits, label, and grid
+-        visibility parameters.
++        based on the provided axis display configuration.
++
++        Parameters
++        ----------
++        ax : Axes
++            The matplotlib axes to decorate
++        axis_display : AxisDisplayConfig
++            Configuration object containing tick positions, limits, and labels
++        axis_grid : bool, default True
++            Whether to show grid on the axes
+         """
+         ax = getattr(ax, "right_ax", ax)
+-        if axis_yticks is not None:
+-            ax.set_yticks(axis_yticks)
++        if axis_display.yticks is not None:
++            ax.set_yticks(axis_display.yticks)
+ 
+-        if axis_xticks is not None:
+-            ax.set_xticks(axis_xticks)
++        if axis_display.xticks is not None:
++            ax.set_xticks(axis_display.xticks)
+ 
+-        if axis_ylim is not None:
+-            ax.set_ylim(axis_ylim)
++        if axis_display.ylim is not None:
++            ax.set_ylim(axis_display.ylim)
+ 
+-        if axis_xlim is not None:
+-            ax.set_xlim(axis_xlim)
++        if axis_display.xlim is not None:
++            ax.set_xlim(axis_display.xlim)
+ 
+         # GH9093, currently Pandas does not show ylabel, so if users provide
+         # ylabel will set it as ylabel in the plot.
+-        if axis_ylabel is not None:
+-            ax.set_ylabel(pprint_thing(axis_ylabel))
++        if axis_display.ylabel is not None:
++            ax.set_ylabel(pprint_thing(axis_display.ylabel))
+ 
+         ax.grid(axis_grid)
+ 
+@@ -829,11 +891,7 @@ class MPLPlot(ABC):
+         for ax in self.axes:
+             type(self)._decorate_axis(
+                 ax,
+-                axis_xticks=self.xticks,
+-                axis_yticks=self.yticks,
+-                axis_xlim=self.xlim,
+-                axis_ylim=self.ylim,
+-                axis_ylabel=self.ylabel,
++                axis_display=self.axis_display,
+                 axis_grid=self.grid,
+             )
+ 
+@@ -865,14 +923,29 @@ class MPLPlot(ABC):
+     @final
+     @staticmethod
+     def _apply_axis_properties(
+-        axis: Axis, rot=None, fontsize: int | None = None
++        axis: Axis, axis_style: AxisStyleConfig | None = None
+     ) -> None:
+         """
++        Apply styling properties to an axis.
++
+         Tick creation within matplotlib is reasonably expensive and is
+         internally deferred until accessed as Ticks are created/destroyed
+         multiple times per draw. It's therefore beneficial for us to avoid
+         accessing unless we will act on the Tick.
++
++        Parameters
++        ----------
++        axis : Axis
++            The matplotlib axis to apply properties to
++        axis_style : AxisStyleConfig, optional
++            Configuration object containing rotation and fontsize
+         """
++        if axis_style is None:
++            return
++
++        rot = axis_style.rot
++        fontsize = axis_style.fontsize
++
+         if rot is not None or fontsize is not None:
+             # rot=0 is a valid setting, hence the explicit None check
+             labels = axis.get_majorticklabels() + axis.get_minorticklabels()
+@@ -1767,7 +1840,7 @@ class LinePlot(MPLPlot):
+             # irregular TS rotated 30 deg. by default
+             # probably a better place to check / set this.
+             if not self._rot_set:
+-                self.rot = 30
++                self.axis_style.rot = 30
+             format_date_labels(ax, rot=self.rot)
+ 
+         if index_name is not None and self.use_index:

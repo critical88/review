@@ -1,0 +1,169 @@
+diff --git a/src/click/core.py b/src/click/core.py
+index 57f549c..9cfc849 100644
+--- a/src/click/core.py
++++ b/src/click/core.py
+@@ -39,6 +39,7 @@ from .termui import prompt
+ from .termui import style
+ from .utils import _detect_program_name
+ from .utils import _expand_args
++from .utils import _setup_main_invocation
+ from .utils import echo
+ from .utils import make_default_short_help
+ from .utils import make_str
+@@ -1397,23 +1398,96 @@ class Command:
+         if prog_name is None:
+             prog_name = _detect_program_name()
+ 
++        # Resolve the completion-trigger environment variable and pre-merge
++        # context_settings into the forwarded extra kwargs so the context
++        # constructor receives a single ready-to-use mapping.
++        _cvar, _cinstr, _ctx_kw = _setup_main_invocation(
++            prog_name, complete_var, self.context_settings, extra
++        )
++
+         # Process shell completion requests and exit early.
+-        self._main_shell_completion(extra, prog_name, complete_var)
++        if _cinstr:
++            from .shell_completion import shell_complete
++
++            sys.exit(shell_complete(self, extra, prog_name, _cvar, _cinstr))
+ 
+         try:
+             try:
+-                with self.make_context(prog_name, args, **extra) as ctx:
+-                    rv = self.invoke(ctx)
++                # Construct the context directly with the pre-merged keyword
++                # arguments rather than delegating to make_context; the
++                # context_settings have already been folded in by the
++                # preparation step above.
++                _ctx = self.context_class(
++                    self, info_name=prog_name, parent=None, **_ctx_kw
++                )
++
++                # Open a parse-phase scope: bump the depth counter to defer
++                # resource teardown until the invoke phase completes, then
++                # activate the context on the thread-local stack while the
++                # argument vector is parsed.  This replaces the layered
++                # scope(cleanup=False) / __enter__ / __exit__ chain that
++                # make_context formerly orchestrated.
++                _ctx._depth += 1
++                _pfail = False
++                _ctx._depth += 1
++                push_context(_ctx)
++                try:
++                    self.parse_args(_ctx, args)
++                except BaseException:
++                    _pfail = True
++                    raise
++                finally:
++                    _ctx._depth -= 1
++                    if _ctx._depth == 0:
++                        _ctx._close_with_exception_info(
++                            *(sys.exc_info() if _pfail else (None, None, None))
++                        )
++                    pop_context()
++                    _ctx._depth -= 1
++
++                # Enter the invoke phase: push the context onto the thread-
++                # local stack again so that get_current_context() works
++                # inside callbacks, then run the command.  The context-
++                # manager protocol (__enter__/__exit__) is expanded inline
++                # so that teardown always executes even when the callback or
++                # ctx.exit() raises.
++                _ctx._depth += 1
++                push_context(_ctx)
++                _iexc: BaseException | None = None
++                _rv: t.Any = None
++                try:
++                    _rv = self.invoke(_ctx)
+                     if not standalone_mode:
+-                        return rv
+-                    # it's not safe to `ctx.exit(rv)` here!
+-                    # note that `rv` may actually contain data like "1" which
+-                    # has obvious effects
+-                    # more subtle case: `rv=[None, None]` can come out of
+-                    # chained commands which all returned `None` -- so it's not
+-                    # even always obvious that `rv` indicates success/failure
+-                    # by its truthiness/falsiness
+-                    ctx.exit()
++                        pass  # will return after context cleanup below
++                    else:
++                        # it's not safe to `_ctx.exit(_rv)` here!
++                        # note that `_rv` may actually contain data like "1"
++                        # which has obvious effects
++                        # more subtle case: `_rv=[None, None]` can come out
++                        # of chained commands which all returned `None` -- so
++                        # it's not even always obvious that `_rv` indicates
++                        # success/failure by its truthiness/falsiness
++                        _ctx.exit()
++                except BaseException as _ie:
++                    _iexc = _ie
++                finally:
++                    _ctx._depth -= 1
++                    _suppressed = False
++                    if _ctx._depth == 0:
++                        if _iexc is not None:
++                            _suppressed = bool(
++                                _ctx._close_with_exception_info(
++                                    type(_iexc), _iexc, _iexc.__traceback__
++                                )
++                            )
++                        else:
++                            _ctx._close_with_exception_info(None, None, None)
++                    pop_context()
++
++                if _iexc is not None and not _suppressed:
++                    raise _iexc
++                if _iexc is None and not standalone_mode:
++                    return _rv
+             except (EOFError, KeyboardInterrupt) as e:
+                 echo(file=sys.stderr)
+                 raise Abort() from e
+diff --git a/src/click/utils.py b/src/click/utils.py
+index beae26f..835b73c 100644
+--- a/src/click/utils.py
++++ b/src/click/utils.py
+@@ -625,3 +625,43 @@ def _expand_args(
+             out.extend(matches)
+ 
+     return out
++
++
++def _setup_main_invocation(
++    prog_name: str,
++    complete_var: str | None,
++    context_settings: cabc.MutableMapping[str, t.Any],
++    caller_extra: cabc.MutableMapping[str, t.Any],
++) -> tuple[str, str | None, dict[str, t.Any]]:
++    """Pre-process the execution environment for :meth:`Command.main`.
++
++    Resolves the shell-completion trigger variable and folds command-level
++    ``context_settings`` into the caller-supplied extra keyword arguments
++    so that the ``Context`` constructor receives a single merged mapping.
++
++    :param prog_name: Name of the executable in the shell.
++    :param complete_var: Explicit completion variable name, or ``None``
++        to derive one from *prog_name*.
++    :param context_settings: The command's :attr:`Command.context_settings`.
++    :param caller_extra: Extra keyword arguments forwarded by the caller.
++    :return: ``(resolved_complete_var, completion_instruction, merged_extra)``
++
++    :meta private:
++    """
++    # Derive the completion-trigger environment variable when the caller
++    # did not specify one explicitly.
++    _resolved_var = complete_var
++    if _resolved_var is None:
++        _resolved_var = (
++            f"_{prog_name.replace('-', '_').replace('.', '_')}_COMPLETE".upper()
++        )
++    _instruction = os.environ.get(_resolved_var)
++
++    # Fold context_settings into a *copy* of caller_extra so that the
++    # original mapping is not mutated; caller values take precedence.
++    _merged: dict[str, t.Any] = dict(caller_extra)
++    for _k, _v in context_settings.items():
++        if _k not in _merged:
++            _merged[_k] = _v
++
++    return _resolved_var, _instruction, _merged

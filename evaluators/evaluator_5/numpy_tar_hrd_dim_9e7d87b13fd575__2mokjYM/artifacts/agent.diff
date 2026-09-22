@@ -1,0 +1,201 @@
+diff --git a/numpy/_core/src/common/pythoncapi-compat b/numpy/_core/src/common/pythoncapi-compat
+index 90c06a4cae..8636bccf29 160000
+--- a/numpy/_core/src/common/pythoncapi-compat
++++ b/numpy/_core/src/common/pythoncapi-compat
+@@ -1 +1 @@
+-Subproject commit 90c06a4cae557bdbfa4f231a781d2b5c1a8f6d1c
++Subproject commit 8636bccf29adfa23463f810b3c2830f7cff1e933
+diff --git a/numpy/_core/src/highway b/numpy/_core/src/highway
+index 37c08e5528..ee36c83712 160000
+--- a/numpy/_core/src/highway
++++ b/numpy/_core/src/highway
+@@ -1 +1 @@
+-Subproject commit 37c08e5528f63ead9c7e4fd99ba454c1b1a3e3f7
++Subproject commit ee36c837129310be19c17c9108c6dc3f6ae06942
+diff --git a/numpy/_core/src/npysort/x86-simd-sort b/numpy/_core/src/npysort/x86-simd-sort
+index 6a7a01da4b..5adb33411f 160000
+--- a/numpy/_core/src/npysort/x86-simd-sort
++++ b/numpy/_core/src/npysort/x86-simd-sort
+@@ -1 +1 @@
+-Subproject commit 6a7a01da4b0dfde108aa626a2364c954e2c50fe1
++Subproject commit 5adb33411f3cea8bdbafa9d91bd75bc4bf19c7dd
+diff --git a/numpy/lib/recfunctions.py b/numpy/lib/recfunctions.py
+index 7cc2d32737..c00c2df88d 100644
+--- a/numpy/lib/recfunctions.py
++++ b/numpy/lib/recfunctions.py
+@@ -411,6 +411,168 @@ def _compute_field_overlap_for_merge(dt_left, dt_right, key_fields=None):
+     }
+ 
+ 
++def _project_array_keys(array, proj_dtype):
++    """
++    Project an array onto key fields defined by proj_dtype.
++    
++    This handles nested structured dtypes by using iterative field population
++    to avoid recursion overhead.
++    
++    Parameters
++    ----------
++    array : ndarray
++        Input structured array to project
++    proj_dtype : dtype
++        Target dtype containing only key fields
++        
++    Returns
++    -------
++    projected : ndarray
++        New array with proj_dtype dtype containing projected key fields
++    """
++    result = np.empty(array.shape, dtype=proj_dtype)
++    
++    # Iterative field fill for projection
++    for field_name in proj_dtype.names:
++        try:
++            src_field = array[field_name]
++        except ValueError:
++            continue
++            
++        if src_field.dtype.names is not None:
++            # Handle nested structured dtypes with queue-based traversal
++            fill_queue = [(src_field, result[field_name])]
++            while fill_queue:
++                src, dst = fill_queue.pop()
++                for sub_field in dst.dtype.names:
++                    try:
++                        sub_src = src[sub_field]
++                    except ValueError:
++                        continue
++                    if sub_src.dtype.names is not None:
++                        fill_queue.append((sub_src, dst[sub_field]))
++                    else:
++                        dst[sub_field][:len(sub_src)] = sub_src
++        else:
++            result[field_name][:len(src_field)] = src_field
++    
++    return result
++
++
++def _compute_join_indices(aux, nb1, nb2, jointype, key):
++    """
++    Compute join indices for the two input arrays.
++    
++    This function determines which records from each array should be included
++    in the join based on the join type and key matching.
++    
++    Parameters
++    ----------
++    aux : MaskedArray
++        Concatenated and sorted key projections
++    nb1 : int
++        Length of first input array
++    nb2 : int
++        Length of second input array
++    jointype : str
++        Type of join ('inner', 'outer', 'leftouter')
++    key : tuple
++        Key field names for sorting and comparison
++        
++    Returns
++    -------
++    idx_1 : ndarray
++        Indices for first array
++    idx_2 : ndarray
++        Indices for second array
++    r1cmn : int
++        Number of common records from first array
++    r2cmn : int
++        Number of common records from second array
++    r1spc : int
++        Number of special records from first array (non-inner joins)
++    r2spc : int
++        Number of special records from second array (outer join only)
++    """
++    # Sort indices and find matching keys
++    idx_sort = aux.argsort(order=key)
++    aux_sorted = aux[idx_sort]
++    flag_in = ma.concatenate(([False], aux_sorted[1:] == aux_sorted[:-1]))
++    flag_in[:-1] = flag_in[1:] + flag_in[:-1]
++    idx_in = idx_sort[flag_in]
++    
++    # Extract indices for matching records
++    idx_1 = idx_in[(idx_in < nb1)]
++    idx_2 = idx_in[(idx_in >= nb1)] - nb1
++    r1cmn, r2cmn = len(idx_1), len(idx_2)
++    
++    # Handle non-inner joins
++    r1spc, r2spc = 0, 0
++    if jointype != 'inner':
++        idx_out = idx_sort[~flag_in]
++        idx_1 = np.concatenate((idx_1, idx_out[(idx_out < nb1)]))
++        r1spc = len(idx_1) - r1cmn
++        if jointype == 'outer':
++            idx_2 = np.concatenate((idx_2, idx_out[(idx_out >= nb1)] - nb1))
++            r2spc = len(idx_2) - r2cmn
++    
++    return idx_1, idx_2, r1cmn, r2cmn, r1spc, r2spc
++
++
++def _populate_join_output(output, s1, s2, r1names, r2names, 
++                         r1cmn, r2cmn, r1spc, r2spc, cmn,
++                         r1postfix, r2postfix, _key_set, jointype):
++    """
++    Populate the join output array with data from the selected records.
++    
++    Parameters
++    ----------
++    output : ndarray
++        Output array to populate
++    s1, s2 : ndarray
++        Selected records from first and second arrays
++    r1names, r2names : tuple
++        Field names from first and second arrays
++    r1cmn, r2cmn : int
++        Number of common records
++    r1spc, r2spc : int
++        Number of special records for non-inner joins
++    cmn : int
++        Maximum of r1cmn and r2cmn
++    r1postfix, r2postfix : str
++        Postfixes for field name collision resolution
++    _key_set : set
++        Set of key field names
++    jointype : str
++        Type of join being performed
++    """
++    names = output.dtype.names
++    
++    # Populate from first array
++    for f in r1names:
++        selected = s1[f]
++        field_name = f
++        # Handle field name collisions
++        if f not in names or (f in r2names and not r2postfix and f not in _key_set):
++            field_name += r1postfix
++        current = output[field_name]
++        current[:r1cmn] = selected[:r1cmn]
++        if jointype in ('outer', 'leftouter'):
++            current[cmn:cmn + r1spc] = selected[r1cmn:]
++    
++    # Populate from second array
++    for f in r2names:
++        selected = s2[f]
++        field_name = f
++        # Handle field name collisions
++        if f not in names or (f in r1names and not r1postfix and f not in _key_set):
++            field_name += r2postfix
++        current = output[field_name]
++        current[:r2cmn] = selected[:r2cmn]
++        if (jointype == 'outer') and r2spc:
++            current[-r2spc:] = selected[r2cmn:]
++
++
+ def _merge_arrays_dispatcher(seqarrays, fill_value=None, flatten=None,
+                              usemask=None, asrecarray=None):
+     return seqarrays
+diff --git a/vendored-meson/meson b/vendored-meson/meson
+index e72c717199..5d5a3d478d 160000
+--- a/vendored-meson/meson
++++ b/vendored-meson/meson
+@@ -1 +1 @@
+-Subproject commit e72c717199fa18d34020c7c97f9de3f388c5e055
++Subproject commit 5d5a3d478da115c812be77afa651db2492d52171

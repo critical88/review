@@ -1,0 +1,134 @@
+diff --git a/src/jinja2/runtime.py b/src/jinja2/runtime.py
+index be007358..313ce467 100644
+--- a/src/jinja2/runtime.py
++++ b/src/jinja2/runtime.py
+@@ -127,7 +127,7 @@ class TemplateReference:
+ 
+     def __getitem__(self, name: str) -> t.Any:
+         blocks = self.__context.blocks[name]
+-        return BlockReference(name, self.__context, blocks, 0)
++        return self.__context._create_block_reference(name, blocks, 0)
+ 
+     def __repr__(self) -> str:
+         return f"<{type(self).__name__} {self.__context.name!r}>"
+@@ -192,10 +192,23 @@ class Context:
+             index = blocks.index(current) + 1
+             blocks[index]
+         except LookupError:
+-            return self.environment.undefined(
++            return self._get_undefined(
+                 f"there is no parent block called {name!r}.", name="super"
+             )
+-        return BlockReference(name, self, blocks, index)
++        return self._create_block_reference(name, blocks, index)
++    
++    def _create_block_reference(
++        self,
++        name: str,
++        stack: t.List[t.Callable[["Context"], t.Iterator[str]]],
++        depth: int,
++    ) -> "BlockReference":
++        """Create a BlockReference for the given block stack and depth."""
++        return BlockReference(name, self, stack, depth)
++    
++    def _get_undefined(self, message: str, name: str = "super") -> "Undefined":
++        """Get an undefined value with the given message."""
++        return self.environment.undefined(message, name=name)
+ 
+     def get(self, key: str, default: t.Any = None) -> t.Any:
+         """Look up a variable by name, or return a default if the key is
+@@ -319,6 +332,44 @@ class Context:
+         context.blocks.update((k, list(v)) for k, v in self.blocks.items())
+         return context
+ 
++    @internalcode
++    def _render_block(
++        self,
++        stack: t.List[t.Callable[["Context"], t.Iterator[str]]],
++        depth: int,
++    ) -> str:
++        """Render a block from the given stack at the specified depth.
++        
++        This encapsulates the block rendering logic that was previously
++        in BlockReference.__call__.
++        """
++        rv = self.environment.concat(stack[depth](self))
++        
++        coerce_mode = self.eval_ctx.output_coerce_mode
++        processor = self.environment.get_block_output_processor(coerce_mode)
++        if processor is not None and coerce_mode == "escape":
++            return processor(rv, Markup)
++        
++        return rv
++
++    @internalcode
++    async def _async_render_block(
++        self,
++        stack: t.List[t.Callable[["Context"], t.Iterator[str]]],
++        depth: int,
++    ) -> str:
++        """Async version of _render_block."""
++        rv = self.environment.concat([
++            x async for x in stack[depth](self)
++        ])
++        
++        coerce_mode = self.eval_ctx.output_coerce_mode
++        processor = self.environment.get_block_output_processor(coerce_mode)
++        if processor is not None and coerce_mode == "escape":
++            return processor(rv, Markup)
++        
++        return rv
++
+     keys = _dict_method_all(dict.keys)
+     values = _dict_method_all(dict.values)
+     items = _dict_method_all(dict.items)
+@@ -360,43 +411,22 @@ class BlockReference:
+     def super(self) -> t.Union["BlockReference", "Undefined"]:
+         """Super the block."""
+         if self._depth + 1 >= len(self._stack):
+-            return self._context.environment.undefined(
++            return self._context._get_undefined(
+                 f"there is no parent block called {self.name!r}.", name="super"
+             )
+-        return BlockReference(self.name, self._context, self._stack, self._depth + 1)
++        return self._context._create_block_reference(
++            self.name, self._stack, self._depth + 1
++        )
+ 
+     @internalcode
+     async def _async_call(self) -> str:
+-        rv = self._context.environment.concat(  # type: ignore
+-            [x async for x in self._stack[self._depth](self._context)]  # type: ignore
+-        )
+-
+-        coerce_mode = self._context.eval_ctx.output_coerce_mode
+-        processor = self._context.environment.get_block_output_processor(
+-            coerce_mode
+-        )
+-        if processor is not None and coerce_mode == "escape":
+-            return processor(rv, Markup)
+-
+-        return rv
++        return await self._context._async_render_block(self._stack, self._depth)
+ 
+     @internalcode
+     def __call__(self) -> str:
+         if self._context.environment.is_async:
+             return self._async_call()  # type: ignore
+-
+-        rv = self._context.environment.concat(  # type: ignore
+-            self._stack[self._depth](self._context)
+-        )
+-
+-        coerce_mode = self._context.eval_ctx.output_coerce_mode
+-        processor = self._context.environment.get_block_output_processor(
+-            coerce_mode
+-        )
+-        if processor is not None and coerce_mode == "escape":
+-            return processor(rv, Markup)
+-
+-        return rv
++        return self._context._render_block(self._stack, self._depth)
+ 
+ 
+ class LoopContext:

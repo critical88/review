@@ -1,0 +1,101 @@
+diff --git a/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py b/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
+index 4a4fa319f4..58fbed5daa 100644
+--- a/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
++++ b/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py
+@@ -65,6 +65,16 @@ _LOSSES.update(
+ )
+ 
+ 
++def _compute_leaf_value(sum_gradients, sum_hessians, leaf_value, loss, y_true_slice,
++                        raw_prediction_slice, sample_weight_slice, shrinkage):
++    """Compute the updated leaf value for non-differentiable losses."""
++    update = loss.fit_intercept_only(
++        y_true=y_true_slice - raw_prediction_slice,
++        sample_weight=sample_weight_slice,
++    )
++    return shrinkage * update
++
++
+ def _update_leaves_values(loss, grower, y_true, raw_prediction, sample_weight):
+     """Update the leaf values to be predicted by the tree.
+ 
+@@ -93,16 +103,19 @@ def _update_leaves_values(loss, grower, y_true, raw_prediction, sample_weight):
+     # similar to _update_raw_predictions(), but this requires a cython version of
+     # median().
+     for leaf in grower.finalized_leaves:
++        sum_gradients = leaf.sum_gradients
++        sum_hessians = leaf.sum_hessians
++        leaf_value = leaf.value
+         indices = leaf.sample_indices
+         if sample_weight is None:
+             sw = None
+         else:
+             sw = sample_weight[indices]
+-        update = loss.fit_intercept_only(
+-            y_true=y_true[indices] - raw_prediction[indices],
+-            sample_weight=sw,
++        leaf.value = _compute_leaf_value(
++            sum_gradients, sum_hessians, leaf_value,
++            loss, y_true[indices], raw_prediction[indices], sw,
++            grower.shrinkage,
+         )
+-        leaf.value = grower.shrinkage * update
+         # Note that the regularization is ignored here
+ 
+ 
+diff --git a/sklearn/ensemble/_hist_gradient_boosting/grower.py b/sklearn/ensemble/_hist_gradient_boosting/grower.py
+index 6ebb5154bd..149766b4be 100644
+--- a/sklearn/ensemble/_hist_gradient_boosting/grower.py
++++ b/sklearn/ensemble/_hist_gradient_boosting/grower.py
+@@ -457,10 +457,14 @@ class TreeGrower:
+ 
+         self.root.histograms = histograms
+ 
+-        self._compute_best_split_and_push(self.root)
++        self._compute_best_split_and_push(
++            self.root, sum_gradients, sum_hessians, self.root.value
++        )
+         self.total_find_split_time += time() - tic
+ 
+-    def _compute_best_split_and_push(self, node):
++    def _compute_best_split_and_push(
++        self, node, sum_gradients, sum_hessians, node_value
++    ):
+         """Compute the best possible split (SplitInfo) of a given node.
+ 
+         Also push it in the heap of splittable nodes if gain isn't zero.
+@@ -472,9 +476,9 @@ class TreeGrower:
+         node.split_info = self.splitter.find_node_split(
+             n_samples=node.n_samples,
+             histograms=node.histograms,
+-            sum_gradients=node.sum_gradients,
+-            sum_hessians=node.sum_hessians,
+-            value=node.value,
++            sum_gradients=sum_gradients,
++            sum_hessians=sum_hessians,
++            value=node_value,
+             lower_bound=node.children_lower_bound,
+             upper_bound=node.children_upper_bound,
+             allowed_features=node.allowed_features,
+@@ -634,9 +638,19 @@ class TreeGrower:
+ 
+             tic = time()
+             if should_split_left:
+-                self._compute_best_split_and_push(left_child_node)
++                self._compute_best_split_and_push(
++                    left_child_node,
++                    left_child_node.sum_gradients,
++                    left_child_node.sum_hessians,
++                    left_child_node.value,
++                )
+             if should_split_right:
+-                self._compute_best_split_and_push(right_child_node)
++                self._compute_best_split_and_push(
++                    right_child_node,
++                    right_child_node.sum_gradients,
++                    right_child_node.sum_hessians,
++                    right_child_node.value,
++                )
+             self.total_find_split_time += time() - tic
+ 
+             # Release memory used by histograms as they are no longer needed
