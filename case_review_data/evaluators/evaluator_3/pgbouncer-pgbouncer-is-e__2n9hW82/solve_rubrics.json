@@ -1,0 +1,95 @@
+{
+  "schema_version": "smellbench.solve_rubrics.v3",
+  "execution_mode": "one_independent_call_per_rubric",
+  "aggregation": "macro_average_by_category",
+  "rubrics": [
+    {
+      "id": "R1",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The interface that a connection kind exposes to the shared machinery declares only operations that shared (kind-agnostic) code actually invokes at runtime — reacting to socket events, taking delivery of a packet that finished buffering, and tearing the connection down — and no longer declares capability members for protocol steps that only a specific connection kind performs (connection establishment/failure results, TLS-ready handling, SSL negotiation character, login-phase handling, work-phase handling, auth exchange, login completion, startup-packet pool selection, cancellation acceptance).",
+      "rationale": "This case's smell is a connection-operations interface that catalogs every capability any connection kind could have; the shared stream-buffer and wire-packet layers are the only consumers, so the resolution is defined by what those generic dispatch sites call, not by how completely the tables describe each kind."
+    },
+    {
+      "id": "R2",
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No registered connection kind is made to declare a capability slot it cannot perform: after the change there is no shared connection-operations initializer that leaves a member empty/NULL or fills it with a placeholder because that kind never runs that operation.",
+      "rationale": "Forcing implementors to carry 'not applicable' bookkeeping for unused capabilities is the concrete harm this task's observation describes (accepted client connections carrying outbound-connection slots, backend connections carrying frontend-only slots, cancel-forwarding connections carrying almost an entire protocol they never run)."
+    },
+    {
+      "id": "R3",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Protocol operations that exactly one connection kind performs are reached through that kind's own code path (its event/state-machine handling) rather than through the shared interface every registered kind must populate.",
+      "rationale": "The prompt asks that operations only ever called on one connection kind belong to that kind; keeping them in the shared surface would preserve the fat interface under a different name."
+    },
+    {
+      "id": "R4",
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Generic dispatch in shared code was not degraded into per-side special-casing: neither the stream buffer layer nor the wire-packet machinery reintroduces 'is this a server socket?' style branching to decide how socket events, fully buffered packets, or error-path teardown route to a connection kind.",
+      "rationale": "The repo's history motivating this change was exactly that shared code grew side checks; a repair that dissolves the connection-ops surface by restoring hardcoded side branching smuggles the old problem back in and is explicitly ruled out by both prompts."
+    },
+    {
+      "id": "R5",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "All sites that install a connection-kind description on a socket are coherent with the new design: every socket the pooler constructs (client connections, backend server connections, and connections opened to forward a cancellation to a peer) receives a description whose operations that connection kind genuinely performs, and the stream-buffer state holding the description, its initialization call, and its generic dispatch use one consistent mechanism.",
+      "rationale": "The stream buffer stores the per-socket description and initializes it where sockets are constructed, and the peer-cancellation path in connection launching was a separate registration site; shrinking the interface without updating every installation point would leave dead slots or stale types behind."
+    },
+    {
+      "id": "R6",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Headers and prototypes match the new shape: no stale callback typedef, field, parameter, or function declaration remains in the stream/packet/connection-kind headers for the members removed from the shared surface, and whatever per-kind declarations remain are referenced by production code.",
+      "rationale": "The injected surface touched the stream-buffer and wire-packet headers plus per-kind header exports; a repair that shrinks implementations but leaves obsolete type or declaration debris in headers stays inconsistent with the stated goal of removing bookkeeping."
+    },
+    {
+      "id": "R7",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No adapter or wrapper function remains whose only reason to exist was to give a removed table slot a body — e.g. trivial pass-throughs extracted from an event arm (TLS-continue, failed-connect disconnect, login-completion wrapper) or thin disconnect adapters — unless the shared machinery still dispatches through them.",
+      "rationale": "The injected revision extracted small helpers precisely so the tables had entries; if those helpers survive without a generic consumer they are exactly the scaffolding the task asks to remove."
+    },
+    {
+      "id": "R8",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "No dead declarations or registration special-cases linger: unreferenced extern table declarations, prototypes or forward declarations of helpers that no longer exist, and per-pool description swaps that select a table no longer distinct from the ordinary one are removed rather than left commented or in place.",
+      "rationale": "The cancel-forwarding connection kind got its own table plus a per-pool branch at launch time; once capabilities that kind never runs leave the interface, a leftover third table or launch-time swap with no functional difference is obsolete injected material."
+    },
+    {
+      "id": "R9",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The deferred-delivery path for oversized packets (the packet-callback buffering in the wire-packet machinery) still ends in the same per-kind packet handling as before, and its error paths still disconnect the connection with equivalent reason text.",
+      "rationale": "Restructuring which operations the interface carries directly touches how the reassembly machinery delivers completed packets and how it tears down on failure; a repair that rewires this path differently would change large-packet traffic (COPY, big parameter payloads) visible to real clients."
+    },
+    {
+      "id": "R10",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Cancellation forwarding to a peered PgBouncer is unchanged: connections opened to forward a cancellation request still send the correctly-addressed request for their pool, get torn down with the same lifecycle as before, and ordinary cancellation routing within this instance is untouched.",
+      "rationale": "The peer-cancellation connection kind is the implementor with the most specialized behavior in this instance; it is both the strongest evidence for the smell and the easiest place for a slimming refactor to silently drop the per-pool distinction its registration encoded."
+    },
+    {
+      "id": "R11",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Connection kinds that behave differently were not merged or unified in a way that changes event handling: frontend connections keep their accepted-socket event handling (no outbound-connect or SSL-negotiation-char behavior), backend connections keep their originate/login event handling (connect results, TLS-ready login step, login completion), and no kind starts executing event arms it never executed before.",
+      "rationale": "The prompt warns not to merge connection kinds that behave differently; over-shrinking (e.g. one shared handler for all sockets) would be a plausible failure mode specific to this smell and would change wire-visible behavior."
+    }
+  ]
+}

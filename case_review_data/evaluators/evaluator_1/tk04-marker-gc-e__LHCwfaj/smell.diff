@@ -1,0 +1,533 @@
+diff --git a/src/components/Project/App.tsx b/src/components/Project/App.tsx
+index 7d3eb10..d53a626 100644
+--- a/src/components/Project/App.tsx
++++ b/src/components/Project/App.tsx
+@@ -1,12 +1,3 @@
+-import {
+-  readDir,
+-  type FileEntry,
+-  writeTextFile,
+-  exists,
+-  createDir,
+-} from "@tauri-apps/api/fs";
+-
+-import { join } from "@tauri-apps/api/path";
+ import {
+   setCurrProject as storeVisitedProject,
+   getProjects,
+@@ -21,7 +12,7 @@ import { BsHouse } from "react-icons/bs";
+ import { isMacOS } from "@tiptap/core";
+ import CommandMenu from "../Settings/CommandMenu";
+ import useStore from "@/store/appStore";
+-import { FileInfo, getFileMeta } from "@/utils/getFileMeta";
++import { WorkspaceService } from "@/utils/workspace";
+ import Root from "./FileTree/Root";
+ import { Link } from "react-router-dom";
+ 
+@@ -46,38 +37,12 @@ const App: React.FC<props> = ({ project }) => {
+   }));
+ 
+   const [collapse, setCollapse] = useState(false);
+-  async function getFiles(path: string) {
+-    const entries = await readDir(path, {
+-      recursive: true,
+-    });
+-
+-    async function processEntries(entries: FileEntry[], arr: FileInfo[]) {
+-      for (const entry of entries) {
+-        if (entry.name?.startsWith(".")) {
+-          continue;
+-        }
+-        if (entry.children) {
+-          let subArr: any[] = [];
+-          processEntries(entry.children, subArr);
+-          arr.push({
+-            ...entry,
+-            children: subArr,
+-            meta: await getFileMeta(entry),
+-          });
+-        } else {
+-          if (!entry.name?.endsWith(".md")) {
+-            continue;
+-          }
+-          arr.push({ ...entry, meta: await getFileMeta(entry) });
+-        }
+-      }
+-    }
+-    const files: FileInfo[] = [];
+-    await processEntries(entries, files);
+-    setFiles(files);
++  const workspaceService = WorkspaceService.forProject(project.dir);
++  async function getFiles() {
++    setFiles(await workspaceService.scanDir());
+   }
+   async function getProject() {
+-    await getFiles(project.dir);
++    await getFiles();
+     setProjects(await getProjects());
+   }
+   useEffect(() => {
+@@ -88,16 +53,8 @@ const App: React.FC<props> = ({ project }) => {
+   }, [project]);
+ 
+   async function addFileHandler(path: string, filename: string) {
+-    if (!filename.endsWith(".md")) filename += ".md";
+-    const newfilePath = await join(path, filename);
+-    const folder = await join(newfilePath, "../");
+-    if (!(await exists(folder))) {
+-      await createDir(folder, { recursive: true });
+-    }
+-    if (newfilePath.endsWith(".md")) {
+-      await writeTextFile(newfilePath, "");
+-    }
+-    await getFiles(project!.dir);
++    await workspaceService.addFile(path, filename);
++    await getFiles();
+   }
+   if (!project) return;
+   return (
+diff --git a/src/components/Project/FileTree/File.tsx b/src/components/Project/FileTree/File.tsx
+index 6c095f5..e1e4b89 100644
+--- a/src/components/Project/FileTree/File.tsx
++++ b/src/components/Project/FileTree/File.tsx
+@@ -1,11 +1,11 @@
+ import useStore from "@/store/appStore";
+ 
+ import { showMenu } from "tauri-plugin-context-menu";
+-import { removeFile, renameFile, type FileEntry } from "@tauri-apps/api/fs";
++import { type FileEntry } from "@tauri-apps/api/fs";
+ import { confirm } from "@tauri-apps/api/dialog";
+ import { useRef, useState } from "react";
+-import { join, resolveResource } from "@tauri-apps/api/path";
+-import removePath from "@/utils/removePath";
++import { resolveResource } from "@tauri-apps/api/path";
++import { workspace } from "@/utils/workspace";
+ 
+ interface props {
+   file: FileEntry;
+@@ -27,20 +27,17 @@ const File: React.FC<props> = ({ file }) => {
+     let name = nameRef.current?.value;
+     if (!name) return;
+ 
+-    if (!name.endsWith(".md")) name += ".md";
+-    const newPath = await join(file.path, "../", name);
+-    await renameFile(file.path!, newPath);
++    const renamed = await workspace.renameEntry(file.path!, name);
+     await fetchDir();
+     setShowInput(false);
+     if (currFile?.path == file.path) {
+-      setCurrFile({ path: newPath, name, children: [] });
++      setCurrFile({ path: renamed.path, name: renamed.name, children: [] });
+     }
+   }
+   async function deleteFile() {
+     const confirmed = await confirm("Are you sure?", `Delete ${file.name}`);
+     if (!confirmed) return;
+-    await removeFile(file.path);
+-    setFiles(removePath(file.path, files));
++    setFiles(await workspace.deleteEntry(file.path!, files, "file"));
+   }
+   return (
+     <div
+diff --git a/src/components/Project/FileTree/Root.tsx b/src/components/Project/FileTree/Root.tsx
+index f2d7af7..d72d35a 100644
+--- a/src/components/Project/FileTree/Root.tsx
++++ b/src/components/Project/FileTree/Root.tsx
+@@ -18,6 +18,7 @@ import {
+ import SortItem from "./SortItem";
+ import { SortBy, SortType } from "@/utils/types";
+ import useStore from "@/store/appStore";
++import { workspace } from "@/utils/workspace";
+ 
+ interface props {
+   file: FileInfo;
+@@ -35,45 +36,9 @@ const Root: React.FC<props> = ({ file, addFile }) => {
+   function createHandler() {
+     setCreate((p) => !p);
+   }
+-  function compare(res: boolean) {
+-    if (sortType == SortType.Asc) {
+-      return res ? -1 : 1;
+-    }
+-    return res ? 1 : -1;
+-  }
+-  function sortFn(a: FileInfo, b: FileInfo) {
+-    let res = 0;
+-    switch (sortBy) {
+-      case SortBy.Name: {
+-        if (!a.name || !b.name) break;
+-        res = compare(a.name < b.name);
+-        break;
+-      }
+-      case SortBy.UpdatedAt: {
+-        if (!a.meta?.updated_at || !b.meta?.updated_at) break;
+-        res = compare(
+-          a.meta.updated_at.secs_since_epoch >
+-          b.meta.updated_at.secs_since_epoch,
+-        );
+-        break;
+-      }
+-
+-      case SortBy.CreatedAt: {
+-        if (!a.meta?.created_at || !b.meta?.created_at) break;
+-        res = compare(
+-          a.meta.created_at.secs_since_epoch >
+-          b.meta.created_at.secs_since_epoch,
+-        );
+-        break;
+-      }
+-    }
+-    a.children?.sort(sortFn);
+-    b.children?.sort(sortFn);
+-    return res;
+-  }
+   useEffect(() => {
+     if (!file.children) return;
+-    file.children?.sort(sortFn);
++    workspace.sortTree(file.children, { sortBy, sortType });
+     setSortedFiles([...file.children]);
+   }, [sortBy, sortType, file.children]);
+   return (
+diff --git a/src/components/Project/FileTree/Tree.tsx b/src/components/Project/FileTree/Tree.tsx
+index 9c979ca..7ebcdbf 100644
+--- a/src/components/Project/FileTree/Tree.tsx
++++ b/src/components/Project/FileTree/Tree.tsx
+@@ -1,14 +1,13 @@
+ import useStore from "@/store/appStore";
+ import { useState, useRef } from "react";
+-import { removeDir } from "@tauri-apps/api/fs";
+ import { confirm } from "@tauri-apps/api/dialog";
+ import { showMenu } from "tauri-plugin-context-menu";
+ import File from "./File";
+ import { IoIosArrowForward } from "react-icons/io";
+ import CreateFile from "../createFile";
+ import { FileInfo } from "@/utils/getFileMeta";
+-import removePath from "@/utils/removePath";
+ import { resolveResource } from "@tauri-apps/api/path";
++import { workspace } from "@/utils/workspace";
+ 
+ interface props {
+   file: FileInfo;
+@@ -30,8 +29,7 @@ const Tree: React.FC<props> = ({ file, addFile }) => {
+   async function deleteFile() {
+     const confirmed = await confirm("Are you sure?", `Delete ${file.name}`);
+     if (!confirmed) return;
+-    await removeDir(file.path, { recursive: true });
+-    setFiles(removePath(file.path, files));
++    setFiles(await workspace.deleteEntry(file.path, files, "dir"));
+   }
+   return (
+     <div>
+diff --git a/src/store/appStore.ts b/src/store/appStore.ts
+index 28c7ef8..dc6818f 100644
+--- a/src/store/appStore.ts
++++ b/src/store/appStore.ts
+@@ -1,7 +1,7 @@
+ import { setCurrProject, setSortInfo } from "@/utils/appStore";
+-import { FileInfo, getFileMeta } from "@/utils/getFileMeta";
++import type { FileInfo } from "@/utils/workspace";
++import { workspace } from "@/utils/workspace";
+ import { Dir, Projects, Settings, SortInfo } from "@/utils/types";
+-import { FileEntry, readDir } from "@tauri-apps/api/fs";
+ import { create } from "zustand";
+ interface AppState {
+   currProject?: Dir;
+@@ -46,33 +46,7 @@ const useStore = create<AppState>()((set, get) => ({
+   fetchDir: async () => {
+     const currProject = get().currProject?.dir;
+     if (!currProject) return;
+-    const entries = await readDir(currProject, {
+-      recursive: true,
+-    });
+-
+-    async function processEntries(entries: FileEntry[], arr: FileInfo[]) {
+-      for (const entry of entries) {
+-        if (entry.name?.startsWith(".")) {
+-          continue;
+-        }
+-        if (entry.children) {
+-          let subArr: any[] = [];
+-          processEntries(entry.children, subArr);
+-          arr.push({
+-            ...entry,
+-            children: subArr,
+-            meta: await getFileMeta(entry),
+-          });
+-        } else {
+-          if (!entry.name?.endsWith(".md")) {
+-            continue;
+-          }
+-          arr.push({ ...entry, meta: await getFileMeta(entry) });
+-        }
+-      }
+-    }
+-    const files: FileInfo[] = [];
+-    await processEntries(entries, files);
++    const files = await workspace.scanDir(currProject);
+     set(() => ({ files }));
+   },
+   setSettings: (settings) => {
+diff --git a/src/utils/getFileMeta.ts b/src/utils/getFileMeta.ts
+index de36431..7439365 100644
+--- a/src/utils/getFileMeta.ts
++++ b/src/utils/getFileMeta.ts
+@@ -1,21 +1,13 @@
+-import { FileEntry } from "@tauri-apps/api/fs";
+-import { invoke } from "@tauri-apps/api/tauri";
++import type { FileEntry } from "@tauri-apps/api/fs";
++import { workspace } from "./workspace";
++import type { FileInfo } from "./workspace";
+ 
+-interface SystemTime {
+-  secs_since_epoch: number;
+-}
+-interface FileMeta {
+-  updated_at?: SystemTime;
+-  created_at?: SystemTime;
+-}
+-
+-interface FileInfo extends FileEntry {
+-  meta?: FileMeta;
+-}
++/**
++ * Compatibility wrapper: entry metadata is owned by the workspace
++ * service now, this module only forwards to it.
++ */
+ async function getFileMeta(file: FileEntry) {
+-  return (await invoke("get_file_metadata", {
+-    filepath: file.path,
+-  })) as FileMeta;
++  return workspace.getEntryMeta(file);
+ }
+ 
+ export { getFileMeta, type FileInfo };
+diff --git a/src/utils/removePath.ts b/src/utils/removePath.ts
+index 51fb3d0..a8b239c 100644
+--- a/src/utils/removePath.ts
++++ b/src/utils/removePath.ts
+@@ -1,13 +1,12 @@
+-import { FileInfo } from "./getFileMeta";
++import { workspace } from "./workspace";
++import type { FileInfo } from "./workspace";
+ 
++/**
++ * Compatibility wrapper: tree pruning is owned by the workspace
++ * service now, this module only forwards to it.
++ */
+ function removePath(path: string, files: FileInfo[]) {
+-  return files.filter((f) => {
+-    if (f.path == path) return false;
+-    if (f.children) {
+-      f.children = removePath(path, f.children);
+-    }
+-    return true;
+-  });
++  return workspace.removePath(path, files);
+ }
+ 
+ export default removePath;
+diff --git a/src/utils/workspace.ts b/src/utils/workspace.ts
+new file mode 100644
+index 0000000..674115e
+--- /dev/null
++++ b/src/utils/workspace.ts
+@@ -0,0 +1,199 @@
++import {
++  createDir,
++  exists,
++  readDir,
++  removeDir,
++  removeFile,
++  renameFile,
++  writeTextFile,
++  type FileEntry,
++} from "@tauri-apps/api/fs";
++import { invoke } from "@tauri-apps/api/tauri";
++import { join } from "@tauri-apps/api/path";
++
++import { SortBy, SortType, type SortInfo } from "@/utils/types";
++
++interface SystemTime {
++  secs_since_epoch: number;
++}
++interface FileMeta {
++  updated_at?: SystemTime;
++  created_at?: SystemTime;
++}
++interface FileInfo extends FileEntry {
++  meta?: FileMeta;
++}
++
++/**
++ * Central coordinator for the project workspace.
++ *
++ * Every operation the file tree needs - directory scans, entry metadata,
++ * sort ordering, tree pruning and the create/rename/delete lifecycle -
++ * routes through this service so components stop owning file logic.
++ * Use `WorkspaceService.shared()` for the process-wide instance or
++ * `WorkspaceService.forProject(dir)` for an instance bound to one
++ * project directory.
++ */
++class WorkspaceService {
++  private static sharedInstance: WorkspaceService | null = null;
++
++  private activeSort: SortInfo = {};
++
++  constructor(readonly projectDir: string = "") {}
++
++  static shared(): WorkspaceService {
++    if (!WorkspaceService.sharedInstance) {
++      WorkspaceService.sharedInstance = new WorkspaceService();
++    }
++    return WorkspaceService.sharedInstance;
++  }
++
++  static forProject(projectDir: string): WorkspaceService {
++    return new WorkspaceService(projectDir);
++  }
++
++  async getEntryMeta(entry: FileEntry): Promise<FileMeta> {
++    return (await invoke("get_file_metadata", {
++      filepath: entry.path,
++    })) as FileMeta;
++  }
++
++  async scanDir(dir?: string): Promise<FileInfo[]> {
++    const targetDir = dir ?? this.projectDir;
++    const entries = await readDir(targetDir, {
++      recursive: true,
++    });
++    const files: FileInfo[] = [];
++    await this.processEntries(entries, files);
++    return files;
++  }
++
++  /**
++   * Walks the scanned directory tree, drops hidden and non-markdown
++   * entries and attaches filesystem metadata to everything it keeps.
++   */
++  private async processEntries(entries: FileEntry[], arr: FileInfo[]) {
++    for (const entry of entries) {
++      if (entry.name?.startsWith(".")) {
++        continue;
++      }
++      if (entry.children) {
++        let subArr: any[] = [];
++        this.processEntries(entry.children, subArr);
++        arr.push({
++          ...entry,
++          children: subArr,
++          meta: await this.getEntryMeta(entry),
++        });
++      } else {
++        if (!entry.name?.endsWith(".md")) {
++          continue;
++        }
++        arr.push({ ...entry, meta: await this.getEntryMeta(entry) });
++      }
++    }
++  }
++
++  private compare(res: boolean) {
++    if (this.activeSort.sortType == SortType.Asc) {
++      return res ? -1 : 1;
++    }
++    return res ? 1 : -1;
++  }
++
++  private sortFn = (a: FileInfo, b: FileInfo) => {
++    let res = 0;
++    switch (this.activeSort.sortBy) {
++      case SortBy.Name: {
++        if (!a.name || !b.name) break;
++        res = this.compare(a.name < b.name);
++        break;
++      }
++      case SortBy.UpdatedAt: {
++        if (!a.meta?.updated_at || !b.meta?.updated_at) break;
++        res = this.compare(
++          a.meta.updated_at.secs_since_epoch >
++            b.meta.updated_at.secs_since_epoch,
++        );
++        break;
++      }
++
++      case SortBy.CreatedAt: {
++        if (!a.meta?.created_at || !b.meta?.created_at) break;
++        res = this.compare(
++          a.meta.created_at.secs_since_epoch >
++            b.meta.created_at.secs_since_epoch,
++        );
++        break;
++      }
++    }
++    a.children?.sort(this.sortFn);
++    b.children?.sort(this.sortFn);
++    return res;
++  };
++
++  /**
++   * Sorts the given tree section (in place, including nested children)
++   * with the sort options the file tree currently shows.
++   */
++  sortTree(files: FileInfo[], sortInfo: SortInfo): FileInfo[] {
++    this.activeSort = sortInfo;
++    files.sort(this.sortFn);
++    return files;
++  }
++
++  removePath(path: string, files: FileInfo[]) {
++    return files.filter((f) => {
++      if (f.path == path) return false;
++      if (f.children) {
++        f.children = this.removePath(path, f.children);
++      }
++      return true;
++    });
++  }
++
++  async addFile(path: string, filename: string) {
++    if (!filename.endsWith(".md")) filename += ".md";
++    const newfilePath = await join(path, filename);
++    const folder = await join(newfilePath, "../");
++    if (!(await exists(folder))) {
++      await createDir(folder, { recursive: true });
++    }
++    if (newfilePath.endsWith(".md")) {
++      await writeTextFile(newfilePath, "");
++    }
++    return newfilePath;
++  }
++
++  async renameEntry(
++    oldPath: string,
++    name: string,
++  ): Promise<{ path: string; name: string }> {
++    if (!name.endsWith(".md")) name += ".md";
++    const newPath = await join(oldPath, "../", name);
++    await renameFile(oldPath, newPath);
++    return { path: newPath, name };
++  }
++
++  /**
++   * Removes a file or folder from disk and returns the updated tree so
++   * callers can drop the entry from their view in one step.
++   */
++  async deleteEntry(
++    path: string,
++    files: FileInfo[],
++    kind: "file" | "dir",
++  ): Promise<FileInfo[]> {
++    if (kind == "dir") {
++      await removeDir(path, { recursive: true });
++    } else {
++      await removeFile(path);
++    }
++    return this.removePath(path, files);
++  }
++}
++
++const workspace = WorkspaceService.shared();
++
++export { WorkspaceService, workspace };
++export type { FileInfo, FileMeta, SystemTime };

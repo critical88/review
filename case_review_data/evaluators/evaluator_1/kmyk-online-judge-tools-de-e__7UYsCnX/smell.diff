@@ -1,0 +1,327 @@
+diff --git a/onlinejudge_command/compat.py b/onlinejudge_command/compat.py
+new file mode 100644
+index 0000000..7e01e41
+--- /dev/null
++++ b/onlinejudge_command/compat.py
+@@ -0,0 +1,36 @@
++"""This module keeps the compatibility switches for the old (pre-12) pipeline.
++
++The 12.0 release replaced several parts of the implementation at once: the rendering of the results of tests, the modes to compare outputs, the rules to parse format strings, the names of subcommands, and the format of the download history. To make the migration gradual, the old implementation was kept available for the users who still needed it, and the switches below were used to select it.
++
++The grace period ended in 12.0. The old pipeline is now retired: LEGACY_COMPATIBILITY_LEVEL is no longer configurable and is always 0. The switches and the old paths behind them are kept in this state, since it was planned to remove them gradually.
++"""
++
++# 0: the old pipeline is fully retired (current)
++# 1: use the old modes to compare outputs and the old rules to parse format strings
++# 2: additionally use the old rendering of the results, the old subcommand names, and the old format of the download history
++LEGACY_COMPATIBILITY_LEVEL = 0
++
++
++def use_legacy_rendering() -> bool:
++    """Return whether the old (pre-12) pipeline should be used to render the results."""
++    return LEGACY_COMPATIBILITY_LEVEL >= 2
++
++
++def use_legacy_comparator() -> bool:
++    """Return whether the old (pre-12) modes should be used to compare outputs."""
++    return LEGACY_COMPATIBILITY_LEVEL >= 1
++
++
++def use_legacy_format() -> bool:
++    """Return whether the old (pre-12) rules should be used to parse format strings."""
++    return LEGACY_COMPATIBILITY_LEVEL >= 1
++
++
++def use_legacy_command_names() -> bool:
++    """Return whether the old (pre-12) names of subcommands should be accepted."""
++    return LEGACY_COMPATIBILITY_LEVEL >= 2
++
++
++def use_legacy_history() -> bool:
++    """Return whether the old (pre-12) format of the download history should be imported."""
++    return LEGACY_COMPATIBILITY_LEVEL >= 1
+diff --git a/onlinejudge_command/download_history.py b/onlinejudge_command/download_history.py
+index 8be5372..b1f4cab 100644
+--- a/onlinejudge_command/download_history.py
++++ b/onlinejudge_command/download_history.py
+@@ -6,7 +6,7 @@ from logging import getLogger
+ from typing import *
+ 
+ from onlinejudge.type import Problem
+-from onlinejudge_command import utils
++from onlinejudge_command import compat, utils
+ 
+ logger = getLogger(__name__)
+ 
+@@ -47,6 +47,9 @@ class DownloadHistory:
+ 
+     def get(self, *, directory: pathlib.Path) -> List[str]:
+         if not self.path.exists():
++            if compat.use_legacy_history():
++                # until 11.x, the history was recorded in a single JSON file; import it if the old format is still used
++                return self._load_legacy_v0(directory=directory)
+             return []
+ 
+         logger.info('read history from: %s', self.path)
+@@ -63,3 +66,20 @@ class DownloadHistory:
+                     found.add(data['url'])
+         logger.info('found urls in history:\n%s', '\n'.join(found))
+         return list(found)
++
++    def _load_legacy_v0(self, *, directory: pathlib.Path) -> List[str]:
++        """Import the history recorded in the old (pre-12) format.
++
++        Until 11.x, the history was recorded in a single JSON file named downloads.json, which lists the pairs of directories and URLs, and not in the current JSONL file. This method reads it for the given directory.
++        """
++        v0_path = self.path.parent / 'downloads.json'
++        if not v0_path.exists():
++            return []
++        logger.info('read history in the old format from: %s', str(v0_path))
++        found: Set[str] = set()
++        with open(v0_path) as fh:
++            records = json.load(fh)
++        for record in records:
++            if pathlib.Path(record['directory']) == directory:
++                found.add(record['url'])
++        return list(found)
+diff --git a/onlinejudge_command/format_utils.py b/onlinejudge_command/format_utils.py
+index 9422977..03605f3 100644
+--- a/onlinejudge_command/format_utils.py
++++ b/onlinejudge_command/format_utils.py
+@@ -7,6 +7,8 @@ import sys
+ from logging import getLogger
+ from typing import Dict, Generator, List, Match, Optional, Set
+ 
++from onlinejudge_command import compat
++
+ logger = getLogger(__name__)
+ 
+ 
+@@ -15,7 +17,28 @@ def percentsplit(s: str) -> Generator[str, None, None]:
+         yield m.group(0)
+ 
+ 
++def _legacy_percentformat(s: str, table: Dict[str, str]) -> str:
++    """Format a format string under the old (pre-12) rules of the format strings.
++
++    Under the old rules, the specifiers of `oj download` such as `%n` (the name of the case) and `%d` (the directory listing the case) were also accepted by the subcommands for tests, so that a single format string could be shared among the subcommands. This was removed in 12.0 because it made the relationship of test cases ambiguous.
++    """
++    merged = dict(table)
++    if 's' in merged:
++        merged.setdefault('n', merged['s'])  # %n was the old alias of %s
++    merged.setdefault('d', str(pathlib.Path.cwd()))  # %d was the directory listing the test cases
++    result = ''
++    for token in percentsplit(s):
++        if token.startswith('%'):
++            result += merged[token[1]]
++        else:
++            result += token
++    return result
++
++
+ def percentformat(s: str, table: Dict[str, str]) -> str:
++    if compat.use_legacy_format():
++        # until 11.x, the specifiers of the download subcommand were also accepted here
++        return _legacy_percentformat(s, table)
+     assert '%' not in table or table['%'] == '%'
+     table['%'] = '%'
+     result = ''
+@@ -28,6 +51,11 @@ def percentformat(s: str, table: Dict[str, str]) -> str:
+ 
+ 
+ def percentparse(s: str, format: str, table: Dict[str, str]) -> Optional[Dict[str, str]]:
++    if compat.use_legacy_format():
++        # until 11.x, %n was the alias of %s even when parsing
++        table = dict(table)
++        if 's' in table and 'n' not in table:
++            table['n'] = table['s']
+     table = {key: '(?P<{}>{})'.format(key, value) for key, value in table.items()}
+     used: Set[str] = set()
+     pattern = ''
+diff --git a/onlinejudge_command/main.py b/onlinejudge_command/main.py
+index 66351be..033562c 100644
+--- a/onlinejudge_command/main.py
++++ b/onlinejudge_command/main.py
+@@ -1,4 +1,5 @@
+ import argparse
++import json
+ import pathlib
+ import sys
+ import traceback
+@@ -15,7 +16,7 @@ import onlinejudge_command.subcommand.login as subcommand_login
+ import onlinejudge_command.subcommand.submit as subcommand_submit
+ import onlinejudge_command.subcommand.test as subcommand_test
+ import onlinejudge_command.subcommand.test_reactive as subcommand_test_reactive
+-from onlinejudge_command import log_formatter, update_checking, utils
++from onlinejudge_command import compat, log_formatter, update_checking, utils
+ 
+ logger = getLogger(__name__)
+ 
+@@ -74,12 +75,35 @@ def run_program(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
+         subcommand_generate_output.run(args)
+     elif args.subcommand in ['generate-input', 'g/i']:
+         subcommand_generate_input.run(args)
++    elif compat.use_legacy_command_names() and args.subcommand in ['results', 'results-all']:
++        # the results subcommand was removed in 12.0; this printout is kept for the users of the old versions
++        if not run_legacy_results_command(args):
++            return 1
+     else:
+         parser.print_help(file=sys.stderr)
+         return 1
+     return 0
+ 
+ 
++def run_legacy_results_command(args: argparse.Namespace) -> bool:
++    """Print the results recorded by `oj test --log-file`, in the old (pre-12) format.
++
++    This printout was the body of the old `results` subcommand, which was removed in 12.0 in favor of just reading the JSON file.
++    """
++    if args.log_file is None:
++        logger.error('the results subcommand requires the log file of the test subcommand')
++        return False
++    with args.log_file.open() as fh:
++        history = json.load(fh)
++    ac_count = 0
++    for result in history:
++        logger.info('%s: %s', result['testcase']['name'], result['status'])
++        if result['status'] == 'AC':
++            ac_count += 1
++    logger.info('%d AC / %d cases', ac_count, len(history))
++    return ac_count == len(history)
++
++
+ def main(args: Optional[List[str]] = None) -> 'NoReturn':
+     parser = get_parser()
+     parsed = parser.parse_args(args=args)
+diff --git a/onlinejudge_command/output_comparators.py b/onlinejudge_command/output_comparators.py
+index fc51f6a..f92ddfe 100644
+--- a/onlinejudge_command/output_comparators.py
++++ b/onlinejudge_command/output_comparators.py
+@@ -4,6 +4,7 @@
+ import abc
+ import enum
+ import math
++import unicodedata
+ from logging import getLogger
+ from typing import *
+ 
+@@ -88,6 +89,21 @@ class CRLFInsensitiveComparator(OutputComparator):
+         return self.file_comparator(actual.replace(b'\r\n', b'\n'), expected.replace(b'\r\n', b'\n'))
+ 
+ 
++class LegacyNormalizingComparator(OutputComparator):
++    """LegacyNormalizingComparator compares outputs after normalizing the Unicode normalization forms.
++
++    This comparator was used for the services like yukicoder whose expected outputs are sometimes written in different Unicode normalization forms. It was removed in 12.0 since the judgment for such cases is now delegated to the remote judge servers.
++    """
++
++    def __init__(self, file_comparator: OutputComparator):
++        self.file_comparator = file_comparator
++
++    def __call__(self, actual: bytes, expected: bytes) -> bool:
++        normalized_actual = unicodedata.normalize('NFKC', actual.decode(errors='replace'))
++        normalized_expected = unicodedata.normalize('NFKC', expected.decode(errors='replace'))
++        return self.file_comparator(normalized_actual.encode(), normalized_expected.encode())
++
++
+ class CompareMode(enum.Enum):
+     EXACT_MATCH = 'exact-match'
+     CRLF_INSENSITIVE_EXACT_MATCH = 'crlf-insensitive-exact-match'
+@@ -105,6 +121,9 @@ def check_lines_match(a: str, b: str, *, compare_mode: CompareMode) -> bool:
+         comparator = SplitComparator(ExactComparator())
+     elif compare_mode == CompareMode.IGNORE_SPACES_AND_NEWLINES:
+         raise RuntimeError('CompareMode.IGNORE_SPACES_AND_NEWLINES is not allowed for this function')
++    elif compare_mode == CompareMode.LEGACY_NORM_MATCH:
++        # LEGACY_NORM_MATCH was the mode of the old (pre-12) pipeline; it was removed in 12.0
++        comparator = LegacyNormalizingComparator(ExactComparator())
+     else:
+         assert False
+     return comparator(a.encode(), b.encode())
+diff --git a/onlinejudge_command/pretty_printers.py b/onlinejudge_command/pretty_printers.py
+index 3c89c26..5ee378b 100644
+--- a/onlinejudge_command/pretty_printers.py
++++ b/onlinejudge_command/pretty_printers.py
+@@ -6,6 +6,7 @@ from typing import *
+ 
+ import colorama
+ 
++from onlinejudge_command import compat
+ from onlinejudge_command.output_comparators import CompareMode, check_lines_match
+ 
+ logger = getLogger(__name__)
+@@ -657,7 +658,35 @@ def _tokenize_pretty_diff(output: str, *, expected: str, compare_mode: CompareMo
+     return tokens
+ 
+ 
++def _render_tokens_legacy(tokens: List[_PrettyToken]) -> str:
++    """Render the tokens without colors, as the old (pre-12) pipeline did.
++
++    The old pipeline had no hints and no colors; it just made the whitespaces visible.
++    """
++    result = []
++    for _, value in tokens:
++        result.append(_replace_whitespace(value))
++    return ''.join(result)
++
++
++def make_pretty_diff_legacy(output_bytes: bytes, *, expected: str, compare_mode: CompareMode, limit: int) -> str:
++    """Render a diff of the outputs in the plain format of the old (pre-12) pipeline.
++
++    The old pipeline tokenized the outputs and rendered the tokens without colors, and then applied difflib.unified_diff to the rendered texts.
++    """
++    assert compare_mode != CompareMode.IGNORE_SPACES_AND_NEWLINES
++    rendered = _render_tokens_legacy(_tokenize_file_content_without_snipping(output_bytes))
++    expected_rendered = _render_tokens_legacy(_tokenize_file_content_without_snipping(expected.encode()))
++    lines = list(difflib.unified_diff(rendered.splitlines(), expected_rendered.splitlines(), fromfile='output', tofile='expected', lineterm=''))
++    if limit != -1:
++        lines = lines[:limit]
++    return '\n'.join(lines)
++
++
+ def make_pretty_diff(output_bytes: bytes, *, expected: str, compare_mode: CompareMode, limit: int) -> str:
++    if compat.use_legacy_rendering():
++        # this is the rendering of the results used until 11.x
++        return make_pretty_diff_legacy(output_bytes, expected=expected, compare_mode=compare_mode, limit=limit)
+     tokens, output = _decode_with_recovery(output_bytes)
+     char_in_line = _get_terminal_size()
+     tokens += _tokenize_pretty_diff(output, expected=expected, compare_mode=compare_mode, char_in_line=char_in_line, limit=limit)
+diff --git a/onlinejudge_command/subcommand/test.py b/onlinejudge_command/subcommand/test.py
+index 465b5ab..69a3926 100644
+--- a/onlinejudge_command/subcommand/test.py
++++ b/onlinejudge_command/subcommand/test.py
+@@ -14,7 +14,7 @@ from logging import getLogger
+ from typing import *
+ 
+ import onlinejudge_command.format_utils as fmtutils
+-from onlinejudge_command import output_comparators, pretty_printers, utils
++from onlinejudge_command import compat, output_comparators, pretty_printers, utils
+ from onlinejudge_command.output_comparators import CompareMode
+ 
+ logger = getLogger(__name__)
+@@ -115,9 +115,12 @@ def build_match_function(*, compare_mode: CompareMode, error: Optional[float], j
+         return run_judge_command
+ 
+     is_exact = False
+-    if compare_mode == CompareMode.EXACT_MATCH and error is None:
++    if compat.use_legacy_comparator() and compare_mode == CompareMode.LEGACY_NORM_MATCH:
++        # LEGACY_NORM_MATCH was the mode of the old (pre-12) pipeline; it was removed in 12.0
++        file_comparator: output_comparators.OutputComparator = output_comparators.LegacyNormalizingComparator(output_comparators.ExactComparator())
++    elif compare_mode == CompareMode.EXACT_MATCH and error is None:
+         is_exact = True
+-        file_comparator: output_comparators.OutputComparator = output_comparators.ExactComparator()
++        file_comparator = output_comparators.ExactComparator()
+     elif compare_mode == CompareMode.CRLF_INSENSITIVE_EXACT_MATCH and error is None:
+         is_exact = True
+         file_comparator = output_comparators.CRLFInsensitiveComparator(output_comparators.ExactComparator())
+@@ -217,7 +220,10 @@ def display_result(proc: subprocess.Popen, answer: str, memory: Optional[float],
+                     expected = outf.read().decode()
+             else:
+                 expected = ''
+-            if display_mode == DisplayMode.SUMMARY:
++            if compat.use_legacy_rendering():
++                # in the old pipeline, the outputs were printed as a plain diff, separately for each case
++                logger.info(utils.NO_HEADER + pretty_printers.make_pretty_diff_legacy(answer.encode(), expected=expected, compare_mode=compare_mode, limit=40))
++            elif display_mode == DisplayMode.SUMMARY:
+                 logger.info(utils.NO_HEADER + 'output:\n%s', pretty_printers.make_pretty_large_file_content(answer.encode(), limit=40, head=20, tail=10))
+                 logger.info(utils.NO_HEADER + 'expected:\n%s', pretty_printers.make_pretty_large_file_content(expected.encode(), limit=40, head=20, tail=10))
+             elif display_mode == DisplayMode.ALL:

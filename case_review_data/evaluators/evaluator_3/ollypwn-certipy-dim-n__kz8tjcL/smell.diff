@@ -1,0 +1,3565 @@
+diff --git a/certipy/commands/cert.py b/certipy/commands/cert.py
+index 885527e..599c840 100755
+--- a/certipy/commands/cert.py
++++ b/certipy/commands/cert.py
+@@ -14,7 +14,15 @@ import sys
+ from typing import Optional, Union
+ 
+ from cryptography import x509
++from cryptography.hazmat.primitives import hashes
++from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
+ from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
++from cryptography.hazmat.primitives.serialization import (
++    Encoding,
++    NoEncryption,
++    PrivateFormat,
++    pkcs12,
++)
+ 
+ from certipy.lib.certificate import (
+     cert_to_pem,
+@@ -160,6 +168,9 @@ def entry(options: argparse.Namespace) -> None:
+     Entry point for the 'cert' command.
+ 
+     Processes certificates and private keys according to specified options.
++    Reading, parsing, conversion, and writing are performed directly on the
++    option values so the flow for a single input/output pair can be followed
++    without leaving this function.
+ 
+     Args:
+         options: Command-line arguments
+@@ -194,8 +205,34 @@ def entry(options: argparse.Namespace) -> None:
+     # Process certificate input if provided
+     if options.cert:
+         try:
+-            cert_data = load_certificate_file(options.cert)
+-            cert = parse_certificate(cert_data)
++            # Read the raw certificate bytes
++            file_path = options.cert
++            logging.debug(f"Loading certificate from {file_path!r}")
++            try:
++                with open(file_path, "rb") as f:
++                    cert_data = f.read()
++            except FileNotFoundError:
++                logging.error(f"Certificate file not found: {file_path!r}")
++                raise
++            except IOError as e:
++                logging.error(f"Error reading certificate file: {e}")
++                raise
++            except Exception as e:
++                logging.error(f"Unexpected error reading certificate file: {e}")
++                raise
++
++            # Transparently handle PEM and DER inputs
++            try:
++                cert = pem_to_cert(cert_data)
++            except Exception:
++                # Fall back to DER format
++                try:
++                    cert = der_to_cert(cert_data)
++                except Exception as e:
++                    logging.error(f"Failed to parse certificate: {e}")
++                    raise ValueError(
++                        "Certificate is not in a valid PEM or DER format"
++                    )
+         except Exception as e:
+             logging.error(f"Failed to process certificate: {e}")
+             handle_error()
+@@ -204,8 +241,32 @@ def entry(options: argparse.Namespace) -> None:
+     # Process private key input if provided
+     if options.key:
+         try:
+-            key_data = load_key_file(options.key)
+-            key = parse_key(key_data)
++            file_path = options.key
++            logging.debug(f"Loading private key from {file_path!r}")
++            try:
++                with open(file_path, "rb") as f:
++                    key_data = f.read()
++            except FileNotFoundError:
++                logging.error(f"Private key file not found: {file_path!r}")
++                raise
++            except IOError as e:
++                logging.error(f"Error reading private key file: {e}")
++                raise
++            except Exception as e:
++                logging.error(f"Unexpected error reading private key file: {e}")
++                raise
++
++            try:
++                key = pem_to_key(key_data)
++            except Exception:
++                # Fall back to DER format
++                try:
++                    key = der_to_key(key_data)
++                except Exception as e:
++                    logging.error(f"Failed to parse private key: {e}")
++                    raise ValueError(
++                        "Private key is not in a valid PEM or DER format"
++                    )
+         except Exception as e:
+             logging.error(f"Failed to process private key: {e}")
+             handle_error()
+@@ -220,8 +281,72 @@ def entry(options: argparse.Namespace) -> None:
+             return
+ 
+         try:
+-            pfx = create_pfx(key, cert, options.export_password)
+-            write_output(pfx, options.out)
++            # Validate the key type before handing it to the serializer
++            if not (
++                isinstance(key, rsa.RSAPrivateKey)
++                or isinstance(key, dsa.DSAPrivateKey)
++                or isinstance(key, ec.EllipticCurvePrivateKey)
++                or isinstance(key, ed25519.Ed25519PrivateKey)
++                or isinstance(key, ed448.Ed448PrivateKey)
++            ):
++                logging.error(
++                    "Private key must be an instance of RSAPrivateKey, DSAPrivateKey, "
++                    f"EllipticCurvePrivateKey, Ed25519PrivateKey or Ed448PrivateKey. Received {type(key)}"
++                )
++                logging.error("Dumping private key to PEM format")
++                logging.error(
++                    key.private_bytes(
++                        Encoding.PEM, PrivateFormat.PKCS8, encryption_algorithm=NoEncryption()
++                    )
++                )
++                logging.error("Dumping certificate to PEM format")
++                logging.error(cert.public_bytes(Encoding.PEM))
++                raise TypeError(
++                    "Private key must be an instance of RSAPrivateKey, DSAPrivateKey, "
++                    "EllipticCurvePrivateKey, Ed25519PrivateKey or Ed448PrivateKey"
++                )
++
++            # Unprotected container unless the caller asked for a password
++            password = options.export_password
++            encryption = NoEncryption()
++            if password is not None:
++                encryption = (
++                    PrivateFormat.PKCS12.encryption_builder()
++                    .kdf_rounds(50000)
++                    .key_cert_algorithm(pkcs12.PBES.PBESv1SHA1And3KeyTripleDESCBC)
++                    .hmac_hash(hashes.SHA1())
++                    .build(bytes(password, "utf-8"))
++                )
++
++            pfx = pkcs12.serialize_key_and_certificates(
++                name=b"",
++                key=key,
++                cert=cert,
++                cas=None,
++                encryption_algorithm=encryption,
++            )
++
++            # Write the container to the requested destination
++            data = pfx
++            output_path = options.out
++            if output_path:
++                # Determine if we need binary mode
++                mode = "wb" if isinstance(data, bytes) else "w"
++                try:
++                    with open(output_path, mode) as f:
++                        _ = f.write(data)
++                    logging.info(f"Data written to {output_path!r}")
++                except IOError as e:
++                    logging.error(f"Error writing output file: {e}")
++                    raise
++                except Exception as e:
++                    logging.error(f"Unexpected error writing output file: {e}")
++                    raise
++            else:
++                if isinstance(data, bytes):
++                    _ = sys.stdout.buffer.write(data)
++                else:
++                    print(data)
+         except Exception as e:
+             logging.error(f"Failed to create PFX: {e}")
+             handle_error()
+@@ -253,7 +378,26 @@ def entry(options: argparse.Namespace) -> None:
+         log_str = " and ".join(output_types)
+ 
+         try:
+-            write_output(output, options.out)
++            data = output
++            output_path = options.out
++            if output_path:
++                # Determine if we need binary mode
++                mode = "wb" if isinstance(data, bytes) else "w"
++                try:
++                    with open(output_path, mode) as f:
++                        _ = f.write(data)
++                    logging.info(f"Data written to {output_path!r}")
++                except IOError as e:
++                    logging.error(f"Error writing output file: {e}")
++                    raise
++                except Exception as e:
++                    logging.error(f"Unexpected error writing output file: {e}")
++                    raise
++            else:
++                if isinstance(data, bytes):
++                    _ = sys.stdout.buffer.write(data)
++                else:
++                    print(data)
+             if options.out:
+                 logging.info(f"Writing {log_str} to {options.out!r}")
+         except Exception as e:
+diff --git a/certipy/commands/find.py b/certipy/commands/find.py
+index 2a58a9c..92cb940 100644
+--- a/certipy/commands/find.py
++++ b/certipy/commands/find.py
+@@ -800,23 +800,141 @@ class Find:
+         """
+         Process certificate template properties.
+ 
++        Every attribute that the report writer consumes is derived here in one
++        pass so the raw LDAP values are normalized as close to the source of the
++        enumeration as possible.
++
+         Args:
+             templates: List of certificate templates
+         """
+-        for template in templates:
+-            # Set enabled flag
+-            template_cas = template.get("cas")
+-            enabled = template_cas is not None and len(template_cas) > 0
+-            template.set("enabled", enabled)
++        for tmpl in templates:
++            # Enabled state follows from the CA bindings the template carries
++            ca_list = tmpl.get("cas")
++            tmpl.set("enabled", ca_list is not None and len(ca_list) > 0)
++
++            # Validity and renewal windows come in as packed filetimes
++            expiration = tmpl.get("pKIExpirationPeriod")
++            if expiration is not None:
++                validity_period = filetime_to_str(expiration)
++            else:
++                validity_period = 0
++            tmpl.set("validity_period", validity_period)
++
++            overlap_period = tmpl.get("pKIOverlapPeriod")
++            if overlap_period is not None:
++                renewal_period = filetime_to_str(overlap_period)
++            else:
++                renewal_period = 0
++            tmpl.set("renewal_period", renewal_period)
++
++            # The msPKI-* flag attributes are raw integers on the wire
++            name_flag_value = tmpl.get("msPKI-Certificate-Name-Flag")
++            name_flags = (
++                CertificateNameFlag(int(name_flag_value)).to_list()
++                if name_flag_value is not None
++                else CertificateNameFlag(0).to_list()
++            )
++            tmpl.set("certificate_name_flag", name_flags)
++
++            enrollment_flag_value = tmpl.get("msPKI-Enrollment-Flag")
++            if enrollment_flag_value is not None:
++                enrollment_flag = EnrollmentFlag(int(enrollment_flag_value))
++            else:
++                enrollment_flag = EnrollmentFlag(0)
++            tmpl.set("enrollment_flag", enrollment_flag.to_list())
++
++            key_flag_value = tmpl.get("msPKI-Private-Key-Flag")
++            if key_flag_value is not None:
++                private_key_flag = PrivateKeyFlag(int(key_flag_value))
++            else:
++                private_key_flag = PrivateKeyFlag(0)
++            tmpl.set("private_key_flag", private_key_flag.to_list())
+ 
+-            # Process validity periods
+-            self._process_template_validity(template)
++            authorized_signatures_required = tmpl.get("msPKI-RA-Signature")
++            if authorized_signatures_required is not None:
++                authorized_signatures_required = int(authorized_signatures_required)
++            else:
++                authorized_signatures_required = 0
++            tmpl.set("authorized_signatures_required", authorized_signatures_required)
+ 
+-            # Process template flags
+-            self._process_template_flags(template)
++            schema_version_value = tmpl.get("msPKI-Template-Schema-Version")
++            if schema_version_value is not None:
++                tmpl.set("schema_version", int(schema_version_value))
++            else:
++                tmpl.set("schema_version", 1)
++
++            # Raw application policy and EKU blobs still need decoding and OID
++            # resolution before the capability rules can look at them
++            application_policies = tmpl.get_raw("msPKI-RA-Application-Policies")
++            if not isinstance(application_policies, list):
++                application_policies = (
++                    [] if application_policies is None else [application_policies]
++                )
++            resolution = [
++                OID_TO_STR_MAP.get(decoded, decoded)
++                for decoded in (raw.decode() for raw in application_policies)
++            ]
++            tmpl.set("application_policies", resolution)
++
++            eku = tmpl.get_raw("pKIExtendedKeyUsage")
++            if not isinstance(eku, list):
++                eku = [] if eku is None else [eku]
++            extended_key_usage = cast(
++                List[str],
++                [
++                    OID_TO_STR_MAP.get(decoded, decoded)
++                    for decoded in (raw.decode() for raw in eku)
++                ],
++            )
++            tmpl.set("extended_key_usage", extended_key_usage)
+ 
+-            # Process template policies
+-            self._process_template_policies(template)
++            # Capability derivation: the vulnerability rules feed off these
++            any_purpose = "Any Purpose" in extended_key_usage or not extended_key_usage
++            tmpl.set("any_purpose", any_purpose)
++
++            client_auth_ekus = [
++                "Client Authentication",
++                "Smart Card Logon",
++                "PKINIT Client Authentication",
++            ]
++            client_authentication = any_purpose or any(
++                eku_value in extended_key_usage for eku_value in client_auth_ekus
++            )
++            tmpl.set("client_authentication", client_authentication)
++
++            server_authentication = (
++                "Server Authentication" in extended_key_usage or any_purpose
++            )
++            tmpl.set("server_authentication", server_authentication)
++
++            enrollment_agent = (
++                any_purpose or "Certificate Request Agent" in extended_key_usage
++            )
++            tmpl.set("enrollment_agent", enrollment_agent)
++
++            certificate_name_flag = tmpl.get("certificate_name_flag", [])
++            enrollee_supplies_subject = any(
++                CertificateNameFlag.ENROLLEE_SUPPLIES_SUBJECT in flag
++                for flag in certificate_name_flag
++            )
++            tmpl.set("enrollee_supplies_subject", enrollee_supplies_subject)
++
++            enrollment_flags = tmpl.get("enrollment_flag", [])
++            requires_manager_approval = (
++                EnrollmentFlag.PEND_ALL_REQUESTS in enrollment_flags
++            )
++            tmpl.set("requires_manager_approval", requires_manager_approval)
++
++            no_security_extension = (
++                EnrollmentFlag.NO_SECURITY_EXTENSION in enrollment_flags
++            )
++            tmpl.set("no_security_extension", no_security_extension)
++
++            private_key_flags = tmpl.get("private_key_flag", [])
++            requires_key_archival = (
++                PrivateKeyFlag.REQUIRE_PRIVATE_KEY_ARCHIVAL in private_key_flags
++            )
++            tmpl.set("requires_key_archival", requires_key_archival)
+ 
+     def _process_template_validity(self, template: LDAPEntry):
+         """
+diff --git a/certipy/commands/forge.py b/certipy/commands/forge.py
+index 5ac5df9..4db18a6 100755
+--- a/certipy/commands/forge.py
++++ b/certipy/commands/forge.py
+@@ -19,12 +19,19 @@ from pathlib import Path
+ from typing import List, Optional, Tuple, Union, cast
+ 
+ from cryptography.hazmat.primitives import hashes
++from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519
+ from cryptography.hazmat.primitives.asymmetric import rsa
+ from cryptography.hazmat.primitives.asymmetric.types import (
+     CertificateIssuerPrivateKeyTypes,
+     CertificateIssuerPublicKeyTypes,
+     PrivateKeyTypes,
+ )
++from cryptography.hazmat.primitives.serialization import (
++    Encoding,
++    NoEncryption,
++    PrivateFormat,
++    pkcs12,
++)
+ from pyasn1.codec.der import encoder
+ 
+ from certipy.lib.certificate import (
+@@ -499,6 +506,11 @@ class Forge:
+         """
+         Build a new certificate without a template.
+ 
++        The complete golden-certificate pipeline — key generation, subject
++        selection, extension assembly, serial handling, signing-algorithm
++        selection, and PFX packaging — is performed here so the flow that the
++        forge command actually exercises can be audited in one place.
++
+         Args:
+             ca_private_key: CA private key
+             ca_public_key: CA public key
+@@ -507,8 +519,8 @@ class Forge:
+         Returns:
+             Tuple of (certificate private key, PFX data)
+         """
+-        # Generate new key pair
+-        key = generate_rsa_key(self.key_size)
++        # Generate fresh RSA material for the forged end-entity certificate
++        key = rsa.generate_private_key(public_exponent=0x10001, key_size=self.key_size)
+ 
+         # Determine identification type and value
+         if self.alt_upn:
+@@ -516,17 +528,44 @@ class Forge:
+         else:
+             id_type, id_value = "DNS Host Name", self.alt_dns
+ 
+-        # Determine subject name
+-        subject = self.subject
+-        if subject is None:
+-            subject = get_subject_from_str(
+-                f"CN={cert_id_to_parts([(id_type, id_value)])[0]}"
++        # Determine subject name, defaulting to the identity-derived CN
++        identity_usernames: List[str] = []
++        if id_type is not None and id_value is not None:
++            if id_type == "DNS Host Name" or id_type == "UPN":
++                cert_username, cert_domain = "", ""
++                if id_type == "DNS Host Name":
++                    hostname_parts = id_value.split(".")
++                    if len(hostname_parts) == 1:
++                        cert_username = id_value
++                        cert_domain = ""
++                    else:
++                        cert_username = hostname_parts[0] + "$"
++                        cert_domain = ".".join(hostname_parts[1:])
++                elif id_type == "UPN":
++                    upn_parts = id_value.split("@")
++                    if len(upn_parts) == 1:
++                        cert_username = id_value
++                        cert_domain = ""
++                    else:
++                        cert_username = "@".join(upn_parts[:-1])
++                        cert_domain = upn_parts[-1]
++                identity_usernames.append(cert_username)
++        patched_username = "_".join(identity_usernames)
++
++        if self.subject:
++            subject = x509.Name(
++                x509.Name.from_rfc4514_string(self.subject).rdns[::-1]
+             )
+         else:
+-            subject = get_subject_from_str(subject)
++            subject = x509.Name(
++                x509.Name.from_rfc4514_string(f"CN={patched_username}").rdns[::-1]
++            )
+ 
+-        # Determine serial number
+-        serial_number = self.get_serial_number()
++        # Serial number: randomized unless the caller pinned one
++        if self.serial is None:
++            serial_number = x509.random_serial_number()
++        else:
++            serial_number = int(self.serial.replace(":", ""), 16)
+ 
+         # Calculate validity period
+         not_valid_before = datetime.datetime.now(
+@@ -542,7 +581,9 @@ class Forge:
+ 
+         # Set issuer name
+         if self.issuer:
+-            cert_builder = cert_builder.issuer_name(get_subject_from_str(self.issuer))
++            cert_builder = cert_builder.issuer_name(
++                x509.Name(x509.Name.from_rfc4514_string(self.issuer).rdns[::-1])
++            )
+         else:
+             cert_builder = cert_builder.issuer_name(ca_cert.subject)
+ 
+@@ -562,49 +603,160 @@ class Forge:
+             False,
+         )
+ 
+-        # Add CRL distribution point if specified
+-        crl_extension = self.get_crl()
+-        if crl_extension:
+-            cert_builder = cert_builder.add_extension(crl_extension, False)
++        # CRL distribution point, if requested
++        if self.crl:
++            cert_builder = cert_builder.add_extension(
++                x509.CRLDistributionPoints(
++                    [
++                        x509.DistributionPoint(
++                            full_name=[x509.UniformResourceIdentifier(self.crl)],
++                            relative_name=None,
++                            reasons=None,
++                            crl_issuer=None,
++                        )
++                    ]
++                ),
++                False,
++            )
+ 
+-        # Add S/MIME capability if specified
+-        smime_extension = self.create_smime_extension()
+-        if smime_extension:
+-            cert_builder = cert_builder.add_extension(smime_extension, False)
++        # S/MIME capability, if requested
++        if self.smime:
++            smime_capability = SMIME_MAP[self.smime]
++            cert_builder = cert_builder.add_extension(
++                x509.UnrecognizedExtension(
++                    SMIME_CAPABILITIES,
++                    asn1x509.ObjectIdentifier(smime_capability).dump(),
++                ),
++                False,
++            )
+ 
+-        # Add application policies if specified
+-        application_policies_extension = self.create_application_policies()
+-        if application_policies_extension:
++        # Microsoft application policies, if requested
++        if self.application_policies:
++            application_policy_oids = [
++                asn1x509.PolicyInformation(
++                    {"policy_identifier": asn1x509.PolicyIdentifier(ap)}
++                )
++                for ap in self.application_policies
++            ]
++            cert_policies = asn1x509.CertificatePolicies(application_policy_oids)
+             cert_builder = cert_builder.add_extension(
+-                application_policies_extension, False
++                x509.UnrecognizedExtension(APPLICATION_POLICIES, cert_policies.dump()),
++                False,
+             )
+ 
+-        # Add subject alternative names
+-        sans = self.create_subject_alternative_names()
+-        if sans:
++        # Subject alternative names: DNS, UPN and SID URL forms
++        forged_sans = []
++        if self.alt_dns:
++            dns_name = self.alt_dns
++            if isinstance(dns_name, bytes):
++                dns_name = dns_name.decode()
++            forged_sans.append(x509.DNSName(dns_name))
++
++        if self.alt_upn:
++            upn_value = self.alt_upn.encode()
++            encoded_upn = encoder.encode(UTF8String(upn_value))
++            forged_sans.append(x509.OtherName(PRINCIPAL_NAME, encoded_upn))
++
++        if self.alt_sid:
++            sid = self.alt_sid
++            if isinstance(sid, bytes):
++                sid = sid.decode()
++            forged_sans.append(x509.UniformResourceIdentifier(f"{SAN_URL_PREFIX}{sid}"))
++
++        if forged_sans:
+             cert_builder = cert_builder.add_extension(
+-                x509.SubjectAlternativeName(sans),
++                x509.SubjectAlternativeName(forged_sans),
+                 False,
+             )
+ 
+-        # Add SID extension if specified
+-        sid_extension = self.create_sid_extension()
+-        if sid_extension:
++        # NTDS security extension carrying the SID, if requested
++        if self.alt_sid:
++            sid_bytes = self.alt_sid.encode()
++            sid_general_names = asn1x509.GeneralNames(
++                [
++                    asn1x509.GeneralName(
++                        {
++                            "other_name": asn1x509.AnotherName(
++                                {
++                                    "type_id": OID_NTDS_OBJECTSID,
++                                    "value": asn1x509.OctetString(sid_bytes).retag(
++                                        {"explicit": 0}
++                                    ),
++                                }
++                            )
++                        }
++                    )
++                ]
++            )
+             cert_builder = cert_builder.add_extension(
+-                sid_extension,
++                x509.UnrecognizedExtension(
++                    NTDS_CA_SECURITY_EXT, sid_general_names.dump()
++                ),
+                 False,
+             )
+ 
+-        # Get appropriate hash algorithm (default to same as CA cert)
+-        signature_hash_alg = self.get_allowed_hash_algorithm(
+-            ca_cert.signature_hash_algorithm
+-        )
++        # Signing hash: keep the CA's algorithm when it is considered safe
++        template_hash_algorithm = ca_cert.signature_hash_algorithm
++        if template_hash_algorithm is None:
++            signature_hash_alg = hashes.SHA256()
++        else:
++            alg_class = template_hash_algorithm.__class__
++            if alg_class in AllowedSignatureAlgorithms.__args__:
++                signature_hash_alg = cast(
++                    AllowedSignatureAlgorithms, template_hash_algorithm
++                )
++            else:
++                logging.warning(
++                    f"Hash algorithm {alg_class.__name__} is not allowed. Using SHA256."
++                )
++                signature_hash_alg = hashes.SHA256()
+ 
+         # Sign the certificate
+         certificate = cert_builder.sign(ca_private_key, signature_hash_alg)
+ 
+-        # Create PFX
+-        pfx_data = create_pfx(key, certificate, self.pfx_password)
++        # Package certificate plus private key
++        password = self.pfx_password
++        # Validate key type
++        if not (
++            isinstance(key, rsa.RSAPrivateKey)
++            or isinstance(key, dsa.DSAPrivateKey)
++            or isinstance(key, ec.EllipticCurvePrivateKey)
++            or isinstance(key, ed25519.Ed25519PrivateKey)
++            or isinstance(key, ed448.Ed448PrivateKey)
++        ):
++            # Log error with details to help diagnose the issue
++            logging.error(
++                "Private key must be an instance of RSAPrivateKey, DSAPrivateKey, "
++                f"EllipticCurvePrivateKey, Ed25519PrivateKey or Ed448PrivateKey. Received {type(key)}"
++            )
++            logging.error("Dumping private key to PEM format")
++            logging.error(
++                key.private_bytes(
++                    Encoding.PEM, PrivateFormat.PKCS8, encryption_algorithm=NoEncryption()
++                )
++            )
++            logging.error("Dumping certificate to PEM format")
++            logging.error(certificate.public_bytes(Encoding.PEM))
++            raise TypeError(
++                "Private key must be an instance of RSAPrivateKey, DSAPrivateKey, "
++                "EllipticCurvePrivateKey, Ed25519PrivateKey or Ed448PrivateKey"
++            )
++        encryption = NoEncryption()
++        if password is not None:
++            encryption = (
++                PrivateFormat.PKCS12.encryption_builder()
++                .kdf_rounds(50000)
++                .key_cert_algorithm(pkcs12.PBES.PBESv1SHA1And3KeyTripleDESCBC)
++                .hmac_hash(hashes.SHA1())
++                .build(bytes(password, "utf-8"))
++            )
++        pfx_data = pkcs12.serialize_key_and_certificates(
++            name=b"",
++            key=key,
++            cert=certificate,
++            cas=None,
++            encryption_algorithm=encryption,
++        )
+ 
+         return key, pfx_data
+ 
+diff --git a/certipy/lib/ntlm.py b/certipy/lib/ntlm.py
+index c9dfbcb..4513a0d 100644
+--- a/certipy/lib/ntlm.py
++++ b/certipy/lib/ntlm.py
+@@ -40,7 +40,10 @@ from impacket.ntlm import (
+ )
+ from impacket.spnego import SPNEGO_NegTokenResp
+ 
+-from certipy.lib.channel_binding import get_channel_binding_data_from_response
++from certipy.lib.channel_binding import (
++    get_channel_binding_data,
++    get_channel_binding_data_from_response,
++)
+ from certipy.lib.http import get_authentication_method
+ from certipy.lib.logger import logging
+ from certipy.lib.target import Target
+@@ -369,10 +372,10 @@ class HttpxNtlmAuth(httpx.Auth):
+         """
+         Retry the request with NTLM authentication.
+ 
+-        Implements the complete NTLM authentication flow:
+-        1. Send Type 1 (Negotiate) message
+-        2. Process Type 2 (Challenge) message from server
+-        3. Send Type 3 (Authenticate) message
++        Implements the complete NTLM authentication flow in one place:
++        1. Build and send the Type 1 (Negotiate) message
++        2. Process the Type 2 (Challenge) message from the server
++        3. Compute the NTLMv2 proof and send the Type 3 (Authenticate) message
+ 
+         Args:
+             request: The original HTTPX request
+@@ -398,8 +401,18 @@ class HttpxNtlmAuth(httpx.Auth):
+         if authenticate_header is None:
+             raise ValueError("No authentication challenge returned from server")
+ 
+-        # Step 1: Generate Type 1 (Negotiate) message
+-        type1 = ntlm_negotiate()
++        # Step 1: Build the Type 1 (Negotiate) message with the standard
++        # flag set for NTLMv2-capable clients
++        type1 = NTLMAuthNegotiate()
++        type1["flags"] = (
++            NTLMSSP_NEGOTIATE_NTLM
++            | NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY
++            | NTLMSSP_NEGOTIATE_UNICODE
++            | NTLMSSP_REQUEST_TARGET
++            | NTLMSSP_NEGOTIATE_128
++            | NTLMSSP_NEGOTIATE_56
++        )
++        type1["flags"] |= NTLMSSP_NEGOTIATE_TARGET_INFO
+ 
+         # Get the authentication method (NTLM, Negotiate, etc.)
+         authentication_method = get_authentication_method(authenticate_header)
+@@ -474,19 +487,142 @@ class HttpxNtlmAuth(httpx.Auth):
+         # Get channel binding data if enabled
+         channel_binding_data: Optional[bytes] = None
+         if self.channel_binding:
+-            channel_binding_data = get_channel_binding_data_from_response(response)
+-
+-        # Step 3: Generate Type 3 (Authentication) message
+-        type3, _, _ = ntlm_authenticate(
+-            type1,
+-            challenge,
++            # Extract the peer certificate from the TLS stream backing the
++            # response, then compute the tls-server-end-point binding
++            if "network_stream" not in response.extensions:
++                raise ValueError(
++                    "No network stream found in response - TLS information unavailable"
++                )
++
++            network_stream = response.extensions["network_stream"]
++            ssl_object = network_stream.get_extra_info("ssl_object")
++
++            if ssl_object is None:
++                raise ValueError(
++                    "No SSL object found in network stream - connection may not be using TLS"
++                )
++
++            # Get the peer/server certificate in binary (DER) format
++            peer_cert = ssl_object.getpeercert(True)
++
++            if peer_cert is None:
++                raise ValueError(
++                    "No peer certificate found in SSL object - server may not have presented a certificate"
++                )
++
++            channel_binding_data = get_channel_binding_data(peer_cert)
++
++        # Step 3: Compute the Type 3 (Authentication) message. The NTLMv2
++        # proof is derived here rather than in a separate helper.
++        response_flags = type1["flags"]
++        client_challenge = struct.pack("<Q", random.getrandbits(64))
++        target_info = challenge["TargetInfoFields"]
++
++        # NT proof material derived from the account credentials
++        nt_hash = self.target.nthash
++        response_key_nt = NTOWFv2(  # type: ignore
+             self.target.username,
+             self.target.password or "",
+             self.target.domain,
+-            self.target.nthash,
+-            channel_binding_data=channel_binding_data,
+-            service=self.service,
++            bytes.fromhex(nt_hash) if nt_hash else "",
++        )
++        av_pairs = AV_PAIRS(target_info)
++
++        # Add SPN (target name)
++        if av_pairs[NTLMSSP_AV_DNS_HOSTNAME] is None:
++            raise ValueError("NTLMSSP_AV_DNS_HOSTNAME not found in target info")
++
++        hostname = cast(Tuple[int, bytes], av_pairs[NTLMSSP_AV_DNS_HOSTNAME])[1]
++        spn = f"{self.service}/".encode("utf-16le") + hostname
++        av_pairs[NTLMSSP_AV_TARGET_NAME] = spn
++
++        # Add timestamp if not already present
++        if av_pairs[NTLMSSP_AV_TIME] is None:
++            timestamp = struct.pack(
++                "<q", (116444736000000000 + calendar.timegm(time.gmtime()) * 10000000)
++            )
++            av_pairs[NTLMSSP_AV_TIME] = timestamp
++
++        # Add channel bindings if channel binding is active
++        if channel_binding_data:
++            av_pairs[NTLMSSP_AV_CHANNEL_BINDINGS] = channel_binding_data
++
++        # Construct temp data for the NT proof
++        temp = (
++            b"\x01"  # RespType
++            + b"\x01"  # HiRespType
++            + b"\x00" * 2  # Reserved1
++            + b"\x00" * 4  # Reserved2
++            + cast(Tuple[int, bytes], av_pairs[NTLMSSP_AV_TIME])[1]  # Timestamp
++            + client_challenge  # ChallengeFromClient
++            + b"\x00" * 4  # Reserved
++            + av_pairs.getData()  # AvPairs
++        )
++
++        # NTLMv2 challenge response parts
++        nt_proof_str = hmac_md5(response_key_nt, challenge["challenge"] + temp)
++        nt_response = nt_proof_str + temp
++        lm_response = (
++            hmac_md5(response_key_nt, challenge["challenge"] + client_challenge)
++            + client_challenge
++        )
++        session_base_key = hmac_md5(response_key_nt, nt_proof_str)
++
++        # Handle anonymous authentication
++        if not self.target.username and not (self.target.password or ""):
++            nt_response = b""
++            lm_response = b""
++
++        # Adjust the response flags to the capabilities the server announced
++        for security_flag in (
++            NTLMSSP_NEGOTIATE_EXTENDED_SESSIONSECURITY,
++            NTLMSSP_NEGOTIATE_128,
++            NTLMSSP_NEGOTIATE_KEY_EXCH,
++            NTLMSSP_NEGOTIATE_SEAL,
++            NTLMSSP_NEGOTIATE_SIGN,
++            NTLMSSP_NEGOTIATE_ALWAYS_SIGN,
++        ):
++            if not (challenge["flags"] & security_flag):
++                response_flags &= ~security_flag
++
++        # Key exchange key for this round
++        key_exchange_key = KXKEY(
++            challenge["flags"],
++            session_base_key,
++            lm_response,
++            challenge["challenge"],
++            self.target.password or "",
++            "",
++            nt_hash,
++            True,
++        )
++
++        # Handle key exchange if required
++        if challenge["flags"] & NTLMSSP_NEGOTIATE_KEY_EXCH:
++            # Generate random session key
++            exported_session_key = "".join(
++                random.choices(string.ascii_letters + string.digits, k=16)
++            ).encode()
++            encrypted_random_session_key = generateEncryptedSessionKey(
++                key_exchange_key, exported_session_key
++            )
++        else:
++            encrypted_random_session_key = None
++            exported_session_key = key_exchange_key
++
++        # Create and populate the challenge response
++        type3 = NTLMAuthChallengeResponse(
++            self.target.username, self.target.password or "", challenge["challenge"]
+         )
++        type3["flags"] = response_flags
++        type3["domain_name"] = self.target.domain.encode("utf-16le")
++        type3["host_name"] = hostname
++        type3["lanman"] = lm_response if lm_response else b"\x00"
++        type3["ntlm"] = nt_response
++
++        # Add session key if key exchange is enabled
++        if encrypted_random_session_key:
++            type3["session_key"] = encrypted_random_session_key
+ 
+         # Encode and add Type 3 message to request
+         auth = base64.b64encode(type3.getData()).decode()
+diff --git a/certipy/lib/req.py b/certipy/lib/req.py
+index 2d12f94..4db45be 100644
+--- a/certipy/lib/req.py
++++ b/certipy/lib/req.py
+@@ -18,11 +18,25 @@ Key components:
+ 5. Helper Functions - Utility functions for common operations
+ """
+ 
++import math
++import os
+ import re
++import struct
+ from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
+ 
+ import httpx
++from asn1crypto import cms as asn1cms
++from asn1crypto import core as asn1core
++from asn1crypto import csr as asn1csr
++from asn1crypto import x509 as asn1x509
++from cryptography.hazmat.primitives import hashes
++from cryptography.hazmat.primitives.asymmetric import padding
+ from cryptography.hazmat.primitives.asymmetric.types import PrivateKeyTypes
++from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
++from cryptography.hazmat.primitives.padding import PKCS7
++from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
++from cryptography.x509 import SubjectKeyIdentifier
++from cryptography.x509.oid import NameOID
+ from impacket.dcerpc.v5 import rpcrt
+ from impacket.dcerpc.v5.dcom.oaut import string_to_bin
+ from impacket.dcerpc.v5.dcomrt import DCOMANSWER, DCOMCALL, DCOMConnection, IRemUnknown2
+@@ -34,19 +48,18 @@ from impacket.uuid import uuidtup_to_bin
+ 
+ from certipy.commands.ca import CA, ICertCustom
+ from certipy.lib.certificate import (
++    OID_CMC_ADD_ATTRIBUTES,
++    OID_ENCRYPTED_KEY_HASH,
++    OID_NTDS_OBJECTSID,
++    OID_PRINCIPAL_NAME,
++    SAN_URL_PREFIX,
++    SMIME_MAP,
+     cert_id_to_parts,
+     cert_to_der,
+     cert_to_pem,
+-    create_csr,
+-    create_csr_attributes,
+-    create_key_archival,
+-    create_on_behalf_of,
+     create_pfx,
+-    create_renewal,
+-    csr_to_der,
+     csr_to_pem,
+     der_to_cert,
+-    der_to_csr,
+     der_to_pem,
+     get_identities_from_certificate,
+     get_object_sid_from_certificate,
+@@ -65,6 +78,16 @@ from certipy.lib.kerberos import HttpxKerberosAuth
+ from certipy.lib.logger import is_verbose, logging
+ from certipy.lib.ntlm import HttpxNtlmAuth
+ from certipy.lib.rpc import get_dce_rpc, get_dcom_connection
++from certipy.lib.structs import (
++    CMCAddAttributesInfo,
++    EnrollmentNameValuePair,
++    OtherMsgs,
++    PKIData,
++    TaggedAttribute,
++    TaggedCertificationRequest,
++    TaggedContentInfos,
++    TaggedRequest,
++)
+ from certipy.lib.target import Target
+ 
+ # =========================================================================
+@@ -1410,6 +1433,12 @@ class Request:
+         """
+         Request a new certificate from AD CS.
+ 
++        The request is assembled, wrapped, and processed within this method:
++        building the CSR, the CMC wrappers for renewal, on-behalf-of and key
++        archival, the request attributes, and the handling of the issued
++        certificate are all performed here directly so the enrollment flow
++        for a single request can be followed without leaving this method.
++
+         Returns:
+             PFX data and filename if successful, False otherwise
+         """
+@@ -1451,33 +1480,480 @@ class Request:
+                     logging.error("Failed to load certificate and private key from PFX")
+                     return False
+ 
+-        # Create the CSR
+-        csr, key = create_csr(
+-            username,
+-            alt_dns=self.alt_dns,
+-            alt_upn=self.alt_upn,
+-            alt_sid=self.alt_sid,
+-            subject=self.subject,
+-            key_size=self.key_size,
+-            application_policies=self.application_policies,
+-            smime=self.smime,
+-            key=self.key,
+-            renewal_cert=renewal_cert,
+-        )
++        # Build the certificate signing request in place. The subject, the
++        # requested extensions, and the request signature all derive from
++        # the options on this request, so they are assembled here directly
++        key = self.key
++        if key is None:
++            logging.debug("Generating RSA key")
++            key = rsa.generate_private_key(
++                public_exponent=0x10001, key_size=self.key_size
++            )
+         self.key = key
+ 
+-        # Convert CSR to DER format
+-        csr_der = csr_to_der(csr)
++        alt_dns = self.alt_dns
++        alt_upn = self.alt_upn
++        alt_sid = self.alt_sid
++
++        certification_request_info = asn1csr.CertificationRequestInfo()
++        certification_request_info["version"] = "v1"
++
++        # Set the subject name
++        if self.subject:
++            subject_name = x509.Name(
++                x509.Name.from_rfc4514_string(self.subject).rdns[::-1]
++            )
++        else:
++            # Validate username before using it as CN — x509 NameAttribute
++            # requires a non-empty value (length >= 1 and <= 64).
++            # This can happen during relay attacks when the NTLM response
++            # contains an empty user_name field.
++            if not username or not username.strip():
++                raise ValueError(
++                    "Cannot create CSR: username is empty. "
++                    "The relayed NTLM authentication did not contain a valid username. "
++                    "Use the '-subject' option to specify an explicit subject DN, "
++                    "or ensure the relayed connection provides a valid username."
++                )
++            subject_name = x509.Name(
++                [x509.NameAttribute(NameOID.COMMON_NAME, username.capitalize())]
++            )
++
++        certification_request_info["subject"] = asn1csr.Name.load(
++            subject_name.public_bytes()
++        )
++
++        # Embed the public key of the private key generated above
++        public_key = key.public_key().public_bytes(
++            Encoding.DER, PublicFormat.SubjectPublicKeyInfo
++        )
++        public_key_info = asn1csr.PublicKeyInfo.load(public_key)
++        certification_request_info["subject_pk_info"] = public_key_info
++
++        cri_attributes = []
++
++        # Add Subject Alternative Name extension if needed
++        if alt_dns or alt_upn or alt_sid:
++            general_names = []
++
++            # Add the DNS name
++            if alt_dns:
++                if isinstance(alt_dns, bytes):
++                    alt_dns = alt_dns.decode()
++                general_names.append(asn1x509.GeneralName({"dns_name": alt_dns}))
++
++            # Add the UPN
++            if alt_upn:
++                if isinstance(alt_upn, bytes):
++                    alt_upn = alt_upn.decode()
++
++                general_names.append(
++                    asn1x509.GeneralName(
++                        {
++                            "other_name": asn1x509.AnotherName(
++                                {
++                                    "type_id": OID_PRINCIPAL_NAME,
++                                    "value": asn1x509.UTF8String(alt_upn).retag(
++                                        {"explicit": 0}
++                                    ),
++                                }
++                            )
++                        }
++                    )
++                )
++
++            # Add the SID URL
++            if alt_sid:
++                if isinstance(alt_sid, bytes):
++                    alt_sid = alt_sid.decode()
++
++                general_names.append(
++                    asn1x509.GeneralName(
++                        {"uniform_resource_identifier": f"{SAN_URL_PREFIX}{alt_sid}"}
++                    )
++                )
++
++            # Turn the collected names into an extension request attribute
++            san_extension = asn1x509.Extension(
++                {"extn_id": "subject_alt_name", "extn_value": general_names}
++            )
++            set_of_extensions = asn1csr.SetOfExtensions([[san_extension]])
++            cri_attribute = asn1csr.CRIAttribute(
++                {"type": "extension_request", "values": set_of_extensions}
++            )
++            cri_attributes.append(cri_attribute)
++
++        # Add SMIME capability extension if requested
++        if self.smime:
++            smime_extension = asn1x509.Extension(
++                {
++                    "extn_id": "smime_capability",
++                    "extn_value": asn1x509.ParsableOctetString(
++                        asn1core.ObjectIdentifier(SMIME_MAP[self.smime]).dump()
++                    ),
++                }
++            )
++            set_of_extensions = asn1csr.SetOfExtensions([[smime_extension]])
++            cri_attribute = asn1csr.CRIAttribute(
++                {"type": "extension_request", "values": set_of_extensions}
++            )
++            cri_attributes.append(cri_attribute)
++
++        # Add the Security Identifier extension if requested
++        if alt_sid:
++            sid_extension = asn1x509.Extension(
++                {
++                    "extn_id": "security_ext",
++                    "extn_value": [
++                        asn1x509.GeneralName(
++                            {
++                                "other_name": asn1x509.AnotherName(
++                                    {
++                                        "type_id": OID_NTDS_OBJECTSID,
++                                        "value": asn1x509.OctetString(
++                                            alt_sid.encode()
++                                        ).retag({"explicit": 0}),
++                                    }
++                                )
++                            }
++                        )
++                    ],
++                }
++            )
++            set_of_extensions = asn1csr.SetOfExtensions([[sid_extension]])
++            cri_attribute = asn1csr.CRIAttribute(
++                {"type": "extension_request", "values": set_of_extensions}
++            )
++            cri_attributes.append(cri_attribute)
++
++        # Reference the renewal certificate, if one is being renewed
++        if renewal_cert:
++            cri_attributes.append(
++                asn1csr.CRIAttribute(
++                    {
++                        "type": "1.3.6.1.4.1.311.13.1",
++                        "values": asn1x509.SetOf(
++                            [asn1x509.Certificate.load(cert_to_der(renewal_cert))],
++                            spec=asn1x509.Certificate,
++                        ),
++                    }
++                )
++            )
++
++        # Add Microsoft Application Policies if requested
++        if self.application_policies:
++            application_policy_oids = [
++                asn1x509.PolicyInformation(
++                    {"policy_identifier": asn1x509.PolicyIdentifier(ap)}
++                )
++                for ap in self.application_policies
++            ]
++
++            cert_policies = asn1x509.CertificatePolicies(application_policy_oids)
++            application_policies_der = cert_policies.dump()
++
++            app_policy_extension = asn1x509.Extension(
++                {
++                    "extn_id": "1.3.6.1.4.1.311.21.10",  # OID for Microsoft Application Policies
++                    "critical": False,
++                    "extn_value": asn1x509.ParsableOctetString(
++                        application_policies_der
++                    ),
++                }
++            )
++            set_of_extensions = asn1csr.SetOfExtensions([[app_policy_extension]])
++            cri_attribute = asn1csr.CRIAttribute(
++                {"type": "extension_request", "values": set_of_extensions}
++            )
++            cri_attributes.append(cri_attribute)
++
++        certification_request_info["attributes"] = cri_attributes
++
++        # Sign the request with the private key and finalize it in DER form
++        if not isinstance(key, rsa.RSAPrivateKey):
++            raise TypeError("key must be an instance of RSAPrivateKey")
++
++        signature = key.sign(
++            certification_request_info.dump(), padding.PKCS1v15(), hashes.SHA256()
++        )
++
++        csr = asn1csr.CertificationRequest(
++            {
++                "certification_request_info": certification_request_info,
++                "signature_algorithm": asn1csr.SignedDigestAlgorithm(
++                    {"algorithm": "sha256_rsa"}
++                ),
++                "signature": signature,
++            }
++        )
++
++        csr_object = x509.load_der_x509_csr(csr.dump())
++        csr_der = csr_object.public_bytes(Encoding.DER)
+ 
+-        # Handle key archival
++        # Handle key archival: the private key is encrypted for the CA's
++        # exchange certificate and the request is wrapped in a CMC envelope
++        # assembled here
+         if self.archive_key:
+             ca = CA(self.target, self.ca)
+             logging.info("Trying to retrieve CAX certificate")
+             cax_cert = ca.get_exchange_certificate()
+             logging.info("Retrieved CAX certificate")
+-            csr_der = create_key_archival(der_to_csr(csr_der), self.key, cax_cert)
+ 
+-        # Handle certificate renewal
++            x509_cax_cert = asn1x509.Certificate.load(cert_to_der(cax_cert))
++            x509_csr = asn1csr.CertificationRequest.load(
++                x509.load_der_x509_csr(csr_der).public_bytes(Encoding.DER)
++            )
++
++            signature_hash_algorithm = (
++                csr_object.signature_hash_algorithm.__class__
++            )
++
++            if signature_hash_algorithm is type(None):
++                raise ValueError("Signature hash algorithm is not set in the CSR")
++
++            # Generate the symmetric encryption key and IV
++            symmetric_key = os.urandom(32)  # 256-bit AES key
++            iv = os.urandom(16)  # 128-bit IV for CBC mode
++
++            # Encrypt the symmetric key with the CAX public key
++            cax_public_key = cax_cert.public_key()
++            if not isinstance(cax_public_key, rsa.RSAPublicKey):
++                raise TypeError("cax_key must be an instance of RSAPublicKey")
++
++            encrypted_key = cax_public_key.encrypt(symmetric_key, padding.PKCS1v15())
++
++            # Set up recipient info
++            cax_issuer_and_serial = asn1cms.IssuerAndSerialNumber(
++                {
++                    "issuer": x509_cax_cert.issuer,
++                    "serial_number": x509_cax_cert.serial_number,
++                }
++            )
++            recipient_info = asn1cms.KeyTransRecipientInfo(
++                {
++                    "version": 0,
++                    "rid": cax_issuer_and_serial,
++                    "key_encryption_algorithm": asn1cms.KeyEncryptionAlgorithm(
++                        {"algorithm": "rsaes_pkcs1v15"}
++                    ),
++                    "encrypted_key": encrypted_key,
++                }
++            )
++
++            encryption_algorithm = asn1cms.EncryptionAlgorithm(
++                {"algorithm": "aes256_cbc", "parameters": iv}
++            )
++
++            # Serialize the private key to be archived in the Microsoft
++            # BLOB representation
++            bitlen = key.key_size
++            private_numbers = key.private_numbers()
++            public_numbers = private_numbers.public_numbers
++
++            bitlen8 = math.ceil(bitlen / 8)
++            bitlen16 = math.ceil(bitlen / 16)
++
++            blob_format = "<bbHI4sII%ds%ds%ds%ds%ds%ds%ds" % (
++                bitlen8,
++                bitlen16,
++                bitlen16,
++                bitlen16,
++                bitlen16,
++                bitlen16,
++                bitlen8,
++            )
++            private_key_bytes = struct.pack(
++                blob_format,
++                7,  # PRIVATEKEYBLOB
++                2,  # Version
++                0,  # Reserved
++                41984,  # Algorithm ID
++                b"RSA2",  # Magic
++                bitlen,  # Key size in bits
++                public_numbers.e,  # Public exponent
++                public_numbers.n.to_bytes(bitlen8, "little"),  # Modulus
++                private_numbers.p.to_bytes(bitlen16, "little"),  # Prime 1
++                private_numbers.q.to_bytes(bitlen16, "little"),  # Prime 2
++                private_numbers.dmp1.to_bytes(bitlen16, "little"),  # Exponent 1
++                private_numbers.dmq1.to_bytes(bitlen16, "little"),  # Exponent 2
++                private_numbers.iqmp.to_bytes(bitlen16, "little"),  # Coefficient
++                private_numbers.d.to_bytes(bitlen8, "little"),  # Private exponent
++            )
++
++            # Encrypt the padded private key with the symmetric key
++            cipher = Cipher(algorithms.AES(symmetric_key), modes.CBC(iv))
++
++            padder = PKCS7(encryption_algorithm.encryption_block_size * 8).padder()
++            padded_private_key_bytes = (
++                padder.update(private_key_bytes) + padder.finalize()
++            )
++
++            encryptor = cipher.encryptor()
++            encrypted_private_key_bytes = (
++                encryptor.update(padded_private_key_bytes) + encryptor.finalize()
++            )
++
++            encrypted_content_info = asn1cms.EncryptedContentInfo(
++                {
++                    "content_type": "data",
++                    "content_encryption_algorithm": encryption_algorithm,
++                    "encrypted_content": encrypted_private_key_bytes,
++                }
++            )
++
++            enveloped_data = asn1cms.EnvelopedData(
++                {
++                    "version": 0,
++                    "recipient_infos": asn1cms.RecipientInfos([recipient_info]),
++                    "encrypted_content_info": encrypted_content_info,
++                }
++            )
++
++            enveloped_data_info = asn1cms.ContentInfo(
++                {
++                    "content_type": "1.2.840.113549.1.7.3",
++                    "content": enveloped_data,
++                }
++            )
++
++            # Hash the envelope so the CA can verify the encrypted key
++            encrypted_key_digest = hashes.Hash(signature_hash_algorithm())
++            encrypted_key_digest.update(enveloped_data_info.dump())
++            encrypted_key_hash = encrypted_key_digest.finalize()
++
++            attributes_information = asn1csr.SetOfAttributes(
++                [
++                    asn1csr.Attribute(
++                        {
++                            "type": OID_ENCRYPTED_KEY_HASH,
++                            "values": [asn1core.OctetString(encrypted_key_hash)],
++                        }
++                    )
++                ]
++            )
++
++            attributes_info = CMCAddAttributesInfo(
++                {
++                    "data_reference": 0,
++                    "cert_reference": [1],
++                    "attributes": attributes_information,
++                }
++            )
++
++            tagged_attribute = TaggedAttribute(
++                {
++                    "bodyPartID": 2,
++                    "attrType": OID_CMC_ADD_ATTRIBUTES,
++                    "attrValues": [attributes_info],
++                }
++            )
++
++            # Carry the CSR itself as the single tagged request
++            tagged_request = TaggedRequest(
++                {
++                    "tcr": TaggedCertificationRequest(
++                        {
++                            "bodyPartID": 1,
++                            "certificationRequest": x509_csr,
++                        }
++                    )
++                }
++            )
++
++            pki_data = PKIData(
++                {
++                    "controlSequence": [tagged_attribute],
++                    "reqSequence": [tagged_request],
++                    "cmsSequence": TaggedContentInfos([]),
++                    "otherMsgSequence": OtherMsgs([]),
++                }
++            )
++
++            pki_data_bytes = pki_data.dump()
++
++            cmc_request_digest = hashes.Hash(signature_hash_algorithm())
++            cmc_request_digest.update(pki_data_bytes)
++            cmc_request_hash = cmc_request_digest.finalize()
++
++            digest_algorithm = asn1cms.DigestAlgorithm(
++                {"algorithm": signature_hash_algorithm.name}
++            )
++
++            # Identify the signer by the subject key of the request
++            skid = SubjectKeyIdentifier.from_public_key(
++                csr_object.public_key()
++            ).digest
++
++            signed_attribs = asn1cms.CMSAttributes(
++                [
++                    asn1cms.CMSAttribute(
++                        {"type": "content_type", "values": ["1.3.6.1.5.5.7.12.2"]}
++                    ),
++                    asn1cms.CMSAttribute(
++                        {
++                            "type": "message_digest",
++                            "values": [cmc_request_hash],
++                        }
++                    ),
++                ]
++            )
++
++            if not isinstance(key, rsa.RSAPrivateKey):
++                raise TypeError("key must be an instance of RSAPrivateKey")
++            attribs_signature = key.sign(
++                signed_attribs.dump(), padding.PKCS1v15(), signature_hash_algorithm()
++            )
++
++            # The envelope travels as an unsigned attribute of the signer
++            signer_info = asn1cms.SignerInfo(
++                {
++                    "version": 3,
++                    "sid": asn1cms.SignerIdentifier({"subject_key_identifier": skid}),
++                    "digest_algorithm": digest_algorithm,
++                    "signature_algorithm": x509_csr["signature_algorithm"],
++                    "signature": attribs_signature,
++                    "signed_attrs": signed_attribs,
++                    "unsigned_attrs": asn1cms.CMSAttributes(
++                        [
++                            asn1cms.CMSAttribute(
++                                {
++                                    "type": "1.3.6.1.4.1.311.21.13",
++                                    "values": [enveloped_data_info],
++                                }
++                            )
++                        ]
++                    ),
++                }
++            )
++
++            content_info = asn1cms.EncapsulatedContentInfo(
++                {
++                    "content_type": "1.3.6.1.5.5.7.12.2",
++                    "content": pki_data_bytes,
++                }
++            )
++
++            signed_data = asn1cms.SignedData(
++                {
++                    "version": 3,
++                    "digest_algorithms": [digest_algorithm],
++                    "encap_content_info": content_info,
++                    "signer_infos": [signer_info],
++                }
++            )
++
++            cmc = asn1cms.ContentInfo(
++                {
++                    "content_type": "signed_data",
++                    "content": signed_data,
++                }
++            )
++
++            csr_der = cmc.dump()
++
++        # Handle certificate renewal: wrap the request in a CMC renewal
++        # structure signed with the key that owns the certificate being
++        # renewed
+         if self.renew:
+             if not renewal_cert or not renewal_key:
+                 logging.error(
+@@ -1489,9 +1965,107 @@ class Request:
+                 logging.error("Currently only RSA keys are supported for renewal")
+                 return False
+ 
+-            csr_der = create_renewal(csr_der, renewal_cert, renewal_key)
++            renewal_x509_cert = asn1x509.Certificate.load(cert_to_der(renewal_cert))
++            signature_hash_algorithm = (
++                renewal_cert.signature_hash_algorithm.__class__
++            )
+ 
+-        # Handle on-behalf-of requests
++            if signature_hash_algorithm is type(None):
++                raise ValueError(
++                    "Signature hash algorithm is not set in the certificate"
++                )
++
++            issuer_and_serial = asn1cms.IssuerAndSerialNumber(
++                {
++                    "issuer": renewal_x509_cert.issuer,
++                    "serial_number": renewal_x509_cert.serial_number,
++                }
++            )
++
++            digest_algorithm = asn1cms.DigestAlgorithm(
++                {"algorithm": signature_hash_algorithm.name}
++            )
++
++            # Digest of the request being wrapped
++            request_digest = hashes.Hash(signature_hash_algorithm())
++            request_digest.update(csr_der)
++            request_digest = request_digest.finalize()
++
++            # Signed attributes carrying the renewed certificate and the
++            # request digest
++            signed_attribs = asn1cms.CMSAttributes(
++                [
++                    asn1cms.CMSAttribute(
++                        {
++                            "type": "1.3.6.1.4.1.311.13.1",
++                            "values": asn1cms.SetOfAny(
++                                [
++                                    asn1x509.Certificate.load(
++                                        cert_to_der(renewal_cert)
++                                    )
++                                ],
++                                spec=asn1x509.Certificate,
++                            ),
++                        }
++                    ),
++                    asn1cms.CMSAttribute(
++                        {
++                            "type": "message_digest",
++                            "values": [request_digest],
++                        }
++                    ),
++                ]
++            )
++
++            if not isinstance(renewal_key, rsa.RSAPrivateKey):
++                raise TypeError("key must be an instance of RSAPrivateKey")
++            attribs_signature = renewal_key.sign(
++                signed_attribs.dump(), padding.PKCS1v15(), signature_hash_algorithm()
++            )
++
++            signer_info = asn1cms.SignerInfo(
++                {
++                    "version": 1,
++                    "sid": issuer_and_serial,
++                    "digest_algorithm": digest_algorithm,
++                    "signature_algorithm": renewal_x509_cert["signature_algorithm"],
++                    "signature": attribs_signature,
++                    "signed_attrs": signed_attribs,
++                }
++            )
++
++            content_info = asn1cms.EncapsulatedContentInfo(
++                {
++                    "content_type": "data",
++                    "content": csr_der,
++                }
++            )
++
++            signed_data = asn1cms.SignedData(
++                {
++                    "version": 3,
++                    "digest_algorithms": [digest_algorithm],
++                    "encap_content_info": content_info,
++                    "certificates": [
++                        asn1cms.CertificateChoices(
++                            {"certificate": renewal_x509_cert}
++                        )
++                    ],
++                    "signer_infos": [signer_info],
++                }
++            )
++
++            cmc = asn1cms.ContentInfo(
++                {
++                    "content_type": "signed_data",
++                    "content": signed_data,
++                }
++            )
++
++            csr_der = cmc.dump()
++
++        # Handle on-behalf-of requests: sign the wrapped request with the
++        # enrollment agent certificate so the CA can attribute the request
+         if self.on_behalf_of:
+             if self.pfx is None:
+                 logging.error(
+@@ -1514,18 +2088,134 @@ class Request:
+                 )
+                 return False
+ 
+-            csr_der = create_on_behalf_of(
+-                csr_der, self.on_behalf_of, agent_cert, agent_key
++            agent_x509_cert = asn1x509.Certificate.load(cert_to_der(agent_cert))
++            signature_hash_algorithm = (
++                agent_cert.signature_hash_algorithm.__class__
+             )
+ 
+-        # Construct attributes list
+-        attributes = create_csr_attributes(
+-            self.template,
+-            self.alt_dns,
+-            self.alt_upn,
+-            self.alt_sid,
+-            self.application_policies,
+-        )
++            if signature_hash_algorithm is type(None):
++                raise ValueError(
++                    "Signature hash algorithm is not set in the certificate"
++                )
++
++            issuer_and_serial = asn1cms.IssuerAndSerialNumber(
++                {
++                    "issuer": agent_x509_cert.issuer,
++                    "serial_number": agent_x509_cert.serial_number,
++                }
++            )
++
++            digest_algorithm = asn1cms.DigestAlgorithm(
++                {"algorithm": signature_hash_algorithm.name}
++            )
++
++            # The requester name attribute tells the CA who is enrolling
++            requester_name = EnrollmentNameValuePair(
++                {
++                    "name": checkNullString("requestername"),
++                    "value": checkNullString(self.on_behalf_of),
++                }
++            )
++
++            request_digest = hashes.Hash(signature_hash_algorithm())
++            request_digest.update(csr_der)
++            request_digest = request_digest.finalize()
++
++            signed_attribs = asn1cms.CMSAttributes(
++                [
++                    asn1cms.CMSAttribute(
++                        {
++                            "type": "1.3.6.1.4.1.311.21.10",
++                            "values": [asn1cms.ObjectIdentifier("1.3.6.1.5.5.7.3.2")],
++                        }
++                    ),
++                    asn1cms.CMSAttribute(
++                        {"type": "1.3.6.1.4.1.311.13.2.1", "values": [requester_name]}
++                    ),
++                    asn1cms.CMSAttribute(
++                        {
++                            "type": "message_digest",
++                            "values": [request_digest],
++                        }
++                    ),
++                ]
++            )
++
++            if not isinstance(agent_key, rsa.RSAPrivateKey):
++                raise TypeError("key must be an instance of RSAPrivateKey")
++            attribs_signature = agent_key.sign(
++                signed_attribs.dump(), padding.PKCS1v15(), signature_hash_algorithm()
++            )
++
++            signer_info = asn1cms.SignerInfo(
++                {
++                    "version": 1,
++                    "sid": issuer_and_serial,
++                    "digest_algorithm": digest_algorithm,
++                    "signature_algorithm": agent_x509_cert["signature_algorithm"],
++                    "signature": attribs_signature,
++                    "signed_attrs": signed_attribs,
++                }
++            )
++
++            content_info = asn1cms.EncapsulatedContentInfo(
++                {
++                    "content_type": "data",
++                    "content": csr_der,
++                }
++            )
++
++            signed_data = asn1cms.SignedData(
++                {
++                    "version": 3,
++                    "digest_algorithms": [digest_algorithm],
++                    "encap_content_info": content_info,
++                    "certificates": [
++                        asn1cms.CertificateChoices({"certificate": agent_x509_cert})
++                    ],
++                    "signer_infos": [signer_info],
++                }
++            )
++
++            cmc = asn1cms.ContentInfo(
++                {
++                    "content_type": "signed_data",
++                    "content": signed_data,
++                }
++            )
++
++            csr_der = cmc.dump()
++
++        # Construct the attributes list the CA expects alongside the request
++        attributes = [f"CertificateTemplate:{self.template}"]
++
++        # Only add a SAN attribute if at least one SAN value is requested
++        if any(value is not None for value in [alt_dns, alt_upn, alt_sid]):
++            san_parts = []
++
++            if alt_dns:
++                if isinstance(alt_dns, bytes):
++                    alt_dns = alt_dns.decode("utf-8")
++                san_parts.append(f"dns={alt_dns}")
++
++            if alt_upn:
++                if isinstance(alt_upn, bytes):
++                    alt_upn = alt_upn.decode("utf-8")
++                san_parts.append(f"upn={alt_upn}")
++
++            if alt_sid:
++                if isinstance(alt_sid, bytes):
++                    alt_sid = alt_sid.decode("utf-8")
++                # Format the SID as URL according to Microsoft's specifications
++                san_parts.append(f"url={SAN_URL_PREFIX}{alt_sid}")
++
++            attributes.append(f"SAN:{'&'.join(san_parts)}")
++
++        # Add application policies if provided
++        if self.application_policies:
++            attributes.append(
++                f"ApplicationPolicies:{'&'.join(self.application_policies)}"
++            )
+ 
+         # Submit the certificate request
+         cert = self.interface.request(csr_der, attributes)
+@@ -1534,15 +2224,36 @@ class Request:
+             logging.error("Failed to request certificate")
+             return False
+ 
+-        return handle_request_response(
+-            cert,
+-            key,
+-            username,
+-            subject=self.subject,
+-            alt_sid=self.alt_sid,
+-            out=self.out,
+-            pfx_password=self.pfx_password,
+-        )
++        # Report what was issued and where the key material was saved
++        if self.subject:
++            subject_str = ",".join(
++                map(lambda rdns: rdns.rfc4514_string(), cert.subject.rdns)
++            )
++            logging.info(f"Got certificate with subject: {subject_str}")
++
++        identities = get_identities_from_certificate(cert)
++        print_certificate_identities(identities)
++
++        object_sid = get_object_sid_from_certificate(cert)
++        if object_sid is not None:
++            logging.info(f"Certificate object SID is {object_sid!r}")
++        else:
++            logging.info("Certificate has no object SID")
++            if not self.alt_sid:
++                logging.info(
++                    "Try using -sid to set the object SID or see the wiki for more details"
++                )
++
++        out_filename = _determine_output_filename(self.out, identities, username)
++
++        pfx = create_pfx(key, cert, self.pfx_password)
++
++        outfile = f"{out_filename}.pfx"
++        logging.info(f"Saving certificate and private key to {outfile!r}")
++        saved_path = try_to_save_file(pfx, outfile)
++        logging.info(f"Wrote certificate and private key to {saved_path!r}")
++
++        return pfx, saved_path
+ 
+     def get_cax(self) -> Union[bool, bytes]:
+         """
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..2044d0b
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,169 @@
++"""
++Shared test fixtures for the Certipy offline test suite.
++
++The fixtures build local cryptographic material (RSA keys, self-signed
++certificates, PFX containers) so that certificate handling, enrollment
++request construction, forging, and reporting code paths can be exercised
++without contacting a live Active Directory environment.
++"""
++
++import datetime
++
++import pytest
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes
++from cryptography.x509.oid import NameOID
++from pyasn1.codec.der import encoder
++from pyasn1.type.char import UTF8String
++
++from certipy.lib.certificate import (
++    NTDS_CA_SECURITY_EXT,
++    PRINCIPAL_NAME,
++    SAN_URL_PREFIX,
++    cert_to_der,
++    create_pfx,
++    generate_rsa_key,
++)
++
++
++class FakeEntry:
++    """
++    Minimal stand-in for LDAPEntry used by the reporting code paths.
++
++    Values and raw attribute values are kept in separate dictionaries so the
++    code under test can rely on the same get/set contract that LDAP-backed
++    entries expose.
++    """
++
++    def __init__(self, values=None, raw=None):
++        self._values = dict(values or {})
++        self._raw = dict(raw or {})
++
++    def get(self, key, default=None):
++        return self._values.get(key, default)
++
++    def set(self, key, value):
++        self._values[key] = value
++        if key not in self._raw:
++            self._raw[key] = value
++
++    def get_raw(self, key, default=None):
++        return self._raw.get(key, default)
++
++
++def _build_self_signed(key, hash_algorithm, common_name="Certipy Test CA"):
++    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
++    builder = (
++        x509.CertificateBuilder()
++        .subject_name(subject)
++        .issuer_name(subject)
++        .public_key(key.public_key())
++        .serial_number(0x0A0B0C)
++        .not_valid_before(
++            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
++        )
++        .not_valid_after(
++            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365)
++        )
++        .add_extension(x509.BasicConstraints(ca=True, path_length=None), True)
++    )
++    return builder.sign(key, hash_algorithm())
++
++
++@pytest.fixture(scope="session")
++def rsa_key():
++    return generate_rsa_key(2048)
++
++
++@pytest.fixture(scope="session")
++def sha256_ca(rsa_key):
++    return _build_self_signed(rsa_key, hashes.SHA256)
++
++
++@pytest.fixture(scope="session")
++def sha256_ca_der(sha256_ca):
++    return cert_to_der(sha256_ca)
++
++
++@pytest.fixture(scope="session")
++def sid_cert_der(rsa_key, sha256_ca):
++    """DER bytes of an end-entity certificate with UPN, SAN-URL SID and SID extension."""
++    sid = "S-1-5-21-1-2-3-4"
++    builder = (
++        x509.CertificateBuilder()
++        .subject_name(
++            x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Certipy Test Service")])
++        )
++        .issuer_name(sha256_ca.subject)
++        .public_key(rsa_key.public_key())
++        .serial_number(1)
++        .not_valid_before(
++            datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
++        )
++        .not_valid_after(
++            datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=30)
++        )
++        .add_extension(
++            x509.SubjectAlternativeName(
++                [
++                    # Encode the UPN exactly the way the forging code does so
++                    # that identity extraction sees a UTF8String payload.
++                    x509.OtherName(
++                        PRINCIPAL_NAME, encoder.encode(UTF8String("user@corp.local"))
++                    ),
++                    x509.UniformResourceIdentifier(f"{SAN_URL_PREFIX}{sid}"),
++                ]
++            ),
++            False,
++        )
++        .add_extension(
++            x509.UnrecognizedExtension(
++                NTDS_CA_SECURITY_EXT, b"\x00\x01S-1-5-21-1-2-3-999"
++            ),
++            False,
++        )
++    )
++    cert = builder.sign(rsa_key, hashes.SHA256())
++    return cert_to_der(cert)
++
++
++@pytest.fixture(scope="session")
++def pfx_bytes(rsa_key, sha256_ca):
++    return create_pfx(rsa_key, sha256_ca, "certipy-test")
++
++
++@pytest.fixture
++def fake_response_factory():
++    class FakeNetworkStream:
++        def __init__(self, ssl_object):
++            self._ssl_object = ssl_object
++
++        def get_extra_info(self, name):
++            if name == "ssl_object":
++                return self._ssl_object
++            return None
++
++    class FakeSslObject:
++        def __init__(self, der):
++            self._der = der
++
++        def getpeercert(self, binary):
++            return self._der if binary else None
++
++    class FakeResponse:
++        def __init__(self, der):
++            self.extensions = {"network_stream": FakeNetworkStream(FakeSslObject(der))}
++
++    return FakeResponse
++
++
++@pytest.fixture
++def fake_ssl_socket_factory():
++    class FakeSslSocket:
++        def __init__(self, der):
++            self._der = der
++
++        def getpeercert(self, binary):
++            return self._der if binary else None
++
++    return FakeSslSocket
+diff --git a/tests/test_cert_cmd.py b/tests/test_cert_cmd.py
+new file mode 100644
+index 0000000..afdfa64
+--- /dev/null
++++ b/tests/test_cert_cmd.py
+@@ -0,0 +1,147 @@
++"""Tests for the cert command entry point and its file helpers."""
++
++import argparse
++
++import pytest
++
++from certipy.commands.cert import (
++    entry,
++    load_certificate_file,
++    parse_certificate,
++    parse_key,
++    write_output,
++)
++from certipy.lib.certificate import (
++    cert_to_der,
++    cert_to_pem,
++    der_to_cert,
++    key_to_pem,
++    load_pfx,
++    pem_to_cert,
++)
++
++
++def _options(**overrides):
++    options = {
++        "pfx": None,
++        "password": None,
++        "cert": None,
++        "key": None,
++        "export": None,
++        "export_password": None,
++        "nocert": False,
++        "nokey": False,
++        "out": None,
++    }
++    options.update(overrides)
++    return argparse.Namespace(**options)
++
++
++def test_load_certificate_file_reads_bytes(tmp_path, sha256_ca):
++    path = tmp_path / "ca.pem"
++    path.write_bytes(cert_to_pem(sha256_ca))
++    assert load_certificate_file(str(path)) == cert_to_pem(sha256_ca)
++
++
++def test_load_certificate_file_missing_raises(tmp_path):
++    with pytest.raises(FileNotFoundError):
++        load_certificate_file(str(tmp_path / "missing.pem"))
++
++
++def test_parse_certificate_accepts_pem_and_der(sha256_ca):
++    pem = parse_certificate(cert_to_pem(sha256_ca))
++    der = parse_certificate(cert_to_der(sha256_ca))
++    assert pem == sha256_ca
++    assert der == sha256_ca
++
++
++def test_parse_certificate_rejects_garbage():
++    with pytest.raises(ValueError):
++        parse_certificate(b"not a certificate")
++
++
++def test_parse_key_accepts_pem_and_der(rsa_key, sha256_ca):
++    pem = parse_key(key_to_pem(rsa_key))
++    assert pem.key_size == rsa_key.key_size
++
++
++def test_parse_key_rejects_garbage():
++    with pytest.raises(ValueError):
++        parse_key(b"not a key")
++
++
++def test_write_output_to_stdout(capsys):
++    write_output("text", None)
++    assert capsys.readouterr().out.strip() == "text"
++
++
++def test_write_output_to_file(tmp_path):
++    target = tmp_path / "out.pem"
++    write_output(b"data", str(target))
++    assert target.read_bytes() == b"data"
++
++
++def test_entry_without_inputs_does_nothing(tmp_path):
++    out = tmp_path / "out.pem"
++    entry(_options(out=str(out)))
++    assert not out.exists()
++
++
++def test_entry_converts_pfx_to_pem(tmp_path, pfx_bytes, sha256_ca):
++    pfx_path = tmp_path / "auth.pfx"
++    pfx_path.write_bytes(pfx_bytes)
++    out = tmp_path / "out.pem"
++    entry(
++        _options(
++            pfx=str(pfx_path),
++            password="certipy-test",
++            out=str(out),
++        )
++    )
++    content = out.read_text()
++    assert "BEGIN CERTIFICATE" in content
++    assert "BEGIN PRIVATE KEY" in content
++    assert pem_to_cert(content.encode()) == sha256_ca
++
++
++def test_entry_exports_certificate_and_key_as_pfx(tmp_path, pfx_bytes):
++    pfx_path = tmp_path / "auth.pfx"
++    pfx_path.write_bytes(pfx_bytes)
++    out = tmp_path / "re-exported.pfx"
++    entry(
++        _options(
++            pfx=str(pfx_path),
++            password="certipy-test",
++            export=True,
++            export_password=None,
++            out=str(out),
++        )
++    )
++    key, cert = load_pfx(out.read_bytes(), None)
++    assert cert is not None and key is not None
++
++
++def test_entry_converts_der_certificate_to_pem(tmp_path, sha256_ca):
++    cert_path = tmp_path / "ca.der"
++    cert_path.write_bytes(cert_to_der(sha256_ca))
++    out = tmp_path / "out.pem"
++    entry(_options(cert=str(cert_path), out=str(out)))
++    content = out.read_text()
++    assert "BEGIN CERTIFICATE" in content
++    assert "BEGIN PRIVATE KEY" not in content
++
++
++def test_entry_converts_pem_key_to_pem_output(tmp_path, rsa_key):
++    key_path = tmp_path / "key.pem"
++    key_path.write_bytes(key_to_pem(rsa_key))
++    out = tmp_path / "out.pem"
++    entry(_options(key=str(key_path), out=str(out)))
++    content = out.read_text()
++    assert "BEGIN PRIVATE KEY" in content
++    assert "BEGIN CERTIFICATE" not in content
++
++
++def test_entry_reports_missing_file_without_raising(tmp_path):
++    out = tmp_path / "out.pem"
++    entry(_options(cert=str(tmp_path / "missing.der"), out=str(out)))
++    assert not out.exists()
+diff --git a/tests/test_certificate_cmc.py b/tests/test_certificate_cmc.py
+new file mode 100644
+index 0000000..a87d768
+--- /dev/null
++++ b/tests/test_certificate_cmc.py
+@@ -0,0 +1,131 @@
++"""Tests for CMC/CMS request builders in certipy.lib.certificate."""
++
++import struct
++
++import pytest
++from asn1crypto import cms as asn1cms
++from asn1crypto import x509 as asn1x509
++
++from certipy.lib.certificate import (
++    SAN_URL_PREFIX,
++    create_csr,
++    create_csr_attributes,
++    create_key_archival,
++    create_on_behalf_of,
++    create_renewal,
++    cert_to_der,
++    private_key_to_ms_blob,
++)
++
++
++def _csr(username="cmcuser", **overrides):
++    return create_csr(
++        username=username,
++        alt_dns=None,
++        alt_upn=None,
++        alt_sid=None,
++        subject=None,
++        key_size=2048,
++        application_policies=None,
++        smime=None,
++        **overrides,
++    )
++
++
++def test_create_csr_attributes_template_only():
++    assert create_csr_attributes("User") == ["CertificateTemplate:User"]
++
++
++def test_create_csr_attributes_with_san_entries():
++    attributes = create_csr_attributes(
++        "Machine",
++        alt_dns=b"host.corp.local",
++        alt_upn=b"user@corp.local",
++        alt_sid=b"S-1-5-21-1-2-3-4",
++    )
++    assert attributes[0] == "CertificateTemplate:Machine"
++    assert attributes[1] == (
++        "SAN:dns=host.corp.local&upn=user@corp.local"
++        f"&url={SAN_URL_PREFIX}S-1-5-21-1-2-3-4"
++    )
++
++
++def test_create_csr_attributes_with_san_strings_and_policies():
++    attributes = create_csr_attributes(
++        "User",
++        alt_dns="host.corp.local",
++        alt_upn="user@corp.local",
++        application_policies=["1.3.6.1.5.5.7.3.2", "1.3.6.1.5.5.7.3.1"],
++    )
++    assert attributes[1] == "SAN:dns=host.corp.local&upn=user@corp.local"
++    assert attributes[2] == (
++        "ApplicationPolicies:1.3.6.1.5.5.7.3.2&1.3.6.1.5.5.7.3.1"
++    )
++
++
++def test_create_renewal_builds_cmc_wrapped_cms(rsa_key, sha256_ca):
++    request = b"enrollment request"
++    cmc_bytes = create_renewal(request, sha256_ca, rsa_key)
++
++    cmc = asn1cms.ContentInfo.load(cmc_bytes)
++    assert cmc["content_type"].native == "signed_data"
++
++    signed_data = cmc["content"]
++    assert signed_data["encap_content_info"]["content"].native == request
++
++    # The renewed certificate travels with the request
++    embedded = signed_data["certificates"][0].chosen
++    assert embedded["tbs_certificate"]["serial_number"].native == sha256_ca.serial_number
++
++    signer_info = signed_data["signer_infos"][0]
++    assert signer_info["digest_algorithm"]["algorithm"].native == "sha256"
++    # Renewal certificate hash attribute and message digest must be present
++    attribute_types = [str(attr["type"]) for attr in signer_info["signed_attrs"]]
++    assert "1.3.6.1.4.1.311.13.1" in attribute_types
++    assert "1.2.840.113549.1.9.4" in attribute_types
++
++
++def test_create_on_behalf_of_adds_requester(rsa_key, sha256_ca):
++    request = b"enrollment request"
++    cmc_bytes = create_on_behalf_of(request, "corp\\helpdesk", sha256_ca, rsa_key)
++
++    cmc = asn1cms.ContentInfo.load(cmc_bytes)
++    assert cmc["content_type"].native == "signed_data"
++
++    signer_info = cmc["content"]["signer_infos"][0]
++    attribute_types = [str(attr["type"]) for attr in signer_info["signed_attrs"]]
++    assert "1.3.6.1.4.1.311.21.10" in attribute_types
++    assert "1.3.6.1.4.1.311.13.2.1" in attribute_types
++    assert "1.2.840.113549.1.9.4" in attribute_types
++
++    # The requester name is carried as a BMPString inside the request
++    assert "corp\\helpdesk".encode("utf-16-be") in cmc_bytes
++
++
++def test_create_key_archival_wraps_csr_and_envelope(rsa_key, sha256_ca):
++    csr, _ = _csr("archival")
++    cmc_bytes = create_key_archival(csr, rsa_key, sha256_ca)
++
++    cmc = asn1cms.ContentInfo.load(cmc_bytes)
++    assert cmc["content_type"].native == "signed_data"
++
++    signed_data = cmc["content"]
++    # The PKI payload is carried as raw bytes inside the CMS wrapper
++    content = signed_data["encap_content_info"]["content"]
++    payload = content.native if isinstance(content.native, bytes) else content.parsed.dump()
++    assert isinstance(payload, bytes) and len(payload) > 0
++
++    signer_info = signed_data["signer_infos"][0]
++    unsigned_attrs = [
++        str(attr["type"]) for attr in (signer_info["unsigned_attrs"] or [])
++    ]
++    # The encrypted key envelope is attached for the CA to decrypt
++    assert "1.3.6.1.4.1.311.21.13" in unsigned_attrs
++
++
++def test_private_key_ms_blob_is_recoverable(rsa_key):
++    blob = private_key_to_ms_blob(rsa_key)
++    # The blob stores public modulus length and the primes in little-endian
++    bitlen = struct.unpack("<I", blob[12:16])[0]
++    assert bitlen == rsa_key.key_size
++    assert b"RSA2" == blob[8:12]
+diff --git a/tests/test_certificate_core.py b/tests/test_certificate_core.py
+new file mode 100644
+index 0000000..af50afa
+--- /dev/null
++++ b/tests/test_certificate_core.py
+@@ -0,0 +1,357 @@
++"""Tests for core certificate helpers in certipy.lib.certificate."""
++
++import hashlib
++import struct
++
++import pytest
++from asn1crypto import csr as asn1csr
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.hazmat.primitives.asymmetric import padding
++from cryptography.hazmat.primitives.asymmetric import ed25519
++from cryptography.x509.oid import NameOID
++
++from certipy.lib.certificate import (
++    NTDS_CA_SECURITY_EXT,
++    PRINCIPAL_NAME,
++    SAN_URL_PREFIX,
++    cert_id_to_parts,
++    cert_to_der,
++    cert_to_pem,
++    create_csr,
++    create_pfx,
++    csr_to_der,
++    der_to_cert,
++    der_to_key,
++    dn_to_components,
++    get_identities_from_certificate,
++    get_object_sid_from_certificate,
++    get_object_sid_from_certificate_san_url,
++    get_object_sid_from_certificate_sid_extension,
++    get_subject_from_str,
++    hash_digest,
++    key_to_pem,
++    load_pfx,
++    pem_to_cert,
++    pem_to_key,
++    private_key_to_ms_blob,
++    rsa_pkcs1v15_sign,
++)
++
++
++def _csr_attribute_oids(csr):
++    """Return the OIDs of all CRI attributes carried by a CSR."""
++    request = asn1csr.CertificationRequest.load(csr_to_der(csr))
++    return [str(attr["type"]) for attr in request["certification_request_info"]["attributes"]]
++
++
++def test_dn_to_components_parses_multivalue_dn():
++    assert dn_to_components("CN=username,DC=domain,DC=local") == [
++        ("CN", "username"),
++        ("DC", "domain"),
++        ("DC", "local"),
++    ]
++
++
++def test_dn_to_components_uppercases_attribute_names():
++    assert dn_to_components("cn=host,dc=corp")[0][0] == "CN"
++
++
++def test_dn_to_components_handles_escaped_commas():
++    components = dn_to_components("CN=Doe\\, John,DC=corp")
++    assert len(components) == 2
++    assert components[0] == ("CN", "Doe\\, John")
++    assert components[1] == ("DC", "corp")
++
++
++def test_get_subject_from_str_builds_x509_name():
++    name = get_subject_from_str("CN=Certipy Test,DC=corp,DC=local")
++    assert isinstance(name, x509.Name)
++    assert name.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == "Certipy Test"
++
++
++def test_hash_digest_matches_hashlib():
++    assert hash_digest(b"certipy", hashes.SHA256) == hashlib.sha256(b"certipy").digest()
++    assert hash_digest(b"certipy", hashes.MD5) == hashlib.md5(b"certipy").digest()
++
++
++def test_rsa_pkcs1v15_sign_verifies(rsa_key):
++    signature = rsa_pkcs1v15_sign(b"payload", rsa_key, hashes.SHA256)
++    rsa_key.public_key().verify(
++        signature, b"payload", padding.PKCS1v15(), hashes.SHA256()
++    )
++
++
++def test_rsa_pkcs1v15_sign_rejects_key_of_wrong_type():
++    key = ed25519.Ed25519PrivateKey.generate()
++    with pytest.raises(TypeError):
++        rsa_pkcs1v15_sign(b"payload", key)
++
++
++def test_create_csr_default_subject_from_username(rsa_key):
++    csr, returned_key = create_csr(
++        username="certipyuser",
++        alt_dns=None,
++        alt_upn=None,
++        alt_sid=None,
++        subject=None,
++        key_size=2048,
++        application_policies=None,
++        smime=None,
++        key=rsa_key,
++    )
++    assert returned_key is rsa_key
++    assert csr.is_signature_valid
++    assert (
++        csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
++        == "Certipyuser"
++    )
++
++
++def test_create_csr_rejects_empty_username_without_subject():
++    with pytest.raises(ValueError):
++        create_csr(
++            username="",
++            alt_dns=None,
++            alt_upn=None,
++            alt_sid=None,
++            subject=None,
++            key_size=2048,
++            application_policies=None,
++            smime=None,
++        )
++
++
++def test_create_csr_with_explicit_subject(rsa_key):
++    csr, _ = create_csr(
++        username="ignored",
++        alt_dns=None,
++        alt_upn=None,
++        alt_sid=None,
++        subject="CN=Certipy Subject,DC=corp,DC=local",
++        key_size=2048,
++        application_policies=None,
++        smime=None,
++        key=rsa_key,
++    )
++    assert (
++        csr.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value
++        == "Certipy Subject"
++    )
++
++
++def test_create_csr_generates_key_when_not_provided():
++    csr, key = create_csr(
++        username="keygen",
++        alt_dns=None,
++        alt_upn=None,
++        alt_sid=None,
++        subject=None,
++        key_size=2048,
++        application_policies=None,
++        smime=None,
++    )
++    assert key is not None
++    assert key.key_size == 2048
++    assert csr.is_signature_valid
++
++
++def test_create_csr_with_san_entries(rsa_key):
++    csr, _ = create_csr(
++        username="sans",
++        alt_dns=b"host.corp.local",
++        alt_upn=b"user@corp.local",
++        alt_sid=None,
++        subject=None,
++        key_size=2048,
++        application_policies=None,
++        smime=None,
++        key=rsa_key,
++    )
++    san = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
++    assert x509.DNSName("host.corp.local") in san
++    upn = san.get_values_for_type(x509.OtherName)[0]
++    assert upn.type_id == PRINCIPAL_NAME
++
++
++def test_create_csr_with_sid_entries(rsa_key):
++    csr, _ = create_csr(
++        username="sids",
++        alt_dns=None,
++        alt_upn=None,
++        alt_sid=b"S-1-5-21-1-2-3-4",
++        subject=None,
++        key_size=2048,
++        application_policies=None,
++        smime=None,
++        key=rsa_key,
++    )
++    extension_oids = {ext.oid.dotted_string for ext in csr.extensions}
++    # The SID is carried both as a SAN URL and in the NTDS security extension
++    assert NTDS_CA_SECURITY_EXT.dotted_string in extension_oids
++
++    request = asn1csr.CertificationRequest.load(csr_to_der(csr))
++    extension_request_count = _csr_attribute_oids(csr).count("1.2.840.113549.1.9.14")
++    assert extension_request_count == 2
++
++    san_values = []
++    for attr in request["certification_request_info"]["attributes"]:
++        if str(attr["type"]) != "1.2.840.113549.1.9.14":
++            continue
++        for values in attr["values"]:
++            for extension in values:
++                if extension["extn_id"].dotted == "2.5.29.17":
++                    san_values = extension["extn_value"].parsed
++    uris = [
++        g.chosen.native
++        for g in san_values
++        if g.name == "uniform_resource_identifier"
++    ]
++    assert uris == [f"{SAN_URL_PREFIX}S-1-5-21-1-2-3-4"]
++
++
++def test_create_csr_with_application_policies(rsa_key):
++    csr, _ = create_csr(
++        username="policies",
++        alt_dns=None,
++        alt_upn=None,
++        alt_sid=None,
++        subject=None,
++        key_size=2048,
++        application_policies=["1.3.6.1.5.5.7.3.2"],
++        smime=None,
++        key=rsa_key,
++    )
++    extension_oids = {ext.oid.dotted_string for ext in csr.extensions}
++    assert "1.3.6.1.4.1.311.21.10" in extension_oids
++
++
++def test_create_csr_with_smime(rsa_key):
++    csr, _ = create_csr(
++        username="smimeuser",
++        alt_dns=None,
++        alt_upn=None,
++        alt_sid=None,
++        subject=None,
++        key_size=2048,
++        application_policies=None,
++        smime="3des",
++        key=rsa_key,
++    )
++    extension_oids = {ext.oid.dotted_string for ext in csr.extensions}
++    assert "1.2.840.113549.1.9.15" in extension_oids
++
++
++def test_create_csr_renewal_attribute(rsa_key, sha256_ca):
++    csr, _ = create_csr(
++        username="renewal",
++        alt_dns=None,
++        alt_upn=None,
++        alt_sid=None,
++        subject=None,
++        key_size=2048,
++        application_policies=None,
++        smime=None,
++        key=rsa_key,
++        renewal_cert=sha256_ca,
++    )
++    assert "1.3.6.1.4.1.311.13.1" in _csr_attribute_oids(csr)
++
++
++def test_pem_der_certificate_roundtrip(sha256_ca):
++    der = cert_to_der(sha256_ca)
++    assert der_to_cert(der) == pem_to_cert(cert_to_pem(sha256_ca))
++    assert der_to_cert(der) == sha256_ca
++
++
++def test_pem_der_private_key_roundtrip(rsa_key):
++    der = rsa_key.private_bytes(
++        serialization.Encoding.DER,
++        serialization.PrivateFormat.PKCS8,
++        serialization.NoEncryption(),
++    )
++    restored = der_to_key(der)
++    assert restored.public_key().public_numbers() == rsa_key.public_key().public_numbers()
++
++
++def test_key_to_pem_loadable(rsa_key):
++    restored = pem_to_key(key_to_pem(rsa_key))
++    assert restored.key_size == rsa_key.key_size
++
++
++def test_private_key_to_ms_blob_header(rsa_key):
++    blob = private_key_to_ms_blob(rsa_key)
++    assert blob[:8] == struct.pack("<bbHI", 7, 2, 0, 41984)
++    assert blob[8:12] == b"RSA2"
++    assert struct.unpack("<I", blob[12:16])[0] == rsa_key.key_size
++
++
++def test_create_pfx_and_load_pfx_roundtrip(pfx_bytes, rsa_key, sha256_ca):
++    key, cert = load_pfx(pfx_bytes, b"certipy-test")
++    assert cert is not None and key is not None
++    assert cert.subject == sha256_ca.subject
++    assert key.key_size == rsa_key.key_size
++
++
++def test_create_pfx_unprotected_container_loads_without_password(rsa_key, sha256_ca):
++    pfx = create_pfx(rsa_key, sha256_ca, None)
++    key, cert = load_pfx(pfx, None)
++    assert cert is not None
++    assert key is not None
++
++
++def test_load_pfx_with_wrong_password_raises(pfx_bytes):
++    with pytest.raises(Exception):
++        load_pfx(pfx_bytes, b"wrong-password")
++
++
++def test_get_identities_from_certificate(sid_cert_der):
++    cert = der_to_cert(sid_cert_der)
++    identities = get_identities_from_certificate(cert)
++    assert identities == [("UPN", "user@corp.local")]
++
++
++def test_get_object_sid_from_certificate_san_url(sid_cert_der):
++    cert = der_to_cert(sid_cert_der)
++    assert get_object_sid_from_certificate_san_url(cert) == "S-1-5-21-1-2-3-4"
++
++
++def test_get_object_sid_from_certificate_sid_extension(sid_cert_der):
++    cert = der_to_cert(sid_cert_der)
++    assert get_object_sid_from_certificate_sid_extension(cert) == "S-1-5-21-1-2-3-999"
++
++
++def test_get_object_sid_prefers_security_extension(sid_cert_der):
++    cert = der_to_cert(sid_cert_der)
++    assert get_object_sid_from_certificate(cert) == "S-1-5-21-1-2-3-999"
++
++
++def test_get_object_sid_returns_none_without_extensions(rsa_key, sha256_ca):
++    # sha256_ca has basic constraints only: no SAN and no SID extension
++    assert get_object_sid_from_certificate(sha256_ca) is None
++    assert get_identities_from_certificate(sha256_ca) == []
++    assert get_object_sid_from_certificate_san_url(sha256_ca) is None
++    assert get_object_sid_from_certificate_sid_extension(sha256_ca) is None
++
++
++def test_cert_id_to_parts_upn_and_dns():
++    username, domain = cert_id_to_parts([("UPN", "user@corp.local")])
++    assert username == "user"
++    assert domain == "corp.local"
++
++    username, domain = cert_id_to_parts([("DNS Host Name", "host.corp.local")])
++    assert username == "host$"
++    assert domain == "corp.local"
++
++
++def test_cert_id_to_parts_filters_unrelated_identity_types():
++    assert cert_id_to_parts([("Email", "user@corp.local")]) == ("", "")
++    assert cert_id_to_parts([]) == (None, None)
++
++
++def test_cert_id_to_parts_merges_multiple_identities():
++    username, domain = cert_id_to_parts(
++        [("UPN", "user@corp.local"), ("DNS Host Name", "web.corp.local")]
++    )
++    assert username == "user_web$"
++    assert domain == "corp.local_corp.local"
+diff --git a/tests/test_channel_binding.py b/tests/test_channel_binding.py
+new file mode 100644
+index 0000000..894e828
+--- /dev/null
++++ b/tests/test_channel_binding.py
+@@ -0,0 +1,106 @@
++"""Tests for RFC 5929 channel binding computation."""
++
++import hashlib
++
++import pytest
++
++from certipy.lib.channel_binding import (
++    get_channel_binding_data,
++    get_channel_binding_data_from_response,
++    get_channel_binding_data_from_ssl_socket,
++)
++
++
++def _expected_binding(der, algorithm="sha256"):
++    """Independently compute the RFC 5929 tls-server-end-point binding."""
++    cert_hash = hashlib.new(algorithm, der).digest()
++    application_data_raw = b"tls-server-end-point:" + cert_hash
++    application_data = len(application_data_raw).to_bytes(4, "little")
++    structure = b"\x00" * 8 + b"\x00" * 8 + application_data + application_data_raw
++    return hashlib.md5(structure).digest()
++
++
++def test_binding_matches_rfc5929_reference(sha256_ca_der):
++    assert get_channel_binding_data(sha256_ca_der) == _expected_binding(
++        sha256_ca_der, "sha256"
++    )
++
++
++def test_binding_is_deterministic(sha256_ca_der):
++    first = get_channel_binding_data(sha256_ca_der)
++    second = get_channel_binding_data(sha256_ca_der)
++    assert first == second
++    assert len(first) == 16
++
++
++def test_binding_uses_sha256_for_sha1_certificates(sha256_ca_der, monkeypatch):
++    # RFC 5929: MD5/SHA-1 signature algorithms must be hashed with SHA-256.
++    # The installed OpenSSL refuses to sign with SHA-1, so the certificate
++    # interface is stubbed out for this specific rule.
++    from cryptography.hazmat.primitives import hashes as _hashes
++
++    class Sha1SignedCertificate:
++        signature_hash_algorithm = _hashes.SHA1()
++
++    import certipy.lib.channel_binding as module
++
++    monkeypatch.setattr(
++        "certipy.lib.channel_binding.x509.load_der_x509_certificate",
++        lambda der: Sha1SignedCertificate(),
++    )
++    binding = get_channel_binding_data(sha256_ca_der)
++    assert binding == _expected_binding(sha256_ca_der, "sha256")
++    # A plain SHA-1 hash must NOT have been used
++    assert binding != _expected_binding(sha256_ca_der, "sha1")
++
++
++def test_binding_depends_on_certificate_bytes(sha256_ca_der, sid_cert_der):
++    sha256_binding = get_channel_binding_data(sha256_ca_der)
++    sid_binding = get_channel_binding_data(sid_cert_der)
++    assert sha256_binding != sid_binding
++
++
++def test_binding_from_response(fake_response_factory, sha256_ca_der):
++    response = fake_response_factory(sha256_ca_der)
++    assert get_channel_binding_data_from_response(response) == get_channel_binding_data(
++        sha256_ca_der
++    )
++
++
++def test_binding_from_response_missing_network_stream():
++    class EmptyResponse:
++        extensions = {}
++
++    with pytest.raises(ValueError):
++        get_channel_binding_data_from_response(EmptyResponse())
++
++
++def test_binding_from_response_missing_ssl_object(fake_response_factory):
++    class NoSslStream:
++        def get_extra_info(self, name):
++            return None
++
++    class Response:
++        extensions = {"network_stream": NoSslStream()}
++
++    with pytest.raises(ValueError):
++        get_channel_binding_data_from_response(Response())
++
++
++def test_binding_from_response_missing_peer_certificate(fake_response_factory):
++    response = fake_response_factory(None)
++    with pytest.raises(ValueError):
++        get_channel_binding_data_from_response(response)
++
++
++def test_binding_from_ssl_socket(fake_ssl_socket_factory, sha256_ca_der):
++    sock = fake_ssl_socket_factory(sha256_ca_der)
++    assert get_channel_binding_data_from_ssl_socket(sock) == get_channel_binding_data(
++        sha256_ca_der
++    )
++
++
++def test_binding_from_ssl_socket_missing_certificate(fake_ssl_socket_factory):
++    sock = fake_ssl_socket_factory(None)
++    with pytest.raises(ValueError):
++        get_channel_binding_data_from_ssl_socket(sock)
+diff --git a/tests/test_files.py b/tests/test_files.py
+new file mode 100644
+index 0000000..e4fa8c4
+--- /dev/null
++++ b/tests/test_files.py
+@@ -0,0 +1,86 @@
++"""Tests for certipy.lib.files saving behaviour."""
++
++import base64
++import os
++
++import pytest
++
++from certipy.lib.errors import handle_error, translate_error_code
++from certipy.lib.files import try_to_save_file
++
++
++def test_save_bytes_creates_file(tmp_path):
++    target = str(tmp_path / "out.pem")
++    assert try_to_save_file(b"data", target) == target
++    assert (tmp_path / "out.pem").read_bytes() == b"data"
++
++
++def test_save_string_creates_file(tmp_path):
++    target = str(tmp_path / "out.txt")
++    assert try_to_save_file("text", target) == target
++    assert (tmp_path / "out.txt").read_text() == "text"
++
++
++def test_save_sanitizes_colons_in_filename(tmp_path):
++    target = str(tmp_path / "out:put.pem")
++    returned = try_to_save_file(b"data", target)
++    assert returned == str(tmp_path / "out_put.pem")
++    assert (tmp_path / "out_put.pem").read_bytes() == b"data"
++
++
++def test_save_overwrites_when_user_confirms(tmp_path, monkeypatch):
++    target = tmp_path / "existing.pem"
++    target.write_bytes(b"old")
++    monkeypatch.setattr("builtins.input", lambda prompt: "y")
++    assert try_to_save_file(b"new", str(target)) == str(target)
++    assert target.read_bytes() == b"new"
++
++
++def test_save_uses_unique_filename_when_user_declines(tmp_path, monkeypatch):
++    target = tmp_path / "existing.pem"
++    target.write_bytes(b"old")
++    monkeypatch.setattr("builtins.input", lambda prompt: "n")
++    returned = try_to_save_file(b"new", str(target))
++    assert returned != str(target)
++    assert os.path.basename(returned).startswith("existing_")
++    assert os.path.basename(returned).endswith(".pem")
++    with open(returned, "rb") as f:
++        assert f.read() == b"new"
++    assert target.read_bytes() == b"old"
++
++
++def test_save_failure_aborts_when_requested(tmp_path):
++    target = str(tmp_path / "missing-dir" / "out.pem")
++    with pytest.raises(OSError):
++        try_to_save_file(b"data", target, abort_on_fail=True)
++
++
++def test_save_failure_falls_back_to_stdout(tmp_path, capsys):
++    target = str(tmp_path / "missing-dir" / "out.pem")
++    returned = try_to_save_file(b"data", target)
++    assert returned == "stdout"
++    captured = capsys.readouterr()
++    assert base64.b64decode(captured.out.strip()) == b"data"
++
++
++def test_save_failure_falls_back_to_stdout_for_text(tmp_path, capsys):
++    target = str(tmp_path / "missing-dir" / "out.txt")
++    assert try_to_save_file("text", target) == "stdout"
++    captured = capsys.readouterr()
++    assert captured.out.strip() == "text"
++
++
++def test_translate_error_code_known_and_unknown():
++    assert translate_error_code(0x80090311).startswith("code: 0x80090311 - ")
++    assert translate_error_code(0xDEADBEEF) == "unknown error code: 0xdeadbeef"
++
++
++def test_translate_error_code_masks_sign_extension():
++    signed = 0x80090311 - 2**32
++    assert str(signed) not in translate_error_code(signed)
++    assert translate_error_code(signed) == translate_error_code(0x80090311)
++
++
++def test_handle_error_does_not_exit():
++    assert handle_error() is None
++    assert handle_error(is_warning=True) is None
+diff --git a/tests/test_find_data.py b/tests/test_find_data.py
+new file mode 100644
+index 0000000..161e74e
+--- /dev/null
++++ b/tests/test_find_data.py
+@@ -0,0 +1,252 @@
++"""Tests for certipy.commands.find data processing."""
++
++import struct
++
++import pytest
++
++from certipy.commands.find import Find
++from certipy.lib.constants import (
++    CertificateNameFlag,
++    EnrollmentFlag,
++    PrivateKeyFlag,
++)
++from conftest import FakeEntry
++
++ONE_YEAR_FILETIME = struct.pack("<q", -315360000000000)
++ONE_WEEK_FILETIME = struct.pack("<q", -6048000000000)
++
++EKU_CLIENT_AUTH = b"1.3.6.1.5.5.7.3.2"
++EKU_SERVER_AUTH = b"1.3.6.1.5.5.7.3.1"
++EKU_REQUEST_AGENT = b"1.3.6.1.4.1.311.20.2.1"
++
++
++def _finder():
++    # No target required: only pure data-processing methods are exercised
++    return Find(None)
++
++
++def _template(**raw):
++    return FakeEntry(raw, raw)
++
++
++def test_enabled_flag_reflects_certificate_authorities():
++    finder = _finder()
++    enabled = _template(cas=["CORP-CA"])
++    disabled = _template(cas=None)
++    finder._process_template_properties([enabled, disabled])
++    assert enabled.get("enabled") is True
++    assert disabled.get("enabled") is False
++
++
++def test_validity_and_renewal_periods_are_converted():
++    finder = _finder()
++    template = _template(
++        pKIExpirationPeriod=ONE_YEAR_FILETIME,
++        pKIOverlapPeriod=ONE_WEEK_FILETIME,
++    )
++    finder._process_template_properties([template])
++    assert template.get("validity_period") == "1 year"
++    assert template.get("renewal_period") == "1 week"
++
++
++def test_missing_validity_periods_default_to_zero():
++    finder = _finder()
++    template = _template()
++    finder._process_template_properties([template])
++    assert template.get("validity_period") == 0
++    assert template.get("renewal_period") == 0
++
++
++def test_flag_attributes_are_listed():
++    finder = _finder()
++    template = _template(
++        **{
++            "msPKI-Certificate-Name-Flag": str(CertificateNameFlag.ENROLLEE_SUPPLIES_SUBJECT.value),
++            "msPKI-Enrollment-Flag": str(EnrollmentFlag.PEND_ALL_REQUESTS.value),
++            "msPKI-Private-Key-Flag": str(PrivateKeyFlag.REQUIRE_PRIVATE_KEY_ARCHIVAL.value),
++            "msPKI-RA-Signature": "2",
++            "msPKI-Template-Schema-Version": "3",
++        }
++    )
++    finder._process_template_properties([template])
++    assert CertificateNameFlag.ENROLLEE_SUPPLIES_SUBJECT in template.get(
++        "certificate_name_flag"
++    )
++    assert EnrollmentFlag.PEND_ALL_REQUESTS in template.get("enrollment_flag")
++    assert PrivateKeyFlag.REQUIRE_PRIVATE_KEY_ARCHIVAL in template.get(
++        "private_key_flag"
++    )
++    assert template.get("authorized_signatures_required") == 2
++    assert template.get("schema_version") == 3
++
++
++def test_flag_defaults_when_attributes_missing():
++    finder = _finder()
++    template = _template()
++    finder._process_template_properties([template])
++    assert template.get("certificate_name_flag") == []
++    assert template.get("enrollment_flag") == []
++    assert template.get("private_key_flag") == []
++    assert template.get("authorized_signatures_required") == 0
++    assert template.get("schema_version") == 1
++
++
++def test_capabilities_derived_from_eku():
++    finder = _finder()
++    template = _template(
++        **{
++            "msPKI-RA-Application-Policies": [EKU_CLIENT_AUTH],
++            "pKIExtendedKeyUsage": [EKU_CLIENT_AUTH],
++        }
++    )
++    finder._process_template_properties([template])
++    assert template.get("extended_key_usage") == ["Client Authentication"]
++    assert template.get("application_policies") == ["Client Authentication"]
++    assert template.get("client_authentication") is True
++    assert template.get("any_purpose") is False
++    assert template.get("enrollment_agent") is False
++
++
++def test_capabilities_with_empty_eku_means_any_purpose():
++    finder = _finder()
++    template = _template(
++        **{
++            "msPKI-RA-Application-Policies": None,
++            "pKIExtendedKeyUsage": None,
++        }
++    )
++    finder._process_template_properties([template])
++    assert template.get("extended_key_usage") == []
++    assert template.get("application_policies") == []
++    assert template.get("any_purpose") is True
++    assert template.get("client_authentication") is True
++    assert template.get("server_authentication") is True
++    assert template.get("enrollment_agent") is True
++
++
++def test_enrollee_supplies_subject_from_certificate_name_flag():
++    finder = _finder()
++    template = _template(
++        **{
++            "msPKI-Certificate-Name-Flag": str(CertificateNameFlag.ENROLLEE_SUPPLIES_SUBJECT.value),
++            "msPKI-Enrollment-Flag": "0",
++            "msPKI-Private-Key-Flag": "0",
++            "msPKI-RA-Application-Policies": None,
++            "pKIExtendedKeyUsage": [EKU_CLIENT_AUTH],
++        }
++    )
++    finder._process_template_properties([template])
++    assert template.get("enrollee_supplies_subject") is True
++    assert template.get("requires_manager_approval") is False
++    assert template.get("requires_key_archival") is False
++
++
++def test_enrollment_agent_and_server_authentication_capabilities():
++    finder = _finder()
++    agent = _template(pKIExtendedKeyUsage=[EKU_REQUEST_AGENT])
++    server = _template(pKIExtendedKeyUsage=[EKU_SERVER_AUTH])
++    finder._process_template_properties([agent, server])
++    assert agent.get("enrollment_agent") is True
++    assert agent.get("server_authentication") is False
++    assert server.get("enrollment_agent") is False
++    assert server.get("server_authentication") is True
++
++
++def test_flatten_template_data():
++    finder = _finder()
++    entry = {
++        "Template Name": "User",
++        "Enabled": False,
++        "Certificate Authorities": ["CA1", "CA2"],
++        "Valid Extensions": {"EKU": "Client Authentication"},
++        "Pending": None,
++        "Permissions": {
++            "Enrollment Permissions": {"Enrollment Rights": ["u1", "u2"]},
++            "Object Control Permissions": {
++                "Write Owner Principals": ["o1"],
++                "Write Dacl Principals": ["d1", "d2"],
++            },
++        },
++    }
++    flattened = finder._flatten_template_data(entry)
++    assert flattened["Template Name"] == "User"
++    assert flattened["Enabled"] == "False"
++    assert flattened["Certificate Authorities"] == "CA1\nCA2"
++    assert flattened["Pending"] == ""
++    assert flattened["Valid Extensions"] == "EKU: Client Authentication"
++    assert flattened["Enrollment Permissions"] == "u1\nu2"
++    assert flattened["Write Owner Principals"] == "o1"
++    assert flattened["Write Dacl Principals"] == "d1\nd2"
++
++
++def test_flatten_ca_data():
++    finder = _finder()
++    entry = {
++        "CA Name": "CORP-CA",
++        "Web Enrollment": {
++            "http": {"enabled": True},
++            "https": {"enabled": False, "channel_binding": True},
++        },
++        "Permissions": {
++            "Owner": "CORP\\Administrator",
++            "Access Rights": {
++                "Manage CA": ["adm"],
++                "Manage Certificates": ["c1", "c2"],
++            },
++        },
++        "[!] Vulnerabilities": {"ESC1": "dangerous template"},
++        "Config": {"flag": "value"},
++        "Templates": ["User", "Machine"],
++        "Notes": None,
++    }
++    flattened = finder._flatten_ca_data(entry)
++    assert flattened["CA Name"] == "CORP-CA"
++    assert flattened["Web Enrollment HTTP"] == "Enabled"
++    assert flattened["Web Enrollment HTTPS"] == "Disabled"
++    assert flattened["Channel Binding"] == "Enabled"
++    assert flattened["Owner"] == "CORP\\Administrator"
++    assert flattened["Manage CA Principals"] == "adm"
++    assert flattened["Manage Certificates Principals"] == "c1\nc2"
++    assert flattened["[!] Vulnerabilities"] == "ESC1: dangerous template"
++    assert flattened["Config"] == "flag: value"
++    assert flattened["Templates"] == "User\nMachine"
++    assert flattened["Notes"] == ""
++
++
++def test_flatten_ca_data_unknown_channel_binding():
++    finder = _finder()
++    flattened = finder._flatten_ca_data(
++        {"Web Enrollment": {"https": {"enabled": True, "channel_binding": None}}}
++    )
++    assert flattened["Channel Binding"] == "Unknown"
++    assert flattened["Web Enrollment HTTPS"] == "Enabled"
++
++
++def test_template_csv_output():
++    finder = _finder()
++    output = {
++        "Certificate Templates": {
++            0: {
++                "Template Name": "User",
++                "Display Name": "User",
++                "Enabled": True,
++                "Certificate Authorities": ["CA1"],
++                "Extended Key Usage": ["Client Authentication"],
++                "[!] Vulnerabilities": {"ESC1": "ESC1"},
++                "Validity Period": "1 year",
++            }
++        }
++    }
++    csv_data = finder.get_template_output_for_csv(output)
++    lines = csv_data.splitlines()
++    assert lines[0].startswith('"Template Name";"Display Name"')
++    assert len(lines) == 2
++    assert "User" in lines[1]
++    assert "ESC1: ESC1" in lines[1]
++
++
++def test_template_csv_output_without_data():
++    finder = _finder()
++    csv_data = finder.get_template_output_for_csv({"Certificate Templates": []})
++    # Only the header row is emitted
++    assert len(csv_data.splitlines()) == 1  # only the header row
+diff --git a/tests/test_forge.py b/tests/test_forge.py
+new file mode 100644
+index 0000000..2609ae2
+--- /dev/null
++++ b/tests/test_forge.py
+@@ -0,0 +1,215 @@
++"""Tests for the certificate forging logic in certipy.commands.forge."""
++
++import pytest
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes
++from cryptography.x509.oid import ExtensionOID
++
++from certipy.lib.certificate import (
++    NTDS_CA_SECURITY_EXT,
++    PRINCIPAL_NAME,
++    SAN_URL_PREFIX,
++    cert_to_der,
++    create_pfx,
++    der_to_cert,
++    get_identities_from_certificate,
++    get_object_sid_from_certificate,
++    get_object_sid_from_certificate_san_url,
++    get_object_sid_from_certificate_sid_extension,
++    load_pfx,
++)
++from certipy.commands.forge import Forge
++
++
++def test_forge_self_signed_ca_with_default_subject(tmp_path):
++    out = str(tmp_path / "ca.pfx")
++    Forge(out=out, pfx_password="secret").create_self_signed_ca()
++    key, cert = load_pfx((tmp_path / "ca.pfx").read_bytes(), b"secret")
++    assert cert is not None and key is not None
++    assert (
++        cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
++        == "Certipy CA"
++    )
++
++
++def test_forge_self_signed_ca_with_custom_subject_and_out(tmp_path):
++    out = str(tmp_path / "custom-name")
++    Forge(subject="CN=Corp Root", out=out).create_self_signed_ca()
++    assert (tmp_path / "custom-name.pfx").exists()
++    _, cert = load_pfx((tmp_path / "custom-name.pfx").read_bytes(), None)
++    assert (
++        cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
++        == "Corp Root"
++    )
++
++
++def test_serial_number_from_hex_string():
++    assert Forge(serial="dead:beef").get_serial_number() == 0xdeadbeef
++    assert Forge(serial="ff").get_serial_number() == 0xFF
++
++    implicit = Forge()
++    serial = implicit.get_serial_number()
++    assert serial > 0
++
++
++def test_get_crl_distribution_points():
++    assert Forge().get_crl() is None
++    extension = Forge(crl="http://crl.corp.local/ca.crl").get_crl()
++    assert isinstance(extension, x509.CRLDistributionPoints)
++    uri = (
++        extension[0]
++        .full_name[0]
++        .value
++    )
++    assert uri == "http://crl.corp.local/ca.crl"
++
++    overridden = Forge(crl="http://first/x.crl").get_crl("http://second/y.crl")
++    assert overridden[0].full_name[0].value == "http://second/y.crl"
++
++
++def test_get_allowed_hash_algorithm_rules():
++    forge = Forge()
++    assert isinstance(forge.get_allowed_hash_algorithm(None), hashes.SHA256)
++
++    sha256 = hashes.SHA256()
++    assert forge.get_allowed_hash_algorithm(sha256) is sha256
++
++    # SHA-1 is rejected for security reasons and downgraded to SHA-256
++    assert isinstance(forge.get_allowed_hash_algorithm(hashes.SHA1()), hashes.SHA256)
++
++
++def test_create_sid_extension_contents():
++    assert Forge().create_sid_extension() is None
++
++    extension = Forge(sid="S-1-5-21-1-2-3-42").create_sid_extension()
++    assert isinstance(extension, x509.UnrecognizedExtension)
++    assert extension.oid == NTDS_CA_SECURITY_EXT
++    assert b"S-1-5-21-1-2-3-42" in extension.value
++
++
++def test_determine_output_filename():
++    assert (
++        Forge(out="explicit.pfx").determine_output_filename("UPN", "user@corp.local")
++        == "explicit.pfx"
++    )
++    assert (
++        Forge().determine_output_filename("UPN", "administrator@corp.local")
++        == "administrator_forged.pfx"
++    )
++    assert (
++        Forge().determine_output_filename("DNS Host Name", "host.corp.local")
++        == "host_forged.pfx"
++    )
++    # Unusable identity values fall back to a timestamped name
++    fallback = Forge().determine_output_filename("Email", "someone@corp.local")
++    assert fallback.endswith("_forged.pfx")
++
++
++def test_build_new_certificate_contents(rsa_key, sha256_ca):
++    forge = Forge(
++        upn="administrator@corp.local",
++        dns="dc01.corp.local",
++        sid="S-1-5-21-1-2-3-999",
++        subject="CN=Certipy Forged",
++        serial="dead:beef",
++        crl="http://crl.corp.local/ca.crl",
++        validity_period=30,
++        pfx_password="forged",
++    )
++    _, pfx = forge.build_new_certificate(
++        rsa_key, rsa_key.public_key(), sha256_ca
++    )
++    key, cert = load_pfx(pfx, b"forged")
++    assert key is not None and cert is not None
++
++    # Subject, issuer, serial and validity
++    assert (
++        cert.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
++        == "Certipy Forged"
++    )
++    assert cert.issuer == sha256_ca.subject
++    assert cert.serial_number == 0xdeadbeef
++    assert (
++        cert.not_valid_after_utc - cert.not_valid_before_utc
++    ).days >= 30
++    cert.verify_directly_issued_by(sha256_ca)
++
++    # Alternative names: UPN, DNS and SID URL
++    san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
++    assert x509.DNSName("dc01.corp.local") in san
++    assert san.get_values_for_type(x509.OtherName)[0].type_id == PRINCIPAL_NAME
++    assert x509.UniformResourceIdentifier(
++        f"{SAN_URL_PREFIX}S-1-5-21-1-2-3-999"
++    ) in san
++
++    # Extractable identities and SIDs through the shared helpers
++    identities = get_identities_from_certificate(cert)
++    assert ("UPN", "administrator@corp.local") in identities
++    assert ("DNS Host Name", "dc01.corp.local") in identities
++    assert get_object_sid_from_certificate_san_url(cert) == "S-1-5-21-1-2-3-999"
++    assert get_object_sid_from_certificate_sid_extension(cert) == "S-1-5-21-1-2-3-999"
++    assert get_object_sid_from_certificate(cert) == "S-1-5-21-1-2-3-999"
++
++    # Distribution point and key identifiers
++    crl_points = cert.extensions.get_extension_for_class(x509.CRLDistributionPoints)
++    assert crl_points.value[0].full_name[0].value == "http://crl.corp.local/ca.crl"
++    assert (
++        cert.extensions.get_extension_for_oid(
++            ExtensionOID.AUTHORITY_KEY_IDENTIFIER
++        ).critical
++        is False
++    )
++    assert cert.extensions.get_extension_for_oid(
++        ExtensionOID.SUBJECT_KEY_IDENTIFIER
++    ).value is not None
++
++
++def test_build_new_certificate_ends_in_loadable_pfx(rsa_key, sha256_ca):
++    forge = Forge(upn="user@corp.local")
++    _, pfx = forge.build_new_certificate(rsa_key, rsa_key.public_key(), sha256_ca)
++    key, cert = load_pfx(pfx, None)
++    assert cert is not None
++    assert key.key_size == 2048
++
++
++def test_build_from_template_reuses_template_values(tmp_path, rsa_key, sha256_ca, sid_cert_der):
++    template_path = tmp_path / "template.pfx"
++    template_path.write_bytes(create_pfx(rsa_key, der_to_cert(sid_cert_der), None))
++
++    forge = Forge(template=str(template_path))
++    _, pfx = forge.build_from_template(rsa_key, rsa_key.public_key(), sha256_ca)
++    _, cert = load_pfx(pfx, None)
++
++    template_cert = der_to_cert(sid_cert_der)
++    # Subject and serial number are inherited from the template
++    assert cert.subject == template_cert.subject
++    assert cert.serial_number == template_cert.serial_number
++    assert cert.issuer == sha256_ca.subject
++    cert.verify_directly_issued_by(sha256_ca)
++    # SAN and the SID extension are dropped when no new identities are given
++    with pytest.raises(x509.ExtensionNotFound):
++        cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
++    with pytest.raises(x509.ExtensionNotFound):
++        cert.extensions.get_extension_for_oid(NTDS_CA_SECURITY_EXT)
++
++
++def test_build_from_template_requires_template(rsa_key, sha256_ca):
++    forge = Forge()
++    with pytest.raises(ValueError):
++        forge.build_from_template(rsa_key, rsa_key.public_key(), sha256_ca)
++
++
++def test_load_ca_certificate_and_key_requires_pfx_password(tmp_path, pfx_bytes):
++    ca_pfx = tmp_path / "ca.pfx"
++    ca_pfx.write_bytes(pfx_bytes)
++
++    forge = Forge(ca_pfx=str(ca_pfx), ca_password="certipy-test")
++    ca_key, ca_cert = forge.load_ca_certificate_and_key()
++    assert ca_cert is not None
++    assert ca_key.key_size == 2048
++
++    with pytest.raises(ValueError):
++        Forge().load_ca_certificate_and_key()
++
++    with pytest.raises(FileNotFoundError):
++        Forge(ca_pfx=str(tmp_path / "missing.pfx")).load_ca_certificate_and_key()
+diff --git a/tests/test_formatting.py b/tests/test_formatting.py
+new file mode 100644
+index 0000000..03216e2
+--- /dev/null
++++ b/tests/test_formatting.py
+@@ -0,0 +1,94 @@
++"""Tests for certipy.lib.formatting output helpers."""
++
++import datetime
++
++import pytest
++
++from certipy.lib.formatting import REMAP, pretty_print, to_pascal_case
++
++
++def _pretty_print_lines(data):
++    """Run pretty_print against a capturing print function and return lines."""
++    lines = []
++
++    def capture(text):
++        lines.append(str(text).rstrip())
++
++    pretty_print(data, print_func=capture)
++    while lines and lines[-1] == "":
++        lines.pop()
++    return lines
++
++
++def test_to_pascal_case_single_word():
++    assert to_pascal_case("enabled") == "Enabled"
++
++
++def test_to_pascal_case_multiple_words():
++    assert to_pascal_case("client_authentication") == "ClientAuthentication"
++
++
++def test_pretty_print_scalars_and_remap():
++    lines = _pretty_print_lines(
++        {"enabled": True, "http": "https://ca.corp.local/certsrv"}
++    )
++    assert lines[0].startswith("Enabled")
++    assert ": True" in lines[0]
++    assert any(line.startswith("HTTP") for line in lines)
++    assert "https://ca.corp.local/certsrv" in lines[1]
++
++
++def test_pretty_print_nested_dictionary():
++    lines = _pretty_print_lines({"parent": {"child": 1}})
++    assert lines[0] == "parent"
++    assert lines[1].lstrip().startswith("child")
++    assert ": 1" in lines[1]
++
++
++def test_pretty_print_list_of_scalars():
++    lines = _pretty_print_lines({"templates": ["User", "Machine"]})
++    assert lines[0].startswith("templates")
++    assert "User" in lines[0]
++    assert "Machine" in " ".join(lines)
++
++
++def test_pretty_print_empty_list():
++    lines = _pretty_print_lines({"templates": []})
++    assert len(lines) == 1
++    assert lines[0].startswith("templates")
++    assert lines[0].endswith(":")
++
++
++def test_pretty_print_list_of_dictionaries():
++    data = {"cas": [{"name": "CA1"}, {"name": "CA2"}]}
++    lines = _pretty_print_lines(data)
++    assert lines[0] == "cas"
++    assert any("name" in line for line in lines[1:])
++
++
++def test_pretty_print_tuple_of_items():
++    lines = _pretty_print_lines({"entries": ({"name": "CA1"}, "extra")})
++    assert lines[0] == "entries"
++    assert any("name" in line for line in lines[1:])
++    assert any("extra" in line for line in lines[1:])
++
++
++def test_pretty_print_datetime_value():
++    stamp = datetime.datetime(2024, 1, 2, 3, 4, 5)
++    lines = _pretty_print_lines({"expires": stamp})
++    assert "2024-01-02T03:04:05" in lines[0]
++
++
++def test_pretty_print_none_values_are_skipped():
++    assert _pretty_print_lines({"missing": None}) == []
++
++
++def test_pretty_print_unsupported_type_raises():
++    with pytest.raises(TypeError):
++        pretty_print({"weird": object()})
++
++
++def test_remap_contains_channel_binding_and_web_keys():
++    assert REMAP["channel_binding"] == "Channel Binding (EPA)"
++    assert REMAP["http"] == "HTTP"
++    assert REMAP["https"] == "HTTPS"
+diff --git a/tests/test_ntlm.py b/tests/test_ntlm.py
+new file mode 100644
+index 0000000..b44b7e7
+--- /dev/null
++++ b/tests/test_ntlm.py
+@@ -0,0 +1,115 @@
++"""Tests for NTLMv2 response computation in certipy.lib.ntlm."""
++
++import struct
++
++import pytest
++from impacket.ntlm import (
++    AV_PAIRS,
++    NTLMSSP_AV_CHANNEL_BINDINGS,
++    NTLMSSP_AV_DNS_HOSTNAME,
++    NTLMSSP_AV_TARGET_NAME,
++    NTLMSSP_AV_TIME,
++    NTLMSSP_NEGOTIATE_KEY_EXCH,
++    NTLMSSP_NEGOTIATE_NTLM,
++    NTLMSSP_NEGOTIATE_TARGET_INFO,
++    NTOWFv2,
++    hmac_md5,
++)
++
++from certipy.lib.ntlm import compute_response, ntlm_negotiate
++
++SERVER_CHALLENGE = b"S" * 8
++CLIENT_CHALLENGE = b"C" * 8
++HOSTNAME = "dc01.corp.local".encode("utf-16le")
++
++
++def _av_pair(attr, value):
++    return struct.pack("<HH", attr, len(value)) + value
++
++
++def _target_info():
++    # Minimal NTLMSSP AV_PAIRS blob advertising only a DNS hostname
++    return _av_pair(NTLMSSP_AV_DNS_HOSTNAME, HOSTNAME) + struct.pack("<HH", 0, 0)
++
++
++def _compute(**overrides):
++    args = dict(
++        server_challenge=SERVER_CHALLENGE,
++        client_challenge=CLIENT_CHALLENGE,
++        target_info=_target_info(),
++        domain="corp",
++        user="user",
++        password="pass",
++    )
++    args.update(overrides)
++    return compute_response(**args)
++
++
++def _av_pairs_of(nt_response):
++    # NT proof is 16 bytes; the temp blob follows: 8-byte header,
++    # 8-byte timestamp, 8-byte client challenge, 4-byte reserved
++    temp = nt_response[16:]
++    assert temp[:8] == b"\x01\x01" + b"\x00" * 6
++    assert temp[16:24] == CLIENT_CHALLENGE
++    assert temp[24:28] == b"\x00" * 4
++    return AV_PAIRS(temp[28:])
++
++
++def test_compute_response_nt_proof_is_verifiable():
++    nt_response, lm_response, session_base_key, hostname = _compute()
++    response_key = NTOWFv2("user", "pass", "corp")
++
++    # NT response = NT proof over the server challenge plus the temp blob
++    assert nt_response[:16] == hmac_md5(response_key, SERVER_CHALLENGE + nt_response[16:])
++    # LM response = HMAC over challenge and client challenge
++    assert lm_response == (
++        hmac_md5(response_key, SERVER_CHALLENGE + CLIENT_CHALLENGE) + CLIENT_CHALLENGE
++    )
++    # Session base key = HMAC over the NT proof
++    assert session_base_key == hmac_md5(response_key, nt_response[:16])
++    assert hostname == HOSTNAME
++
++
++def test_compute_response_populates_av_pairs():
++    nt_response, _, _, _ = _compute()
++    av_pairs = _av_pairs_of(nt_response)
++    assert av_pairs[NTLMSSP_AV_DNS_HOSTNAME] == (len(HOSTNAME), HOSTNAME)
++    # A timestamp is added when the server did not include one
++    assert av_pairs[NTLMSSP_AV_TIME] is not None
++
++
++def test_compute_response_sets_spn_target_name():
++    nt_response, _, _, _ = _compute(service="ldap")
++    av_pairs = _av_pairs_of(nt_response)
++    spn = "ldap/".encode("utf-16le") + HOSTNAME
++    assert av_pairs[NTLMSSP_AV_TARGET_NAME] == (len(spn), spn)
++
++
++def test_compute_response_includes_channel_binding_data():
++    without_cb, _, _, _ = _compute()
++    with_cb, _, _, _ = _compute(channel_binding_data=b"\x11" * 16)
++    assert with_cb != without_cb
++    av_pairs = _av_pairs_of(with_cb)
++    assert av_pairs[NTLMSSP_AV_CHANNEL_BINDINGS] == (16, b"\x11" * 16)
++    assert _av_pairs_of(without_cb)[NTLMSSP_AV_CHANNEL_BINDINGS] is None
++
++
++def test_compute_response_without_dns_hostname_raises():
++    with pytest.raises(ValueError):
++        _compute(target_info=struct.pack("<HH", 0, 0))
++
++
++def test_compute_response_anonymous_yields_empty_responses():
++    nt_response, lm_response, _, _ = _compute(user="", password="")
++    assert nt_response == b""
++    assert lm_response == b""
++
++
++def test_ntlm_negotiate_flags():
++    auth = ntlm_negotiate()
++    assert auth["flags"] & NTLMSSP_NEGOTIATE_NTLM
++    assert auth["flags"] & NTLMSSP_NEGOTIATE_TARGET_INFO
++    assert not auth["flags"] & NTLMSSP_NEGOTIATE_KEY_EXCH
++
++    signing = ntlm_negotiate(signing_required=True)
++    assert signing["flags"] & NTLMSSP_NEGOTIATE_KEY_EXCH
+diff --git a/tests/test_time.py b/tests/test_time.py
+new file mode 100644
+index 0000000..8aaa87e
+--- /dev/null
++++ b/tests/test_time.py
+@@ -0,0 +1,77 @@
++"""Tests for certipy.lib.time FILETIME and span conversions."""
++
++import struct
++
++import pytest
++
++from certipy.lib.time import (
++    filetime_to_span,
++    filetime_to_str,
++    span_to_filetime,
++    span_to_str,
++)
++
++
++def test_filetime_to_span_one_year():
++    # 1 year expressed in 100-nanosecond intervals, negative per validity convention
++    assert filetime_to_span(struct.pack("<q", -315360000000000)) == 31536000
++
++
++def test_filetime_to_span_roundtrip_with_span_to_filetime():
++    span = 3600
++    filetime = span_to_filetime(span)
++    assert filetime_to_span(filetime) == span
++
++
++def test_filetime_to_span_accepts_negative_values_absolutely():
++    value = struct.pack("<q", -864000000000)
++    assert filetime_to_span(value) == 86400
++
++
++def test_filetime_to_span_invalid_length_raises():
++    with pytest.raises(struct.error):
++        filetime_to_span(b"\x01\x02\x03")
++
++
++def test_span_to_filetime_negative_span_raises():
++    with pytest.raises(ValueError):
++        span_to_filetime(-1)
++
++
++def test_span_to_filetime_epoch_values():
++    assert span_to_filetime(0) == struct.pack("<q", 0)
++    packed = span_to_filetime(604800)
++    assert struct.unpack("<q", packed)[0] == -6048000000000
++
++
++def test_span_to_str_units():
++    assert span_to_str(31536000) == "1 year"
++    assert span_to_str(63072000) == "2 years"
++    assert span_to_str(2592000) == "1 month"
++    assert span_to_str(604800) == "1 week"
++    assert span_to_str(86400) == "1 day"
++    assert span_to_str(3600) == "1 hour"
++
++
++def test_span_to_str_pluralisation():
++    assert span_to_str(1209600) == "2 weeks"
++    assert span_to_str(7200) == "2 hours"
++
++
++def test_span_to_str_non_divisible_falls_back_to_seconds():
++    assert span_to_str(7) == "7 seconds"
++    assert span_to_str(3601) == "3601 seconds"
++
++
++def test_span_to_str_non_positive_returns_empty():
++    assert span_to_str(0) == ""
++    assert span_to_str(-5) == ""
++
++
++def test_filetime_to_str_combined_conversion():
++    assert filetime_to_str(struct.pack("<q", -6048000000000)) == "1 week"
++
++
++def test_filetime_to_str_invalid_payload_returns_error_message():
++    result = filetime_to_str(b"short")
++    assert "Invalid FILETIME format" in result

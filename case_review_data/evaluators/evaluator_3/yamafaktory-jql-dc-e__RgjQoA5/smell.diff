@@ -1,0 +1,281 @@
+diff --git a/crates/jql-runner/src/lazy.rs b/crates/jql-runner/src/lazy.rs
+index 8b41b85..5819e7c 100644
+--- a/crates/jql-runner/src/lazy.rs
++++ b/crates/jql-runner/src/lazy.rs
+@@ -185,54 +185,23 @@ impl Evaluator {
+ 
+         // A lens compares numbers to decide which elements survive, so a
+         // divergence there changes the selection rather than a value in the
+-        // outcome, where the check below would see it. Those queries keep the
+-        // up-front scan.
++        // outcome, where the check a taped outcome runs would see it. Those
++        // queries keep the up-front scan.
+         if lens_compares_numbers(tokens) && numbers_may_diverge(json) {
+             return Ok(Outcome::fallback());
+         }
+ 
+         // The only bytes the tape builder writes are the ones it unescapes a
+         // string into, so input without a backslash is left intact and can be
+-        // taped in place — the fallback below still sees pristine bytes.
+-        // Anything else gets a copy. `tape_leaves_escape_free_input_intact`
+-        // pins that invariant down.
+-        let outcome = if memchr::memchr(b'\\', json).is_none() {
+-            match simd_json::to_tape_with_buffers(json, &mut self.buffers) {
+-                Ok(tape) => eval(tokens, tape.as_value()),
+-                Err(_) => return Ok(self.declined(json)),
+-            }
++        // taped in place — the fallback still sees pristine bytes. Anything
++        // else gets a copy. `tape_leaves_escape_free_input_intact` pins that
++        // invariant down.
++        if memchr::memchr(b'\\', json).is_none() {
++            tape_in_place(&mut self.buffers, tokens, json)
+         } else {
+             let mut scratch = json.to_vec();
+ 
+-            match simd_json::to_tape_with_buffers(&mut scratch, &mut self.buffers) {
+-                Ok(tape) => eval(tokens, tape.as_value()),
+-                // The pristine input, not the copy the failure may have partly
+-                // unescaped, is what the offsets are read against.
+-                Err(_) => return Ok(self.declined(json)),
+-            }
+-        };
+-
+-        if outcome_may_diverge(&outcome, json) {
+-            return Ok(Outcome::fallback());
+-        }
+-
+-        outcome.map(|value| Outcome {
+-            value: Some(value),
+-            document_starts: None,
+-        })
+-    }
+-
+-    /// Turns a tape build failure into a declined outcome, reading the document
+-    /// boundaries out of the stage-1 scan it already paid for.
+-    ///
+-    /// The failure itself says nothing usable about why — a second document
+-    /// reports the same internal tape error as some malformed input — so
+-    /// [`document_starts`] is what decides whether the scan describes a clean
+-    /// sequence of documents.
+-    fn declined(&self, json: &[u8]) -> Outcome {
+-        Outcome {
+-            value: None,
+-            document_starts: document_starts(self.buffers.structural_indexes(), json),
++            tape_escaped(&mut self.buffers, tokens, json, &mut scratch)
+         }
+     }
+ }
+@@ -255,6 +224,72 @@ impl Outcome {
+     }
+ }
+ 
++/// Builds a tape in place over `json` and evaluates `tokens` against it. The
++/// tape builder writes only the bytes it unescapes a string into, so
++/// escape-free input — the caller has checked for a backslash — is left intact
++/// for the reads a decline and a taped outcome make against it.
++fn tape_in_place(
++    buffers: &mut Buffers,
++    tokens: &[Token],
++    json: &mut [u8],
++) -> Result<Outcome, JqlRunnerError> {
++    let tape = match simd_json::to_tape_with_buffers(json, buffers) {
++        Ok(tape) => tape,
++        Err(_) => return Ok(declined(buffers, json)),
++    };
++
++    taped_outcome(eval(tokens, tape.as_value()), json)
++}
++
++/// Builds a tape over a scratch `copy` of `json` — the tape builder unescapes
++/// strings into the copy — and evaluates `tokens` against it. The pristine
++/// `json`, not the copy a failed build may have partly unescaped, is what a
++/// decline is read against.
++fn tape_escaped(
++    buffers: &mut Buffers,
++    tokens: &[Token],
++    json: &[u8],
++    copy: &mut [u8],
++) -> Result<Outcome, JqlRunnerError> {
++    let tape = match simd_json::to_tape_with_buffers(copy, buffers) {
++        Ok(tape) => tape,
++        Err(_) => return Ok(declined(buffers, json)),
++    };
++
++    taped_outcome(eval(tokens, tape.as_value()), json)
++}
++
++/// Turns a tape build failure into a declined outcome, reading the document
++/// boundaries out of the stage-1 scan it already paid for.
++///
++/// The failure itself says nothing usable about why — a second document
++/// reports the same internal tape error as some malformed input — so
++/// [`document_starts`] is what decides whether the scan describes a clean
++/// sequence of documents.
++fn declined(buffers: &Buffers, json: &[u8]) -> Outcome {
++    Outcome {
++        value: None,
++        document_starts: document_starts(buffers.structural_indexes(), json),
++    }
++}
++
++/// Wraps the result a taped evaluation came back with, reporting a fallback
++/// when the numbers it carries could have been parsed differently by
++/// serde_json.
++fn taped_outcome(
++    outcome: Result<Value, JqlRunnerError>,
++    json: &[u8],
++) -> Result<Outcome, JqlRunnerError> {
++    if outcome_may_diverge(&outcome, json) {
++        return Ok(Outcome::fallback());
++    }
++
++    outcome.map(|value| Outcome {
++        value: Some(value),
++        document_starts: None,
++    })
++}
++
+ /// Whether the numbers `outcome` carries could have been parsed differently by
+ /// serde_json, which means the tape must be given up for it.
+ ///
+diff --git a/crates/jql/src/main.rs b/crates/jql/src/main.rs
+index c269923..74474ab 100644
+--- a/crates/jql/src/main.rs
++++ b/crates/jql/src/main.rs
+@@ -87,10 +87,13 @@ fn resolve_query(args: &Args) -> Result<String> {
+ fn process_json(
+     json: &mut [u8],
+     query: &str,
+-    args: &Args,
++    validate: bool,
++    inline: bool,
++    raw_string: bool,
++    sort_keys: bool,
+     evaluator: &mut lazy::Evaluator,
+ ) -> Result<Vec<String>> {
+-    if args.validate {
++    if validate {
+         return serde_json::from_slice::<Value>(json).map_or_else(
+             |_| Err(anyhow!("Invalid JSON file or content")),
+             |_| Ok(vec!["Valid JSON file or content".to_string()]),
+@@ -100,23 +103,28 @@ fn process_json(
+     evaluator
+         .raw_all(query, json)?
+         .into_iter()
+-        .map(|result| format_json(result, args))
++        .map(|result| format_json(result, inline, raw_string, sort_keys))
+         .collect()
+ }
+ 
+ /// Renders one query result according to the output arguments.
+-fn format_json(mut result: Value, args: &Args) -> Result<String> {
+-    if args.sort_keys {
++fn format_json(
++    mut result: Value,
++    inline: bool,
++    raw_string: bool,
++    sort_keys: bool,
++) -> Result<String> {
++    if sort_keys {
+         result.sort_all_objects();
+     }
+ 
+-    if args.inline {
++    if inline {
+         return ColoredFormatter::new(CompactFormatter {})
+             .to_colored_json_auto(&result)
+             .with_context(|| "Failed to inline the JSON data".to_string());
+     }
+ 
+-    if args.raw_string && result.is_string() {
++    if raw_string && result.is_string() {
+         // We can safely unwrap since the result is a string.
+         return Ok(String::from(result.as_str().unwrap()));
+     }
+@@ -143,7 +151,15 @@ fn main() -> Result<()> {
+     if let Some(path) = args.json_file.as_deref() {
+         let mut contents = read_file_bytes(path)?;
+ 
+-        render(process_json(&mut contents, &query, &args, &mut evaluator));
++        render(process_json(
++            &mut contents,
++            &query,
++            args.validate,
++            args.inline,
++            args.raw_string,
++            args.sort_keys,
++            &mut evaluator,
++        ));
+ 
+         return Ok(());
+     }
+@@ -156,7 +172,15 @@ fn main() -> Result<()> {
+                 .with_context(|| "Failed to read stream".to_string())?
+                 .into_bytes();
+ 
+-            render(process_json(&mut line, &query, &args, &mut evaluator));
++            render(process_json(
++                &mut line,
++                &query,
++                args.validate,
++                args.inline,
++                args.raw_string,
++                args.sort_keys,
++                &mut evaluator,
++            ));
+ 
+             stdout
+                 .flush()
+@@ -174,7 +198,15 @@ fn main() -> Result<()> {
+         .read_to_end(&mut buffer)
+         .with_context(|| "Failed to read piped content from stdin".to_string())?;
+ 
+-    render(process_json(&mut buffer, &query, &args, &mut evaluator));
++    render(process_json(
++        &mut buffer,
++        &query,
++        args.validate,
++        args.inline,
++        args.raw_string,
++        args.sort_keys,
++        &mut evaluator,
++    ));
+ 
+     Ok(())
+ }
+@@ -192,7 +224,16 @@ mod tests {
+         let query = resolve_query(&args).unwrap();
+ 
+         assert_eq!(
+-            process_json(&mut json, &query, &args, &mut lazy::Evaluator::new()).unwrap(),
++            process_json(
++                &mut json,
++                &query,
++                args.validate,
++                args.inline,
++                args.raw_string,
++                args.sort_keys,
++                &mut lazy::Evaluator::new()
++            )
++            .unwrap(),
+             [r#"{"a":3,"b":{"x":2,"y":1},"d":1}"#]
+         );
+     }
+@@ -204,7 +245,16 @@ mod tests {
+         let query = resolve_query(&args).unwrap();
+ 
+         assert_eq!(
+-            process_json(&mut json, &query, &args, &mut lazy::Evaluator::new()).unwrap(),
++            process_json(
++                &mut json,
++                &query,
++                args.validate,
++                args.inline,
++                args.raw_string,
++                args.sort_keys,
++                &mut lazy::Evaluator::new()
++            )
++            .unwrap(),
+             [r#"{"d":1,"a":3}"#]
+         );
+     }

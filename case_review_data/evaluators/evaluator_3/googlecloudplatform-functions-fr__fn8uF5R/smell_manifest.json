@@ -1,0 +1,149 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "ESLint (@typescript-eslint)",
+  "smell_type": "shotgun_surgery",
+  "rule": {
+    "id": "admission-scatter",
+    "description": "Reports fragments of the per-instance concurrent invocation admission-control responsibility (bookkeeping state, gate helper internals, per-request admission markers, and direct reads of the raw cap setting) appearing in more than one production source file, so that a conceptual change to the admission policy cannot be made in one place."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "src/server.ts",
+      "class_name": null,
+      "function_name": "getServer"
+    },
+    {
+      "id": "E2",
+      "file_path": "src/invoker.ts",
+      "class_name": null,
+      "function_name": null
+    },
+    {
+      "id": "E3",
+      "file_path": "src/function_wrappers.ts",
+      "class_name": null,
+      "function_name": "releaseInvocationAdmission"
+    },
+    {
+      "id": "E4",
+      "file_path": "src/middleware/timeout.ts",
+      "class_name": null,
+      "function_name": "timeoutMiddleware"
+    },
+    {
+      "id": "E5",
+      "file_path": "src/main.ts",
+      "class_name": null,
+      "function_name": "main"
+    }
+  ],
+  "injected_match_count": 7,
+  "checks": [
+    {
+      "id": "admission-implementation-fragment",
+      "description": "Detects a piece of the admission-control implementation (shared bookkeeping state, gate or release helper internals, or the per-request admission marker) hand-written in a production file rather than imported from a single owning module.",
+      "detected_relation": "production file -> locally coded admission-control implementation fragment",
+      "why_this_is_the_smell": "Admission bookkeeping, gating, and slot release form one conceptual responsibility. When fragments of it are coded directly in the request-assembly, bookkeeping, wrapper, and socket-timeout modules, changing the admission policy (for example how a slot is handed over when an invocation settles) requires coordinated edits in every fragment.",
+      "matches": [
+        {
+          "file": "src/server.ts",
+          "symbol": "getServer",
+          "entry_ids": [
+            "E1"
+          ],
+          "evidence": "The request pipeline constructor defines the inline admission gate middleware, a local release helper, and the per-request admission marker stamp, all mutating the admission state imported from the bookkeeping module.",
+          "measurement": {
+            "tokens": 8,
+            "lines": "69-110"
+          }
+        },
+        {
+          "file": "src/invoker.ts",
+          "symbol": "InvocationAdmissionState",
+          "entry_ids": [
+            "E2"
+          ],
+          "evidence": "The module-level bookkeeping interface for the gate state (in-flight counter and parked-request queue) is declared in the shared request-dispatch module instead of an admission owner.",
+          "measurement": {
+            "tokens": 3,
+            "lines": "40-49"
+          }
+        },
+        {
+          "file": "src/invoker.ts",
+          "symbol": "invocationAdmissionState",
+          "entry_ids": [
+            "E2"
+          ],
+          "evidence": "The mutable shared admission state object that the pipeline and wrappers mutate directly is exported from the bookkeeping module rather than hidden behind an admission API.",
+          "measurement": {
+            "tokens": 2,
+            "lines": "57-58"
+          }
+        },
+        {
+          "file": "src/function_wrappers.ts",
+          "symbol": "releaseInvocationAdmission",
+          "entry_ids": [
+            "E3"
+          ],
+          "evidence": "The signature wrappers re-implement slot release (marker guard, queue shift, in-flight decrement) as a local helper duplicated from the pipeline's version and call it from the callback completion path and the domain error path.",
+          "measurement": {
+            "tokens": 3,
+            "lines": "64-72"
+          }
+        },
+        {
+          "file": "src/middleware/timeout.ts",
+          "symbol": "timeoutMiddleware",
+          "entry_ids": [
+            "E4"
+          ],
+          "evidence": "The socket-inactivity-timeout and connection-close event handlers each inline a copy of the admission slot release block instead of deferring to one owner.",
+          "measurement": {
+            "tokens": 6,
+            "lines": "21-47"
+          }
+        }
+      ]
+    },
+    {
+      "id": "raw-configuration-read",
+      "description": "Detects a direct read of the raw admission cap setting (the boot-time environment value) in a production file, instead of one module owning how the cap is parsed, validated, and defaulted.",
+      "detected_relation": "production file -> direct raw admission configuration read",
+      "why_this_is_the_smell": "How the concurrency cap is parsed, validated, and defaulted is one configuration concern. Duplicating the raw environment reads across the request pipeline constructor and the process entrypoint means changing the value format or the fallback for an invalid value requires editing every site in step.",
+      "matches": [
+        {
+          "file": "src/server.ts",
+          "symbol": "getServer",
+          "entry_ids": [
+            "E1"
+          ],
+          "evidence": "The request pipeline constructor parses the cap from the environment in a local immediately-invoked function each time a server is constructed.",
+          "measurement": {
+            "tokens": 1,
+            "lines": "50-50"
+          }
+        },
+        {
+          "file": "src/main.ts",
+          "symbol": "main",
+          "entry_ids": [
+            "E5"
+          ],
+          "evidence": "The process entrypoint parses the same setting twice more: once to validate it at startup and once to print the startup banner.",
+          "measurement": {
+            "tokens": 2,
+            "lines": "47-83"
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    "Import specifiers, bare identifier references, and plain call sites are never reported, so a repair that consolidates the responsibility into one owning module and merely imports and calls its API from consumer files passes, whatever the owner is named, file layout, or shape.",
+    "Only production sources under src are analyzed; tests, build output, and configuration JSON are out of scope.",
+    "Literal text inside template or message strings does not count as a configuration access; only actual read sites (property access or the constant string definition) count."
+  ]
+}

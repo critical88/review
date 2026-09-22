@@ -1,0 +1,255 @@
+diff --git a/pew/_print_utils.py b/pew/_print_utils.py
+index 9073b00..c2cf4ab 100644
+--- a/pew/_print_utils.py
++++ b/pew/_print_utils.py
+@@ -45,6 +45,20 @@ def columnize(venvs):
+ def print_virtualenvs(*venvs):
+     venvs = sorted(venvs)
+     if os.isatty(1):
+-        print(*columnize(venvs), sep='\n')
++        max_width, _ = get_terminal_size()
++        longest = partial(max, key=len)
++        columns_number = 1
++        for columns_number in range(1, len(venvs) + 1):
++            lines_number = int(ceil(len(venvs) / columns_number))
++            longest_row = list(map(longest, zip_longest(*[venvs[i::lines_number] for i in range(lines_number)], fillvalue='')))
++            if sum(map(len, longest_row)) + L * len(longest_row) - L > max_width:
++                columns_number = ((columns_number - 1) or 1)
++                break
++        lines_number = int(ceil(len(venvs) / columns_number))
++        aligned_columns = []
++        for column in zip_longest(*[venvs[i::lines_number] for i in range(lines_number)], fillvalue=''):
++            column_width = max(map(len, column))
++            aligned_columns.append([name.ljust(column_width) for name in column])
++        print(*[SEP.join(line) for line in zip(*aligned_columns)], sep='\n')
+     else:
+         print(*venvs, sep=' ')
+diff --git a/pew/pew.py b/pew/pew.py
+index 4a9b690..53c5d32 100644
+--- a/pew/pew.py
++++ b/pew/pew.py
+@@ -5,7 +5,9 @@ import shutil
+ import random
+ import textwrap
+ from functools import partial
+-from subprocess import CalledProcessError
++from itertools import zip_longest
++from math import ceil
++from subprocess import CalledProcessError, Popen, PIPE
+ from pathlib import Path
+ 
+ from shutil import get_terminal_size
+@@ -41,7 +43,7 @@ else:
+     import shellingham
+ 
+ from pew._utils import (check_call, invoke, expandpath, own, env_bin_dir,
+-                        check_path, temp_environ, NamedTemporaryFile)
++                        check_path, temp_environ, NamedTemporaryFile, encoding)
+ from pew._print_utils import print_virtualenvs
+ 
+ err = partial(print, file=sys.stderr)
+@@ -259,8 +261,48 @@ project directory to associate with the new environment.')
+     args, rest = parser.parse_known_args(argv)
+     project = expandpath(args.project) if args.project else None
+ 
+-    mkvirtualenv(args.envname, args.python, args.packages, project,
+-                 args.requirements, rest)
++    if args.python:
++        rest = ["--python=%s" % args.python] + rest
++
++    path = (workon_home / args.envname).absolute()
++    try:
++        check_call([sys.executable, "-m", "virtualenv", str(path)] + rest)
++    except (CalledProcessError, KeyboardInterrupt):
++        rmvirtualenvs([args.envname])
++        raise
++    else:
++        if project:
++            print('Setting project for {0} to {1}'.format(args.envname,
++                                                          project.absolute()))
++            with (workon_home / args.envname / '.project').open('wb') as prj:
++                prj.write(str(project.absolute()).encode())
++
++        installs = []
++        if args.requirements:
++            installs.append(['install', '-r', str(expandpath(args.requirements))])
++        if args.packages:
++            installs.append(['install'] + list(args.packages))
++        for pip_args in installs:
++            saved_environment = dict(os.environ)
++            try:
++                os.environ['VIRTUAL_ENV'] = str(workon_home / args.envname)
++                os.environ['PATH'] = os.pathsep.join([
++                    str(workon_home / args.envname / env_bin_dir),
++                    os.environ['PATH']])
++                for env_key in ('PYTHONHOME', '__PYVENV_LAUNCHER__'):
++                    if env_key in os.environ:
++                        del os.environ[env_key]
++                try:
++                    check_call(['pip'] + pip_args, shell=windows)
++                except OSError as e:
++                    if e.errno == 2:
++                        err('Unable to find', 'pip')
++                    else:
++                        raise
++            finally:
++                os.environ.clear()
++                os.environ.update(saved_environment)
++
+     if args.activate:
+         shell(args.envname)
+ 
+@@ -296,12 +338,27 @@ def packages(site_packages):
+ 
+ 
+ def showvirtualenv(env):
++    if not env:
++        sys.exit('ERROR: no virtualenv active')
+     columns, _ = get_terminal_size()
+-    pkgs = sorted(packages(sitepackages_dir(env)))
+-    env_python = workon_home / env / env_bin_dir / 'python'
+     l = len(env) + 2
+-    version = invoke(str(env_python), '-V')
+-    version = ' - '.join((version.out + version.err).splitlines())
++    env_python = str(workon_home / env / env_bin_dir / 'python')
++
++    inp = ''.encode(encoding)
++    popen = Popen([env_python, '-c', 'from distutils.sysconfig import '
++                   'get_python_lib; print(get_python_lib())'],
++                  stdin=PIPE, stdout=PIPE, stderr=PIPE)
++    out, err_ = [o.strip().decode(encoding) for o in popen.communicate(inp)]
++    site_dir = Path(out)
++    pkgs = sorted(set([x.stem.split('-')[0] for x in site_dir.iterdir()])
++                  - set(['__pycache__']))
++
++    version_out, version_err = [o.strip().decode(encoding) for o in
++                                Popen([env_python, '-V'], stdin=PIPE,
++                                      stdout=PIPE, stderr=PIPE)
++                                .communicate(inp)]
++    version = ' - '.join((version_out + version_err).splitlines())
++
+     print(env, ': ', version, sep='')
+     print(textwrap.fill(' '.join(pkgs),
+                         width=columns-l,
+@@ -341,7 +398,35 @@ def ls_cmd(argv):
+     p_group.add_argument('-b', '--brief', action='store_false')
+     p_group.add_argument('-l', '--long', action='store_true')
+     args = parser.parse_args(argv)
+-    lsvirtualenv(args.long)
++
++    envs = sorted(set(env.parts[-3] for env in
++                      workon_home.glob(os.path.join('*', env_bin_dir, 'python*'))))
++
++    if not args.long:
++        venvs = sorted(envs)
++        if os.isatty(1):
++            max_width, _ = get_terminal_size()
++            longest = partial(max, key=len)
++            columns_n = 1
++            for columns_n in range(1, len(venvs) + 1):
++                lines_number = int(ceil(len(venvs) / columns_n))
++                longest_row = list(map(longest, zip_longest(*[
++                    venvs[i::lines_number] for i in range(lines_number)],
++                    fillvalue='')))
++                if sum(map(len, longest_row)) + 2 * len(longest_row) - 2 > max_width:
++                    columns_n = (columns_n - 1) or 1
++                    break
++            lines_number = int(ceil(len(venvs) / columns_n))
++            columns = map(lambda column: [name.ljust(max(map(len, column)))
++                                          for name in column],
++                          zip_longest(*[venvs[i::lines_number]
++                                        for i in range(lines_number)], fillvalue=''))
++            print(*map('  '.join, zip(*columns)), sep='\n')
++        else:
++            print(*venvs, sep=' ')
++    else:
++        for env in envs:
++            showvirtualenv(env)
+ 
+ def parse_envname(argv, no_arg_callback):
+     if len(argv) < 1 or argv[0] is None:
+@@ -379,7 +464,83 @@ def workon_cmd(argv):
+     if project_dir is None or args.no_cd:
+         project_dir = os.getcwd()
+ 
+-    return shell(env, cwd=project_dir)
++    shell_str = os.environ.get('SHELL', None)
++    if not shell_str:
++        if 'CMDER_ROOT' in os.environ:
++            shell_str = 'Cmder'
++        elif windows:
++            try:
++                _, shell_str = shellingham.detect_shell()
++            except shellingham.ShellDetectionFailure:
++                shell_str = os.environ.get('COMSPEC', 'cmd.exe')
++        else:
++            shell_str = 'sh'
++    shell_name = Path(shell_str).stem
++
++    if shell_name not in ('Cmder', 'bash', 'elvish', 'powershell', 'klingon', 'cmd'):
++        # On Windows the PATH is usually set with System Utility
++        # so we won't worry about trying to check mistakes there
++        shell_check = (sys.executable + ' -c "from pew.pew import '
++                       'prevent_path_errors; prevent_path_errors()"')
++        try:
++            inve(env, shell_str, '-c', shell_check)
++        except CalledProcessError:
++            return
++
++    rcfile = None
++    if shell_name == 'Cmder':
++        shellcmd = ['cmd']
++        cmderrc_path = r'%CMDER_ROOT%\vendor\init.bat'
++        if expandpath(cmderrc_path).exists():
++            shellcmd += ['/k', cmderrc_path]
++        if project_dir:
++            os.environ['CMDER_START'] = project_dir
++    elif shell_name == 'bash':
++        # bash is a special little snowflake, and prevent_path_errors cannot work there
++        # https://github.com/berdario/pew/issues/58#issuecomment-102182346
++        shellcmd = ['bash']
++        bashrcpath = expandpath('~/.bashrc')
++        if bashrcpath.exists():
++            rcfile = NamedTemporaryFile('w+')
++            with bashrcpath.open() as bashrc:
++                rcfile.write(bashrc.read())
++            rcfile.write('\nexport PATH="' + os.pathsep.join([
++                str(workon_home / env / env_bin_dir),
++                os.environ['PATH']]) + '"')
++            rcfile.flush()
++            shellcmd = ['bash', '--rcfile', rcfile.name]
++    else:
++        shellcmd = [shell_str]
++
++    or_ctrld = '' if windows else "or 'Ctrl+D' "
++    err("Launching subshell in virtual environment. Type 'exit' ", or_ctrld,
++        "to return.", sep='')
++    if 'VIRTUAL_ENV' in os.environ:
++        err("Be aware that this environment will be nested on top "
++            "of '%s'" % Path(os.environ['VIRTUAL_ENV']).name)
++
++    saved_environment = dict(os.environ)
++    try:
++        os.environ['VIRTUAL_ENV'] = str(workon_home / env)
++        os.environ['PATH'] = os.pathsep.join([
++            str(workon_home / env / env_bin_dir),
++            os.environ['PATH']])
++        for env_key in ('PYTHONHOME', '__PYVENV_LAUNCHER__'):
++            if env_key in os.environ:
++                del os.environ[env_key]
++        try:
++            return check_call(shellcmd, shell=windows, cwd=project_dir)
++        except OSError as e:
++            if e.errno == 2:
++                err('Unable to find', shellcmd[0])
++                return 2
++            else:
++                raise
++    finally:
++        os.environ.clear()
++        os.environ.update(saved_environment)
++        if rcfile is not None:
++            rcfile.close()
+ 
+ 
+ def sitepackages_dir(env=os.environ.get('VIRTUAL_ENV')):

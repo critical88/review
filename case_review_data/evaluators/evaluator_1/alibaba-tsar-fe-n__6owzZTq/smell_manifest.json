@@ -1,0 +1,127 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Clang-Tidy",
+  "smell_type": "feature_envy",
+  "task_id": "alibaba-tsar-fe-n",
+  "rule": {
+    "id": "tsar-feature-envy",
+    "description": "A module-state service defined outside the module-owner layer: a function that receives a struct module * operand, reads or writes at least six distinct struct module fields through it, and touches more distinct struct module fields than fields of any other record type, while being defined in a translation unit other than the module-owner units (src/framework.c, src/common.c, src/tsar_lua_util.c) that own the module record definition, its lifecycle and its services."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "src/output_print.c",
+      "class_name": null,
+      "function_name": "print_module_row"
+    },
+    {
+      "id": "E2",
+      "file_path": "src/output_print.c",
+      "class_name": null,
+      "function_name": "print_module_tail"
+    },
+    {
+      "id": "E3",
+      "file_path": "src/output_print.c",
+      "class_name": null,
+      "function_name": "print_module_check_state"
+    },
+    {
+      "id": "E4",
+      "file_path": "src/output_nagios.c",
+      "class_name": null,
+      "function_name": "module_state_to_nagios"
+    },
+    {
+      "id": "E5",
+      "file_path": "src/output_db.c",
+      "class_name": null,
+      "function_name": "module_state_to_sql"
+    }
+  ],
+  "injected_match_count": 5,
+  "checks": [
+    {
+      "id": "misplaced-module-state-service",
+      "description": "Detect functions living in an output front-end translation unit whose primary data is one module record: the function operates on struct module internals through a struct module * operand, reaching into at least six distinct fields, more than it reaches into any other record.",
+      "detected_relation": "output front-end unit -> struct module record internals (enable, opt_line, name, record, spec, st_flag, st_array, n_col, n_item, p_item, print_item, max_array, mean_array, min_array)",
+      "why_this_is_the_smell": "The routine's whole job is to render or serialize one module's collected state, so the module record is the data it is primarily interested in; living in an output front-end, it duplicates the record-walking responsibility of the owner units that define struct module (include/framework.h) and its lifecycle, instead of sitting next to that record.",
+      "matches": [
+        {
+          "file": "src/output_print.c",
+          "symbol": "print_module_row",
+          "entry_ids": [
+            "E1"
+          ],
+          "evidence": "print_module_row(struct module *mod) in src/output_print.c walks the module record for the live/merge row: it branches on mod->enable and mod->n_item, honours mod->print_item/mod->p_item selection, and locates the sample window in mod->st_array with mod->n_col stride, replicating the per-module row walk that belongs with the module record.",
+          "measurement": {
+            "distinct_module_fields": 6,
+            "module_field_names": "enable,n_col,n_item,p_item,print_item,st_array"
+          }
+        },
+        {
+          "file": "src/output_print.c",
+          "symbol": "print_module_tail",
+          "entry_ids": [
+            "E2"
+          ],
+          "evidence": "print_module_tail(struct module *mod, int tail_type) in src/output_print.c chooses the aggregation series with mod->max_array/mod->mean_array/mod->min_array, filters items via mod->print_item/mod->p_item/mod->n_item and renders columns from mod->info against conf.print_mode, so the whole tail-aggregation policy is derived from the module record.",
+          "measurement": {
+            "distinct_module_fields": 10,
+            "module_field_names": "enable,info,max_array,mean_array,min_array,n_col,n_item,p_item,print_item,spec"
+          }
+        },
+        {
+          "file": "src/output_print.c",
+          "symbol": "print_module_check_state",
+          "entry_ids": [
+            "E3"
+          ],
+          "evidence": "print_module_check_state(struct module *mod) in src/output_print.c produces the tsar --check key=value payload: it resolves the check name from mod->opt_line, tokenises mod->record, walks mod->n_item x mod->n_col windows of mod->st_array honouring mod->st_flag and mod->spec, and labels each value with headers from mod->info.",
+          "measurement": {
+            "distinct_module_fields": 9,
+            "module_field_names": "enable,info,n_col,n_item,opt_line,record,spec,st_array,st_flag"
+          }
+        },
+        {
+          "file": "src/output_nagios.c",
+          "symbol": "module_state_to_nagios",
+          "entry_ids": [
+            "E4"
+          ],
+          "evidence": "module_state_to_nagios(struct module *mod, ...) in src/output_nagios.c turns one module's state into nagios plugin output: it names the check from mod->name, replays mod->record, indexes mod->st_array with mod->n_col, consults mod->st_flag/mod->info and passes threshold decisions on, so the nagios payload is decided entirely by module internals.",
+          "measurement": {
+            "distinct_module_fields": 7,
+            "module_field_names": "enable,info,n_col,name,record,st_array,st_flag"
+          }
+        },
+        {
+          "file": "src/output_db.c",
+          "symbol": "module_state_to_sql",
+          "entry_ids": [
+            "E5"
+          ],
+          "evidence": "module_state_to_sql(struct module *mod, ...) in src/output_db.c builds one module's INSERT statement: the table comes from mod->opt_line, the column list from mod->info headers with mod->n_col, and the value tuple from mod->st_array, gated by mod->enable and mod->st_flag, i.e. the SQL row is an exact serialization of the record.",
+          "measurement": {
+            "distinct_module_fields": 6,
+            "module_field_names": "enable,info,n_col,opt_line,st_array,st_flag"
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "reference": "src/framework.c, src/common.c, src/tsar_lua_util.c",
+      "reason": "Owner layer: the translation units that define struct module's lifecycle and walk its fields heavily (load_modules, collect_record_stat, init_module_fields, get_st_array_from_file, load_lua_module, lua_set_mod) legitimately live with the record; the rule never fires inside them."
+    },
+    {
+      "reference": "struct mod_info *info (mod->info)",
+      "reason": "Column-header reads through mod->info are counted toward the module record (the pointer itself is a field), but the rule also requires that no other single record type be touched at least as many times as struct module, so functions dominated by some other record are not misreported."
+    },
+    {
+      "reference": "modules/mod_*.c collectors",
+      "reason": "Every module collector (collect_mod_* / set_st_record_*) primarily fills its own stats_* record, not struct module; none of them reaches the six-distinct-module-field requirement while module fields dominate, so no collector is reported on the clean tree."
+    }
+  ]
+}

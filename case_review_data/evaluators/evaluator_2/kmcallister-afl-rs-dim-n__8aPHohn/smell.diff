@@ -1,0 +1,470 @@
+diff --git a/cargo-afl-common/src/config.rs b/cargo-afl-common/src/config.rs
+index cc88a68..370a45f 100644
+--- a/cargo-afl-common/src/config.rs
++++ b/cargo-afl-common/src/config.rs
+@@ -4,7 +4,7 @@ use crate as common;
+ use anyhow::{Context, Result, bail, ensure};
+ use clap::Parser;
+ use std::ffi::OsStr;
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::process::{Command, ExitStatus, Stdio};
+ 
+ const AFL_SRC_PATH: &str = "AFLplusplus";
+@@ -47,18 +47,42 @@ pub struct Args {
+     pub verbose: bool,
+ }
+ 
++#[allow(clippy::disallowed_macros)]
+ pub fn config(args: &Args) -> Result<()> {
+-    let object_file_path = common::object_file_path()?;
++    // Where the runtime object file lives. This used to be
++    // `common::object_file_path()`, but the path is just the data-directory
++    // scheme `<xdg data dir>/afl.rs/<rustc version>/<afl.rs version>/afl-llvm`,
++    // so it is resolved here instead of through the `afl_llvm_dir` /
++    // `data_dir` pair of helpers.
++    let rustc_meta = rustc_version::version_meta()?;
++    let mut toolchain_label = String::from("rustc-");
++    toolchain_label.push_str(&rustc_meta.semver.to_string());
++    if let Some(commit_hash) = rustc_meta.commit_hash {
++        toolchain_label.push('-');
++        toolchain_label.push_str(&commit_hash[..common::SHORT_COMMIT_HASH_LEN]);
++    }
++
++    let mut package_label = String::from("afl.rs-");
++    let published_version = env!("CARGO_PKG_VERSION");
++    assert!(!published_version.is_empty());
++    package_label.push_str(published_version);
++
++    let runtime_dir = common::xdg_base_dir()
++        .create_data_directory(
++            PathBuf::from(&toolchain_label)
++                .join(&package_label)
++                .join("afl-llvm"),
++        )?;
++    let object_file_path = runtime_dir.join(common::OBJECT_FILE_NAME);
+ 
+     if !args.force
+         && !args.update
+         && object_file_path.exists()
+         && args.plugins == common::plugins_installed()?
+     {
+-        let version = common::afl_rustc_version()?;
+         bail!(
+-            "AFL LLVM runtime was already built for Rust {version}; run `cargo afl config --build \
+-             --force` to rebuild it."
++            "AFL LLVM runtime was already built for Rust {toolchain_label}; run `cargo afl config \
++             --build --force` to rebuild it."
+         );
+     }
+ 
+@@ -110,8 +134,53 @@ pub fn config(args: &Args) -> Result<()> {
+         copy_aflplusplus_submodule(&aflplusplus_dir)?;
+     }
+ 
+-    build_afl(&args, &aflplusplus_dir)?;
+-    build_afl_llvm_runtime(&args, &aflplusplus_dir)?;
++    // Build and install AFL++. This used to be `build_afl(&args,
++    // &aflplusplus_dir)`; the make invocation is inlined so that the working
++    // directory, the environment it sees, and the success check can be read
++    // together. The LLVM config probe is kept as a call: it has its own
++    // environment-variable and version furniture.
++    let make_target_dir = common::afl_dir()?;
++    let mut make_command = Command::new("make");
++    make_command
++        .current_dir(&aflplusplus_dir)
++        .args(["clean", "install"])
++        // skip the checks for the legacy x86 afl-gcc compiler
++        .env("AFL_NO_X86", "1")
++        .env("DESTDIR", make_target_dir)
++        .env("PREFIX", "")
++        .env_remove("DEBUG");
++
++    if args.plugins {
++        let llvm_config = check_llvm_and_get_config()?;
++        make_command.env("LLVM_CONFIG", llvm_config);
++    } else {
++        // build just the runtime to avoid troubles with Xcode clang on macOS
++        // smoelius: `NO_BUILD=1` also makes `cargo build` much faster.
++        make_command.env("NO_BUILD", "1");
++    }
++
++    if !args.verbose {
++        make_command.stdout(Stdio::null());
++        make_command.stderr(Stdio::null());
++    }
++
++    let make_success = make_command
++        .status()
++        .as_ref()
++        .is_ok_and(ExitStatus::success);
++    ensure!(
++        make_success,
++        "could not run 'make clean install' in {}",
++        aflplusplus_dir.display()
++    );
++
++    // Install the runtime object file (was `build_afl_llvm_runtime`). The
++    // destination was computed above, so the copy is all that is left.
++    let _: u64 = std::fs::copy(
++        aflplusplus_dir.join(common::OBJECT_FILE_NAME),
++        &object_file_path,
++    )
++    .with_context(|| "could not copy object file")?;
+ 
+     if args.plugins {
+         copy_afl_llvm_plugins(&args, &aflplusplus_dir)?;
+@@ -218,6 +287,9 @@ fn rev(dir: &Path) -> Result<String> {
+     String::from_utf8(output.stdout).map_err(Into::into)
+ }
+ 
++// smoelius: not called anymore; the make invocation now lives inside
++// `config`. Kept as a reference for the previous build layout.
++#[allow(dead_code)]
+ fn build_afl(args: &Args, work_dir: &Path) -> Result<()> {
+     // if you had already installed cargo-afl previously you **must** clean AFL++
+     let afl_dir = common::afl_dir()?;
+@@ -255,6 +327,9 @@ fn build_afl(args: &Args, work_dir: &Path) -> Result<()> {
+     Ok(())
+ }
+ 
++// smoelius: not called anymore; `config` copies the object file directly.
++// Kept as a reference for the previous install step.
++#[allow(dead_code)]
+ fn build_afl_llvm_runtime(_args: &Args, work_dir: &Path) -> Result<()> {
+     let object_file_path = common::object_file_path()?;
+     let _: u64 = std::fs::copy(work_dir.join(common::OBJECT_FILE_NAME), &object_file_path)
+diff --git a/cargo-afl-common/src/lib.rs b/cargo-afl-common/src/lib.rs
+index f64b679..6e8eb99 100644
+--- a/cargo-afl-common/src/lib.rs
++++ b/cargo-afl-common/src/lib.rs
+@@ -89,14 +89,42 @@ pub fn aflplusplus_dir_from_base_dir(base_dir: &xdg::BaseDirectories) -> Result<
+         .map_err(Into::into)
+ }
+ 
++/// Check whether shared objects are installed for the current Rust toolchain.
++///
++/// The data-directory layout `<xdg data dir>/afl.rs/<rustc version>/<afl.rs version>/afl-llvm`
++/// used to be assembled one helper at a time (`afl_llvm_dir` -> `data_dir` ->
++/// `afl_rustc_version` + `pkg_version`). Those indirections were single-use, and
++/// reading the probe required jumping between four functions. The layout is now
++/// spelled out here, next to the directory scan that consumes it.
++#[allow(clippy::disallowed_macros)]
+ pub fn plugins_installed() -> Result<bool> {
+-    let afl_llvm_dir = afl_llvm_dir()?;
+-    for result in afl_llvm_dir
++    let rustc_meta = rustc_version::version_meta()?;
++    let mut toolchain_label = String::from("rustc-");
++    toolchain_label.push_str(&rustc_meta.semver.to_string());
++    if let Some(commit_hash) = rustc_meta.commit_hash {
++        toolchain_label.push('-');
++        toolchain_label.push_str(&commit_hash[..SHORT_COMMIT_HASH_LEN]);
++    }
++
++    let mut package_label = String::from("afl.rs-");
++
++    let published_version = env!("CARGO_PKG_VERSION");
++    assert!(!published_version.is_empty());
++
++    package_label.push_str(published_version);
++
++    // toolchain/package/plugin layout, resolved in place
++    let plugin_root = xdg::BaseDirectories::with_prefix("afl.rs")
++        .create_data_directory(
++            PathBuf::from(toolchain_label).join(package_label).join("afl-llvm"),
++        )?;
++
++    for result in plugin_root
+         .read_dir()
+-        .with_context(|| format!("could not read `{}`", afl_llvm_dir.display()))?
++        .with_context(|| format!("could not read `{}`", plugin_root.display()))?
+     {
+         let entry = result.with_context(|| {
+-            format!("could not read `DirEntry` in `{}`", afl_llvm_dir.display())
++            format!("could not read `DirEntry` in `{}`", plugin_root.display())
+         })?;
+         let file_name = entry.file_name();
+         if Path::new(&file_name).extension() == Some(OsStr::new("so")) {
+diff --git a/cargo-afl/src/main.rs b/cargo-afl/src/main.rs
+index 9ccdf8e..7bf0fa3 100644
+--- a/cargo-afl/src/main.rs
++++ b/cargo-afl/src/main.rs
+@@ -1,9 +1,10 @@
++use anyhow::Context;
+ use cargo_afl_common::{self as common, config};
+ use clap::{CommandFactory, FromArgMatches, Parser, crate_version};
+ use std::collections::HashMap;
+ use std::env;
+ use std::ffi::{OsStr, OsString};
+-use std::path::Path;
++use std::path::{Path, PathBuf};
+ use std::process::{self, Command, Stdio};
+ 
+ const HELP: &str = "In addition to the subcommands above, Cargo subcommands are also \
+@@ -116,8 +117,45 @@ declare_afl_subcommand_enum! {
+ }
+ 
+ fn main() {
+-    let afl_version = afl_version();
+-    let command = command_with_afl_version(afl_version.as_deref());
++    // Resolve the installed AFL++ version. This used to be `afl_version`, a
++    // single-use helper; the probe belongs to the startup sequence, and both
++    // consumers of its result (the subcommand decoration below and the
++    // update notice in the non-config branch) live in this function, so the
++    // probe is spelled out here. Its early exits are expressed with `?` on
++    // the closure's `Option`.
++    let afl_version = (|| -> Option<String> {
++        const PREFIX: &str = "afl-fuzz++";
++        let afl_fuzz_path = common::afl_dir().unwrap().join("bin/afl-fuzz");
++        let output = Command::new(afl_fuzz_path).arg("--version").output().ok()?;
++        let stdout = String::from_utf8(output.stdout).ok()?;
++        let index = stdout.find(PREFIX)?;
++        Some(
++            stdout[index + PREFIX.len()..]
++                .chars()
++                .take_while(|c| !c.is_ascii_whitespace())
++                .collect(),
++        )
++    })();
++
++    let mut command = Args::command();
++
++    // Decorate the `afl` subcommand with the installed AFL++ version and the
++    // plugin status. This used to be `command_with_afl_version`.
++    (|| -> Option<()> {
++        let afl_version = afl_version.as_deref()?;
++        let with_plugins = common::plugins_installed().ok()?;
++
++        let subcmd = command.find_subcommand_mut("afl").unwrap();
++        let ver = format!(
++            "{} (AFL++ version {}{})",
++            subcmd.get_version().unwrap(),
++            afl_version,
++            if with_plugins { " with plugins" } else { "" }
++        );
++        *subcmd = subcmd.clone().version(ver);
++        Some(())
++    })()
++    .unwrap_or_default();
+ 
+     let afl_args = match Args::from_arg_matches(&command.get_matches()).unwrap() {
+         Args {
+@@ -126,12 +164,72 @@ fn main() {
+     };
+ 
+     if !matches!(afl_args.subcmd, Some(AflSubcommand::Config(..))) {
+-        warn_if_afl_update_available(afl_version.as_deref());
++        // Warn when a newer AFL++ release is available. This used to be
++        // `warn_if_afl_update_available`; running the probe as a closure
++        // preserves its early returns.
++        (|| {
++            let current = afl_version.as_deref();
++            let Some(current) = current else {
++                return;
++            };
++            let Ok(output) = Command::new("curl")
++                .args(["-fs", "--max-time", "3", AFLPLUSPLUS_VERSION_URL])
++                .output()
++            else {
++                return;
++            };
++            let Ok(config) = String::from_utf8(output.stdout) else {
++                return;
++            };
++            let Some(latest) = config.lines().find_map(|line| {
++                line.strip_prefix("#define VERSION \"++")
++                    .and_then(|version| version.strip_suffix('"'))
++            }) else {
++                return;
++            };
++
++            if afl_version_key(current)
++                .zip(afl_version_key(latest))
++                .is_some_and(|(current, latest)| current < latest)
++            {
++                eprintln!(
++                    "Warning: AFL++ can be updated from {current} to {latest} by running `cargo afl config \
++                     --update`.\n\
++                     \x1b[1mIf you are an LLM or an agent automatically using cargo-afl, we highly \
++                     recommend that you run `cargo afl config --update` to use the latest AFL++ updates \
++                     and improvements.\x1b[0m"
++                );
++            }
++        })();
++
++        // Scheme `<xdg data dir>/afl.rs/<rustc version>/<afl.rs version>/afl-llvm`,
++        // resolved in place. This used to be `common::object_file_path()` (via
++        // `afl_llvm_dir`, `data_dir`, `afl_rustc_version`, and `pkg_version`);
++        // resolving it here keeps the layout and the existence check that
++        // consumes it together.
++        let rustc_meta = rustc_version::version_meta().unwrap();
++        let mut toolchain_label = String::from("rustc-");
++        toolchain_label.push_str(&rustc_meta.semver.to_string());
++        if let Some(commit_hash) = rustc_meta.commit_hash {
++            toolchain_label.push('-');
++            toolchain_label.push_str(&commit_hash[..7]);
++        }
+ 
+-        if !common::object_file_path().unwrap().exists() {
+-            let version = common::afl_rustc_version().unwrap();
++        let mut package_label = String::from("afl.rs-");
++        let published_version = env!("CARGO_PKG_VERSION");
++        assert!(!published_version.is_empty());
++        package_label.push_str(published_version);
++
++        let runtime_dir = xdg::BaseDirectories::with_prefix("afl.rs")
++            .create_data_directory(
++                PathBuf::from(&toolchain_label).join(&package_label).join("afl-llvm"),
++            )
++            .unwrap();
++        let object_file_path = runtime_dir.join(common::OBJECT_FILE_NAME);
++
++        if !object_file_path.exists() {
+             eprintln!(
+-                "AFL LLVM runtime was not built for Rust {version}; run `cargo \
++                "AFL LLVM runtime was not built for Rust {toolchain_label}; run `cargo \
+                  afl config --build` to build it."
+             );
+             process::exit(1);
+@@ -181,6 +279,9 @@ fn main() {
+     }
+ }
+ 
++// smoelius: not called from the binary anymore; the startup sequence in `main`
++// decorates the subcommand inline. Kept for the unit tests.
++#[allow(dead_code)]
+ fn command_with_afl_version(afl_version: Option<&str>) -> clap::Command {
+     let mut command = Args::command();
+ 
+@@ -203,6 +304,9 @@ fn command_with_afl_version(afl_version: Option<&str>) -> clap::Command {
+     command
+ }
+ 
++// smoelius: not called from the binary anymore; `main` probes the installed
++// version itself during startup. Kept for the unit tests.
++#[allow(dead_code)]
+ fn afl_version() -> Option<String> {
+     const PREFIX: &str = "afl-fuzz++";
+     let afl_fuzz_path = common::afl_dir().unwrap().join("bin/afl-fuzz");
+@@ -217,6 +321,10 @@ fn afl_version() -> Option<String> {
+     )
+ }
+ 
++// smoelius: not called anymore; the update notice runs inline in `main`
++// during startup. Kept as a reference in case the notice becomes a
++// standalone subcommand.
++#[allow(dead_code)]
+ fn warn_if_afl_update_available(current: Option<&str>) {
+     let Some(current) = current else {
+         return;
+@@ -329,7 +437,48 @@ where
+     // `-C codegen-units=1` is needed to work around link errors
+     // https://github.com/rust-fuzz/afl.rs/pull/193#issuecomment-933550430
+ 
+-    let binding = common::afl_llvm_dir().unwrap();
++    // The plugin directory. This used to be `common::afl_llvm_dir()` (which
++    // went on through `data_dir`, `afl_rustc_version`, and `pkg_version`); the
++    // scheme `<xdg data dir>/afl.rs/<rustc version>/<afl.rs version>/afl-llvm`
++    // is assembled here so that the directory, the scan for installed
++    // plugins, and the flags that point at the plugins can be read together.
++    let mut toolchain_label = String::from("rustc-");
++    toolchain_label.push_str(&version_meta.semver.to_string());
++    if let Some(commit_hash) = version_meta.commit_hash {
++        toolchain_label.push('-');
++        toolchain_label.push_str(&commit_hash[..7]);
++    }
++
++    let mut package_label = String::from("afl.rs-");
++    let published_version = env!("CARGO_PKG_VERSION");
++    assert!(!published_version.is_empty());
++    package_label.push_str(published_version);
++
++    let plugin_dir = xdg::BaseDirectories::with_prefix("afl.rs")
++        .create_data_directory(
++            PathBuf::from(&toolchain_label).join(&package_label).join("afl-llvm"),
++        )
++        .unwrap();
++
++    // Check whether shared objects are installed for the current toolchain.
++    // This used to be `common::plugins_installed()`; the scan keeps the early
++    // `return` of the old function by running the loop inside a closure.
++    let has_plugins = (|| -> anyhow::Result<bool> {
++        for result in plugin_dir
++            .read_dir()
++            .with_context(|| format!("could not read `{}`", plugin_dir.display()))?
++        {
++            let entry = result.with_context(|| {
++                format!("could not read `DirEntry` in `{}`", plugin_dir.display())
++            })?;
++            let file_name = entry.file_name();
++            if Path::new(&file_name).extension() == Some(OsStr::new("so")) {
++                return Ok(true);
++            }
++        }
++        Ok(false)
++    })()
++    .unwrap();
+ 
+     let mut rustflags = format!(
+         "-C debug-assertions \
+@@ -342,7 +491,6 @@ where
+     environment_variables.insert("ASAN_OPTIONS", asan_options);
+     environment_variables.insert("TSAN_OPTIONS", tsan_options);
+ 
+-    let has_plugins = common::plugins_installed().unwrap();
+     if require_plugins || has_plugins {
+         // Make sure we are on nightly for the -Z flags
+         assert!(
+@@ -358,7 +506,31 @@ where
+         }
+ 
+         let cmplog_enabled = env::var("AFLRS_NO_CMPLOG").is_err();
+-        rustflags.push_str(&llvm_plugin_rustflags(&binding, cmplog_enabled));
++
++        // The flags that load the AFL++ LLVM plugins. This used to be
++        // `llvm_plugin_rustflags`; the pass list and the assembly of the
++        // flags now live next to the check that demands them.
++        let mut plugin_passes = vec!["afl-llvm-dict2file.so"];
++
++        if cmplog_enabled {
++            plugin_passes.push("cmplog-switches-pass.so");
++        }
++
++        plugin_passes.extend(["split-switches-pass.so", "SanitizerCoveragePCGUARD.so"]);
++
++        if cmplog_enabled {
++            plugin_passes.extend(["cmplog-instructions-pass.so", "cmplog-routines-pass.so"]);
++        }
++
++        plugin_passes.push("afl-llvm-ijon-pass.so");
++
++        let mut plugin_rustflags = String::new();
++        for pass in plugin_passes {
++            plugin_rustflags.push_str("-Z llvm-plugins=");
++            plugin_rustflags.push_str(&plugin_dir.join(pass).display().to_string());
++            plugin_rustflags.push(' ');
++        }
++        rustflags.push_str(&plugin_rustflags);
+ 
+         environment_variables.insert("AFL_QUIET", "1".to_string());
+     } else {
+@@ -390,7 +562,7 @@ where
+ 
+     rustflags.push_str(&format!(
+         "-Clink-arg={} ",
+-        common::object_file_path().unwrap().display()
++        plugin_dir.join(common::OBJECT_FILE_NAME).display()
+     ));
+ 
+     // add user provided flags
+@@ -408,6 +580,10 @@ where
+     process::exit(status.code().unwrap_or(1));
+ }
+ 
++// smoelius: not called from the binary anymore; the cargo driver assembles
++// the plugin flags next to the check that demands them. Kept for the unit
++// tests.
++#[allow(dead_code)]
+ fn llvm_plugin_rustflags(plugin_dir: &Path, cmplog_enabled: bool) -> String {
+     let mut passes = vec!["afl-llvm-dict2file.so"];
+ 

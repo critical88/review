@@ -1,0 +1,242 @@
+diff --git a/errors.go b/errors.go
+index b9664b4..a49a4fb 100644
+--- a/errors.go
++++ b/errors.go
+@@ -404,22 +404,27 @@ type twerrJSON struct {
+ 	Meta map[string]string `json:"meta,omitempty"`
+ }
+ 
+-// marshalErrorToJSON returns JSON from a twirp.Error, that can be used as HTTP error response body.
+-// If serialization fails, it will use a descriptive Internal error instead.
+-func marshalErrorToJSON(twerr Error) []byte {
++// fillFromError loads tj with the code, msg and metadata map of a twirp.Error,
++// clamping very large messages so responses stay manageable.
++func (tj *twerrJSON) fillFromError(twerr Error) {
+ 	// make sure that msg is not too large
+ 	msg := twerr.Msg()
+ 	if len(msg) > 1e6 {
+ 		msg = msg[:1e6]
+ 	}
+ 
+-	tj := twerrJSON{
+-		Code: string(twerr.Code()),
+-		Msg:  msg,
+-		Meta: twerr.MetaMap(),
+-	}
++	tj.Code = string(twerr.Code())
++	tj.Msg = msg
++	tj.Meta = twerr.MetaMap()
++}
++
++// marshalErrorToJSON returns JSON from a twirp.Error, that can be used as HTTP error response body.
++// If serialization fails, it will use a descriptive Internal error instead.
++func marshalErrorToJSON(twerr Error) []byte {
++	var payload twerrJSON
++	payload.fillFromError(twerr)
+ 
+-	buf, err := json.Marshal(&tj)
++	buf, err := json.Marshal(&payload)
+ 	if err != nil {
+ 		buf = []byte("{\"type\": \"" + Internal + "\", \"msg\": \"There was an error but it could not be serialized into JSON\"}") // fallback
+ 	}
+diff --git a/internal/gen/typemap/typemap.go b/internal/gen/typemap/typemap.go
+index 265a2a5..a046ed7 100644
+--- a/internal/gen/typemap/typemap.go
++++ b/internal/gen/typemap/typemap.go
+@@ -42,7 +42,7 @@ func New(files []*descriptor.FileDescriptorProto) *Registry {
+ 	// Next, index all the message definitions by their fully-qualified proto
+ 	// names.
+ 	for _, f := range files {
+-		defs := messageDefsForFile(f, r.filesByName)
++		defs := messageDefsForFile(f, r)
+ 		for name, def := range defs {
+ 			r.messagesByProtoName[name] = def
+ 		}
+@@ -91,6 +91,45 @@ func (r *Registry) MessageDefinition(name string) *MessageDefinition {
+ 	return r.messagesByProtoName[name]
+ }
+ 
++// protoNameOf returns the dot-delimited, fully-qualified protobuf name of the
++// message held by the given definition. The registry drives the lookup because
++// naming rules depend on how files were indexed when the registry was built.
++func (r *Registry) protoNameOf(def *MessageDefinition) string {
++	prefix := "."
++	if pkg := def.File.GetPackage(); pkg != "" {
++		prefix += pkg + "."
++	}
++
++	if lineage := def.Lineage(); len(lineage) > 0 {
++		for _, parent := range lineage {
++			prefix += parent.Descriptor.GetName() + "."
++		}
++	}
++
++	return prefix + def.Descriptor.GetName()
++}
++
++// descendantsOf returns all the submessages defined within the message held by
++// the given definition, and all the descendants of those, recursively. Like
++// the rest of the indexing helpers, it runs through the registry so callers do
++// not need to keep track of definitions themselves.
++func (r *Registry) descendantsOf(def *MessageDefinition) []*MessageDefinition {
++	descendants := make([]*MessageDefinition, 0)
++	for i, child := range def.Descriptor.NestedType {
++		path := append(def.path, []int32{messageMessagePath, int32(i)}...)
++		childDef := &MessageDefinition{
++			Descriptor: child,
++			File:       def.File,
++			Parent:     def,
++			Comments:   commentsAtPath(path, def.File),
++			path:       path,
++		}
++		descendants = append(descendants, childDef)
++		descendants = append(descendants, r.descendantsOf(childDef)...)
++	}
++	return descendants
++}
++
+ type MessageDefinition struct {
+ 	// Descriptor is is the DescriptorProto defining the message.
+ 	Descriptor *descriptor.DescriptorProto
+@@ -111,23 +150,6 @@ type MessageDefinition struct {
+ 	path []int32
+ }
+ 
+-// ProtoName returns the dot-delimited, fully-qualified protobuf name of the
+-// message.
+-func (m *MessageDefinition) ProtoName() string {
+-	prefix := "."
+-	if pkg := m.File.GetPackage(); pkg != "" {
+-		prefix += pkg + "."
+-	}
+-
+-	if lineage := m.Lineage(); len(lineage) > 0 {
+-		for _, parent := range lineage {
+-			prefix += parent.Descriptor.GetName() + "."
+-		}
+-	}
+-
+-	return prefix + m.Descriptor.GetName()
+-}
+-
+ // Lineage returns m's parental chain all the way back up to a top-level message
+ // definition. The first element of the returned slice is the highest-level
+ // parent.
+@@ -139,31 +161,11 @@ func (m *MessageDefinition) Lineage() []*MessageDefinition {
+ 	return parents
+ }
+ 
+-// descendants returns all the submessages defined within m, and all the
+-// descendants of those, recursively.
+-func (m *MessageDefinition) descendants() []*MessageDefinition {
+-	descendants := make([]*MessageDefinition, 0)
+-	for i, child := range m.Descriptor.NestedType {
+-		path := append(m.path, []int32{messageMessagePath, int32(i)}...)
+-		childDef := &MessageDefinition{
+-			Descriptor: child,
+-			File:       m.File,
+-			Parent:     m,
+-			Comments:   commentsAtPath(path, m.File),
+-			path:       path,
+-		}
+-		descendants = append(descendants, childDef)
+-		descendants = append(descendants, childDef.descendants()...)
+-	}
+-	return descendants
+-}
+-
+ // messageDefsForFile gathers a mapping of fully-qualified protobuf names to
+-// their definitions. It scans a singles file at a time. It requires a mapping
+-// of .proto file names to their definitions in order to correctly handle
+-// 'import public' declarations; this mapping should include all files
+-// transitively imported by f.
+-func messageDefsForFile(f *descriptor.FileDescriptorProto, filesByName map[string]*descriptor.FileDescriptorProto) map[string]*MessageDefinition {
++// their definitions. It scans a singles file at a time. It uses the registry's
++// index of .proto file names in order to correctly handle 'import public'
++// declarations; the index should include all files transitively imported by f.
++func messageDefsForFile(f *descriptor.FileDescriptorProto, r *Registry) map[string]*MessageDefinition {
+ 	byProtoName := make(map[string]*MessageDefinition)
+ 	// First, gather all the messages defined at the top level.
+ 	for i, d := range f.MessageType {
+@@ -176,18 +178,18 @@ func messageDefsForFile(f *descriptor.FileDescriptorProto, filesByName map[strin
+ 			path:       path,
+ 		}
+ 
+-		byProtoName[def.ProtoName()] = def
++		byProtoName[r.protoNameOf(def)] = def
+ 		// Next, all nested message definitions.
+-		for _, child := range def.descendants() {
+-			byProtoName[child.ProtoName()] = child
++		for _, child := range r.descendantsOf(def) {
++			byProtoName[r.protoNameOf(child)] = child
+ 		}
+ 	}
+ 
+ 	// Finally, all messages imported publicly.
+ 	for _, depIdx := range f.PublicDependency {
+ 		depFileName := f.Dependency[depIdx]
+-		depFile := filesByName[depFileName]
+-		depDefs := messageDefsForFile(depFile, filesByName)
++		depFile := r.filesByName[depFileName]
++		depDefs := messageDefsForFile(depFile, r)
+ 		for _, def := range depDefs {
+ 			imported := &MessageDefinition{
+ 				Descriptor: def.Descriptor,
+@@ -196,7 +198,7 @@ func messageDefsForFile(f *descriptor.FileDescriptorProto, filesByName map[strin
+ 				Comments:   commentsAtPath(def.path, depFile),
+ 				path:       def.path,
+ 			}
+-			byProtoName[imported.ProtoName()] = imported
++			byProtoName[r.protoNameOf(imported)] = imported
+ 		}
+ 	}
+ 
+diff --git a/protoc-gen-twirp/generator.go b/protoc-gen-twirp/generator.go
+index 991d367..9c22e6e 100644
+--- a/protoc-gen-twirp/generator.go
++++ b/protoc-gen-twirp/generator.go
+@@ -276,6 +276,16 @@ func (t *twirp) generateFileHeader(file *descriptor.FileDescriptorProto) {
+ 	t.P()
+ }
+ 
++// methodDeps returns the input and output message definitions used by a
++// service method. The registry is taken as an explicit argument so the lookup
++// can be exercised without a fully configured generator.
++func (t *twirp) methodDeps(reg *typemap.Registry, m *descriptor.MethodDescriptorProto) []*typemap.MessageDefinition {
++	return []*typemap.MessageDefinition{
++		reg.MethodInputDefinition(m),
++		reg.MethodOutputDefinition(m),
++	}
++}
++
+ func (t *twirp) generateImports(file *descriptor.FileDescriptorProto) {
+ 	if len(file.Service) == 0 {
+ 		return
+@@ -305,10 +315,7 @@ func (t *twirp) generateImports(file *descriptor.FileDescriptorProto) {
+ 	ourImportPath := path.Dir(t.goFileName(file))
+ 	for _, s := range file.Service {
+ 		for _, m := range s.Method {
+-			defs := []*typemap.MessageDefinition{
+-				t.reg.MethodInputDefinition(m),
+-				t.reg.MethodOutputDefinition(m),
+-			}
++			defs := t.methodDeps(t.reg, m)
+ 			for _, def := range defs {
+ 				importPath, _ := parseGoPackageOption(def.File.GetOptions().GetGoPackage())
+ 				if importPath == "" { // no option go_package
+@@ -1571,7 +1578,15 @@ func (t *twirp) goTypeName(protoName string) string {
+ 	if def == nil {
+ 		gen.Fail("could not find message for", protoName)
+ 	}
++	return t.goTypeNameFromDef(def)
++}
+ 
++// goTypeNameFromDef returns the Go name for a message definition, including its
++// package prefix: a package prefix when the definition does not live in the
++// package being generated, followed by the CamelCased lineage and name of the
++// message. The definition is taken as an explicit argument so generated names
++// can be resolved one definition at a time while a file is being emitted.
++func (t *twirp) goTypeNameFromDef(def *typemap.MessageDefinition) string {
+ 	var prefix string
+ 	if pkg := t.goPackageName(def.File); pkg != t.genPkgName {
+ 		prefix = pkg + "."

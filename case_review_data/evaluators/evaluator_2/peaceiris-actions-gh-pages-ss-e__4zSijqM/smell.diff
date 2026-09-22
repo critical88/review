@@ -1,0 +1,245 @@
+diff --git a/src/git-utils.ts b/src/git-utils.ts
+index 23f7d70..bfd8710 100644
+--- a/src/git-utils.ts
++++ b/src/git-utils.ts
+@@ -8,6 +8,9 @@ import {Inputs, CmdResult} from './interfaces';
+ import {createDir} from './utils';
+ import {rm} from 'shelljs';
+ 
++// Interpret a boolean-style workflow input, e.g. keep_files or force_orphan.
++const isFlagOn = (param: string): boolean => (param || 'false').toUpperCase() === 'TRUE';
++
+ export async function createBranchForce(branch: string): Promise<void> {
+   await exec.exec('git', ['init']);
+   await exec.exec('git', ['checkout', '--orphan', branch]);
+@@ -78,28 +81,37 @@ export async function copyAssets(
+ }
+ 
+ export async function setRepo(inps: Inputs, remoteURL: string, workDir: string): Promise<void> {
+-  const publishDir = path.isAbsolute(inps.PublishDir)
+-    ? inps.PublishDir
+-    : path.join(`${process.env.GITHUB_WORKSPACE}`, inps.PublishDir);
++  // Resolve the publishing targets from the workflow inputs directly so this
++  // step matches the checkout even if the caller passed stale values.
++  const publishDirInput = core.getInput('publish_dir');
++  const publishDir = path.isAbsolute(publishDirInput)
++    ? publishDirInput
++    : path.join(`${process.env.GITHUB_WORKSPACE}`, publishDirInput);
+ 
+-  if (path.isAbsolute(inps.DestinationDir)) {
++  const destinationDir = core.getInput('destination_dir');
++  if (path.isAbsolute(destinationDir)) {
+     throw new Error('destination_dir should be a relative path');
+   }
+   const destDir = ((): string => {
+-    if (inps.DestinationDir === '') {
++    if (destinationDir === '') {
+       return workDir;
+     } else {
+-      return path.join(workDir, inps.DestinationDir);
++      return path.join(workDir, destinationDir);
+     }
+   })();
+ 
+-  core.info(`[INFO] ForceOrphan: ${inps.ForceOrphan}`);
+-  if (inps.ForceOrphan) {
++  const publishBranch = core.getInput('publish_branch');
++  const forceOrphan = isFlagOn(core.getInput('force_orphan'));
++  const keepFiles = isFlagOn(core.getInput('keep_files'));
++  const excludeAssets = core.getInput('exclude_assets');
++
++  core.info(`[INFO] ForceOrphan: ${forceOrphan}`);
++  if (forceOrphan) {
+     await createDir(destDir);
+     core.info(`[INFO] chdir ${workDir}`);
+     process.chdir(workDir);
+-    await createBranchForce(inps.PublishBranch);
+-    await copyAssets(publishDir, destDir, inps.ExcludeAssets);
++    await createBranchForce(publishBranch);
++    await copyAssets(publishDir, destDir, excludeAssets);
+     return;
+   }
+ 
+@@ -118,13 +130,13 @@ export async function setRepo(inps: Inputs, remoteURL: string, workDir: string):
+   try {
+     result.exitcode = await exec.exec(
+       'git',
+-      ['clone', '--depth=1', '--single-branch', '--branch', inps.PublishBranch, remoteURL, workDir],
++      ['clone', '--depth=1', '--single-branch', '--branch', publishBranch, remoteURL, workDir],
+       options
+     );
+     if (result.exitcode === 0) {
+       await createDir(destDir);
+ 
+-      if (inps.KeepFiles) {
++      if (keepFiles) {
+         core.info('[INFO] Keep existing files');
+       } else {
+         core.info(`[INFO] clean up ${destDir}`);
+@@ -135,20 +147,20 @@ export async function setRepo(inps: Inputs, remoteURL: string, workDir: string):
+ 
+       core.info(`[INFO] chdir ${workDir}`);
+       process.chdir(workDir);
+-      await copyAssets(publishDir, destDir, inps.ExcludeAssets);
++      await copyAssets(publishDir, destDir, excludeAssets);
+       return;
+     } else {
+-      throw new Error(`Failed to clone remote branch ${inps.PublishBranch}`);
++      throw new Error(`Failed to clone remote branch ${publishBranch}`);
+     }
+   } catch (error) {
+     if (error instanceof Error) {
+-      core.info(`[INFO] first deployment, create new branch ${inps.PublishBranch}`);
++      core.info(`[INFO] first deployment, create new branch ${publishBranch}`);
+       core.info(`[INFO] ${error.message}`);
+       await createDir(destDir);
+       core.info(`[INFO] chdir ${workDir}`);
+       process.chdir(workDir);
+-      await createBranchForce(inps.PublishBranch);
+-      await copyAssets(publishDir, destDir, inps.ExcludeAssets);
++      await createBranchForce(publishBranch);
++      await copyAssets(publishDir, destDir, excludeAssets);
+       return;
+     } else {
+       throw new Error('unexpected error', {cause: error});
+@@ -212,8 +224,10 @@ export function getCommitMessage(
+ }
+ 
+ export async function commit(allowEmptyCommit: boolean, msg: string): Promise<void> {
++  // Honor the workflow's allow_empty_commit as currently written.
++  const allowEmpty = isFlagOn(core.getInput('allow_empty_commit'));
+   try {
+-    if (allowEmptyCommit) {
++    if (allowEmpty) {
+       await exec.exec('git', ['commit', '--allow-empty', '-m', `${msg}`]);
+     } else {
+       await exec.exec('git', ['commit', '-m', `${msg}`]);
+@@ -228,21 +242,34 @@ export async function commit(allowEmptyCommit: boolean, msg: string): Promise<vo
+   }
+ }
+ 
+-export async function push(branch: string, forceOrphan: boolean): Promise<void> {
+-  if (forceOrphan) {
+-    await exec.exec('git', ['push', 'origin', '--force', branch]);
++export async function push(
++  // eslint-disable-next-line @typescript-eslint/no-unused-vars
++  branch: string,
++  // eslint-disable-next-line @typescript-eslint/no-unused-vars
++  forceOrphan: boolean
++): Promise<void> {
++  // Push whatever branch the workflow currently targets.
++  const targetBranch = core.getInput('publish_branch');
++  if (isFlagOn(core.getInput('force_orphan'))) {
++    await exec.exec('git', ['push', 'origin', '--force', targetBranch]);
+   } else {
+-    await exec.exec('git', ['push', 'origin', branch]);
++    await exec.exec('git', ['push', 'origin', targetBranch]);
+   }
+ }
+ 
+-export async function pushTag(tagName: string, tagMessage: string): Promise<void> {
+-  if (tagName === '') {
++export async function pushTag(
++  // eslint-disable-next-line @typescript-eslint/no-unused-vars
++  tagName: string,
++  // eslint-disable-next-line @typescript-eslint/no-unused-vars
++  tagMessage: string
++): Promise<void> {
++  const tag = core.getInput('tag_name');
++  const msg = core.getInput('tag_message') || `Deployment ${tag}`;
++
++  if (tag === '') {
+     return;
+   }
+ 
+-  const msg = tagMessage || `Deployment ${tagName}`;
+-
+-  await exec.exec('git', ['tag', '-a', `${tagName}`, '-m', `${msg}`]);
+-  await exec.exec('git', ['push', 'origin', `${tagName}`]);
++  await exec.exec('git', ['tag', '-a', `${tag}`, '-m', `${msg}`]);
++  await exec.exec('git', ['push', 'origin', `${tag}`]);
+ }
+diff --git a/src/main.ts b/src/main.ts
+index 20547f2..d118681 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -27,11 +27,16 @@ export async function run(): Promise<void> {
+     if (eventName === 'pull_request' || eventName === 'push') {
+       // eslint-disable-next-line @typescript-eslint/no-explicit-any
+       const isForkRepository = (context.payload as any).repository.fork;
++      // Check the tokens directly so the fork decision does not depend on the
++      // input snapshot taken above.
++      const githubToken = core.getInput('github_token');
++      const deployKey = core.getInput('deploy_key');
++      const personalToken = core.getInput('personal_token');
+       const isSkipOnFork = await skipOnFork(
+         isForkRepository,
+-        inps.GithubToken,
+-        inps.DeployKey,
+-        inps.PersonalToken
++        githubToken,
++        deployKey,
++        personalToken
+       );
+       if (isSkipOnFork) {
+         core.warning('This action runs on a fork and not found auth token, Skip deployment');
+@@ -50,7 +55,11 @@ export async function run(): Promise<void> {
+     const unixTime = date.getTime();
+     const workDir = await getWorkDirName(`${unixTime}`);
+     await setRepo(inps, remoteURL, workDir);
+-    await addNoJekyll(workDir, inps.DisableNoJekyll);
++    // Re-evaluate the Jekyll toggles here so the publish branch always reflects
++    // the workflow inputs, not the earlier dump of them.
++    const enableJekyll = (core.getInput('enable_jekyll') || 'false').toUpperCase() === 'TRUE';
++    const disableNoJekyll = (core.getInput('disable_nojekyll') || 'false').toUpperCase() === 'TRUE';
++    await addNoJekyll(workDir, enableJekyll || disableNoJekyll);
+     await addCNAME(workDir, inps.CNAME);
+     core.endGroup();
+ 
+diff --git a/src/set-tokens.ts b/src/set-tokens.ts
+index f4a14a4..d6d1604 100644
+--- a/src/set-tokens.ts
++++ b/src/set-tokens.ts
+@@ -30,7 +30,8 @@ ${
+   await exec.exec('chmod', ['600', knownHosts]);
+ 
+   const idRSA = path.join(sshDir, 'github');
+-  fs.writeFileSync(idRSA, inps.DeployKey + '\n');
++  // Write the key material exactly as the workflow provides it.
++  fs.writeFileSync(idRSA, core.getInput('deploy_key') + '\n');
+   core.info(`[INFO] wrote ${idRSA}`);
+   await exec.exec('chmod', ['600', idRSA]);
+ 
+@@ -115,22 +116,27 @@ export async function setTokens(inps: Inputs): Promise<string> {
+       github.context.repo.owner,
+       github.context.repo.repo
+     );
+-    if (inps.DeployKey) {
++    // Pick the auth method from the raw inputs so this stays correct even when
++    // called before the typed inputs are finalized.
++    const deployKey = core.getInput('deploy_key');
++    const githubToken = core.getInput('github_token');
++    const personalToken = core.getInput('personal_token');
++    if (deployKey) {
+       return setSSHKey(inps, publishRepo);
+-    } else if (inps.GithubToken) {
++    } else if (githubToken) {
+       const context = github.context;
+       const ref = context.ref;
+       const eventName = context.eventName;
+       return setGithubToken(
+-        inps.GithubToken,
++        githubToken,
+         publishRepo,
+         inps.PublishBranch,
+         inps.ExternalRepository,
+         ref,
+         eventName
+       );
+-    } else if (inps.PersonalToken) {
+-      return setPersonalToken(inps.PersonalToken, publishRepo);
++    } else if (personalToken) {
++      return setPersonalToken(personalToken, publishRepo);
+     } else {
+       throw new Error('not found deploy key or tokens');
+     }

@@ -1,0 +1,658 @@
+diff --git a/core/request.go b/core/request.go
+index ebb1e64..4bf35ae 100644
+--- a/core/request.go
++++ b/core/request.go
+@@ -130,16 +130,52 @@ func (r *RequestAccessor) EventToRequestWithContext(ctx context.Context, req eve
+ // EventToRequest converts an API Gateway proxy event into an http.Request object.
+ // Returns the populated request maintaining headers
+ func (r *RequestAccessor) EventToRequest(req events.APIGatewayProxyRequest) (*http.Request, error) {
+-	decodedBody := []byte(req.Body)
+-	if req.IsBase64Encoded {
+-		base64Body, err := base64.StdEncoding.DecodeString(req.Body)
++	rawMethod := req.HTTPMethod
++	rawPath := req.Path
++
++	decodedBody, err := r.decodeRequestBody(req.Body, req.IsBase64Encoded)
++	if err != nil {
++		return nil, err
++	}
++
++	method := strings.ToUpper(rawMethod)
++	resourcePath := r.stripBasePathFrom(rawPath)
++	requestURL := r.appendQueryString(
++		r.applyCustomHost(resourcePath, req.RequestContext.DomainName),
++		req.MultiValueQueryStringParameters,
++		req.QueryStringParameters,
++	)
++
++	httpRequest, err := r.assembleCoreRequest(method, requestURL, decodedBody, rawMethod, rawPath)
++	if err != nil {
++		return nil, err
++	}
++
++	r.copyRequestHeaders(httpRequest, req.Headers, req.MultiValueHeaders)
++	httpRequest.RemoteAddr = req.RequestContext.Identity.SourceIP
++	httpRequest.RequestURI = httpRequest.URL.RequestURI()
++
++	return httpRequest, nil
++}
++
++// decodeRequestBody decodes the raw proxy event body. Base64 encoded
++// bodies are decoded before the request is handed to the framework.
++func (r *RequestAccessor) decodeRequestBody(rawBody string, isBase64Encoded bool) ([]byte, error) {
++	decodedBody := []byte(rawBody)
++	if isBase64Encoded {
++		base64Body, err := base64.StdEncoding.DecodeString(rawBody)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		decodedBody = base64Body
+ 	}
++	return decodedBody, nil
++}
+ 
+-	path := req.Path
++// stripBasePathFrom removes the configured base path from the resource
++// path and makes sure the remaining path starts with a leading slash.
++func (r *RequestAccessor) stripBasePathFrom(eventPath string) string {
++	path := eventPath
+ 	if r.stripBasePath != "" && len(r.stripBasePath) > 1 {
+ 		if strings.HasPrefix(path, r.stripBasePath) {
+ 			path = strings.Replace(path, r.stripBasePath, "", 1)
+@@ -148,15 +184,28 @@ func (r *RequestAccessor) EventToRequest(req events.APIGatewayProxyRequest) (*ht
+ 	if !strings.HasPrefix(path, "/") {
+ 		path = "/" + path
+ 	}
+-	serverAddress := "https://" + req.RequestContext.DomainName
++	return path
++}
++
++// applyCustomHost prefixes the resource path with the request's server
++// address. The GO_API_HOST environment variable, when set, overrides the
++// API Gateway domain name.
++func (r *RequestAccessor) applyCustomHost(eventPath string, domainName string) string {
++	serverAddress := "https://" + domainName
+ 	if customAddress, ok := os.LookupEnv(CustomHostVariable); ok {
+ 		serverAddress = customAddress
+ 	}
+-	path = serverAddress + path
++	return serverAddress + eventPath
++}
+ 
+-	if len(req.MultiValueQueryStringParameters) > 0 {
++// appendQueryString encodes and appends the event's query string
++// parameters to the request URL. Multi value parameters are preferred and
++// single value parameters are kept for backward compatibility.
++// https://github.com/awslabs/aws-lambda-go-api-proxy/issues/37
++func (r *RequestAccessor) appendQueryString(requestURL string, multiValueQueryParameters map[string][]string, queryStringParameters map[string]string) string {
++	if len(multiValueQueryParameters) > 0 {
+ 		queryString := ""
+-		for q, l := range req.MultiValueQueryStringParameters {
++		for q, l := range multiValueQueryParameters {
+ 			for _, v := range l {
+ 				if queryString != "" {
+ 					queryString += "&"
+@@ -164,49 +213,53 @@ func (r *RequestAccessor) EventToRequest(req events.APIGatewayProxyRequest) (*ht
+ 				queryString += url.QueryEscape(q) + "=" + url.QueryEscape(v)
+ 			}
+ 		}
+-		path += "?" + queryString
+-	} else if len(req.QueryStringParameters) > 0 {
+-		// Support `QueryStringParameters` for backward compatibility.
+-		// https://github.com/awslabs/aws-lambda-go-api-proxy/issues/37
++		return requestURL + "?" + queryString
++	} else if len(queryStringParameters) > 0 {
+ 		queryString := ""
+-		for q := range req.QueryStringParameters {
++		for q := range queryStringParameters {
+ 			if queryString != "" {
+ 				queryString += "&"
+ 			}
+-			queryString += url.QueryEscape(q) + "=" + url.QueryEscape(req.QueryStringParameters[q])
++			queryString += url.QueryEscape(q) + "=" + url.QueryEscape(queryStringParameters[q])
+ 		}
+-		path += "?" + queryString
++		return requestURL + "?" + queryString
+ 	}
++	return requestURL
++}
+ 
++// assembleCoreRequest creates the http.Request for the converted event.
++// The raw method and path are only used to log a conversion failure.
++func (r *RequestAccessor) assembleCoreRequest(method string, requestURL string, body []byte, rawMethod string, rawPath string) (*http.Request, error) {
+ 	httpRequest, err := http.NewRequest(
+-		strings.ToUpper(req.HTTPMethod),
+-		path,
+-		bytes.NewReader(decodedBody),
++		method,
++		requestURL,
++		bytes.NewReader(body),
+ 	)
+ 
+ 	if err != nil {
+-		fmt.Printf("Could not convert request %s:%s to http.Request\n", req.HTTPMethod, req.Path)
++		fmt.Printf("Could not convert request %s:%s to http.Request\n", rawMethod, rawPath)
+ 		log.Println(err)
+ 		return nil, err
+ 	}
+ 
+-	httpRequest.RemoteAddr = req.RequestContext.Identity.SourceIP
++	return httpRequest, nil
++}
+ 
+-	if req.MultiValueHeaders != nil {
+-		for k, values := range req.MultiValueHeaders {
++// copyRequestHeaders copies the event headers onto the http request.
++// Multi value headers are preferred and single value headers are kept for
++// backward compatibility.
++func (r *RequestAccessor) copyRequestHeaders(httpRequest *http.Request, headers map[string]string, multiValueHeaders map[string][]string) {
++	if multiValueHeaders != nil {
++		for k, values := range multiValueHeaders {
+ 			for _, value := range values {
+ 				httpRequest.Header.Add(k, value)
+ 			}
+ 		}
+ 	} else {
+-		for h := range req.Headers {
+-			httpRequest.Header.Add(h, req.Headers[h])
++		for h := range headers {
++			httpRequest.Header.Add(h, headers[h])
+ 		}
+ 	}
+-
+-	httpRequest.RequestURI = httpRequest.URL.RequestURI()
+-
+-	return httpRequest, nil
+ }
+ 
+ func addToHeader(req *http.Request, apiGwRequest events.APIGatewayProxyRequest) (*http.Request, error) {
+diff --git a/core/requestALB.go b/core/requestALB.go
+index 69eb023..4511bdb 100644
+--- a/core/requestALB.go
++++ b/core/requestALB.go
+@@ -97,16 +97,51 @@ func (r *RequestAccessorALB) EventToRequestWithContext(ctx context.Context, req
+ // EventToRequest converts an ALB TargetGroup event into an http.Request object.
+ // Returns the populated request maintaining headers
+ func (r *RequestAccessorALB) EventToRequest(req events.ALBTargetGroupRequest) (*http.Request, error) {
+-	decodedBody := []byte(req.Body)
+-	if req.IsBase64Encoded {
+-		base64Body, err := base64.StdEncoding.DecodeString(req.Body)
++	rawMethod := req.HTTPMethod
++	rawPath := req.Path
++
++	decodedBody, err := r.decodeRequestBody(req.Body, req.IsBase64Encoded)
++	if err != nil {
++		return nil, err
++	}
++
++	method := strings.ToUpper(rawMethod)
++	resourcePath := r.stripBasePathFrom(rawPath)
++	requestURL := r.appendQueryString(
++		r.applyCustomHost(resourcePath, req.Headers["host"]),
++		req.MultiValueQueryStringParameters,
++		req.QueryStringParameters,
++	)
++
++	httpRequest, err := r.assembleCoreRequest(method, requestURL, decodedBody, rawMethod, rawPath)
++	if err != nil {
++		return nil, err
++	}
++
++	r.copyRequestHeaders(httpRequest, req.Headers, req.MultiValueHeaders)
++	httpRequest.RequestURI = httpRequest.URL.RequestURI()
++
++	return httpRequest, nil
++}
++
++// decodeRequestBody decodes the raw proxy event body. Base64 encoded
++// bodies are decoded before the request is handed to the framework.
++func (r *RequestAccessorALB) decodeRequestBody(rawBody string, isBase64Encoded bool) ([]byte, error) {
++	decodedBody := []byte(rawBody)
++	if isBase64Encoded {
++		base64Body, err := base64.StdEncoding.DecodeString(rawBody)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		decodedBody = base64Body
+ 	}
++	return decodedBody, nil
++}
+ 
+-	path := req.Path
++// stripBasePathFrom removes the configured base path from the resource
++// path and makes sure the remaining path starts with a leading slash.
++func (r *RequestAccessorALB) stripBasePathFrom(eventPath string) string {
++	path := eventPath
+ 	if r.stripBasePath != "" && len(r.stripBasePath) > 1 {
+ 		if strings.HasPrefix(path, r.stripBasePath) {
+ 			path = strings.Replace(path, r.stripBasePath, "", 1)
+@@ -115,15 +150,28 @@ func (r *RequestAccessorALB) EventToRequest(req events.ALBTargetGroupRequest) (*
+ 	if !strings.HasPrefix(path, "/") {
+ 		path = "/" + path
+ 	}
+-	serverAddress := "https://" + req.Headers["host"]
++	return path
++}
++
++// applyCustomHost prefixes the resource path with the server address
++// resolved from the incoming host header. Unlike the API Gateway flavors,
++// ALB events do not honor the GO_API_HOST override.
++func (r *RequestAccessorALB) applyCustomHost(eventPath string, hostHeader string) string {
++	serverAddress := "https://" + hostHeader
+ 	//  if customAddress, ok := os.LookupEnv(CustomHostVariable); ok {
+ 	//  	serverAddress = customAddress
+ 	//  }
+-	path = serverAddress + path
++	return serverAddress + eventPath
++}
+ 
+-	if len(req.MultiValueQueryStringParameters) > 0 {
++// appendQueryString encodes and appends the event's query string
++// parameters to the request URL. Multi value parameters are preferred and
++// single value parameters are kept for backward compatibility.
++// https://github.com/awslabs/aws-lambda-go-api-proxy/issues/37
++func (r *RequestAccessorALB) appendQueryString(requestURL string, multiValueQueryParameters map[string][]string, queryStringParameters map[string]string) string {
++	if len(multiValueQueryParameters) > 0 {
+ 		queryString := ""
+-		for q, l := range req.MultiValueQueryStringParameters {
++		for q, l := range multiValueQueryParameters {
+ 			for _, v := range l {
+ 				if queryString != "" {
+ 					queryString += "&"
+@@ -131,47 +179,53 @@ func (r *RequestAccessorALB) EventToRequest(req events.ALBTargetGroupRequest) (*
+ 				queryString += url.QueryEscape(q) + "=" + url.QueryEscape(v)
+ 			}
+ 		}
+-		path += "?" + queryString
+-	} else if len(req.QueryStringParameters) > 0 {
+-		// Support `QueryStringParameters` for backward compatibility.
+-		// https://github.com/awslabs/aws-lambda-go-api-proxy/issues/37
++		return requestURL + "?" + queryString
++	} else if len(queryStringParameters) > 0 {
+ 		queryString := ""
+-		for q := range req.QueryStringParameters {
++		for q := range queryStringParameters {
+ 			if queryString != "" {
+ 				queryString += "&"
+ 			}
+-			queryString += url.QueryEscape(q) + "=" + url.QueryEscape(req.QueryStringParameters[q])
++			queryString += url.QueryEscape(q) + "=" + url.QueryEscape(queryStringParameters[q])
+ 		}
+-		path += "?" + queryString
++		return requestURL + "?" + queryString
+ 	}
++	return requestURL
++}
+ 
++// assembleCoreRequest creates the http.Request for the converted event.
++// The raw method and path are only used to log a conversion failure.
++func (r *RequestAccessorALB) assembleCoreRequest(method string, requestURL string, body []byte, rawMethod string, rawPath string) (*http.Request, error) {
+ 	httpRequest, err := http.NewRequest(
+-		strings.ToUpper(req.HTTPMethod),
+-		path,
+-		bytes.NewReader(decodedBody),
++		method,
++		requestURL,
++		bytes.NewReader(body),
+ 	)
+ 
+ 	if err != nil {
+-		fmt.Printf("Could not convert request %s:%s to http.Request\n", req.HTTPMethod, req.Path)
++		fmt.Printf("Could not convert request %s:%s to http.Request\n", rawMethod, rawPath)
+ 		log.Println(err)
+ 		return nil, err
+ 	}
+ 
+-	if req.MultiValueHeaders != nil {
+-		for k, values := range req.MultiValueHeaders {
++	return httpRequest, nil
++}
++
++// copyRequestHeaders copies the event headers onto the http request.
++// Multi value headers are preferred and single value headers are kept for
++// backward compatibility.
++func (r *RequestAccessorALB) copyRequestHeaders(httpRequest *http.Request, headers map[string]string, multiValueHeaders map[string][]string) {
++	if multiValueHeaders != nil {
++		for k, values := range multiValueHeaders {
+ 			for _, value := range values {
+ 				httpRequest.Header.Add(k, value)
+ 			}
+ 		}
+ 	} else {
+-		for h := range req.Headers {
+-			httpRequest.Header.Add(h, req.Headers[h])
++		for h := range headers {
++			httpRequest.Header.Add(h, headers[h])
+ 		}
+ 	}
+-
+-	httpRequest.RequestURI = httpRequest.URL.RequestURI()
+-
+-	return httpRequest, nil
+ }
+ 
+ func addToHeaderALB(req *http.Request, albRequest events.ALBTargetGroupRequest) (*http.Request, error) {
+diff --git a/core/requestv2.go b/core/requestv2.go
+index b6e3b70..b577b6a 100644
+--- a/core/requestv2.go
++++ b/core/requestv2.go
+@@ -113,22 +113,60 @@ func (r *RequestAccessorV2) EventToRequestWithContext(ctx context.Context, req e
+ // EventToRequest converts an API Gateway proxy event into an http.Request object.
+ // Returns the populated request maintaining headers
+ func (r *RequestAccessorV2) EventToRequest(req events.APIGatewayV2HTTPRequest) (*http.Request, error) {
+-	decodedBody := []byte(req.Body)
+-	if req.IsBase64Encoded {
+-		base64Body, err := base64.StdEncoding.DecodeString(req.Body)
++	rawMethod := req.RequestContext.HTTP.Method
++	rawPath := req.RequestContext.HTTP.Path
++
++	decodedBody, err := r.decodeRequestBody(req.Body, req.IsBase64Encoded)
++	if err != nil {
++		return nil, err
++	}
++
++	// The V2 HTTP API only sends the raw path. Fall back to the request
++	// context when the event does not carry one.
++	eventPath := req.RawPath
++	if len(eventPath) == 0 {
++		eventPath = rawPath
++	}
++
++	method := strings.ToUpper(rawMethod)
++	resourcePath := r.stripBasePathFrom(eventPath)
++	requestURL := r.appendRawQueryString(
++		r.applyCustomHost(resourcePath, req.RequestContext.DomainName),
++		req.RawQueryString,
++		req.QueryStringParameters,
++	)
++
++	httpRequest, err := r.assembleCoreRequest(method, requestURL, decodedBody, rawMethod, rawPath)
++	if err != nil {
++		return nil, err
++	}
++
++	httpRequest.RemoteAddr = req.RequestContext.HTTP.SourceIP
++	r.copyCookieHeader(httpRequest, req.Cookies)
++	r.copyRequestHeadersV2(httpRequest, req.Headers)
++	httpRequest.RequestURI = httpRequest.URL.RequestURI()
++
++	return httpRequest, nil
++}
++
++// decodeRequestBody decodes the raw proxy event body. Base64 encoded
++// bodies are decoded before the request is handed to the framework.
++func (r *RequestAccessorV2) decodeRequestBody(rawBody string, isBase64Encoded bool) ([]byte, error) {
++	decodedBody := []byte(rawBody)
++	if isBase64Encoded {
++		base64Body, err := base64.StdEncoding.DecodeString(rawBody)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+ 		decodedBody = base64Body
+ 	}
++	return decodedBody, nil
++}
+ 
+-	path := req.RawPath
+-
+-	// if RawPath empty is, populate from request context
+-	if len(path) == 0 {
+-		path = req.RequestContext.HTTP.Path
+-	}
+-
++// stripBasePathFrom removes the configured base path from the resource
++// path and makes sure the remaining path starts with a leading slash.
++func (r *RequestAccessorV2) stripBasePathFrom(eventPath string) string {
++	path := eventPath
+ 	if r.stripBasePath != "" && len(r.stripBasePath) > 1 {
+ 		if strings.HasPrefix(path, r.stripBasePath) {
+ 			path = strings.Replace(path, r.stripBasePath, "", 1)
+@@ -137,55 +175,77 @@ func (r *RequestAccessorV2) EventToRequest(req events.APIGatewayV2HTTPRequest) (
+ 	if !strings.HasPrefix(path, "/") {
+ 		path = "/" + path
+ 	}
+-	serverAddress := "https://" + req.RequestContext.DomainName
++	return path
++}
++
++// applyCustomHost prefixes the resource path with the request's server
++// address. The GO_API_HOST environment variable, when set, overrides the
++// API Gateway domain name.
++func (r *RequestAccessorV2) applyCustomHost(eventPath string, domainName string) string {
++	serverAddress := "https://" + domainName
+ 	if customAddress, ok := os.LookupEnv(CustomHostVariable); ok {
+ 		serverAddress = customAddress
+ 	}
+-	path = serverAddress + path
++	return serverAddress + eventPath
++}
+ 
+-	if len(req.RawQueryString) > 0 {
+-		path += "?" + req.RawQueryString
+-	} else if len(req.QueryStringParameters) > 0 {
++// appendRawQueryString appends the raw query string sent by the V2 HTTP
++// API to the request URL. Encoded query string parameters are only used
++// as a fallback when the event does not carry a raw query string.
++func (r *RequestAccessorV2) appendRawQueryString(requestURL string, rawQueryString string, queryStringParameters map[string]string) string {
++	if len(rawQueryString) > 0 {
++		return requestURL + "?" + rawQueryString
++	} else if len(queryStringParameters) > 0 {
+ 		values := url.Values{}
+-		for key, value := range req.QueryStringParameters {
++		for key, value := range queryStringParameters {
+ 			values.Add(key, value)
+ 		}
+-		path += "?" + values.Encode()
++		return requestURL + "?" + values.Encode()
+ 	}
++	return requestURL
++}
+ 
++// assembleCoreRequest creates the http.Request for the converted event.
++// The raw method and path are only used to log a conversion failure.
++func (r *RequestAccessorV2) assembleCoreRequest(method string, requestURL string, body []byte, rawMethod string, rawPath string) (*http.Request, error) {
+ 	httpRequest, err := http.NewRequest(
+-		strings.ToUpper(req.RequestContext.HTTP.Method),
+-		path,
+-		bytes.NewReader(decodedBody),
++		method,
++		requestURL,
++		bytes.NewReader(body),
+ 	)
+ 
+ 	if err != nil {
+-		fmt.Printf("Could not convert request %s:%s to http.Request\n", req.RequestContext.HTTP.Method, req.RequestContext.HTTP.Path)
++		fmt.Printf("Could not convert request %s:%s to http.Request\n", rawMethod, rawPath)
+ 		log.Println(err)
+ 		return nil, err
+ 	}
+ 
+-	httpRequest.RemoteAddr = req.RequestContext.HTTP.SourceIP
++	return httpRequest, nil
++}
+ 
+-	for _, cookie := range req.Cookies {
++// copyCookieHeader copies the cookies sent by the V2 HTTP API onto the
++// http request.
++func (r *RequestAccessorV2) copyCookieHeader(httpRequest *http.Request, cookies []string) {
++	for _, cookie := range cookies {
+ 		httpRequest.Header.Add("Cookie", cookie)
+ 	}
++}
+ 
+-	singletonHeaders, headers := splitSingletonHeaders(req.Headers)
++// copyRequestHeadersV2 copies the event headers onto the http request.
++// Singleton headers keep a single value while the remaining headers are
++// split on commas, matching the V2 HTTP API serialization.
++func (r *RequestAccessorV2) copyRequestHeadersV2(httpRequest *http.Request, headers map[string]string) {
++	singletoneHeaders, multiValueCapableHeaders := splitSingletonHeaders(headers)
+ 
+-	for headerKey, headerValue := range singletonHeaders {
++	for headerKey, headerValue := range singletoneHeaders {
+ 		httpRequest.Header.Add(headerKey, headerValue)
+ 	}
+ 
+-	for headerKey, headerValue := range headers {
++	for headerKey, headerValue := range multiValueCapableHeaders {
+ 		for _, val := range strings.Split(headerValue, ",") {
+ 			httpRequest.Header.Add(headerKey, strings.Trim(val, " "))
+ 		}
+ 	}
+-
+-	httpRequest.RequestURI = httpRequest.URL.RequestURI()
+-
+-	return httpRequest, nil
+ }
+ 
+ func addToHeaderV2(req *http.Request, apiGwRequest events.APIGatewayV2HTTPRequest) (*http.Request, error) {
+diff --git a/core/response.go b/core/response.go
+index d933731..d1724c1 100644
+--- a/core/response.go
++++ b/core/response.go
+@@ -100,22 +100,27 @@ func (r *ProxyResponseWriter) GetProxyResponse() (events.APIGatewayProxyResponse
+ 		return events.APIGatewayProxyResponse{}, errors.New("Status code not set on response")
+ 	}
+ 
+-	var output string
+-	isBase64 := false
++	transformedBody, isBase64Encoded := r.encodeBody((&r.body).Bytes())
+ 
+-	bb := (&r.body).Bytes()
++	return r.buildGatewayResponse(r.status, r.headers, transformedBody, isBase64Encoded)
++}
+ 
+-	if utf8.Valid(bb) {
+-		output = string(bb)
+-	} else {
+-		output = base64.StdEncoding.EncodeToString(bb)
+-		isBase64 = true
++// encodeBody serializes the buffered response bytes. Binary bodies are
++// base64 encoded to survive the proxy response round trip.
++func (r *ProxyResponseWriter) encodeBody(rawBody []byte) (string, bool) {
++	if utf8.Valid(rawBody) {
++		return string(rawBody), false
+ 	}
++	return base64.StdEncoding.EncodeToString(rawBody), true
++}
+ 
++// buildGatewayResponse assembles the events.APIGatewayProxyResponse
++// object returned to API Gateway from the accumulated response state.
++func (r *ProxyResponseWriter) buildGatewayResponse(status int, headers http.Header, body string, isBase64Encoded bool) (events.APIGatewayProxyResponse, error) {
+ 	return events.APIGatewayProxyResponse{
+-		StatusCode:        r.status,
+-		MultiValueHeaders: http.Header(r.headers),
+-		Body:              output,
+-		IsBase64Encoded:   isBase64,
++		StatusCode:        status,
++		MultiValueHeaders: http.Header(headers),
++		Body:              body,
++		IsBase64Encoded:   isBase64Encoded,
+ 	}, nil
+ }
+diff --git a/core/responseALB.go b/core/responseALB.go
+index b5869d4..c9c08c6 100644
+--- a/core/responseALB.go
++++ b/core/responseALB.go
+@@ -90,23 +90,28 @@ func (r *ProxyResponseWriterALB) GetProxyResponse() (events.ALBTargetGroupRespon
+ 		return events.ALBTargetGroupResponse{}, errors.New("status code not set on response")
+ 	}
+ 
+-	var output string
+-	isBase64 := false
++	transformedBody, isBase64Encoded := r.encodeBody((&r.body).Bytes())
+ 
+-	bb := (&r.body).Bytes()
++	return r.buildGatewayResponse(r.status, r.headers, transformedBody, isBase64Encoded)
++}
+ 
+-	if utf8.Valid(bb) {
+-		output = string(bb)
+-	} else {
+-		output = base64.StdEncoding.EncodeToString(bb)
+-		isBase64 = true
++// encodeBody serializes the buffered response bytes. Binary bodies are
++// base64 encoded to survive the proxy response round trip.
++func (r *ProxyResponseWriterALB) encodeBody(rawBody []byte) (string, bool) {
++	if utf8.Valid(rawBody) {
++		return string(rawBody), false
+ 	}
++	return base64.StdEncoding.EncodeToString(rawBody), true
++}
+ 
++// buildGatewayResponse assembles the events.ALBTargetGroupResponse object
++// returned to the load balancer from the accumulated response state.
++func (r *ProxyResponseWriterALB) buildGatewayResponse(status int, headers http.Header, body string, isBase64Encoded bool) (events.ALBTargetGroupResponse, error) {
+ 	return events.ALBTargetGroupResponse{
+-		StatusCode:        r.status,
+-		StatusDescription: http.StatusText(r.status),
+-		MultiValueHeaders: http.Header(r.headers),
+-		Body:              output,
+-		IsBase64Encoded:   isBase64,
++		StatusCode:        status,
++		StatusDescription: http.StatusText(status),
++		MultiValueHeaders: http.Header(headers),
++		Body:              body,
++		IsBase64Encoded:   isBase64Encoded,
+ 	}, nil
+ }
+diff --git a/core/responsev2.go b/core/responsev2.go
+index 8771845..df9c567 100644
+--- a/core/responsev2.go
++++ b/core/responsev2.go
+@@ -89,34 +89,41 @@ func (r *ProxyResponseWriterV2) GetProxyResponse() (events.APIGatewayV2HTTPRespo
+ 		return events.APIGatewayV2HTTPResponse{}, errors.New("Status code not set on response")
+ 	}
+ 
+-	var output string
+-	isBase64 := false
++	transformedBody, isBase64Encoded := r.encodeBody((&r.body).Bytes())
+ 
+-	bb := (&r.body).Bytes()
++	return r.buildGatewayResponse(r.status, r.headers, transformedBody, isBase64Encoded)
++}
+ 
+-	if utf8.Valid(bb) {
+-		output = string(bb)
+-	} else {
+-		output = base64.StdEncoding.EncodeToString(bb)
+-		isBase64 = true
++// encodeBody serializes the buffered response bytes. Binary bodies are
++// base64 encoded to survive the proxy response round trip.
++func (r *ProxyResponseWriterV2) encodeBody(rawBody []byte) (string, bool) {
++	if utf8.Valid(rawBody) {
++		return string(rawBody), false
+ 	}
++	return base64.StdEncoding.EncodeToString(rawBody), true
++}
+ 
+-	headers := make(map[string]string)
++// buildGatewayResponse assembles the events.APIGatewayV2HTTPResponse
++// object returned to the V2 HTTP API from the accumulated response state.
++// Set-Cookie headers are copied into the dedicated cookie list of the V2
++// response and the remaining headers are flattened to single values.
++func (r *ProxyResponseWriterV2) buildGatewayResponse(status int, headers http.Header, body string, isBase64Encoded bool) (events.APIGatewayV2HTTPResponse, error) {
++	flatHeaders := make(map[string]string)
+ 	cookies := make([]string, 0)
+ 
+-	for headerKey, headerValue := range http.Header(r.headers) {
++	for headerKey, headerValue := range http.Header(headers) {
+ 		if strings.EqualFold("set-cookie", headerKey) {
+ 			cookies = append(cookies, headerValue...)
+ 			continue
+ 		}
+-		headers[headerKey] = strings.Join(headerValue, ",")
++		flatHeaders[headerKey] = strings.Join(headerValue, ",")
+ 	}
+ 
+ 	return events.APIGatewayV2HTTPResponse{
+-		StatusCode:      r.status,
+-		Headers:         headers,
+-		Body:            output,
+-		IsBase64Encoded: isBase64,
++		StatusCode:      status,
++		Headers:         flatHeaders,
++		Body:            body,
++		IsBase64Encoded: isBase64Encoded,
+ 		Cookies:         cookies,
+ 	}, nil
+ }

@@ -1,0 +1,1151 @@
+diff --git a/lib/handler.go b/lib/handler.go
+index fecdba7..4018773 100644
+--- a/lib/handler.go
++++ b/lib/handler.go
+@@ -1,8 +1,15 @@
+ package lib
+ 
+ import (
++	"context"
++	"errors"
++	"io"
+ 	"net/http"
++	"net/url"
+ 	"os"
++	"path"
++	"strings"
++	"time"
+ 
+ 	"github.com/rs/cors"
+ 	"go.uber.org/zap"
+@@ -15,6 +22,24 @@ type handlerUser struct {
+ 	fs      permissionsFS
+ }
+ 
++// request is the internal, handler-shaped view of an incoming HTTP request:
++// the method, the cleaned request path and, for COPY and MOVE, the cleaned
++// destination path.
++type request struct {
++	method      string
++	path        string
++	destination string
++}
++
++// Handler coordinates the whole life of a request. Every procedure a request
++// can reach is a method here: preparing the users it may be served for,
++// authenticating it, parsing and normalizing its paths, authorizing it and its
++// subtree against the rules, admitting its locks, serving OPTIONS and partial
++// updates and dispatching to the backing WebDAV handler. Keeping the pipeline
++// on one type means a request never leaves the coordinator's hands, and
++// everything that happens to it — including the request-path normalization the
++// per-user file systems reuse, and the request loggers — can be read in one
++// place.
+ type Handler struct {
+ 	noPassword  bool
+ 	behindProxy bool
+@@ -25,20 +50,20 @@ type Handler struct {
+ func NewHandler(c *Config) (http.Handler, error) {
+ 	ls := webdav.NewMemLS()
+ 
+-	logFunc := func(r *http.Request, err error) {
+-		lZap := getRequestLogger(r, c.BehindProxy)
+-		lZap.Debug("handle webdav request", zap.String("method", r.Method), zap.String("path", r.URL.Path), zap.Error(err))
+-	}
+-
+ 	h := &Handler{
+ 		noPassword:  c.NoPassword,
+ 		behindProxy: c.BehindProxy,
+-		user:        newHandlerUser(User{UserPermissions: c.UserPermissions}, c, ls, logFunc),
+ 		users:       map[string]*handlerUser{},
+ 	}
+ 
++	logFunc := func(r *http.Request, err error) {
++		h.requestLogger(r).Debug("handle webdav request", zap.String("method", r.Method), zap.String("path", r.URL.Path), zap.Error(err))
++	}
++
++	h.user = h.newUser(User{UserPermissions: c.UserPermissions}, c, ls, logFunc)
++
+ 	for _, u := range c.Users {
+-		h.users[u.Username] = newHandlerUser(u, c, ls, logFunc)
++		h.users[u.Username] = h.newUser(u, c, ls, logFunc)
+ 	}
+ 
+ 	if c.CORS.Enabled {
+@@ -64,22 +89,28 @@ func NewHandler(c *Config) (http.Handler, error) {
+ 	return h, nil
+ }
+ 
+-// newHandlerUser prepares a user for serving, keeping the unwrapped file system
+-// alongside the handler.
+-func newHandlerUser(u User, c *Config, ls webdav.LockSystem, logFunc func(*http.Request, error)) *handlerUser {
+-	fs := permissionsFS{fs: buildFileSystem(u.UserPermissions, c.NoSniff), perms: u.UserPermissions}
++// newUser prepares a user for serving, keeping the unwrapped file system
++// alongside the handler. The file system is handed the coordinator's
++// request-path normalization, since the names it is asked for are the same
++// paths the request was parsed into.
++func (h *Handler) newUser(u User, c *Config, ls webdav.LockSystem, logFunc func(*http.Request, error)) *handlerUser {
++	fs := permissionsFS{
++		fs:            h.newUserFileSystem(u.UserPermissions, c.NoSniff),
++		perms:         u.UserPermissions,
++		normalizePath: h.cleanRequestPath,
++	}
+ 
+ 	return &handlerUser{
+ 		User:    u,
+-		handler: buildWebdavHandler(u.UserPermissions, fs, c.Prefix, ls, logFunc),
++		handler: h.newUserWebdavHandler(u.UserPermissions, fs, c.Prefix, ls, logFunc),
+ 		fs:      fs,
+ 	}
+ }
+ 
+-// buildFileSystem creates the unfiltered [webdav.FileSystem] for a set of user
+-// permissions, selecting between single-directory and multi-directory backing
+-// depending on whether directories are configured.
+-func buildFileSystem(p UserPermissions, noSniff bool) webdav.FileSystem {
++// newUserFileSystem creates the unfiltered [webdav.FileSystem] for a set of
++// user permissions, selecting between single-directory and multi-directory
++// backing depending on whether directories are configured.
++func (h *Handler) newUserFileSystem(p UserPermissions, noSniff bool) webdav.FileSystem {
+ 	if p.useDirectories {
+ 		return multiDir{
+ 			mounts:  p.Directories,
+@@ -93,61 +124,454 @@ func buildFileSystem(p UserPermissions, noSniff bool) webdav.FileSystem {
+ 	}
+ }
+ 
+-// buildWebdavHandler creates the [webdav.Handler] for a set of user permissions.
+-func buildWebdavHandler(p UserPermissions, fs permissionsFS, prefix string, ls webdav.LockSystem, logFunc func(*http.Request, error)) webdav.Handler {
+-	h := webdav.Handler{
++// newUserWebdavHandler creates the [webdav.Handler] for a set of user
++// permissions, choosing the lock namespace that matches how the user's files
++// are laid out.
++func (h *Handler) newUserWebdavHandler(p UserPermissions, fs permissionsFS, prefix string, ls webdav.LockSystem, logFunc func(*http.Request, error)) webdav.Handler {
++	w := webdav.Handler{
+ 		Prefix:     prefix,
+ 		Logger:     logFunc,
+ 		FileSystem: fs,
+ 	}
+ 
+ 	if p.useDirectories {
+-		h.LockSystem = newMultiDirLockSystem(ls, p.Directories)
++		w.LockSystem = newMultiDirLockSystem(ls, p.Directories)
+ 	} else {
+-		h.LockSystem = newLockSystem(ls, p.Directory)
++		w.LockSystem = newLockSystem(ls, p.Directory)
+ 	}
+ 
+-	return h
++	return w
+ }
+ 
+-// ServeHTTP determines if the request is for this plugin, and if all prerequisites are met.
+-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+-	user := h.user
++// authenticateRequest resolves the user a request is served for. When users
++// are configured the request has to present matching basic credentials;
++// otherwise the coordinator's default user serves it. It writes the failure
++// responses itself.
++func (h *Handler) authenticateRequest(w http.ResponseWriter, r *http.Request, lZap *zap.Logger) (*handlerUser, bool) {
++	if len(h.users) == 0 {
++		return h.user, true
++	}
++
++	w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+ 
+-	lZap := getRequestLogger(r, h.behindProxy)
++	// Gets the correct user for this request.
++	username, password, ok := r.BasicAuth()
++	if !ok {
++		http.Error(w, "Not authorized", http.StatusUnauthorized)
++		return nil, false
++	}
+ 
+-	// Authentication
+-	if len(h.users) > 0 {
+-		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
++	user, ok := h.users[username]
++	if !ok {
++		// Log invalid username
++		lZap.Info("invalid username", zap.String("username", username))
++		http.Error(w, "Not authorized", http.StatusUnauthorized)
++		return nil, false
++	}
+ 
+-		// Gets the correct user for this request.
+-		username, password, ok := r.BasicAuth()
+-		if !ok {
+-			http.Error(w, "Not authorized", http.StatusUnauthorized)
++	if !h.noPassword && !user.checkPassword(password) {
++		// Log invalid password
++		lZap.Info("invalid password", zap.String("username", username))
++		http.Error(w, "Not authorized", http.StatusUnauthorized)
++		return nil, false
++	}
++
++	// Log successful authorization
++	lZap.Info("user authorized", zap.String("username", username))
++
++	return user, true
++}
++
++// parseRequest converts the HTTP request into the internal request type,
++// stripping the prefix both paths were served under and normalizing them.
++func (h *Handler) parseRequest(r *http.Request) (*request, error) {
++	prefix := h.user.handler.Prefix
++
++	ctx := &request{
++		method: r.Method,
++	}
++
++	if destination := r.Header.Get("Destination"); destination != "" {
++		u, err := url.Parse(destination)
++		if err != nil {
++			return nil, errors.New("invalid destination header")
++		}
++
++		// RFC 4918, section 10.3, has Destination as an absolute URI, which is
++		// what clients send in practice. Only the path is relevant here, and
++		// taking it unconditionally keeps the host out of the matched value.
++		destination = u.Path
++
++		if prefix != "" {
++			destination = strings.TrimPrefix(u.Path, prefix)
++			if len(destination) >= len(u.Path) {
++				return nil, errors.New("invalid url prefix")
++			}
++		}
++
++		ctx.destination = h.cleanRequestPath(destination)
++	}
++
++	reqPath := r.URL.Path
++
++	if prefix != "" {
++		reqPath = strings.TrimPrefix(r.URL.Path, prefix)
++		if len(reqPath) >= len(r.URL.Path) {
++			return nil, errors.New("invalid url prefix")
++		}
++	}
++
++	ctx.path = h.cleanRequestPath(reqPath)
++
++	return ctx, nil
++}
++
++// cleanRequestPath resolves dot segments so that the permission checks see the
++// same path that the backing file system will ultimately open. The file systems
++// in golang.org/x/net/webdav apply path.Clean before joining the backing
++// directory, so without this the two layers disagree on which file a request
++// names and a rule can be bypassed with e.g. "/public/../secret/file.txt".
++func (h *Handler) cleanRequestPath(p string) string {
++	if !strings.HasPrefix(p, "/") {
++		p = "/" + p
++	}
++
++	cleaned := path.Clean(p)
++
++	// path.Clean drops the trailing slash, but rules are prefix matches and are
++	// commonly written with one, such as "/c/". Dropping it would stop a request
++	// for the collection itself from matching the rule that names it.
++	if cleaned != "/" && h.isCollectionRequestPath(p) {
++		cleaned += "/"
++	}
++
++	return cleaned
++}
++
++// isCollectionRequestPath reports whether p names a collection rather than a
++// resource within it. Besides an explicit trailing slash, a trailing "." or
++// ".." segment also resolves to the collection itself.
++func (h *Handler) isCollectionRequestPath(p string) bool {
++	return strings.HasSuffix(p, "/") || strings.HasSuffix(p, "/.") || strings.HasSuffix(p, "/..")
++}
++
++// authorizeRequest checks if the user has permission to access a
++// directory/file. COPY and MOVE resolve the destination first, so a rule that
++// denies the destination refuses the request even when the source is allowed;
++// if no rule matches, the global permissions decide.
++func (h *Handler) authorizeRequest(user *handlerUser, req *request, fileExists func(string) bool) bool {
++	// For COPY and MOVE requests, we first check the permissions for the destination
++	// path. As soon as a rule matches and does not allow the operation at the destination,
++	// we fail immediately. If no rule matches, we check the global permissions.
++	if req.method == "COPY" || req.method == "MOVE" {
++		if !user.UserPermissions.allowedAt(req.destination, func(perms Permissions) bool {
++			return perms.AllowedDestination(req, fileExists)
++		}) {
++			return false
++		}
++	}
++
++	return user.UserPermissions.allowedAt(req.path, func(perms Permissions) bool {
++		return perms.Allowed(req, fileExists)
++	})
++}
++
++// authorizeSubtree reports whether the request is permitted on name and every
++// descendant of it. MOVE and DELETE act on a whole subtree in one call, so
++// every descendant needs authorizing here; COPY and PROPFIND instead reach
++// descendants through the filtered listings of the per-user file system.
++//
++// It reads the unwrapped file system directly: the filtered view omits the
++// very entries this has to refuse on.
++func (h *Handler) authorizeSubtree(ctx context.Context, user *handlerUser, req *request, name string, fileExists func(string) bool) (bool, error) {
++	info, err := user.fs.fs.Stat(ctx, name)
++	if err != nil {
++		if os.IsNotExist(err) {
++			// Nothing to walk; the request fails later on its own terms.
++			return true, nil
++		}
++
++		return false, err
++	}
++
++	if !info.IsDir() {
++		return true, nil
++	}
++
++	file, err := user.fs.fs.OpenFile(ctx, name, os.O_RDONLY, 0)
++	if err != nil {
++		return false, err
++	}
++
++	entries, err := file.Readdir(-1)
++	err = errors.Join(err, file.Close())
++	if err != nil {
++		return false, err
++	}
++
++	for _, entry := range entries {
++		child := path.Join(name, entry.Name())
++
++		if !user.fs.perms.allowedAt(child, func(p Permissions) bool {
++			return p.Allowed(req, fileExists)
++		}) {
++			return false, nil
++		}
++
++		if entry.IsDir() {
++			ok, err := h.authorizeSubtree(ctx, user, req, child, fileExists)
++			if !ok || err != nil {
++				return ok, err
++			}
++		}
++	}
++
++	return true, nil
++}
++
++// confirmRequestLocks mirrors the unexported confirmLocks helper from
++// golang.org/x/net/webdav so that partial updates honor WebDAV locks the same
++// way regular PUT requests do. Keep it in sync if the upstream behavior changes.
++func (h *Handler) confirmRequestLocks(user *handlerUser, r *http.Request, src string) (release func(), status int, err error) {
++	hdr := r.Header.Get("If")
++	if hdr == "" {
++		now := time.Now()
++		token, err := user.handler.LockSystem.Create(now, webdav.LockDetails{
++			Root:      src,
++			Duration:  -1,
++			ZeroDepth: true,
++		})
++		if err != nil {
++			if errors.Is(err, webdav.ErrLocked) {
++				return nil, webdav.StatusLocked, err
++			}
++			return nil, http.StatusInternalServerError, err
++		}
++		return func() {
++			_ = user.handler.LockSystem.Unlock(now, token)
++		}, 0, nil
++	}
++
++	ifLists, ok := parsePartialIfHeader(hdr)
++	if !ok {
++		return nil, http.StatusBadRequest, errors.New("webdav: invalid If header")
++	}
++	for _, l := range ifLists {
++		lsrc := l.resourceTag
++		if lsrc == "" {
++			lsrc = src
++		} else {
++			parsedURL, err := url.Parse(lsrc)
++			if err != nil {
++				continue
++			}
++			if parsedURL.Host != r.Host {
++				continue
++			}
++			lsrc, err = stripPartialPrefix(parsedURL.Path, user.handler.Prefix)
++			if err != nil {
++				return nil, http.StatusNotFound, err
++			}
++			if lsrc == "" {
++				lsrc = src
++			}
++		}
++		release, err = user.handler.LockSystem.Confirm(time.Now(), lsrc, "", l.conditions...)
++		if errors.Is(err, webdav.ErrConfirmationFailed) {
++			continue
++		}
++		if err != nil {
++			return nil, http.StatusInternalServerError, err
++		}
++		return release, 0, nil
++	}
++	return nil, http.StatusPreconditionFailed, webdav.ErrLocked
++}
++
++// checkPartialUpdatePreconditions negotiates the If-Match and If-None-Match
++// headers of a partial update against the resource's current entity tag.
++func (h *Handler) checkPartialUpdatePreconditions(user *handlerUser, r *http.Request, exists bool, fi os.FileInfo) (etag string, status int, err error) {
++	ifMatch := r.Header.Get("If-Match")
++	ifNoneMatch := r.Header.Get("If-None-Match")
++	if ifMatch == "" && ifNoneMatch == "" {
++		return "", 0, nil
++	}
++
++	if ifMatch != "" && !exists {
++		return "", http.StatusPreconditionFailed, errors.New("resource does not exist")
++	}
++
++	if exists {
++		etag, err = findPartialETag(r.Context(), fi)
++		if err != nil {
++			return "", http.StatusInternalServerError, err
++		}
++	}
++
++	if ifMatch != "" && !partialETagHeaderMatches(ifMatch, etag, exists) {
++		return etag, http.StatusPreconditionFailed, errors.New("etag does not match")
++	}
++
++	if ifNoneMatch != "" && exists && partialETagHeaderMatches(ifNoneMatch, etag, true) {
++		return etag, http.StatusPreconditionFailed, errors.New("etag matches")
++	}
++
++	return etag, 0, nil
++}
++
++// serveOptions answers an OPTIONS request with the capabilities of the
++// resource it names.
++func (h *Handler) serveOptions(user *handlerUser, w http.ResponseWriter, r *http.Request, reqPath string) {
++	allow := "OPTIONS, LOCK, PUT, MKCOL, PATCH"
++	if fi, err := user.fs.Stat(r.Context(), reqPath); err == nil {
++		if fi.IsDir() {
++			allow = "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
++		} else {
++			allow = "OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT, PATCH"
++		}
++	}
++
++	w.Header().Set("Allow", allow)
++	w.Header().Set("DAV", "1, 2, sabredav-partialupdate")
++	w.Header().Set("MS-Author-Via", "DAV")
++	w.Header().Set("Accept-Patch", partialUpdateContentType)
++	w.WriteHeader(http.StatusOK)
++}
++
++// servePartialUpdate applies the byte-range body of a PATCH request, or the
++// ranged body of a PUT carrying a Content-Range, to the resource it names.
++func (h *Handler) servePartialUpdate(user *handlerUser, w http.ResponseWriter, r *http.Request, reqPath string) {
++	contentRange := r.Header.Get("Content-Range")
++	isContentRangePut := r.Method == "PUT" && contentRange != ""
++
++	var (
++		updateRange updateRange
++		err         error
++	)
++	if isContentRangePut {
++		updateRange, err = parseContentRange(contentRange)
++	} else {
++		if err := checkPartialUpdateContentType(r.Header.Get("Content-Type")); err != nil {
++			http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+ 			return
+ 		}
++		updateRange, err = parseUpdateRange(r.Header.Get("X-Update-Range"))
++	}
++	if err != nil {
++		writePartialUpdateError(w, err, http.StatusBadRequest)
++		return
++	}
++	if r.Method == "PATCH" && r.ContentLength < 0 {
++		http.Error(w, "missing content length", http.StatusLengthRequired)
++		return
++	}
+ 
+-		user, ok = h.users[username]
+-		if !ok {
+-			// Log invalid username
+-			lZap.Info("invalid username", zap.String("username", username))
+-			http.Error(w, "Not authorized", http.StatusUnauthorized)
++	release, status, err := h.confirmRequestLocks(user, r, reqPath)
++	if err != nil {
++		http.Error(w, err.Error(), status)
++		return
++	}
++	defer release()
++
++	ctx := r.Context()
++	fi, statErr := user.fs.Stat(ctx, reqPath)
++	exists := statErr == nil
++	if statErr != nil && !os.IsNotExist(statErr) {
++		http.Error(w, statErr.Error(), http.StatusMethodNotAllowed)
++		return
++	}
++	if exists && fi.IsDir() {
++		http.Error(w, "cannot update a collection", http.StatusMethodNotAllowed)
++		return
++	}
++
++	etag, status, err := h.checkPartialUpdatePreconditions(user, r, exists, fi)
++	if err != nil {
++		if etag != "" {
++			w.Header().Set("ETag", etag)
++		}
++		http.Error(w, err.Error(), status)
++		return
++	}
++
++	currentSize := int64(0)
++	if exists {
++		currentSize = fi.Size()
++	}
++	if updateRange.append {
++		updateRange.offset = currentSize
++	} else if updateRange.offset < 0 {
++		updateRange.offset += currentSize
++		if updateRange.offset < 0 {
++			updateRange.offset = 0
++		}
++	}
++
++	if updateRange.hasEnd {
++		expected := updateRange.end - updateRange.offset + 1
++		if expected < 0 {
++			http.Error(w, "invalid byte range", http.StatusRequestedRangeNotSatisfiable)
++			return
++		}
++		if r.ContentLength >= 0 && r.ContentLength != expected {
++			http.Error(w, "content length does not match byte range", http.StatusRequestedRangeNotSatisfiable)
++			return
++		}
++	}
++
++	body := io.Reader(r.Body)
++	var cleanup func()
++	if updateRange.hasEnd {
++		body, cleanup, err = spoolBoundedBody(r.Body, updateRange.end-updateRange.offset+1)
++		if err != nil {
++			writePartialUpdateError(w, err, http.StatusMethodNotAllowed)
+ 			return
+ 		}
++		defer cleanup()
++	}
+ 
+-		if !h.noPassword && !user.checkPassword(password) {
+-			// Log invalid password
+-			lZap.Info("invalid password", zap.String("username", username))
+-			http.Error(w, "Not authorized", http.StatusUnauthorized)
++	flag := os.O_RDWR
++	if !exists {
++		flag |= os.O_CREATE
++	}
++	f, err := user.fs.OpenFile(ctx, reqPath, flag, 0666)
++	if err != nil {
++		if os.IsNotExist(err) {
++			http.Error(w, err.Error(), http.StatusConflict)
+ 			return
+ 		}
++		http.Error(w, err.Error(), http.StatusNotFound)
++		return
++	}
++	defer func() { _ = f.Close() }()
+ 
+-		// Log successful authorization
+-		lZap.Info("user authorized", zap.String("username", username))
++	if _, err := f.Seek(updateRange.offset, io.SeekStart); err != nil {
++		http.Error(w, err.Error(), http.StatusMethodNotAllowed)
++		return
++	}
++	if _, err := io.Copy(f, body); err != nil {
++		http.Error(w, err.Error(), http.StatusMethodNotAllowed)
++		return
++	}
++
++	if !exists {
++		w.WriteHeader(http.StatusCreated)
++		return
++	}
++	w.WriteHeader(http.StatusNoContent)
++}
++
++// ServeHTTP determines if the request is for this plugin, and if all prerequisites are met.
++func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
++	lZap := h.requestLogger(r)
++
++	user, ok := h.authenticateRequest(w, r, lZap)
++	if !ok {
++		return
+ 	}
+ 
+ 	// Convert the HTTP request into an internal request type
+-	req, err := newRequest(r, h.user.handler.Prefix)
++	req, err := h.parseRequest(r)
+ 	if err != nil {
+ 		lZap.Info("invalid request path or destination", zap.Error(err))
+ 		http.Error(w, "Invalid request path or destination", http.StatusBadRequest)
+@@ -160,7 +584,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// Checks for user permissions relatively to this PATH.
+-	allowed := user.Allowed(req, fileExists)
++	allowed := h.authorizeRequest(user, req, fileExists)
+ 
+ 	lZap.Debug("allowed & method & path", zap.Bool("allowed", allowed), zap.String("method", r.Method), zap.String("path", r.URL.Path))
+ 
+@@ -170,11 +594,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	// MOVE and DELETE act on a whole subtree in one call, so every descendant
+-	// needs authorizing here. COPY and PROPFIND go through permFS instead.
++	// needs authorizing here. COPY and PROPFIND go through the per-user file
++	// system's filtered listings instead.
+ 	if r.Method == "MOVE" || r.Method == "DELETE" {
+-		ok, err := user.fs.allowedThroughout(r.Context(), req.path, func(p Permissions) bool {
+-			return p.Allowed(req, fileExists)
+-		})
++		ok, err := h.authorizeSubtree(r.Context(), user, req, req.path, fileExists)
+ 		if err != nil {
+ 			lZap.Error("could not authorize subtree", zap.String("path", req.path), zap.Error(err))
+ 			w.WriteHeader(http.StatusForbidden)
+@@ -195,12 +618,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	// Excerpt from RFC4918, section 9.4:
+ 	//
+ 	// 		GET, when applied to a collection, may return the contents of an
+-	//		"index.html" resource, a human-readable view of the contents of
+-	//		the collection, or something else altogether.
++	//		"index.html" resource, a human-readable view of the contents of the
++	//		collection, or something else altogether.
+ 	//
+ 	//    Similarly, since the definition of HEAD is a GET without a response
+ 	// 		message body, the semantics of HEAD are unmodified when applied to
+-	// 		collection resources.
++	//		collection resources.
+ 	//
+ 	// GET (or HEAD), when applied to collection, will return the same as PROPFIND method.
+ 	if r.Method == "GET" || r.Method == "HEAD" {
+@@ -215,12 +638,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	}
+ 
+ 	if r.Method == "OPTIONS" {
+-		user.handleOptions(w, r, req.path)
++		h.serveOptions(user, w, r, req.path)
+ 		return
+ 	}
+ 
+ 	if r.Method == "PATCH" || (r.Method == "PUT" && r.Header.Get("Content-Range") != "") {
+-		user.handlePartialUpdate(w, r, req.path)
++		h.servePartialUpdate(user, w, r, req.path)
+ 		return
+ 	}
+ 
+@@ -228,17 +651,15 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 	user.handler.ServeHTTP(w, r)
+ }
+ 
+-// getRequestLogger creates a zap.Logger using the request remote ip.
+-func getRequestLogger(r *http.Request, behindProxy bool) *zap.Logger {
+-	// Retrieve the real client IP address using the updated helper function
+-	remoteAddr := getRealRemoteIP(r, behindProxy)
+-
++// requestLogger creates a zap.Logger using the request remote ip.
++func (h *Handler) requestLogger(r *http.Request) *zap.Logger {
++	remoteAddr := h.realRemoteIP(r)
+ 	return zap.L().With(zap.String("remote_address", remoteAddr))
+ }
+ 
+-// getRealRemoteIP retrieves the client's actual IP address, considering reverse proxies.
+-func getRealRemoteIP(r *http.Request, behindProxy bool) string {
+-	if behindProxy {
++// realRemoteIP retrieves the client's actual IP address, considering reverse proxies.
++func (h *Handler) realRemoteIP(r *http.Request) string {
++	if h.behindProxy {
+ 		if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+ 			return ip
+ 		}
+diff --git a/lib/partial_update.go b/lib/partial_update.go
+index 7a43715..4f922fd 100644
+--- a/lib/partial_update.go
++++ b/lib/partial_update.go
+@@ -7,11 +7,9 @@ import (
+ 	"io"
+ 	"mime"
+ 	"net/http"
+-	"net/url"
+ 	"os"
+ 	"strconv"
+ 	"strings"
+-	"time"
+ 
+ 	"golang.org/x/net/webdav"
+ )
+@@ -46,144 +44,6 @@ func writePartialUpdateError(w http.ResponseWriter, err error, fallbackStatus in
+ 	http.Error(w, err.Error(), fallbackStatus)
+ }
+ 
+-func (u *handlerUser) handleOptions(w http.ResponseWriter, r *http.Request, reqPath string) {
+-	allow := "OPTIONS, LOCK, PUT, MKCOL, PATCH"
+-	if fi, err := u.fs.Stat(r.Context(), reqPath); err == nil {
+-		if fi.IsDir() {
+-			allow = "OPTIONS, LOCK, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND"
+-		} else {
+-			allow = "OPTIONS, LOCK, GET, HEAD, POST, DELETE, PROPPATCH, COPY, MOVE, UNLOCK, PROPFIND, PUT, PATCH"
+-		}
+-	}
+-
+-	w.Header().Set("Allow", allow)
+-	w.Header().Set("DAV", "1, 2, sabredav-partialupdate")
+-	w.Header().Set("MS-Author-Via", "DAV")
+-	w.Header().Set("Accept-Patch", partialUpdateContentType)
+-	w.WriteHeader(http.StatusOK)
+-}
+-
+-func (u *handlerUser) handlePartialUpdate(w http.ResponseWriter, r *http.Request, reqPath string) {
+-	contentRange := r.Header.Get("Content-Range")
+-	isContentRangePut := r.Method == "PUT" && contentRange != ""
+-
+-	var (
+-		updateRange updateRange
+-		err         error
+-	)
+-	if isContentRangePut {
+-		updateRange, err = parseContentRange(contentRange)
+-	} else {
+-		if err := checkPartialUpdateContentType(r.Header.Get("Content-Type")); err != nil {
+-			http.Error(w, err.Error(), http.StatusUnsupportedMediaType)
+-			return
+-		}
+-		updateRange, err = parseUpdateRange(r.Header.Get("X-Update-Range"))
+-	}
+-	if err != nil {
+-		writePartialUpdateError(w, err, http.StatusBadRequest)
+-		return
+-	}
+-	if r.Method == "PATCH" && r.ContentLength < 0 {
+-		http.Error(w, "missing content length", http.StatusLengthRequired)
+-		return
+-	}
+-
+-	release, status, err := u.confirmPartialUpdateLocks(r, reqPath)
+-	if err != nil {
+-		http.Error(w, err.Error(), status)
+-		return
+-	}
+-	defer release()
+-
+-	ctx := r.Context()
+-	fi, statErr := u.fs.Stat(ctx, reqPath)
+-	exists := statErr == nil
+-	if statErr != nil && !os.IsNotExist(statErr) {
+-		http.Error(w, statErr.Error(), http.StatusMethodNotAllowed)
+-		return
+-	}
+-	if exists && fi.IsDir() {
+-		http.Error(w, "cannot update a collection", http.StatusMethodNotAllowed)
+-		return
+-	}
+-
+-	etag, status, err := u.checkPartialUpdatePreconditions(r, exists, fi)
+-	if err != nil {
+-		if etag != "" {
+-			w.Header().Set("ETag", etag)
+-		}
+-		http.Error(w, err.Error(), status)
+-		return
+-	}
+-
+-	currentSize := int64(0)
+-	if exists {
+-		currentSize = fi.Size()
+-	}
+-	if updateRange.append {
+-		updateRange.offset = currentSize
+-	} else if updateRange.offset < 0 {
+-		updateRange.offset += currentSize
+-		if updateRange.offset < 0 {
+-			updateRange.offset = 0
+-		}
+-	}
+-
+-	if updateRange.hasEnd {
+-		expected := updateRange.end - updateRange.offset + 1
+-		if expected < 0 {
+-			http.Error(w, "invalid byte range", http.StatusRequestedRangeNotSatisfiable)
+-			return
+-		}
+-		if r.ContentLength >= 0 && r.ContentLength != expected {
+-			http.Error(w, "content length does not match byte range", http.StatusRequestedRangeNotSatisfiable)
+-			return
+-		}
+-	}
+-
+-	body := io.Reader(r.Body)
+-	var cleanup func()
+-	if updateRange.hasEnd {
+-		body, cleanup, err = spoolBoundedBody(r.Body, updateRange.end-updateRange.offset+1)
+-		if err != nil {
+-			writePartialUpdateError(w, err, http.StatusMethodNotAllowed)
+-			return
+-		}
+-		defer cleanup()
+-	}
+-
+-	flag := os.O_RDWR
+-	if !exists {
+-		flag |= os.O_CREATE
+-	}
+-	f, err := u.fs.OpenFile(ctx, reqPath, flag, 0666)
+-	if err != nil {
+-		if os.IsNotExist(err) {
+-			http.Error(w, err.Error(), http.StatusConflict)
+-			return
+-		}
+-		http.Error(w, err.Error(), http.StatusNotFound)
+-		return
+-	}
+-	defer func() { _ = f.Close() }()
+-
+-	if _, err := f.Seek(updateRange.offset, io.SeekStart); err != nil {
+-		http.Error(w, err.Error(), http.StatusMethodNotAllowed)
+-		return
+-	}
+-	if _, err := io.Copy(f, body); err != nil {
+-		http.Error(w, err.Error(), http.StatusMethodNotAllowed)
+-		return
+-	}
+-
+-	if !exists {
+-		w.WriteHeader(http.StatusCreated)
+-		return
+-	}
+-	w.WriteHeader(http.StatusNoContent)
+-}
+-
+ func checkPartialUpdateContentType(contentType string) error {
+ 	if contentType == "" {
+ 		return errors.New("missing content type")
+@@ -198,35 +58,6 @@ func checkPartialUpdateContentType(contentType string) error {
+ 	return nil
+ }
+ 
+-func (u *handlerUser) checkPartialUpdatePreconditions(r *http.Request, exists bool, fi os.FileInfo) (etag string, status int, err error) {
+-	ifMatch := r.Header.Get("If-Match")
+-	ifNoneMatch := r.Header.Get("If-None-Match")
+-	if ifMatch == "" && ifNoneMatch == "" {
+-		return "", 0, nil
+-	}
+-
+-	if ifMatch != "" && !exists {
+-		return "", http.StatusPreconditionFailed, errors.New("resource does not exist")
+-	}
+-
+-	if exists {
+-		etag, err = findPartialETag(r.Context(), fi)
+-		if err != nil {
+-			return "", http.StatusInternalServerError, err
+-		}
+-	}
+-
+-	if ifMatch != "" && !partialETagHeaderMatches(ifMatch, etag, exists) {
+-		return etag, http.StatusPreconditionFailed, errors.New("etag does not match")
+-	}
+-
+-	if ifNoneMatch != "" && exists && partialETagHeaderMatches(ifNoneMatch, etag, true) {
+-		return etag, http.StatusPreconditionFailed, errors.New("etag matches")
+-	}
+-
+-	return etag, 0, nil
+-}
+-
+ func findPartialETag(ctx context.Context, fi os.FileInfo) (string, error) {
+ 	if etager, ok := fi.(webdav.ETager); ok {
+ 		etag, err := etager.ETag(ctx)
+@@ -354,65 +185,6 @@ func spoolBoundedBody(body io.Reader, expected int64) (io.Reader, func(), error)
+ 	return tmp, cleanup, nil
+ }
+ 
+-// confirmPartialUpdateLocks mirrors the unexported confirmLocks helper from
+-// golang.org/x/net/webdav so that partial updates honor WebDAV locks the same
+-// way regular PUT requests do. Keep it in sync if the upstream behavior changes.
+-func (u *handlerUser) confirmPartialUpdateLocks(r *http.Request, src string) (release func(), status int, err error) {
+-	hdr := r.Header.Get("If")
+-	if hdr == "" {
+-		now := time.Now()
+-		token, err := u.handler.LockSystem.Create(now, webdav.LockDetails{
+-			Root:      src,
+-			Duration:  -1,
+-			ZeroDepth: true,
+-		})
+-		if err != nil {
+-			if errors.Is(err, webdav.ErrLocked) {
+-				return nil, webdav.StatusLocked, err
+-			}
+-			return nil, http.StatusInternalServerError, err
+-		}
+-		return func() {
+-			_ = u.handler.LockSystem.Unlock(now, token)
+-		}, 0, nil
+-	}
+-
+-	ifLists, ok := parsePartialIfHeader(hdr)
+-	if !ok {
+-		return nil, http.StatusBadRequest, errors.New("webdav: invalid If header")
+-	}
+-	for _, l := range ifLists {
+-		lsrc := l.resourceTag
+-		if lsrc == "" {
+-			lsrc = src
+-		} else {
+-			parsedURL, err := url.Parse(lsrc)
+-			if err != nil {
+-				continue
+-			}
+-			if parsedURL.Host != r.Host {
+-				continue
+-			}
+-			lsrc, err = stripPartialPrefix(parsedURL.Path, u.handler.Prefix)
+-			if err != nil {
+-				return nil, http.StatusNotFound, err
+-			}
+-			if lsrc == "" {
+-				lsrc = src
+-			}
+-		}
+-		release, err = u.handler.LockSystem.Confirm(time.Now(), lsrc, "", l.conditions...)
+-		if errors.Is(err, webdav.ErrConfirmationFailed) {
+-			continue
+-		}
+-		if err != nil {
+-			return nil, http.StatusInternalServerError, err
+-		}
+-		return release, 0, nil
+-	}
+-	return nil, http.StatusPreconditionFailed, webdav.ErrLocked
+-}
+-
+ type partialIfList struct {
+ 	resourceTag string
+ 	conditions  []webdav.Condition
+diff --git a/lib/permissions.go b/lib/permissions.go
+index cf40e66..9c5a515 100644
+--- a/lib/permissions.go
++++ b/lib/permissions.go
+@@ -88,24 +88,6 @@ type DirectoryMount struct {
+ 
+ type DirectoryMounts []DirectoryMount
+ 
+-// Allowed checks if the user has permission to access a directory/file
+-func (p UserPermissions) Allowed(r *request, fileExists func(string) bool) bool {
+-	// For COPY and MOVE requests, we first check the permissions for the destination
+-	// path. As soon as a rule matches and does not allow the operation at the destination,
+-	// we fail immediately. If no rule matches, we check the global permissions.
+-	if r.method == "COPY" || r.method == "MOVE" {
+-		if !p.allowedAt(r.destination, func(perms Permissions) bool {
+-			return perms.AllowedDestination(r, fileExists)
+-		}) {
+-			return false
+-		}
+-	}
+-
+-	return p.allowedAt(r.path, func(perms Permissions) bool {
+-		return perms.Allowed(r, fileExists)
+-	})
+-}
+-
+ // allowedAt resolves the permissions that govern path and applies check to them.
+ func (p UserPermissions) allowedAt(path string, check func(Permissions) bool) bool {
+ 	// Go through rules beginning from the last one. The first matched rule returns.
+diff --git a/lib/permissions_fs.go b/lib/permissions_fs.go
+index 164bf92..769889e 100644
+--- a/lib/permissions_fs.go
++++ b/lib/permissions_fs.go
+@@ -17,12 +17,16 @@ var _ webdav.FileSystem = permissionsFS{}
+ // through the file system, so rules have to be applied as those listings are produced.
+ //
+ // The wrapped file system is a named field rather than an embedded one on
+-// purpose. allowedThroughout has to read unfiltered listings, and a promoted
+-// OpenFile would make walking the filtered view by accident a one-character
+-// change that authorizes everything without failing any obvious way.
++// purpose. Subtree authorization has to read unfiltered listings, and a
++// promoted OpenFile would make walking the filtered view by accident a
++// one-character change that authorizes everything without failing any
++// obvious way. That authorization and the path normalization below both live
++// with the request coordinator, which hands this wrapper the normalization
++// rather than leaving it in the file system's hands.
+ type permissionsFS struct {
+-	fs    webdav.FileSystem
+-	perms UserPermissions
++	fs            webdav.FileSystem
++	perms         UserPermissions
++	normalizePath func(string) string
+ }
+ 
+ func (f permissionsFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
+@@ -47,9 +51,11 @@ func (f permissionsFS) OpenFile(ctx context.Context, name string, flag int, perm
+ 		return nil, err
+ 	}
+ 
+-	// The handler strips its prefix first, which for the default prefix "/" also
+-	// drops the leading slash. Rules are written with one.
+-	return &permissionsFile{File: file, name: cleanPath(name), perms: f.perms}, nil
++	// The request coordinator strips its prefix first, which for the default
++	// prefix "/" also drops the leading slash. Rules are written with one, so
++	// the name is normalized with the very normalization the coordinator
++	// parsed the request with, received here at construction time.
++	return &permissionsFile{File: file, name: f.normalizePath(name), perms: f.perms}, nil
+ }
+ 
+ type permissionsFile struct {
+@@ -106,53 +112,3 @@ func (f *permissionsFile) readable(fis []os.FileInfo) []os.FileInfo {
+ 
+ 	return allowed
+ }
+-
+-// allowedThroughout reports whether check holds for every descendant of name.
+-// Rename and RemoveAll act on a subtree in one call without consulting the file
+-// system per descendant, so MOVE and DELETE need this before dispatching.
+-//
+-// It reads f.fs directly rather than the [permissionsFS] view: the latter omits
+-// the very entries this needs to refuse on.
+-func (f permissionsFS) allowedThroughout(ctx context.Context, name string, check func(Permissions) bool) (bool, error) {
+-	info, err := f.fs.Stat(ctx, name)
+-	if err != nil {
+-		if os.IsNotExist(err) {
+-			// Nothing to walk; the request fails later on its own terms.
+-			return true, nil
+-		}
+-
+-		return false, err
+-	}
+-
+-	if !info.IsDir() {
+-		return true, nil
+-	}
+-
+-	file, err := f.fs.OpenFile(ctx, name, os.O_RDONLY, 0)
+-	if err != nil {
+-		return false, err
+-	}
+-
+-	entries, err := file.Readdir(-1)
+-	err = errors.Join(err, file.Close())
+-	if err != nil {
+-		return false, err
+-	}
+-
+-	for _, entry := range entries {
+-		child := path.Join(name, entry.Name())
+-
+-		if !f.perms.allowedAt(child, check) {
+-			return false, nil
+-		}
+-
+-		if entry.IsDir() {
+-			ok, err := f.allowedThroughout(ctx, child, check)
+-			if !ok || err != nil {
+-				return ok, err
+-			}
+-		}
+-	}
+-
+-	return true, nil
+-}
+diff --git a/lib/request.go b/lib/request.go
+deleted file mode 100644
+index 7422334..0000000
+--- a/lib/request.go
++++ /dev/null
+@@ -1,84 +0,0 @@
+-package lib
+-
+-import (
+-	"errors"
+-	"net/http"
+-	"net/url"
+-	"path"
+-	"strings"
+-)
+-
+-// cleanPath resolves dot segments so that the permission checks see the same
+-// path that the backing file system will ultimately open. The file systems in
+-// golang.org/x/net/webdav apply path.Clean before joining the backing
+-// directory, so without this the two layers disagree on which file a request
+-// names and a rule can be bypassed with e.g. "/public/../secret/file.txt".
+-func cleanPath(p string) string {
+-	if !strings.HasPrefix(p, "/") {
+-		p = "/" + p
+-	}
+-
+-	cleaned := path.Clean(p)
+-
+-	// path.Clean drops the trailing slash, but rules are prefix matches and are
+-	// commonly written with one, such as "/c/". Dropping it would stop a request
+-	// for the collection itself from matching the rule that names it.
+-	if cleaned != "/" && isCollectionPath(p) {
+-		cleaned += "/"
+-	}
+-
+-	return cleaned
+-}
+-
+-// isCollectionPath reports whether p names a collection rather than a resource
+-// within it. Besides an explicit trailing slash, a trailing "." or ".." segment
+-// also resolves to the collection itself.
+-func isCollectionPath(p string) bool {
+-	return strings.HasSuffix(p, "/") || strings.HasSuffix(p, "/.") || strings.HasSuffix(p, "/..")
+-}
+-
+-type request struct {
+-	method      string
+-	path        string
+-	destination string
+-}
+-
+-func newRequest(r *http.Request, prefix string) (*request, error) {
+-	ctx := &request{
+-		method: r.Method,
+-	}
+-
+-	if destination := r.Header.Get("Destination"); destination != "" {
+-		u, err := url.Parse(destination)
+-		if err != nil {
+-			return nil, errors.New("invalid destination header")
+-		}
+-
+-		// RFC 4918, section 10.3, has Destination as an absolute URI, which is
+-		// what clients send in practice. Only the path is relevant here, and
+-		// taking it unconditionally keeps the host out of the matched value.
+-		destination = u.Path
+-
+-		if prefix != "" {
+-			destination = strings.TrimPrefix(u.Path, prefix)
+-			if len(destination) >= len(u.Path) {
+-				return nil, errors.New("invalid url prefix")
+-			}
+-		}
+-
+-		ctx.destination = cleanPath(destination)
+-	}
+-
+-	path := r.URL.Path
+-
+-	if prefix != "" {
+-		path = strings.TrimPrefix(r.URL.Path, prefix)
+-		if len(path) >= len(r.URL.Path) {
+-			return nil, errors.New("invalid url prefix")
+-		}
+-	}
+-
+-	ctx.path = cleanPath(path)
+-
+-	return ctx, nil
+-}

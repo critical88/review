@@ -1,0 +1,477 @@
+diff --git a/goimports.go b/goimports.go
+index a008d82..8f74501 100644
+--- a/goimports.go
++++ b/goimports.go
+@@ -5,17 +5,12 @@
+ package main
+ 
+ import (
+-	"bytes"
+ 	"flag"
+ 	"fmt"
+-	"go/scanner"
+-	"io"
+ 	"io/ioutil"
+ 	"os"
+ 	"os/exec"
+-	"path/filepath"
+ 	"runtime"
+-	"strings"
+ 
+ 	"golang.org/x/tools/imports"
+ )
+@@ -39,92 +34,12 @@ func init() {
+ 	flag.BoolVar(&options.AllErrors, "e", false, "report all errors (not just the first 10 on different lines)")
+ }
+ 
+-func report(err error) {
+-	scanner.PrintError(os.Stderr, err)
+-	exitCode = 2
+-}
+-
+ func usage() {
+ 	fmt.Fprintf(os.Stderr, "usage: goimports [flags] [path ...]\n")
+ 	flag.PrintDefaults()
+ 	os.Exit(2)
+ }
+ 
+-func isGoFile(f os.FileInfo) bool {
+-	// ignore non-Go files
+-	name := f.Name()
+-	return !f.IsDir() && !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go")
+-}
+-
+-func processFile(filename string, in io.Reader, out io.Writer, stdin bool) error {
+-	opt := options
+-	if stdin {
+-		nopt := *options
+-		nopt.Fragment = true
+-		opt = &nopt
+-	}
+-
+-	if in == nil {
+-		f, err := os.Open(filename)
+-		if err != nil {
+-			return err
+-		}
+-		defer f.Close()
+-		in = f
+-	}
+-
+-	src, err := ioutil.ReadAll(in)
+-	if err != nil {
+-		return err
+-	}
+-
+-	res, err := imports.Process(filename, src, opt)
+-	if err != nil {
+-		return err
+-	}
+-
+-	if !bytes.Equal(src, res) {
+-		// formatting has changed
+-		if *list {
+-			fmt.Fprintln(out, filename)
+-		}
+-		if *write {
+-			err = ioutil.WriteFile(filename, res, 0)
+-			if err != nil {
+-				return err
+-			}
+-		}
+-		if *doDiff {
+-			data, err := diff(src, res)
+-			if err != nil {
+-				return fmt.Errorf("computing diff: %s", err)
+-			}
+-			fmt.Printf("diff %s gofmt/%s\n", filename, filename)
+-			out.Write(data)
+-		}
+-	}
+-
+-	if !*list && !*write && !*doDiff {
+-		_, err = out.Write(res)
+-	}
+-
+-	return err
+-}
+-
+-func visitFile(path string, f os.FileInfo, err error) error {
+-	if err == nil && isGoFile(f) {
+-		err = processFile(path, nil, os.Stdout, false)
+-	}
+-	if err != nil {
+-		report(err)
+-	}
+-	return nil
+-}
+-
+-func walkDir(path string) {
+-	filepath.Walk(path, visitFile)
+-}
+-
+ func main() {
+ 	runtime.GOMAXPROCS(runtime.NumCPU())
+ 
+@@ -135,35 +50,32 @@ func main() {
+ 	os.Exit(exitCode)
+ }
+ 
++// gofmtMain assembles the run from the command-line flags and hands it
++// to either the walker, when paths were named, or to standard input.
+ func gofmtMain() {
+ 	flag.Usage = usage
+ 	flag.Parse()
+ 
+-	if options.TabWidth < 0 {
+-		fmt.Fprintf(os.Stderr, "negative tabwidth %d\n", options.TabWidth)
++	sess := newSession(*list, *write, *doDiff, flag.NArg() == 0, *options)
++	rep := newReport(os.Stdout, os.Stderr, sess)
++	run := newWalker(rep)
++
++	if sess.opts.TabWidth < 0 {
++		fmt.Fprintf(os.Stderr, "negative tabwidth %d\n", sess.opts.TabWidth)
+ 		exitCode = 2
+ 		return
+ 	}
+ 
+ 	if flag.NArg() == 0 {
+-		if err := processFile("<standard input>", os.Stdin, os.Stdout, true); err != nil {
+-			report(err)
++		stdinFile := &sourceFile{display: "<standard input>"}
++		if err := run.formatStdin(sess, stdinFile); err != nil {
++			rep.noteProblem(sess, err)
+ 		}
+-		return
++	} else {
++		run.paths(sess, flag.Args())
+ 	}
+-
+-	for i := 0; i < flag.NArg(); i++ {
+-		path := flag.Arg(i)
+-		switch dir, err := os.Stat(path); {
+-		case err != nil:
+-			report(err)
+-		case dir.IsDir():
+-			walkDir(path)
+-		default:
+-			if err := processFile(path, nil, os.Stdout, false); err != nil {
+-				report(err)
+-			}
+-		}
++	if sess.failed() {
++		exitCode = 2
+ 	}
+ }
+ 
+diff --git a/report.go b/report.go
+new file mode 100644
+index 0000000..f40cd71
+--- /dev/null
++++ b/report.go
+@@ -0,0 +1,81 @@
++// Copyright 2013 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package main
++
++import (
++	"bytes"
++	"fmt"
++	"go/scanner"
++	"io"
++	"io/ioutil"
++)
++
++// A report owns the streams a run writes to: formatted results, diffs
++// and diagnostics all go through it.  It also carries a handle to the
++// run it reports for, so that the reporting modes stay within reach
++// while an outcome is being written up.
++type report struct {
++	out    io.Writer
++	errOut io.Writer
++	sess   *session
++}
++
++// newReport prepares the report streams for a run.
++func newReport(out, errOut io.Writer, sess *session) *report {
++	return &report{out: out, errOut: errOut, sess: sess}
++}
++
++// deliverResult presents the outcome for one processed file.  The
++// run's reporting modes decide between listing the file, writing its
++// formatted text back, showing a diff, and the plain formatted text
++// itself.
++func (r *report) deliverResult(fh *sourceFile) error {
++	s := r.sess
++	if !bytes.Equal(fh.data, fh.rendered) {
++		// formatting has changed
++		if s.list {
++			fmt.Fprintln(r.out, fh.display)
++		}
++		if s.write {
++			if err := ioutil.WriteFile(fh.display, fh.rendered, 0); err != nil {
++				return err
++			}
++		}
++		if s.doDiff {
++			if err := r.showDiff(fh); err != nil {
++				return err
++			}
++		}
++	}
++
++	if !s.list && !s.write && !s.doDiff {
++		_, err := r.out.Write(fh.rendered)
++		return err
++	}
++
++	return nil
++}
++
++// showDiff writes a unified diff between the original and the
++// formatted text of one file, in gofmt's format.
++func (r *report) showDiff(fh *sourceFile) error {
++	data, err := diff(fh.data, fh.rendered)
++	if err != nil {
++		return fmt.Errorf("computing diff: %s", err)
++	}
++	fmt.Printf("diff %s gofmt/%s\n", fh.display, fh.display)
++	_, _ = r.out.Write(data)
++	return nil
++}
++
++// noteProblem reports a failure on the diagnostics stream and keeps
++// the run's error tally in sync so the exit status comes out right.
++func (r *report) noteProblem(s *session, err error) {
++	if err == nil {
++		return
++	}
++	scanner.PrintError(r.errOut, err)
++	s.failures++
++}
+diff --git a/session.go b/session.go
+new file mode 100644
+index 0000000..041ba1b
+--- /dev/null
++++ b/session.go
+@@ -0,0 +1,55 @@
++// Copyright 2013 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package main
++
++import (
++	"golang.org/x/tools/imports"
++)
++
++// A session owns the settings and the progress of one goimports run:
++// the reporting modes selected on the command line, the formatter
++// options, and the error tally that decides the exit status.
++type session struct {
++	// reporting modes, selected with -l, -w and -d
++	list   bool
++	write  bool
++	doDiff bool
++
++	// whether this run reads standard input rather than named paths
++	stdin bool
++
++	// formatter settings, seeded from the command-line defaults
++	opts imports.Options
++
++	// files we had to give up on
++	failures int
++}
++
++// newSession captures the command-line shape of one run.
++func newSession(list, write, doDiff, stdin bool, opts imports.Options) *session {
++	return &session{
++		list:   list,
++		write:  write,
++		doDiff: doDiff,
++		stdin:  stdin,
++		opts:   opts,
++	}
++}
++
++// optionsFor reports the formatter settings one input should use.
++// Standard input is never a complete file, so fragment mode is forced
++// for it; the settings of the run are left untouched.
++func (s *session) optionsFor() *imports.Options {
++	opts := s.opts
++	if s.stdin {
++		opts.Fragment = true
++	}
++	return &opts
++}
++
++// failed reports whether any file had to be given up on.
++func (s *session) failed() bool {
++	return s.failures > 0
++}
+diff --git a/source.go b/source.go
+new file mode 100644
+index 0000000..ec965e5
+--- /dev/null
++++ b/source.go
+@@ -0,0 +1,14 @@
++// Copyright 2013 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package main
++
++// A sourceFile is one candidate input of a run: the name to show for
++// it, the bytes exactly as they were read, and the rendered text
++// gofmt proposes for them once formatting is done.
++type sourceFile struct {
++	display  string
++	data     []byte
++	rendered []byte
++}
+diff --git a/walk.go b/walk.go
+new file mode 100644
+index 0000000..5b7a587
+--- /dev/null
++++ b/walk.go
+@@ -0,0 +1,137 @@
++// Copyright 2013 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package main
++
++import (
++	"io/ioutil"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"golang.org/x/tools/imports"
++)
++
++// A walker finds the files a run should look at — the paths named on
++// the command line and the Go files below them — and runs each one
++// through the formatter.
++type walker struct {
++	rep *report
++}
++
++// newWalker prepares the traversal for a run.
++func newWalker(rep *report) *walker {
++	return &walker{rep: rep}
++}
++
++// paths processes each command-line argument in turn: directories are
++// walked recursively, anything else is treated as a single file.
++func (w *walker) paths(s *session, args []string) {
++	for i := 0; i < len(args); i++ {
++		path := args[i]
++		switch dir, err := os.Stat(path); {
++		case err != nil:
++			w.rep.noteProblem(s, err)
++		case dir.IsDir():
++			w.walkDir(s, path)
++		default:
++			if err := w.processFile(s, path); err != nil {
++				w.rep.noteProblem(s, err)
++			}
++		}
++	}
++}
++
++// walkDir visits every Go file under path.
++func (w *walker) walkDir(s *session, path string) {
++	filepath.Walk(path, func(p string, fi os.FileInfo, err error) error {
++		return w.visitFile(s, p, fi, err)
++	})
++}
++
++// visitFile processes one candidate discovered by a walk. Walk
++// errors and per-file failures are reported, but never stop the walk.
++func (w *walker) visitFile(s *session, path string, fi os.FileInfo, err error) error {
++	if err == nil && isGoFile(fi) {
++		err = w.processFile(s, path)
++	}
++	if err != nil {
++		w.rep.noteProblem(s, err)
++	}
++	return nil
++}
++
++// formatStdin handles the no-argument invocation: standard input is
++// read into the work record, formatted as a fragment, and the outcome
++// is presented under the run's reporting modes.
++func (w *walker) formatStdin(s *session, fh *sourceFile) error {
++	src, err := ioutil.ReadAll(os.Stdin)
++	if err != nil {
++		return err
++	}
++	fh.data = src
++
++	opts := s.opts
++	if s.stdin {
++		opts.Fragment = true
++	}
++	res, err := imports.Process(fh.display, fh.data, &opts)
++	if err != nil {
++		return err
++	}
++	fh.rendered = res
++
++	// without an explicit reporting mode the formatted text simply
++	// goes to the output stream
++	if !s.list && !s.write && !s.doDiff {
++		_, err := w.rep.out.Write(fh.rendered)
++		return err
++	}
++	return w.rep.deliverResult(fh)
++}
++
++// open reads the file at path into a work record.
++func (w *walker) open(path string) (*sourceFile, error) {
++	f, err := os.Open(path)
++	if err != nil {
++		return nil, err
++	}
++	defer f.Close()
++	src, err := ioutil.ReadAll(f)
++	if err != nil {
++		return nil, err
++	}
++	return &sourceFile{display: path, data: src}, nil
++}
++
++// processFile runs one file through the formatter and hands the
++// result to the reporting layer.
++func (w *walker) processFile(s *session, path string) error {
++	fh, err := w.open(path)
++	if err != nil {
++		return err
++	}
++	if err := w.rerender(s, fh); err != nil {
++		return err
++	}
++	return w.rep.deliverResult(fh)
++}
++
++// rerender formats the text stored in one work record and keeps the
++// result next to it.
++func (w *walker) rerender(s *session, fh *sourceFile) error {
++	res, err := imports.Process(fh.display, fh.data, s.optionsFor())
++	if err != nil {
++		return err
++	}
++	fh.rendered = res
++	return nil
++}
++
++// isGoFile reports whether fi names a Go source file worth looking at.
++func isGoFile(fi os.FileInfo) bool {
++	// ignore non-Go files
++	name := fi.Name()
++	return !fi.IsDir() && !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".go")
++}

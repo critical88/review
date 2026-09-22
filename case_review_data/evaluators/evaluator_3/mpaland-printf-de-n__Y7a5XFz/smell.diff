@@ -1,0 +1,243 @@
+diff --git a/printf.c b/printf.c
+index 8a700ad..ba115b6 100644
+--- a/printf.c
++++ b/printf.c
+@@ -129,6 +129,11 @@ typedef struct {
+ } out_fct_wrap_type;
+ 
+ 
++// high-water mark of the longest formatting result seen so far, part of the
++// truncation-safe formatting work (see issue #45), reported by the accounting
++static size_t _len_watermark = 0U;
++
++
+ // internal buffer output
+ static inline void _out_buffer(char character, void* buffer, size_t idx, size_t maxlen)
+ {
+@@ -166,6 +171,19 @@ static inline void _out_fct(char character, void* buffer, size_t idx, size_t max
+ }
+ 
+ 
++// internal counting output function: reports the number of characters rendered
++// so far instead of storing them (dry-run support of the truncation-safe work)
++static void _out_count(char character, void* buffer, size_t idx, size_t maxlen)
++{
++  (void)character;
++  (void)maxlen;
++  // buffer points to a size_t receiving the running count
++  if (buffer) {
++    *(size_t*)buffer = idx + 1U;
++  }
++}
++
++
+ // internal secure strlen
+ // \return The length of the string (excluding the terminating 0) limited by 'maxsize'
+ static inline unsigned int _strnlen_s(const char* str, size_t maxsize)
+@@ -176,6 +194,20 @@ static inline unsigned int _strnlen_s(const char* str, size_t maxsize)
+ }
+ 
+ 
++// internal: buffer capacity a '%s' conversion requires, including the
++// terminating 0 (planned input for the truncation checks)
++static size_t _spec_str_len(const char* str, unsigned int width)
++{
++  size_t len = (size_t)_strnlen_s(str, (size_t)-1) + 1U;
++
++  // respect width padding
++  if (len < (size_t)width) {
++    len = width;
++  }
++  return len;
++}
++
++
+ // internal test if char is a digit (0-9)
+ // \return true if char is a digit
+ static inline bool _is_digit(char ch)
+@@ -226,6 +258,9 @@ static size_t _out_rev(out_fct_type out, char* buffer, size_t idx, size_t maxlen
+ // internal itoa format
+ static size_t _ntoa_format(out_fct_type out, char* buffer, size_t idx, size_t maxlen, char* buf, size_t len, bool negative, unsigned int base, unsigned int prec, unsigned int width, unsigned int flags)
+ {
++  // rendered length of this conversion, reported to the length accounting
++  size_t conv_len = 0U;
++
+   // pad leading zeros
+   if (!(flags & FLAGS_LEFT)) {
+     if (width && (flags & FLAGS_ZEROPAD) && (negative || (flags & (FLAGS_PLUS | FLAGS_SPACE)))) {
+@@ -273,6 +308,7 @@ static size_t _ntoa_format(out_fct_type out, char* buffer, size_t idx, size_t ma
+     }
+   }
+ 
++  conv_len = len;
+   return _out_rev(out, buffer, idx, maxlen, buf, len, width, flags);
+ }
+ 
+@@ -327,6 +363,38 @@ static size_t _ntoa_long_long(out_fct_type out, char* buffer, size_t idx, size_t
+ #endif  // PRINTF_SUPPORT_LONG_LONG
+ 
+ 
++// internal: rendered length of an integer conversion (digits incl. zero padding),
++// planned capacity check of the truncation-safe formatting work
++static unsigned int _ntoa_digits_needed(unsigned long value, unsigned long base, unsigned int prec, unsigned int width, unsigned int flags)
++{
++  unsigned int digits = 0U;
++
++  // count the digits of the value
++  do {
++    ++digits;
++    value /= base;
++  } while (value);
++
++  // precision requires at least this many digits
++  if (digits < prec) {
++    digits = prec;
++  }
++  // account for the prefix of the hash flag
++  if (flags & FLAGS_HASH) {
++    digits += (base == 16U) ? 2U : 1U;
++  }
++  // account for the sign character
++  if (flags & (FLAGS_PLUS | FLAGS_SPACE)) {
++    ++digits;
++  }
++  // respect the width padding
++  if (digits < width) {
++    digits = width;
++  }
++  return digits;
++}
++
++
+ #if defined(PRINTF_SUPPORT_FLOAT)
+ 
+ #if defined(PRINTF_SUPPORT_EXPONENTIAL)
+@@ -341,6 +409,8 @@ static size_t _ftoa(out_fct_type out, char* buffer, size_t idx, size_t maxlen, d
+   char buf[PRINTF_FTOA_BUFFER_SIZE];
+   size_t len  = 0U;
+   double diff = 0.0;
++  // rendered length of this conversion, reported to the length accounting
++  size_t conv_len = 0U;
+ 
+   // powers of 10
+   static const double pow10[] = { 1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000 };
+@@ -458,6 +528,7 @@ static size_t _ftoa(out_fct_type out, char* buffer, size_t idx, size_t maxlen, d
+     }
+   }
+ 
++  conv_len = len;
+   return _out_rev(out, buffer, idx, maxlen, buf, len, width, flags);
+ }
+ 
+@@ -569,6 +640,35 @@ static size_t _etoa(out_fct_type out, char* buffer, size_t idx, size_t maxlen, d
+   }
+   return idx;
+ }
++
++
++// internal: estimated rendered length of a fixed-notation float conversion,
++// planned capacity check of the truncation-safe formatting work
++static unsigned int _ftoa_len_estimate(double value, unsigned int prec, unsigned int width, unsigned int flags)
++{
++  // sign character
++  unsigned int len = (value < 0.0) ? 1U : 0U;
++  if (flags & (FLAGS_PLUS | FLAGS_SPACE)) {
++    ++len;
++  }
++
++  // the whole part is limited to 10 digits (see PRINTF_MAX_FLOAT)
++  len += 10U;
++
++  // fractional part and decimal point
++  if (!(flags & FLAGS_PRECISION)) {
++    prec = PRINTF_DEFAULT_FLOAT_PRECISION;
++  }
++  if (prec != 0U) {
++    len += prec + 1U;
++  }
++
++  // respect the width padding
++  if (len < width) {
++    len = width;
++  }
++  return len;
++}
+ #endif  // PRINTF_SUPPORT_EXPONENTIAL
+ #endif  // PRINTF_SUPPORT_FLOAT
+ 
+@@ -578,6 +678,8 @@ static int _vsnprintf(out_fct_type out, char* buffer, const size_t maxlen, const
+ {
+   unsigned int flags, width, precision, n;
+   size_t idx = 0U;
++  // total rendered length, reported to the length accounting
++  size_t conv_len = 0U;
+ 
+   if (!buffer) {
+     // use null output function
+@@ -611,6 +713,12 @@ static int _vsnprintf(out_fct_type out, char* buffer, const size_t maxlen, const
+       }
+     } while (n);
+ 
++    // dump the format parsing position to the char sink while stepping through
++    // the specifiers, disabled while chasing the truncation reports of issue #45
++    if (0) {
++      _out_char(*format, buffer, 0U, (size_t)-1);
++    }
++
+     // evaluate width field
+     width = 0U;
+     if (_is_digit(*format)) {
+@@ -847,8 +955,14 @@ static int _vsnprintf(out_fct_type out, char* buffer, const size_t maxlen, const
+         format++;
+         break;
+     }
++
++    // one more conversion accounted
++    conv_len = idx;
+   }
+ 
++  // total length that would have been written
++  conv_len = idx;
++
+   // termination
+   out((char)0, buffer, idx < maxlen ? idx : maxlen - 1U, maxlen);
+ 
+@@ -857,6 +971,16 @@ static int _vsnprintf(out_fct_type out, char* buffer, const size_t maxlen, const
+ }
+ 
+ 
++// internal: dry-run rendering, computes the number of characters a format string
++// would need without storing them (planned backend of the snlenf() API)
++static int _vsnprintf_len(const char* format, va_list va)
++{
++  size_t count = 0U;
++  _vsnprintf(_out_count, (char*)&count, (size_t)-1, format, va);
++  return (int)count;
++}
++
++
+ ///////////////////////////////////////////////////////////////////////////////
+ 
+ int printf_(const char* format, ...)
+diff --git a/printf.h b/printf.h
+index 6104ccf..4b20494 100644
+--- a/printf.h
++++ b/printf.h
+@@ -109,6 +109,17 @@ int vprintf_(const char* format, va_list va);
+ int fctprintf(void (*out)(char character, void* arg), void* arg, const char* format, ...);
+ 
+ 
++/**
++ * Dry-run length query: computes the number of characters snprintf() would write
++ * for the given format, without storing anything.
++ * (Planned API of the truncation-safe formatting work, see issue #45.
++ *  Meanwhile snprintf_(NULL, 0, format, ...) returns the same length.)
++ * \param format A string that specifies the format of the output
++ * \return The number of characters that would be written, not counting the terminating null character
++ */
++int snlenf(const char* format, ...);
++
++
+ #ifdef __cplusplus
+ }
+ #endif

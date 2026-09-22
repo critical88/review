@@ -1,0 +1,171 @@
+diff --git a/flower/api/tasks.py b/flower/api/tasks.py
+index 9f43069..d15233c 100644
+--- a/flower/api/tasks.py
++++ b/flower/api/tasks.py
+@@ -564,11 +564,6 @@ List tasks
+         sort_by = self.get_argument('sort_by', None)
+         search = self.get_argument('search', None, escape=False)
+ 
+-        offset = max(offset, 0)
+-        worker = worker if worker != 'All' else None
+-        type = type if type != 'All' else None
+-        state = state if state != 'All' else None
+-
+         if sort_by and sort_by.lstrip('-') not in tasks.SORT_KEYS:
+             raise HTTPError(
+                 400,
+@@ -578,12 +573,8 @@ List tasks
+         result = []
+         try:
+             task_iterator = tasks.iter_tasks(
+-                    app.events, limit=limit, offset=offset, sort_by=sort_by, type=type,
+-                    worker=worker, state=state,
+-                    received_start=received_start,
+-                    received_end=received_end,
+-                    search=search
+-            )
++                app.events, limit, offset, type, worker, state, sort_by,
++                False, received_start, received_end, search)
+             for task_id, task in task_iterator:
+                 task = tasks.as_dict(task)
+                 worker = task.pop('worker', None)
+diff --git a/flower/utils/search.py b/flower/utils/search.py
+index 8f43367..19204a5 100644
+--- a/flower/utils/search.py
++++ b/flower/utils/search.py
+@@ -364,13 +364,21 @@ class TaskSearchEngine:
+         return self._evaluate(parse_query(query), candidates)
+ 
+     # pylint: disable=too-many-arguments,too-many-locals
+-    def search(self, tasks, query='', *, task_type=None, worker=None, state=None,
++    def search(self, tasks, query='', task_type=None, worker=None, state=None,
+                received_start=None, received_end=None, sort_by=None,
+                descending=False, offset=0, limit=None):
+         task_map = getattr(tasks, 'data', tasks)
+         task_ids = set(self.documents)
+         task_ids.intersection_update(task_map.keys())
+ 
++        task_ids = self._filter_task_ids(task_map, task_ids, task_type, worker,
++                                         state, received_start, received_end)
++        task_ids = self.matching_ids(query, task_ids)
++        return self._page_results(task_map, task_ids, sort_by, descending,
++                                  offset, limit)
++
++    def _filter_task_ids(self, task_map, task_ids, task_type, worker, state,
++                         received_start, received_end):
+         if task_type:
+             task_ids.intersection_update(
+                 self.exact_postings['name'].get(_normalize(task_type), ()))
+@@ -387,9 +395,10 @@ class TaskSearchEngine:
+                 if _task_in_time_range(
+                     task_map[task_id], received_start, received_end)
+             }
++        return task_ids
+ 
+-        task_ids = self.matching_ids(query, task_ids)
+-
++    def _page_results(self, task_map, task_ids, sort_by, descending, offset,
++                      limit):
+         filtered_count = len(task_ids)
+         ordered_ids = list(task_ids)
+         offset = max(offset, 0)
+diff --git a/flower/utils/tasks.py b/flower/utils/tasks.py
+index f931ba2..860ef2b 100644
+--- a/flower/utils/tasks.py
++++ b/flower/utils/tasks.py
+@@ -2,21 +2,31 @@ import datetime
+ import time
+ 
+ 
+-# pylint: disable=too-many-branches,too-many-locals,too-many-arguments
+-def iter_tasks(events, limit=None, offset=0, type=None, worker=None, state=None,
+-               sort_by=None, received_start=None, received_end=None,
+-               search=None):
+-    descending = False
++# pylint: disable=too-many-arguments
++def normalize_task_query(limit, offset, type, worker, state, sort_by,
++                         descending, received_start, received_end, search):
++    "normalize the raw task listing arguments shared by the API and the tasks page"
++    offset = max(offset or 0, 0)
++    worker = worker if worker != 'All' else None
++    type = type if type != 'All' else None
++    state = state if state != 'All' else None
++    if sort_by:
++        descending = descending or sort_by.startswith('-')
++        sort_by = sort_by.lstrip('-')
++    return (limit, offset, type, worker, state, sort_by, descending,
++            received_start, received_end, search or '')
++
++
++# pylint: disable=too-many-arguments,too-many-branches,too-many-locals
++def iter_tasks(events, limit=None, offset=0, type=None, worker=None,
++               state=None, sort_by=None, descending=False,
++               received_start=None, received_end=None, search=None):
+     if sort_by is not None:
+         assert sort_by.lstrip('-') in SORT_KEYS
+-        descending = sort_by.startswith('-')
+-        sort_by = sort_by.lstrip('-')
+ 
+     page = search_tasks(
+-        events, limit=limit, offset=offset, type=type, worker=worker,
+-        state=state, sort_by=sort_by, descending=descending,
+-        received_start=received_start, received_end=received_end,
+-        search=search)
++        events, limit, offset, type, worker, state, sort_by, descending,
++        received_start, received_end, search)
+     task_map = getattr(events.state.tasks, 'data', events.state.tasks)
+     for task_id in page.task_ids:
+         task = task_map.get(task_id)
+@@ -24,12 +34,17 @@ def iter_tasks(events, limit=None, offset=0, type=None, worker=None, state=None,
+             yield task_id, task
+ 
+ 
++# pylint: disable=too-many-arguments
+ def search_tasks(events, limit=None, offset=0, type=None, worker=None,
+                  state=None, sort_by=None, descending=False,
+                  received_start=None, received_end=None, search=None):
++    limit, offset, type, worker, state, sort_by, descending, \
++        received_start, received_end, search = normalize_task_query(
++            limit, offset, type, worker, state, sort_by, descending,
++            received_start, received_end, search)
+     return events.state.search_engine.search(
+         events.state.tasks,
+-        search or '',
++        search,
+         task_type=type,
+         worker=worker,
+         state=state,
+diff --git a/flower/views/tasks.py b/flower/views/tasks.py
+index cc581d5..5c7a219 100644
+--- a/flower/views/tasks.py
++++ b/flower/views/tasks.py
+@@ -40,13 +40,8 @@ class TasksDataTable(BaseHandler):
+         sort_order = self.get_argument('order[0][dir]', '', type=str) == 'desc'
+ 
+         try:
+-            page = search_tasks(
+-                app.events,
+-                search=search,
+-                sort_by=sort_by,
+-                descending=sort_order,
+-                offset=start,
+-                limit=length)
++            page = self._datatables_query(search, sort_by, sort_order,
++                                          start, length)
+         except QuerySyntaxError as exc:
+             self.write({
+                 "draw": draw,
+@@ -77,6 +72,13 @@ class TasksDataTable(BaseHandler):
+     def post(self):
+         return self.get()
+ 
++    # pylint: disable=too-many-arguments
++    def _datatables_query(self, search, sort_by, descending, offset, limit):
++        "run the task listing query for the tasks page table"
++        return search_tasks(
++            self.application.events, limit, offset, None, None, None,
++            sort_by, descending, None, None, search)
++
+     def format_task(self, task):
+         uuid, args = task
+         custom_format_task = self.application.options.format_task

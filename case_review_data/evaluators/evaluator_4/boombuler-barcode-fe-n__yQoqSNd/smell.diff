@@ -1,0 +1,166 @@
+diff --git a/datamatrix/errorcorrection.go b/datamatrix/errorcorrection.go
+index 2e5c9e5..41393e9 100644
+--- a/datamatrix/errorcorrection.go
++++ b/datamatrix/errorcorrection.go
+@@ -22,7 +22,24 @@ func (ec *errorCorrection) calcECC(data []byte, size *dmCodeSize) []byte {
+ 	data = append(data, make([]byte, size.ECCCount)...)
+ 
+ 	for block := 0; block < size.BlockCount; block++ {
+-		dataCnt := size.DataCodewordsForBlock(block)
++		// Keep the whole block budget in this pass: derive the per-block
++		// data budget and the ECC budget straight from the raw symbol
++		// profile instead of round-tripping through the size accessors.
++		var dataCnt int
++		if size.Rows == 144 && size.Columns == 144 {
++			// Special Case...
++			if block < 8 {
++				dataCnt = 156
++			} else {
++				dataCnt = 155
++			}
++		} else {
++			regionCols := (size.Columns - (size.RegionCountHorizontal * 2)) / size.RegionCountHorizontal
++			regionRows := (size.Rows - (size.RegionCountVertical * 2)) / size.RegionCountVertical
++			matrixCells := regionCols * regionRows * size.RegionCountHorizontal * size.RegionCountVertical
++			dataCnt = ((matrixCells / 8) - size.ECCCount) / size.BlockCount
++		}
++		eccPerBlock := size.ECCCount / size.BlockCount
+ 
+ 		buff := make([]int, dataCnt)
+ 		// copy the data for the current block to buff
+@@ -32,10 +49,10 @@ func (ec *errorCorrection) calcECC(data []byte, size *dmCodeSize) []byte {
+ 			j++
+ 		}
+ 		// calc the error correction codes
+-		ecc := ec.rs.Encode(buff, size.ErrorCorrectionCodewordsPerBlock())
++		ecc := ec.rs.Encode(buff, eccPerBlock)
+ 		// and append them to the result
+ 		j = 0
+-		for i := block; i < size.ErrorCorrectionCodewordsPerBlock()*size.BlockCount; i += size.BlockCount {
++		for i := block; i < eccPerBlock*size.BlockCount; i += size.BlockCount {
+ 			data[dataSize+i] = byte(ecc[j])
+ 			j++
+ 		}
+diff --git a/ean/encoder.go b/ean/encoder.go
+index 4a80706..fd6de7f 100644
+--- a/ean/encoder.go
++++ b/ean/encoder.go
+@@ -122,36 +122,48 @@ func encodeEAN8(code string) *utils.BitList {
+ 	return result
+ }
+ 
++// digitPlan coaches which bar pattern a digit contributes at each position
++// of an EAN 13 symbol: the left hand side alternates the odd and even
++// variants following the parity row encoded by the lead digit.
++type digitPlan struct {
++	parity []bool
++}
++
++func newDigitPlan(num encodedNumber) *digitPlan {
++	return &digitPlan{parity: num.CheckSum}
++}
++
++// barsAt returns the bar pattern for the digit num at the given content
++// position, choosing the left hand variant from the plan's parity pattern.
++func (dp *digitPlan) barsAt(cpos int, num encodedNumber) []bool {
++	if cpos < 7 { // Left
++		if dp.parity[cpos-1] {
++			return num.LeftEven
++		}
++		return num.LeftOdd
++	}
++	return num.Right
++}
++
+ func encodeEAN13(code string) *utils.BitList {
+ 	result := new(utils.BitList)
+ 	result.AddBit(true, false, true)
+ 
+-	var firstNum []bool
++	var plan *digitPlan
+ 	for cpos, r := range code {
+ 		num, ok := encoderTable[r]
+ 		if !ok {
+ 			return nil
+ 		}
+ 		if cpos == 0 {
+-			firstNum = num.CheckSum
++			plan = newDigitPlan(num)
+ 			continue
+ 		}
+ 
+-		var data []bool
+-		if cpos < 7 { // Left
+-			if firstNum[cpos-1] {
+-				data = num.LeftEven
+-			} else {
+-				data = num.LeftOdd
+-			}
+-		} else {
+-			data = num.Right
+-		}
+-
+ 		if cpos == 7 {
+ 			result.AddBit(false, true, false, true, false)
+ 		}
+-		result.AddBit(data...)
++		result.AddBit(plan.barsAt(cpos, num)...)
+ 	}
+ 	result.AddBit(true, false, true)
+ 	return result
+diff --git a/qr/encoder.go b/qr/encoder.go
+index ec4092f..bec6464 100644
+--- a/qr/encoder.go
++++ b/qr/encoder.go
+@@ -73,7 +73,7 @@ func Encode(content string, level ErrorCorrectionLevel, mode Encoding) (barcode.
+ }
+ 
+ func render(data []byte, vi *versionInfo, color barcode.ColorScheme) *qrcode {
+-	dim := vi.modulWidth()
++	dim, _ := new(symbolPlanner).frameMetrics(vi)
+ 	results := make([]*qrcode, 8)
+ 	for i := 0; i < 8; i++ {
+ 		results[i] = newBarCodeWithColor(dim, color)
+@@ -395,7 +395,8 @@ func drawVersionInfo(vi *versionInfo, set func(int, int, bool)) {
+ }
+ 
+ func addPaddingAndTerminator(bl *utils.BitList, vi *versionInfo) {
+-	for i := 0; i < 4 && bl.Len() < vi.totalDataBytes()*8; i++ {
++	_, dataBytes := new(symbolPlanner).frameMetrics(vi)
++	for i := 0; i < 4 && bl.Len() < dataBytes*8; i++ {
+ 		bl.AddBit(false)
+ 	}
+ 
+@@ -403,7 +404,7 @@ func addPaddingAndTerminator(bl *utils.BitList, vi *versionInfo) {
+ 		bl.AddBit(false)
+ 	}
+ 
+-	for i := 0; bl.Len() < vi.totalDataBytes()*8; i++ {
++	for i := 0; bl.Len() < dataBytes*8; i++ {
+ 		if i%2 == 0 {
+ 			bl.AddByte(236)
+ 		} else {
+diff --git a/qr/versioninfo.go b/qr/versioninfo.go
+index 6852a57..d202bca 100644
+--- a/qr/versioninfo.go
++++ b/qr/versioninfo.go
+@@ -308,3 +308,19 @@ func findSmallestVersionInfo(ecl ErrorCorrectionLevel, mode encodingMode, dataBi
+ 	}
+ 	return nil
+ }
++
++// symbolPlanner re-derives the geometry of the final QR matrix and the
++// payload budget of its data region in one place, so the render pass can
++// consult a single planning call instead of the version tables.
++type symbolPlanner struct{}
++
++// frameMetrics returns the number of modules per matrix axis together with
++// the number of bytes the layout can carry, taken straight from the
++// chosen version's block layout.
++func (sp *symbolPlanner) frameMetrics(vi *versionInfo) (dim int, dataBytes int) {
++	dim = ((int(vi.Version) - 1) * 4) + 21
++	g1Data := int(vi.NumberOfBlocksInGroup1) * int(vi.DataCodeWordsPerBlockInGroup1)
++	g2Data := int(vi.NumberOfBlocksInGroup2) * int(vi.DataCodeWordsPerBlockInGroup2)
++	dataBytes = g1Data + g2Data
++	return
++}

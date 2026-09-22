@@ -1,0 +1,1045 @@
+diff --git a/proxybroker/api.py b/proxybroker/api.py
+index 9f59294..f03d1eb 100644
+--- a/proxybroker/api.py
++++ b/proxybroker/api.py
+@@ -1,18 +1,40 @@
+ import asyncio
+ import io
++import random
+ import signal
++import time
+ import warnings
++import zlib
+ from collections import Counter, defaultdict
+ from functools import partial
+ from pprint import pprint
+ 
++import aiohttp
++
+ from .checker import Checker
+-from .errors import ResolveError
++from .errors import (
++    BadResponseError,
++    BadStatusError,
++    ProxyConnError,
++    ProxyEmptyRecvError,
++    ProxyRecvError,
++    ProxySendError,
++    ProxyTimeoutError,
++    ResolveError,
++)
++from .judge import Judge
+ from .providers import PROVIDERS, Provider
+ from .proxy import Proxy
+ from .resolver import Resolver
+ from .server import Server
+-from .utils import IPPortPatternLine, log
++from .utils import (
++    IPPortPatternLine,
++    get_all_ip,
++    get_headers,
++    get_status_code,
++    log,
++    parse_headers,
++)
+ 
+ # Pause between grabbing cycles; in seconds.
+ GRAB_PAUSE = 180
+@@ -27,6 +49,10 @@ class Broker:
+     | One broker to rule them all, one broker to find them,
+     | One broker to bring them all and in the darkness bind them.
+ 
++    The Broker is the single entry point of the library: it collects
++    the judges, builds the checking parameters, checks the found proxies,
++    and hands the working ones to the consumer.
++
+     :param asyncio.Queue queue: (optional) Queue of found/checked proxies
+     :param int timeout: (optional) Timeout of a request in seconds
+     :param int max_conn:
+@@ -49,6 +75,29 @@ class Broker:
+         :attr:`max_concurrent_conn` and :attr:`attempts_conn`.
+     """
+ 
++    # Judging pages used when the user has not passed their own.
++    _default_judges = [
++        'http://httpbin.org/get?show_env',
++        'https://httpbin.org/get?show_env',
++        'smtp://smtp.gmail.com',
++        'smtp://aspmx.l.google.com',
++        'http://azenv.net/',
++        'https://www.proxy-listen.de/azenv.php',
++        'http://www.proxyfire.net/fastenv',
++        'http://proxyjudge.us/azenv.php',
++        'http://ip.spys.ru/',
++        'http://www.proxy-listen.de/azenv.php',
++    ]
++
++    # Working judges, gathered by the scheme and shared by all brokers
++    # in the process (as it was on Judge before).
++    _judge_availability = {'HTTP': [], 'HTTPS': [], 'SMTP': []}
++    _judge_events = {
++        'HTTP': asyncio.Event(),
++        'HTTPS': asyncio.Event(),
++        'SMTP': asyncio.Event(),
++    }
++
+     def __init__(
+         self,
+         queue=None,
+@@ -97,6 +146,7 @@ class Broker:
+         self._on_check = asyncio.Queue(maxsize=max_conn, loop=self._loop)
+         self._max_tries = max_tries
+         self._judges = judges
++        self._judges_resolver = Resolver(loop=self._loop)
+         self._providers = [
+             p if isinstance(p, Provider) else Provider(p)
+             for p in (providers or PROVIDERS)
+@@ -176,6 +226,7 @@ class Broker:
+         if not types:
+             raise ValueError('`types` is required')
+ 
++        self._reset_judges()
+         self._checker = Checker(
+             judges=self._judges,
+             timeout=self._timeout,
+@@ -188,10 +239,15 @@ class Broker:
+             dnsbl=dnsbl,
+             loop=self._loop,
+         )
++        self._judges = self._build_judges(
++            judges=self._judges,
++            timeout=self._timeout,
++            verify_ssl=self._verify_ssl,
++        )
+         self._countries = countries
+         self._limit = limit
+ 
+-        tasks = [asyncio.ensure_future(self._checker.check_judges())]
++        tasks = [asyncio.ensure_future(self._check_judges())]
+         if data:
+             task = asyncio.ensure_future(self._load(data, check=True))
+         else:
+@@ -392,7 +448,7 @@ class Broker:
+             log.debug('unpause. proxies: %s' % self._proxies.qsize())
+ 
+         await self._on_check.put(None)
+-        task = asyncio.ensure_future(self._checker.check(proxy))
++        task = asyncio.ensure_future(self._check_proxy(proxy))
+         task.add_done_callback(partial(_task_done, proxy))
+         self._all_tasks.append(task)
+ 
+@@ -513,6 +569,402 @@ class Broker:
+             print('%s (%s): %s' % (proto, len(proxies), proxies))
+         print('Errors:', errors)
+ 
++    # ------------------------------------------------------------------
++    # Collecting and verification of judges.
++
++    def _reset_judges(self):
++        """Drop the working judges and their readiness events collected so far."""
++        self._judge_availability['HTTP'].clear()
++        self._judge_availability['HTTPS'].clear()
++        self._judge_availability['SMTP'].clear()
++        self._judge_events['HTTP'].clear()
++        self._judge_events['HTTPS'].clear()
++        self._judge_events['SMTP'].clear()
++
++    def _build_judges(self, judges=None, timeout=8, verify_ssl=False):
++        """Turn the passed judge urls (or :class:`Judge` objects)
++        into configured judge records.
++        """
++        judges = judges or self._default_judges
++        _judges = []
++        for j in judges:
++            j = j if isinstance(j, Judge) else Judge(j)
++            j.timeout = timeout
++            j.verify_ssl = verify_ssl
++            _judges.append(j)
++        return _judges
++
++    async def _check_judges(self):
++        """Verify the judges and disable the protocols
++        for which no working judge has been found.
++        """
++        log.debug('Start check judges')
++        stime = time.time()
++        await asyncio.gather(
++            *[
++                self._verify_judge(j, real_ext_ip=self._checker._real_ext_ip)
++                for j in self._judges
++            ]
++        )
++
++        self._judges = [j for j in self._judges if j.is_working]
++        log.debug(
++            '%d judges added. Runtime: %.4f;'
++            % (len(self._judges), time.time() - stime)
++        )
++
++        nojudges = []
++        disable_protocols = []
++
++        if len(self._judge_availability['HTTP']) == 0:
++            nojudges.append('HTTP')
++            disable_protocols.extend(['HTTP', 'CONNECT:80', 'SOCKS4', 'SOCKS5'])
++            self._checker._req_http_proto = False
++            # for coroutines, which is already waiting
++            self._judge_events['HTTP'].set()
++        if len(self._judge_availability['HTTPS']) == 0:
++            nojudges.append('HTTPS')
++            disable_protocols.append('HTTPS')
++            self._checker._req_https_proto = False
++            # for coroutines, which is already waiting
++            self._judge_events['HTTPS'].set()
++        if len(self._judge_availability['SMTP']) == 0:
++            # nojudges.append('SMTP')
++            disable_protocols.append('SMTP')
++            self._checker._req_smtp_proto = False
++            # for coroutines, which is already waiting
++            self._judge_events['SMTP'].set()
++
++        for proto in disable_protocols:
++            if proto in self._checker._ngtrs:
++                self._checker._ngtrs.remove(proto)
++
++        if nojudges:
++            warnings.warn(
++                'Not found judges for the {nojudges} protocol.\n'
++                'Checking proxy on protocols {disp} is disabled.'.format(
++                    nojudges=nojudges, disp=disable_protocols
++                ),
++                UserWarning,
++            )
++        if self._judges:
++            log.debug('Loaded: %d proxy judges' % len(set(self._judges)))
++        else:
++            RuntimeError('Not found judges')
++
++    async def _verify_judge(self, judge, real_ext_ip):
++        """Check that the judge page is reachable
++        and reports the external IP, then collect it as working.
++        """
++        try:
++            judge.ip = await self._judges_resolver.resolve(judge.host)
++        except ResolveError:
++            return
++
++        if judge.scheme == 'SMTP':
++            judge.is_working = True
++            self._judge_availability[judge.scheme].append(judge)
++            self._judge_events[judge.scheme].set()
++            return
++
++        page = False
++        headers, rv = get_headers(rv=True)
++        connector = aiohttp.TCPConnector(
++            loop=self._loop, ssl=judge.verify_ssl, force_close=True
++        )
++        try:
++            timeout = aiohttp.ClientTimeout(total=judge.timeout)
++            async with aiohttp.ClientSession(
++                connector=connector, timeout=timeout, loop=self._loop
++            ) as session, session.get(
++                url=judge.url, headers=headers, allow_redirects=False
++            ) as resp:
++                page = await resp.text()
++        except (
++            asyncio.TimeoutError,
++            aiohttp.ClientOSError,
++            aiohttp.ClientResponseError,
++            aiohttp.ServerDisconnectedError,
++        ) as e:
++            log.debug('%s is failed. Error: %r;' % (judge, e))
++            return
++
++        page = page.lower()
++
++        if resp.status == 200 and real_ext_ip in page and rv in page:
++            judge.marks['via'] = page.count('via')
++            judge.marks['proxy'] = page.count('proxy')
++            judge.is_working = True
++            self._judge_availability[judge.scheme].append(judge)
++            self._judge_events[judge.scheme].set()
++            log.debug('%s is verified' % judge)
++        else:
++            log.debug(
++                (
++                    '{j} is failed. HTTP status code: {code}; '
++                    'Real IP on page: {ip}; Version: {word}; '
++                    'Response: {page}'
++                ).format(
++                    j=judge,
++                    code=resp.status,
++                    page=page,
++                    ip=(real_ext_ip in page),
++                    word=(rv in page),
++                )
++            )
++
++    def _pick_judge(self, proto):
++        """Return a random working judge suitable for the protocol."""
++        if proto == 'HTTPS':
++            scheme = 'HTTPS'
++        elif proto == 'CONNECT:25':
++            scheme = 'SMTP'
++        else:
++            scheme = 'HTTP'
++        return random.choice(self._judge_availability[scheme])
++
++    # ------------------------------------------------------------------
++    # Checking of the found proxies.
++
++    async def _check_proxy(self, proxy):
++        """Check the proxy on the protocols from the check parameters.
++
++        :return: True if the proxy is working and suits
++                 the requested types, False otherwise
++        """
++        if self._checker._dnsbl:
++            if await self._in_DNSBL(proxy.host):
++                proxy.log('Found in DNSBL')
++                return False
++
++        if self._checker._req_http_proto:
++            await self._judge_events['HTTP'].wait()
++        if self._checker._req_https_proto:
++            await self._judge_events['HTTPS'].wait()
++        if self._checker._req_smtp_proto:
++            await self._judge_events['SMTP'].wait()
++
++        if proxy.expected_types:
++            ngtrs = proxy.expected_types & self._checker._ngtrs
++        else:
++            ngtrs = self._checker._ngtrs
++
++        results = []
++        for proto in ngtrs:
++            if proto == 'CONNECT:25':
++                result = await self._check_conn_25(proxy, proto)
++            else:
++                result = await self._check(proxy, proto)
++            results.append(result)
++
++        proxy.is_working = True if any(results) else False
++
++        if proxy.is_working and self._types_passed(proxy):
++            return True
++        return False
++
++    async def _in_DNSBL(self, host):
++        """Check that the host is presented in one of the DNSBL databases."""
++        _host = '.'.join(reversed(host.split('.')))  # reverse address
++        tasks = []
++        for domain in self._checker._dnsbl:
++            query = '.'.join([_host, domain])
++            tasks.append(self._judges_resolver.resolve(query, logging=False))
++        responses = await asyncio.gather(*tasks, return_exceptions=True)
++        if any([r for r in responses if not isinstance(r, ResolveError)]):
++            return True
++        return False
++
++    def _types_passed(self, proxy):
++        """Whether the types (protocols) of the proxy suit the requested."""
++        if not self._checker._types:
++            return True
++        for proto, lvl in proxy.types.copy().items():
++            req_levels = self._checker._types.get(proto)
++            if not req_levels or (lvl in req_levels):
++                if not self._checker._strict:
++                    return True
++            else:
++                if self._checker._strict:
++                    del proxy.types[proto]
++        if self._checker._strict and proxy.types:
++            return True
++        proxy.log(
++            'Protocol or the level of anonymity differs from the requested'
++        )
++        return False
++
++    async def _check_conn_25(self, proxy, proto):
++        judge = self._pick_judge(proto)
++        proxy.log('Selected judge: %s' % judge)
++        result = False
++        for attempt in range(self._checker._max_tries):
++            try:
++                proxy.ngtr = proto
++                await proxy.connect()
++                await proxy.ngtr.negotiate(host=judge.host, ip=judge.ip)
++            except ProxyTimeoutError:
++                continue
++            except (
++                ProxyConnError,
++                ProxyRecvError,
++                ProxySendError,
++                ProxyEmptyRecvError,
++                BadStatusError,
++                BadResponseError,
++            ):
++                break
++            else:
++                proxy.types[proxy.ngtr.name] = None
++                result = True
++                break
++            finally:
++                proxy.close()
++        return result
++
++    async def _check(self, proxy, proto):
++        judge = self._pick_judge(proto)
++        proxy.log('Selected judge: %s' % judge)
++        result = False
++        for attempt in range(self._checker._max_tries):
++            try:
++                proxy.ngtr = proto
++                await proxy.connect()
++                await proxy.ngtr.negotiate(host=judge.host, ip=judge.ip)
++                headers, content, rv = await self._send_test_request(
++                    self._checker._method, proxy, judge
++                )
++            except ProxyTimeoutError:
++                continue
++            except (
++                ProxyConnError,
++                ProxyRecvError,
++                ProxySendError,
++                ProxyEmptyRecvError,
++                BadStatusError,
++                BadResponseError,
++            ):
++                break
++            else:
++                content = self._decompress_content(headers, content)
++                result = self._check_test_response(proxy, headers, content, rv)
++                if result:
++                    if proxy.ngtr.check_anon_lvl:
++                        lvl = self._get_anonymity_lvl(proxy, judge, content)
++                    else:
++                        lvl = None
++                    proxy.types[proxy.ngtr.name] = lvl
++                break
++            finally:
++                proxy.close()
++        return result
++
++    def _request(self, method, host, path, fullpath=False, data=''):
++        hdrs, rv = get_headers(rv=True)
++        hdrs['Host'] = host
++        hdrs['Connection'] = 'close'
++        hdrs['Content-Length'] = len(data)
++        if method == 'POST':
++            hdrs['Content-Type'] = 'application/octet-stream'
++        kw = {
++            'method': method,
++            'path': 'http://%s%s' % (host, path) if fullpath else path,  # HTTP
++            'headers': '\r\n'.join(('%s: %s' % (k, v) for k, v in hdrs.items())),
++            'data': data,
++        }
++        req = (
++            ('{method} {path} HTTP/1.1\r\n{headers}\r\n\r\n{data}')
++            .format(**kw)
++            .encode()
++        )
++        return req, rv
++
++    async def _send_test_request(self, method, proxy, judge):
++        resp, content, err = None, None, None
++        request, rv = self._request(
++            method=method,
++            host=judge.host,
++            path=judge.path,
++            fullpath=proxy.ngtr.use_full_path,
++        )
++        try:
++            await proxy.send(request)
++            resp = await proxy.recv()
++            code = get_status_code(resp)
++            if code != 200:
++                err = BadStatusError
++                raise err
++            headers, content, *_ = resp.split(b'\r\n\r\n', maxsplit=1)
++        except ValueError:
++            err = BadResponseError
++            raise err
++        finally:
++            proxy.log('Get: %s' % ('success' if content else 'failed'), err=err)
++            log.debug(
++                '{h}:{p} [{n}]: ({j}) rv: {rv}, response: {resp}'.format(
++                    h=proxy.host,
++                    p=proxy.port,
++                    n=proxy.ngtr.name,
++                    j=judge.url,
++                    rv=rv,
++                    resp=resp,
++                )
++            )
++        return headers, content, rv
++
++    def _decompress_content(self, headers, content):
++        headers = parse_headers(headers)
++        is_compressed = headers.get('Content-Encoding') in ('gzip', 'deflate')
++        is_chunked = headers.get('Transfer-Encoding') == 'chunked'
++        if is_compressed:
++            # gzip: zlib.MAX_WBITS|16;
++            # deflate: -zlib.MAX_WBITS;
++            # auto: zlib.MAX_WBITS|32;
++            if is_chunked:
++                # b'278\r\n\x1f\x8b...\x00\r\n0\r\n\r\n' => b'\x1f\x8b...\x00
++                content = b''.join(content.split(b'\r\n')[1::2])
++            try:
++                content = zlib.decompress(content, zlib.MAX_WBITS | 32)
++            except zlib.error:
++                content = b''
++        return content.decode('utf-8', 'ignore')
++
++    def _check_test_response(self, proxy, headers, content, rv):
++        verIsCorrect = rv in content
++        refSupported = get_headers()['Referer'] in content
++        cookieSupported = get_headers()['Cookie'] in content
++        foundIP = get_all_ip(content)
++
++        if all([verIsCorrect, foundIP, refSupported, cookieSupported]):
++            proxy.log('Response: correct')
++            return True
++        else:
++            proxy.log(
++                'Response: not correct; ip: %s, rv: %s, ref: %s, cookie: %s'
++                % (bool(foundIP), verIsCorrect, refSupported, cookieSupported)
++            )
++            return False
++
++    def _get_anonymity_lvl(self, proxy, judge, content):
++        real_ext_ip = self._checker._real_ext_ip
++        content = content.lower()
++        foundIP = get_all_ip(content)
++
++        via = (content.count('via') > judge.marks['via']) or (
++            content.count('proxy') > judge.marks['proxy']
++        )
++
++        if real_ext_ip in foundIP:
++            lvl = 'Transparent'
++        elif via:
++            lvl = 'Anonymous'
++        else:
++            lvl = 'High'
++        proxy.log(
++            'A: {lvl}; {ip}; via(p): {via}'.format(lvl=lvl[:4], ip=foundIP, via=via)
++        )
++        return lvl
++
+ 
+ def _update_types(types):
+     _types = {}
+diff --git a/proxybroker/checker.py b/proxybroker/checker.py
+index 202045b..c6e4619 100644
+--- a/proxybroker/checker.py
++++ b/proxybroker/checker.py
+@@ -1,26 +1,36 @@
+ import asyncio
+-import time
+ import warnings
+-import zlib
+ 
+-from .errors import (
+-    BadResponseError,
+-    BadStatusError,
+-    ProxyConnError,
+-    ProxyEmptyRecvError,
+-    ProxyRecvError,
+-    ProxySendError,
+-    ProxyTimeoutError,
+-    ResolveError,
+-)
+-from .judge import Judge, get_judges
+ from .negotiators import NGTRS
+-from .resolver import Resolver
+-from .utils import get_all_ip, get_headers, get_status_code, log, parse_headers
+ 
+ 
+ class Checker:
+-    """Proxy checker."""
++    """Parameters of a proxy checking session.
++
++    Holds the settings of one check: the protocols to probe, the required
++    levels of anonymity, the DNSBL domains, and the flags derived from them.
++    The checking itself is performed by the :class:`~proxybroker.api.Broker`
++    over these parameters.
++
++    :param list judges: Urls of pages that show HTTP headers and IP address.
++        Or :class:`~proxybroker.judge.Judge` objects
++    :param int max_tries:
++        (optional) The maximum number of attempts to check a proxy
++    :param int timeout: (optional) Timeout of a request in seconds
++    :param bool verify_ssl:
++        (optional) Flag indicating whether to check the SSL certificates.
++    :param bool strict:
++        (optional) Flag indicating that anonymity levels of types
++        (protocols) supported by a proxy must be equal to the requested
++        types and levels of anonymity.
++    :param list dnsbl: (optional) Spam databases for proxy checking.
++    :param str real_ext_ip: (optional) Real external IP address.
++    :param dict types: (optional) Requested types of proxies and levels.
++    :param bool post:
++        (optional) Flag indicating use POST instead of GET for requests
++        when checking proxies.
++    :param loop: (optional) asyncio compatible event loop
++    """
+ 
+     def __init__(
+         self,
+@@ -35,8 +45,7 @@ class Checker:
+         post=False,
+         loop=None,
+     ):
+-        Judge.clear()
+-        self._judges = get_judges(judges, timeout, verify_ssl)
++        self._judges = judges
+         self._method = 'POST' if post else 'GET'
+         self._max_tries = max_tries
+         self._real_ext_ip = real_ext_ip
+@@ -44,7 +53,6 @@ class Checker:
+         self._dnsbl = dnsbl or []
+         self._types = types or {}
+         self._loop = loop or asyncio.get_event_loop()
+-        self._resolver = Resolver(loop=self._loop)
+ 
+         self._req_http_proto = not types or bool(
+             ('HTTP', 'CONNECT:80', 'SOCKS4', 'SOCKS5') & types.keys()
+@@ -56,297 +64,6 @@ class Checker:
+ 
+         self._ngtrs = {proto for proto in types or NGTRS}
+ 
+-    async def check_judges(self):
+-        # TODO: need refactoring
+-        log.debug('Start check judges')
+-        stime = time.time()
+-        await asyncio.gather(
+-            *[j.check(real_ext_ip=self._real_ext_ip) for j in self._judges]
+-        )
+-
+-        self._judges = [j for j in self._judges if j.is_working]
+-        log.debug(
+-            '%d judges added. Runtime: %.4f;'
+-            % (len(self._judges), time.time() - stime)
+-        )
+-
+-        nojudges = []
+-        disable_protocols = []
+-
+-        if len(Judge.available['HTTP']) == 0:
+-            nojudges.append('HTTP')
+-            disable_protocols.extend(['HTTP', 'CONNECT:80', 'SOCKS4', 'SOCKS5'])
+-            self._req_http_proto = False
+-            # for coroutines, which is already waiting
+-            Judge.ev['HTTP'].set()
+-        if len(Judge.available['HTTPS']) == 0:
+-            nojudges.append('HTTPS')
+-            disable_protocols.append('HTTPS')
+-            self._req_https_proto = False
+-            # for coroutines, which is already waiting
+-            Judge.ev['HTTPS'].set()
+-        if len(Judge.available['SMTP']) == 0:
+-            # nojudges.append('SMTP')
+-            disable_protocols.append('SMTP')
+-            self._req_smtp_proto = False
+-            # for coroutines, which is already waiting
+-            Judge.ev['SMTP'].set()
+-
+-        for proto in disable_protocols:
+-            if proto in self._ngtrs:
+-                self._ngtrs.remove(proto)
+-
+-        if nojudges:
+-            warnings.warn(
+-                'Not found judges for the {nojudges} protocol.\n'
+-                'Checking proxy on protocols {disp} is disabled.'.format(
+-                    nojudges=nojudges, disp=disable_protocols
+-                ),
+-                UserWarning,
+-            )
+-        if self._judges:
+-            log.debug('Loaded: %d proxy judges' % len(set(self._judges)))
+-        else:
+-            RuntimeError('Not found judges')
+-
+-    def _types_passed(self, proxy):
+-        if not self._types:
+-            return True
+-        for proto, lvl in proxy.types.copy().items():
+-            req_levels = self._types.get(proto)
+-            if not req_levels or (lvl in req_levels):
+-                if not self._strict:
+-                    return True
+-            else:
+-                if self._strict:
+-                    del proxy.types[proto]
+-        if self._strict and proxy.types:
+-            return True
+-        proxy.log(
+-            'Protocol or the level of anonymity differs from the requested'
+-        )
+-        return False
+-
+-    async def _in_DNSBL(self, host):
+-        _host = '.'.join(reversed(host.split('.')))  # reverse address
+-        tasks = []
+-        for domain in self._dnsbl:
+-            query = '.'.join([_host, domain])
+-            tasks.append(self._resolver.resolve(query, logging=False))
+-        responses = await asyncio.gather(*tasks, return_exceptions=True)
+-        if any([r for r in responses if not isinstance(r, ResolveError)]):
+-            return True
+-        return False
+-
+-    async def check(self, proxy):
+-        if self._dnsbl:
+-            if await self._in_DNSBL(proxy.host):
+-                proxy.log('Found in DNSBL')
+-                return False
+-
+-        if self._req_http_proto:
+-            await Judge.ev['HTTP'].wait()
+-        if self._req_https_proto:
+-            await Judge.ev['HTTPS'].wait()
+-        if self._req_smtp_proto:
+-            await Judge.ev['SMTP'].wait()
+-
+-        if proxy.expected_types:
+-            ngtrs = proxy.expected_types & self._ngtrs
+-        else:
+-            ngtrs = self._ngtrs
+-
+-        results = []
+-        for proto in ngtrs:
+-            if proto == 'CONNECT:25':
+-                result = await self._check_conn_25(proxy, proto)
+-            else:
+-                result = await self._check(proxy, proto)
+-            results.append(result)
+-
+-        proxy.is_working = True if any(results) else False
+-
+-        if proxy.is_working and self._types_passed(proxy):
+-            return True
+-        return False
+-
+-    async def _check_conn_25(self, proxy, proto):
+-        judge = Judge.get_random(proto)
+-        proxy.log('Selected judge: %s' % judge)
+-        result = False
+-        for attempt in range(self._max_tries):
+-            try:
+-                proxy.ngtr = proto
+-                await proxy.connect()
+-                await proxy.ngtr.negotiate(host=judge.host, ip=judge.ip)
+-            except ProxyTimeoutError:
+-                continue
+-            except (
+-                ProxyConnError,
+-                ProxyRecvError,
+-                ProxySendError,
+-                ProxyEmptyRecvError,
+-                BadStatusError,
+-                BadResponseError,
+-            ):
+-                break
+-            else:
+-                proxy.types[proxy.ngtr.name] = None
+-                result = True
+-                break
+-            finally:
+-                proxy.close()
+-        return result
+-
+-    async def _check(self, proxy, proto):
+-        judge = Judge.get_random(proto)
+-        proxy.log('Selected judge: %s' % judge)
+-        result = False
+-        for attempt in range(self._max_tries):
+-            try:
+-                proxy.ngtr = proto
+-                await proxy.connect()
+-                await proxy.ngtr.negotiate(host=judge.host, ip=judge.ip)
+-                headers, content, rv = await _send_test_request(
+-                    self._method, proxy, judge
+-                )
+-            except ProxyTimeoutError:
+-                continue
+-            except (
+-                ProxyConnError,
+-                ProxyRecvError,
+-                ProxySendError,
+-                ProxyEmptyRecvError,
+-                BadStatusError,
+-                BadResponseError,
+-            ):
+-                break
+-            else:
+-                content = _decompress_content(headers, content)
+-                result = _check_test_response(proxy, headers, content, rv)
+-                if result:
+-                    if proxy.ngtr.check_anon_lvl:
+-                        lvl = _get_anonymity_lvl(
+-                            self._real_ext_ip, proxy, judge, content
+-                        )
+-                    else:
+-                        lvl = None
+-                    proxy.types[proxy.ngtr.name] = lvl
+-                break
+-            finally:
+-                proxy.close()
+-        return result
+-
+-
+-def _request(method, host, path, fullpath=False, data=''):
+-    hdrs, rv = get_headers(rv=True)
+-    hdrs['Host'] = host
+-    hdrs['Connection'] = 'close'
+-    hdrs['Content-Length'] = len(data)
+-    if method == 'POST':
+-        hdrs['Content-Type'] = 'application/octet-stream'
+-    kw = {
+-        'method': method,
+-        'path': 'http://%s%s' % (host, path) if fullpath else path,  # HTTP
+-        'headers': '\r\n'.join(('%s: %s' % (k, v) for k, v in hdrs.items())),
+-        'data': data,
+-    }
+-    req = (
+-        ('{method} {path} HTTP/1.1\r\n{headers}\r\n\r\n{data}')
+-        .format(**kw)
+-        .encode()
+-    )
+-    return req, rv
+-
+-
+-async def _send_test_request(method, proxy, judge):
+-    resp, content, err = None, None, None
+-    request, rv = _request(
+-        method=method,
+-        host=judge.host,
+-        path=judge.path,
+-        fullpath=proxy.ngtr.use_full_path,
+-    )
+-    try:
+-        await proxy.send(request)
+-        resp = await proxy.recv()
+-        code = get_status_code(resp)
+-        if code != 200:
+-            err = BadStatusError
+-            raise err
+-        headers, content, *_ = resp.split(b'\r\n\r\n', maxsplit=1)
+-    except ValueError:
+-        err = BadResponseError
+-        raise err
+-    finally:
+-        proxy.log('Get: %s' % ('success' if content else 'failed'), err=err)
+-        log.debug(
+-            '{h}:{p} [{n}]: ({j}) rv: {rv}, response: {resp}'.format(
+-                h=proxy.host,
+-                p=proxy.port,
+-                n=proxy.ngtr.name,
+-                j=judge.url,
+-                rv=rv,
+-                resp=resp,
+-            )
+-        )
+-    return headers, content, rv
+-
+-
+-def _decompress_content(headers, content):
+-    headers = parse_headers(headers)
+-    is_compressed = headers.get('Content-Encoding') in ('gzip', 'deflate')
+-    is_chunked = headers.get('Transfer-Encoding') == 'chunked'
+-    if is_compressed:
+-        # gzip: zlib.MAX_WBITS|16;
+-        # deflate: -zlib.MAX_WBITS;
+-        # auto: zlib.MAX_WBITS|32;
+-        if is_chunked:
+-            # b'278\r\n\x1f\x8b...\x00\r\n0\r\n\r\n' => b'\x1f\x8b...\x00
+-            content = b''.join(content.split(b'\r\n')[1::2])
+-        try:
+-            content = zlib.decompress(content, zlib.MAX_WBITS | 32)
+-        except zlib.error:
+-            content = b''
+-    return content.decode('utf-8', 'ignore')
+-
+-
+-def _check_test_response(proxy, headers, content, rv):
+-    verIsCorrect = rv in content
+-    refSupported = get_headers()['Referer'] in content
+-    cookieSupported = get_headers()['Cookie'] in content
+-    foundIP = get_all_ip(content)
+-
+-    if all([verIsCorrect, foundIP, refSupported, cookieSupported]):
+-        proxy.log('Response: correct')
+-        return True
+-    else:
+-        proxy.log(
+-            'Response: not correct; ip: %s, rv: %s, ref: %s, cookie: %s'
+-            % (bool(foundIP), verIsCorrect, refSupported, cookieSupported)
+-        )
+-        return False
+-
+-
+-def _get_anonymity_lvl(real_ext_ip, proxy, judge, content):
+-    content = content.lower()
+-    foundIP = get_all_ip(content)
+-
+-    via = (content.count('via') > judge.marks['via']) or (
+-        content.count('proxy') > judge.marks['proxy']
+-    )
+-
+-    if real_ext_ip in foundIP:
+-        lvl = 'Transparent'
+-    elif via:
+-        lvl = 'Anonymous'
+-    else:
+-        lvl = 'High'
+-    proxy.log(
+-        'A: {lvl}; {ip}; via(p): {via}'.format(lvl=lvl[:4], ip=foundIP, via=via)
+-    )
+-    return lvl
+-
+ 
+ class ProxyChecker(Checker):
+     def __init__(self, *args, **kwargs):
+diff --git a/proxybroker/judge.py b/proxybroker/judge.py
+index 470be13..0879902 100644
+--- a/proxybroker/judge.py
++++ b/proxybroker/judge.py
+@@ -1,23 +1,12 @@
+ import asyncio
+-import random
+ from urllib.parse import urlparse
+ 
+-import aiohttp
+-
+-from .errors import ResolveError
+-from .resolver import Resolver
+-from .utils import get_headers, log
+-
+ 
+ class Judge:
+-    """Proxy Judge."""
++    """Proxy Judge.
+ 
+-    available = {'HTTP': [], 'HTTPS': [], 'SMTP': []}
+-    ev = {
+-        'HTTP': asyncio.Event(),
+-        'HTTPS': asyncio.Event(),
+-        'SMTP': asyncio.Event(),
+-    }
++    Keeps the attributes of a page that shows HTTP headers and IP address.
++    """
+ 
+     def __init__(self, url, timeout=8, verify_ssl=False, loop=None):
+         self.url = url
+@@ -30,107 +19,6 @@ class Judge:
+         self.timeout = timeout
+         self.verify_ssl = verify_ssl
+         self._loop = loop or asyncio.get_event_loop()
+-        self._resolver = Resolver(loop=self._loop)
+ 
+     def __repr__(self):
+         return '<Judge [%s] %s>' % (self.scheme, self.host)
+-
+-    @classmethod
+-    def get_random(cls, proto):
+-        if proto == 'HTTPS':
+-            scheme = 'HTTPS'
+-        elif proto == 'CONNECT:25':
+-            scheme = 'SMTP'
+-        else:
+-            scheme = 'HTTP'
+-        return random.choice(cls.available[scheme])
+-
+-    @classmethod
+-    def clear(cls):
+-        cls.available['HTTP'].clear()
+-        cls.available['HTTPS'].clear()
+-        cls.available['SMTP'].clear()
+-        cls.ev['HTTP'].clear()
+-        cls.ev['HTTPS'].clear()
+-        cls.ev['SMTP'].clear()
+-
+-    async def check(self, real_ext_ip):
+-        # TODO: need refactoring
+-        try:
+-            self.ip = await self._resolver.resolve(self.host)
+-        except ResolveError:
+-            return
+-
+-        if self.scheme == 'SMTP':
+-            self.is_working = True
+-            self.available[self.scheme].append(self)
+-            self.ev[self.scheme].set()
+-            return
+-
+-        page = False
+-        headers, rv = get_headers(rv=True)
+-        connector = aiohttp.TCPConnector(
+-            loop=self._loop, ssl=self.verify_ssl, force_close=True
+-        )
+-        try:
+-            timeout = aiohttp.ClientTimeout(total=self.timeout)
+-            async with aiohttp.ClientSession(
+-                connector=connector, timeout=timeout, loop=self._loop
+-            ) as session, session.get(
+-                url=self.url, headers=headers, allow_redirects=False
+-            ) as resp:
+-                page = await resp.text()
+-        except (
+-            asyncio.TimeoutError,
+-            aiohttp.ClientOSError,
+-            aiohttp.ClientResponseError,
+-            aiohttp.ServerDisconnectedError,
+-        ) as e:
+-            log.debug('%s is failed. Error: %r;' % (self, e))
+-            return
+-
+-        page = page.lower()
+-
+-        if resp.status == 200 and real_ext_ip in page and rv in page:
+-            self.marks['via'] = page.count('via')
+-            self.marks['proxy'] = page.count('proxy')
+-            self.is_working = True
+-            self.available[self.scheme].append(self)
+-            self.ev[self.scheme].set()
+-            log.debug('%s is verified' % self)
+-        else:
+-            log.debug(
+-                (
+-                    '{j} is failed. HTTP status code: {code}; '
+-                    'Real IP on page: {ip}; Version: {word}; '
+-                    'Response: {page}'
+-                ).format(
+-                    j=self,
+-                    code=resp.status,
+-                    page=page,
+-                    ip=(real_ext_ip in page),
+-                    word=(rv in page),
+-                )
+-            )
+-
+-
+-def get_judges(judges=None, timeout=8, verify_ssl=False):
+-    judges = judges or [
+-        'http://httpbin.org/get?show_env',
+-        'https://httpbin.org/get?show_env',
+-        'smtp://smtp.gmail.com',
+-        'smtp://aspmx.l.google.com',
+-        'http://azenv.net/',
+-        'https://www.proxy-listen.de/azenv.php',
+-        'http://www.proxyfire.net/fastenv',
+-        'http://proxyjudge.us/azenv.php',
+-        'http://ip.spys.ru/',
+-        'http://www.proxy-listen.de/azenv.php',
+-    ]
+-    _judges = []
+-    for j in judges:
+-        j = j if isinstance(j, Judge) else Judge(j)
+-        j.timeout = timeout
+-        j.verify_ssl = verify_ssl
+-        _judges.append(j)
+-    return _judges

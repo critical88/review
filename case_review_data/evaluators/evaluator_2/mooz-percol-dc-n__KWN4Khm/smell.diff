@@ -1,0 +1,260 @@
+diff --git a/percol/__init__.py b/percol/__init__.py
+index b0e5010..b6bbd94 100644
+--- a/percol/__init__.py
++++ b/percol/__init__.py
+@@ -109,13 +109,22 @@ class Percol(object):
+         selected_actions = self.model_action.get_selected_results_with_index()
+ 
+         if selected_actions and self.args_for_action:
+-            for name, _, act_idx in selected_actions:
+-                try:
+-                    action = self.actions[act_idx]
+-                    if action:
+-                        action.act([arg for arg, _, _ in self.args_for_action], self)
+-                except Exception as e:
+-                    debug.log("execute_action", e)
++            for line, res, idx in selected_actions:
++                self.run_action_row(line, res, idx)
++
++    def run_action_row(self, line, res, idx):
++        # run the action bound to a selected action-row position
++        try:
++            action = self.actions[idx]
++            if action:
++                action.act([self.candidate_text(arg_row, arg_res, arg_idx)
++                            for arg_row, arg_res, arg_idx in self.args_for_action], self)
++        except Exception as e:
++            debug.log("execute_action", e)
++
++    def candidate_text(self, line, res, idx):
++        # candidate text field of a (line, res, idx) selection row
++        return line
+ 
+     # ============================================================ #
+     # Statuses
+diff --git a/percol/cli.py b/percol/cli.py
+index 0af9f35..91fdfd1 100644
+--- a/percol/cli.py
++++ b/percol/cli.py
+@@ -230,9 +230,9 @@ Maybe all descriptors are redirected."""))
+         candidate_finder_class = action_finder_class = decide_match_method(options)
+ 
+         def set_finder_attribute_from_option(finder_instance):
+-            finder_instance.lazy_finding = not options.eager
+-            finder_instance.case_insensitive = not options.case_sensitive
+-            finder_instance.invert_match = options.invert_match
++            finder_instance.configure_matcher(not options.case_sensitive,
++                                              options.invert_match,
++                                              not options.eager)
+ 
+         def set_if_not_none(src, dest, name):
+             value = getattr(src, name)
+diff --git a/percol/command.py b/percol/command.py
+index 3436dd4..992a657 100644
+--- a/percol/command.py
++++ b/percol/command.py
+@@ -225,13 +225,25 @@ class SelectorCommand(object):
+     # ------------------------------------------------------------ #
+ 
+     def specify_case_sensitive(self, case_sensitive):
+-        self.model.finder.case_insensitive = not case_sensitive
++        finder = self.model.finder
++        self.assign_matcher_flags(not case_sensitive,
++                                  finder.invert_match,
++                                  finder.lazy_finding)
+         self.model.force_search()
+ 
+     def toggle_case_sensitive(self):
+-        self.model.finder.case_insensitive = not self.model.finder.case_insensitive
++        finder = self.model.finder
++        self.assign_matcher_flags(not finder.case_insensitive,
++                                  finder.invert_match,
++                                  finder.lazy_finding)
+         self.model.force_search()
+ 
++    def assign_matcher_flags(self, case_insensitive, invert_match, lazy_finding):
++        # hand one complete matcher flag group to the active finder
++        self.model.finder.configure_matcher(case_insensitive,
++                                             invert_match,
++                                             lazy_finding)
++
+     def specify_split_query(self, split_query):
+         self.model.finder.split_query = split_query
+         self.model.force_search()
+diff --git a/percol/finder.py b/percol/finder.py
+index 9509be7..cfd53fc 100644
+--- a/percol/finder.py
++++ b/percol/finder.py
+@@ -14,6 +14,13 @@ class Finder(object):
+     def __init__(self, **args):
+         pass
+ 
++    def configure_matcher(self, case_insensitive, invert_match, lazy_finding):
++        # one complete matcher flag group is applied at once so callers
++        # build the flags they want without touching each attribute
++        self.case_insensitive = case_insensitive
++        self.invert_match = invert_match
++        self.lazy_finding = lazy_finding
++
+     def clone_as(self, new_finder_class):
+         new_finder = new_finder_class(collection = self.collection)
+         new_finder.invert_match = self.invert_match
+@@ -74,11 +81,20 @@ class FinderMultiQuery(CachedFinder):
+         self.split_str  = split_str
+ 
+     def clone_as(self, new_finder_class):
+-        new_finder = Finder.clone_as(self, new_finder_class)
+-        new_finder.case_insensitive = self.case_insensitive
++        new_finder = self.build_clone(new_finder_class,
++                                      self.case_insensitive,
++                                      self.invert_match,
++                                      self.lazy_finding)
+         new_finder.and_search = self.and_search
+         return new_finder
+ 
++    def build_clone(self, new_finder_class, case_insensitive, invert_match, lazy_finding):
++        new_finder = new_finder_class(collection = self.collection)
++        new_finder.case_insensitive = case_insensitive
++        new_finder.invert_match = invert_match
++        new_finder.lazy_finding = lazy_finding
++        return new_finder
++
+     split_query = True
+     case_insensitive = True
+ 
+@@ -109,13 +125,20 @@ class FinderMultiQuery(CachedFinder):
+                 else:
+                     line_to_match = line
+                 res = self.find_queries(queries, line_to_match)
+-                # When invert_match is enabled (via "-v" option),
+-                # select non matching line
+-                if self.invert_match:
+-                    res = None if res else self.dummy_res
+ 
+-            if res:
+-                yield line, res, idx
++            row = self.compose_row(line, res, idx,
++                                   not query_is_empty and self.invert_match)
++            if row is not None:
++                yield row
++
++    def compose_row(self, line, res, idx, invert_match):
++        # When invert_match is enabled (via "-v" option),
++        # select non matching line
++        if invert_match:
++            res = None if res else self.dummy_res
++        if res:
++            return line, res, idx
++        return None
+ 
+     and_search = True
+ 
+diff --git a/percol/model.py b/percol/model.py
+index c30a368..b623178 100644
+--- a/percol/model.py
++++ b/percol/model.py
+@@ -77,10 +77,15 @@ class SelectorModel(object):
+ 
+     def get_result(self, index):
+         try:
+-            return self.results[index][0]
++            line, res, idx = self.results[index]
++            return self.row_line(line, res, idx)
+         except IndexError:
+             return None
+ 
++    def row_line(self, line, res, idx):
++        # text field carried by a (line, res, idx) result row
++        return line
++
+     def get_selected_result(self):
+         return self.get_result(self.index)
+ 
+@@ -89,8 +94,8 @@ class SelectorModel(object):
+         if not results:
+             try:
+                 index = self.index
+-                result = self.results[index] # EAFP (results may be a zero-length list)
+-                results.append((result[0], index, result[2]))
++                line, res, idx = self.results[index] # EAFP (results may be a zero-length list)
++                results.append(self.selected_row(line, res, idx, index))
+             except Exception as e:
+                 debug.log("get_selected_results_with_index", e)
+         return results
+@@ -122,11 +127,20 @@ class SelectorModel(object):
+ 
+     def get_marked_results_with_index(self):
+         if self.marks:
+-            return [(self.results[index][0], index, self.results[index][2])
+-                    for index in self.marks if self.get_is_marked(index)]
++            marked = []
++            for res_index in self.marks:
++                if self.get_is_marked(res_index):
++                    line, res, idx = self.results[res_index]
++                    marked.append(self.selected_row(line, res, idx, res_index))
++            return marked
+         else:
+             return []
+ 
++    def selected_row(self, line, res, idx, sel_index):
++        # selected view of a (line, res, idx) result row:
++        # text, position among results, position in the original collection
++        return (line, sel_index, idx)
++
+     def set_is_marked(self, marked, index = None):
+         if index is None:
+             index = self.index          # use current index
+diff --git a/percol/view.py b/percol/view.py
+index 63f01b8..4247c76 100644
+--- a/percol/view.py
++++ b/percol/view.py
+@@ -57,22 +57,27 @@ class SelectorView(object):
+             style = self.CANDIDATES_LINE_BASIC
+         self.display.add_aligned_string(s, y_offset = y, x_offset = x, style = style, fill = True)
+ 
+-    def display_result(self, y, result, is_current = False, is_marked = False):
+-        line, find_info, abs_idx = result
+-
+-        if is_current:
+-            line_style = self.CANDIDATES_LINE_SELECTED
+-        elif is_marked:
+-            line_style = self.CANDIDATES_LINE_MARKED
+-        else:
+-            line_style = self.CANDIDATES_LINE_BASIC
+-
++    def display_result(self, y, line, find_info, abs_idx, is_current = False, is_marked = False):
++        line_style = self.row_style(line, find_info, abs_idx, is_current, is_marked)
+         keyword_style = self.CANDIDATES_LINE_QUERY + line_style
+ 
+         self.display_line(y, 0, line, style = line_style)
+ 
+         if find_info is None:
+             return
++        self.render_match_highlights(y, line, find_info, abs_idx, keyword_style)
++
++    def row_style(self, line, find_info, abs_idx, is_current, is_marked):
++        # display state of a result row decides its base style
++        if is_current:
++            return self.CANDIDATES_LINE_SELECTED
++        elif is_marked:
++            return self.CANDIDATES_LINE_MARKED
++        else:
++            return self.CANDIDATES_LINE_BASIC
++
++    def render_match_highlights(self, y, line, find_info, abs_idx, keyword_style):
++        # repaint the matched keywords of one result row
+         for (subq, match_info) in find_info:
+             for x_offset, subq_len in match_info:
+                 try:
+@@ -94,9 +99,9 @@ class SelectorView(object):
+         results_in_page = islice(enumerate(self.model.results), self.absolute_page_head, self.absolute_page_tail)
+ 
+         try:
+-            for cand_nth, result in results_in_page:
++            for cand_nth, (line, find_info, abs_idx) in results_in_page:
+                 try:
+-                    self.display_result(result_vertical_pos, result,
++                    self.display_result(result_vertical_pos, line, find_info, abs_idx,
+                                         is_current = cand_nth == self.model.index,
+                                         is_marked = self.model.get_is_marked(cand_nth))
+                 except curses.error as e:

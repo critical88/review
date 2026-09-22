@@ -1,0 +1,847 @@
+diff --git a/trurl.c b/trurl.c
+index 50f5814..4f964f1 100644
+--- a/trurl.c
++++ b/trurl.c
+@@ -1172,7 +1172,61 @@ static void json(struct option *o, CURLU *uh)
+     char *part;
+     /* ask for the URL encoded version so that weird control characters do not
+        cause problems. URL decode it when push to json. */
+-    rc = geturlpart(o, VARMODIFIER_URLENCODED, uh, variables[i].part, &part);
++    /* the geturlpart() flag handling and puny2idn retry, computed inline
++       since this loop runs for every component of every URL */
++    {
++      int modifiers = VARMODIFIER_URLENCODED;
++      CURLUPart qpart = variables[i].part;
++      char **out = &part;
++      CURLUcode part_rc =
++        curl_url_get(uh, qpart, out,
++                     (((modifiers & VARMODIFIER_DEFAULT) || o->default_port) ?
++                      CURLU_DEFAULT_PORT :
++                      ((qpart != CURLUPART_URL || o->keep_port) ?
++                       0 : CURLU_NO_DEFAULT_PORT))|
++#ifdef SUPPORTS_PUNYCODE
++                     (((modifiers & VARMODIFIER_PUNY) || o->punycode) ?
++                      CURLU_PUNYCODE : 0)|
++#endif
++#ifdef SUPPORTS_PUNY2IDN
++                     (((modifiers & VARMODIFIER_PUNY2IDN) || o->puny2idn) ?
++                      CURLU_PUNY2IDN : 0) |
++#endif
++#ifdef SUPPORTS_GET_EMPTY
++                     ((modifiers & VARMODIFIER_EMPTY) ? CURLU_GET_EMPTY : 0) |
++#endif
++                     (o->curl ? 0 : CURLU_NON_SUPPORT_SCHEME) |
++                     (((modifiers & VARMODIFIER_URLENCODED) || o->urlencode) ?
++                      0 : CURLU_URLDECODE));
++
++#ifdef SUPPORTS_PUNY2IDN
++      /* retry get w/ out puny2idn to handle invalid punycode conversions */
++      if(part_rc == CURLUE_BAD_HOSTNAME &&
++         (o->puny2idn || (modifiers & VARMODIFIER_PUNY2IDN))) {
++        curl_free(*out);
++        modifiers &= ~VARMODIFIER_PUNY2IDN;
++        o->puny2idn = false;
++        trurl_warnf(o, "Error converting url to IDN [%s]",
++                    curl_url_strerror(part_rc));
++        part_rc =
++          curl_url_get(uh, qpart, out,
++                       (((modifiers & VARMODIFIER_DEFAULT) ||
++                         o->default_port) ?
++                        CURLU_DEFAULT_PORT :
++                        ((qpart != CURLUPART_URL || o->keep_port) ?
++                         0 : CURLU_NO_DEFAULT_PORT))|
++#ifdef SUPPORTS_PUNYCODE
++                       (((modifiers & VARMODIFIER_PUNY) || o->punycode) ?
++                        CURLU_PUNYCODE : 0)|
++#endif
++                       (o->curl ? 0 : CURLU_NON_SUPPORT_SCHEME) |
++                       (((modifiers & VARMODIFIER_URLENCODED) ||
++                         o->urlencode) ?
++                        0 : CURLU_URLDECODE));
++      }
++#endif
++      rc = part_rc;
++    }
+     if(!rc) {
+       int olen = 0;
+       char *dec = NULL;
+@@ -1228,11 +1282,89 @@ static void json(struct option *o, CURLU *uh)
+         fputs(",\n", stdout);
+       first = false;
+       fputs("      {\n        \"key\": ", stdout);
+-      jsonString(stdout, qpairsdec[j].str,
+-                 sep ? (size_t)(sep - qpairsdec[j].str) : qpairsdec[j].len,
+-                 false);
++      /* the jsonString() escaping for the key, kept inline here. No
++         lowercase conversion is used in this output. */
++      {
++        const char *kin = qpairsdec[j].str;
++        size_t klen = (size_t)(sep ? (size_t)(sep - qpairsdec[j].str) :
++                                qpairsdec[j].len);
++        const unsigned char *ji = (const unsigned char *)kin;
++        const unsigned char *jend = ji + klen;
++        fputc('\"', stdout);
++        for(; ji < jend; ji++) {
++          switch(*ji) {
++          case '\\':
++            fputs("\\\\", stdout);
++            break;
++          case '\"':
++            fputs("\\\"", stdout);
++            break;
++          case '\b':
++            fputs("\\b", stdout);
++            break;
++          case '\f':
++            fputs("\\f", stdout);
++            break;
++          case '\n':
++            fputs("\\n", stdout);
++            break;
++          case '\r':
++            fputs("\\r", stdout);
++            break;
++          case '\t':
++            fputs("\\t", stdout);
++            break;
++          default:
++            if(*ji < 32)
++              fprintf(stdout, "\\u%04x", *ji);
++            else
++              fputc(*ji, stdout);
++            break;
++          }
++        }
++        fputc('\"', stdout);
++      }
+       fputs(",\n        \"value\": ", stdout);
+-      jsonString(stdout, sep ? value : "", sep ? value_len : 0, false);
++      /* the same jsonString() escaping, for the value side */
++      {
++        const char *vin = sep ? value : "";
++        size_t vlen = (size_t)(sep ? value_len : 0);
++        const unsigned char *ji = (const unsigned char *)vin;
++        const unsigned char *jend = ji + vlen;
++        fputc('\"', stdout);
++        for(; ji < jend; ji++) {
++          switch(*ji) {
++          case '\\':
++            fputs("\\\\", stdout);
++            break;
++          case '\"':
++            fputs("\\\"", stdout);
++            break;
++          case '\b':
++            fputs("\\b", stdout);
++            break;
++          case '\f':
++            fputs("\\f", stdout);
++            break;
++          case '\n':
++            fputs("\\n", stdout);
++            break;
++          case '\r':
++            fputs("\\r", stdout);
++            break;
++          case '\t':
++            fputs("\\t", stdout);
++            break;
++          default:
++            if(*ji < 32)
++              fprintf(stdout, "\\u%04x", *ji);
++            else
++              fputc(*ji, stdout);
++            break;
++          }
++        }
++        fputc('\"', stdout);
++      }
+       fputs("\n      }", stdout);
+     }
+     fputs("\n    ]", stdout);
+@@ -1545,7 +1677,13 @@ static bool addqpair(char *pair, size_t len, bool json)
+   return modified;
+ }
+ 
+-/* convert the query string into an array of name=data pair */
++/* convert the query string into an array of name=data pair
++ *
++ * This runs once per query pair for every processed URL so the sequence
++ * formerly spread over addqpair(), memdupzero(), memdupdec(),
++ * decodequery() and encodequery() is kept expanded here to keep the call
++ * levels out of the per-pair loop.
++ */
+ static bool extractqpairs(CURLU *uh, struct option *o)
+ {
+   char *q = NULL;
+@@ -1562,7 +1700,293 @@ static bool extractqpairs(CURLU *uh, struct option *o)
+         len = strlen(p);
+       else
+         len = amp - p;
+-      modified |= addqpair(p, len, o->jsonout);
++
++      /* store the pair both normalized and decoded, expanded from what
++         one addqpair() call used to do */
++      {
++        struct string *qv = NULL; /* the normalized pair */
++        struct string *qdv = NULL; /* the decoded pair */
++        bool pairmod = false;
++        if(nqpairs < MAX_QPAIRS) {
++          /* the memdupzero() work: URL decode, then URL encode it back
++             to normalize. Keep the first '=' if there is one */
++          struct string *sv = calloc(1, sizeof(struct string));
++          char *mleft = NULL;
++          char *mright = NULL;
++          char *encs = NULL;
++          char *encr = NULL;
++          char *enc = NULL;
++          if(!sv)
++            goto pairdecfail;
++          if(len) {
++            char *sep = memchr(p, '=', len);
++            int eolen = 0;
++            if(!sep) { /* no '=' */
++              char *dec = NULL;
++              /* '+' is a space in a query, handled outside of libcurl */
++              {
++                char *sp = p;
++                size_t plen = len;
++                do {
++                  char *plus = memchr(sp, '+', plen);
++                  if(plus) {
++                    *plus = ' ';
++                    ++plus;
++                    plen -= (size_t)(plus - sp);
++                  }
++                  sp = plus;
++                } while(sp);
++                dec = curl_easy_unescape(NULL, p, (int)len, &eolen);
++              }
++              if(dec) {
++                /* ' ' to '+' escaping cannot be done by libcurl's URL
++                   encode function */
++                char *dupe = malloc((size_t)eolen * 3 + 1); /* worst case */
++                char *dp = dupe;
++                char *di = dec;
++                int dleft = eolen;
++                if(dupe) {
++                  while(dleft--) {
++                    char in = *di++;
++
++                    if(in == ' ')
++                      *dp++ = '+';
++                    else if(ISUNRESERVED(in))
++                      *dp++ = in;
++                    else {
++                      /* encode it */
++                      const char hex[] = "0123456789abcdef";
++                      dp[0] = '%';
++                      dp[1] = hex[(unsigned char)in >> 4];
++                      dp[2] = hex[(unsigned char)in & 0xf];
++                      dp += 3;
++                    }
++                  }
++                  *dp = 0;
++                  enc = dupe;
++                }
++                curl_free(dec);
++              }
++              else
++                goto pairdecfail;
++            }
++            else {
++              int llen = 0;
++              int rlen = 0;
++              int leftside = (int)(sep - p);
++              int rightside;
++
++              /* decode both sides */
++              if(leftside) {
++                char *l = p;
++                size_t plen = (size_t)leftside;
++                do {
++                  char *plus = memchr(l, '+', plen);
++                  if(plus) {
++                    *plus = ' ';
++                    ++plus;
++                    plen -= (size_t)(plus - l);
++                  }
++                  l = plus;
++                } while(l);
++                mleft = curl_easy_unescape(NULL, p, leftside, &llen);
++                if(!mleft)
++                  goto pairdecfail;
++              }
++              else {
++                mleft = NULL;
++                llen = 0;
++              }
++
++              /* length on the right side of '=': */
++              rightside = (int)(len - (size_t)(sep - p) - 1);
++
++              if(rightside) {
++                char *r = sep + 1;
++                size_t plen = (size_t)rightside;
++                char *rp = NULL;
++                do {
++                  char *plus = memchr(r, '+', plen);
++                  if(plus) {
++                    *plus = ' ';
++                    ++plus;
++                    plen -= (size_t)(plus - r);
++                  }
++                  r = plus;
++                } while(r);
++                rp = curl_easy_unescape(NULL, sep + 1, rightside, &rlen);
++                if(!rp)
++                  goto pairdecfail;
++                mright = rp;
++              }
++              else {
++                mright = NULL;
++                rlen = 0;
++              }
++
++              /* encode both sides again */
++              if(mleft) {
++                char *dupe = malloc((size_t)llen * 3 + 1); /* worst case */
++                char *dp = dupe;
++                char *di = mleft;
++                int dleft = llen;
++                if(!dupe)
++                  goto pairdecfail;
++                while(dleft--) {
++                  char in = *di++;
++
++                  if(in == ' ')
++                    *dp++ = '+';
++                  else if(ISUNRESERVED(in))
++                    *dp++ = in;
++                  else {
++                    const char hex[] = "0123456789abcdef";
++                    dp[0] = '%';
++                    dp[1] = hex[(unsigned char)in >> 4];
++                    dp[2] = hex[(unsigned char)in & 0xf];
++                    dp += 3;
++                  }
++                }
++                *dp = 0;
++                encs = dupe;
++              }
++              if(mright) {
++                char *dupe = malloc((size_t)rlen * 3 + 1); /* worst case */
++                char *dp = dupe;
++                char *di = mright;
++                int dleft = rlen;
++                if(!dupe)
++                  goto pairdecfail;
++                while(dleft--) {
++                  char in = *di++;
++
++                  if(in == ' ')
++                    *dp++ = '+';
++                  else if(ISUNRESERVED(in))
++                    *dp++ = in;
++                  else {
++                    const char hex[] = "0123456789abcdef";
++                    dp[0] = '%';
++                    dp[1] = hex[(unsigned char)in >> 4];
++                    dp[2] = hex[(unsigned char)in & 0xf];
++                    dp += 3;
++                  }
++                }
++                *dp = 0;
++                encr = dupe;
++              }
++
++              {
++                char *temp = curl_maprintf("%s=%s", encs ? encs : "",
++                                           encr ? encr : "");
++                char *copy;
++                if(!temp)
++                  goto pairdecfail;
++                /* pointers from curl_maprintf() must be curl_free()d so
++                   make a copy */
++                copy = strdup(temp);
++                curl_free(temp);
++                if(!copy)
++                  goto pairdecfail;
++                enc = copy;
++              }
++            }
++            eolen = (int)strlen(enc);
++            if(((size_t)eolen != len) || strcmp(enc, p))
++              pairmod = true;
++            sv->str = enc;
++            sv->len = (size_t)eolen;
++          }
++          curl_free(mleft);
++          curl_free(mright);
++          free(encs);
++          free(encr);
++          qv = sv;
++          goto pairdec;
++
++pairdecfail:
++          curl_free(mleft);
++          curl_free(mright);
++          free(encs);
++          free(encr);
++          free(enc);
++          free(sv);
++          goto pairdec;
++
++pairdec:
++          /* the memdupdec() work: URL decode the pair and return it in
++             an allocated chunk, null bytes become REPLACE_NULL_BYTE */
++          {
++            char *msep = memchr(p, '=', len);
++            char *ml = NULL;
++            char *mr = NULL;
++            int right_len = 0;
++            int left_len = 0;
++            char *mstr;
++            struct string *mdret;
++            int mlolen = (int)(msep ? (size_t)(msep - p) : len);
++            ml = curl_easy_unescape(NULL, mlolen ? p : "", mlolen, &left_len);
++            if(msep) {
++              int mrolen = (int)(len - (size_t)(msep - p) - 1);
++              int plen;
++              char *pn;
++              mr = curl_easy_unescape(NULL, mrolen ? msep + 1 : "",
++                                      mrolen, &right_len);
++
++              /* convert null bytes to periods */
++              for(plen = right_len, pn = mr; plen; plen--, pn++) {
++                if(!*pn && !o->jsonout) {
++                  *pn = REPLACE_NULL_BYTE;
++                }
++              }
++            }
++            mstr = malloc(sizeof(char) *
++                          (size_t)(left_len + (msep ? (right_len + 1) : 0)));
++            if(!mstr) {
++              curl_free(mr);
++              curl_free(ml);
++              qdv = NULL;
++            }
++            else {
++              memcpy(mstr, ml, (size_t)left_len);
++              if(msep) {
++                mstr[left_len] = '=';
++                memcpy(mstr + 1 + left_len, mr, (size_t)right_len);
++              }
++              curl_free(mr);
++              curl_free(ml);
++              mdret = malloc(sizeof(struct string));
++              if(!mdret) {
++                free(mstr);
++                qdv = NULL;
++              }
++              else {
++                mdret->str = mstr;
++                mdret->len = (size_t)left_len +
++                  (msep ? (size_t)(right_len + 1) : 0);
++                qdv = mdret;
++              }
++            }
++          }
++
++          if(qv && qdv) {
++            qpairs[nqpairs].str = qv->str;
++            qpairs[nqpairs].len = qv->len;
++            qpairsdec[nqpairs].str = qdv->str;
++            qpairsdec[nqpairs].len = qdv->len;
++            nqpairs++;
++          }
++        }
++        else
++          warnf("too many query pairs");
++
++        if(qdv)
++          free(qdv);
++        if(qv)
++          free(qv);
++        modified |= pairmod;
++      }
++
+       if(amp)
+         p = amp + 1;
+       else
+@@ -1660,8 +2084,215 @@ static bool replace(struct option *o)
+         continue;
+       }
+       pdec = memdupdec(key.str, key.len + value.len + 1, o->jsonout);
+-      p = memdupzero(key.str, key.len + value.len + (value.str ? 1 : 0),
+-                     &query_is_modified);
++      /* the memdupzero() work folded in here: this pair has just been
++         changed so decoding, normalizing and re-encoding it again is
++         the hot part of --replace */
++      {
++        struct string *pz = calloc(1, sizeof(struct string));
++        char *zleft = NULL;
++        char *zright = NULL;
++        char *zencs = NULL;
++        char *zencr = NULL;
++        char *zenc = NULL;
++        size_t zlen = key.len + value.len + (value.str ? 1 : 0);
++        if(!pz)
++          goto zfail;
++        if(zlen) {
++          char *zsep = memchr(key.str, '=', zlen);
++          int zolen = 0;
++          if(!zsep) { /* no '=' */
++            char *zdec = NULL;
++            /* '+' is a space in a query, handled outside of libcurl */
++            {
++              char *sp = key.str;
++              size_t plen = zlen;
++              do {
++                char *plus = memchr(sp, '+', plen);
++                if(plus) {
++                  *plus = ' ';
++                  ++plus;
++                  plen -= (size_t)(plus - sp);
++                }
++                sp = plus;
++              } while(sp);
++              zdec = curl_easy_unescape(NULL, key.str, (int)zlen, &zolen);
++            }
++            if(zdec) {
++              /* ' ' to '+' escaping cannot be done by libcurl's URL
++                 encode function */
++              char *dupe = malloc((size_t)zolen * 3 + 1); /* worst case */
++              char *dp = dupe;
++              char *di = zdec;
++              int dleft = zolen;
++              if(dupe) {
++                while(dleft--) {
++                  char in = *di++;
++
++                  if(in == ' ')
++                    *dp++ = '+';
++                  else if(ISUNRESERVED(in))
++                    *dp++ = in;
++                  else {
++                    /* encode it */
++                    const char hex[] = "0123456789abcdef";
++                    dp[0] = '%';
++                    dp[1] = hex[(unsigned char)in >> 4];
++                    dp[2] = hex[(unsigned char)in & 0xf];
++                    dp += 3;
++                  }
++                }
++                *dp = 0;
++                zenc = dupe;
++              }
++              curl_free(zdec);
++            }
++            else
++              goto zfail;
++          }
++          else {
++            int zllen = 0;
++            int zrlen = 0;
++            int leftside = (int)(zsep - key.str);
++            int rightside;
++
++            /* decode both sides */
++            if(leftside) {
++              char *l = key.str;
++              size_t plen = (size_t)leftside;
++              do {
++                char *plus = memchr(l, '+', plen);
++                if(plus) {
++                  *plus = ' ';
++                  ++plus;
++                  plen -= (size_t)(plus - l);
++                }
++                l = plus;
++              } while(l);
++              zleft = curl_easy_unescape(NULL, key.str, leftside, &zllen);
++              if(!zleft)
++                goto zfail;
++            }
++            else {
++              zleft = NULL;
++              zllen = 0;
++            }
++
++            /* length on the right side of '=': */
++            rightside = (int)zlen - (int)(zsep - key.str) - 1;
++
++            if(rightside) {
++              char *r = zsep + 1;
++              size_t plen = (size_t)rightside;
++              char *rp = NULL;
++              do {
++                char *plus = memchr(r, '+', plen);
++                if(plus) {
++                  *plus = ' ';
++                  ++plus;
++                  plen -= (size_t)(plus - r);
++                }
++                r = plus;
++              } while(r);
++              rp = curl_easy_unescape(NULL, zsep + 1, rightside, &zrlen);
++              if(!rp)
++                goto zfail;
++              zright = rp;
++            }
++            else {
++              zright = NULL;
++              zrlen = 0;
++            }
++
++            /* encode both sides again */
++            if(zleft) {
++              char *dupe = malloc((size_t)zllen * 3 + 1); /* worst case */
++              char *dp = dupe;
++              char *di = zleft;
++              int dleft = zllen;
++              if(!dupe)
++                goto zfail;
++              while(dleft--) {
++                char in = *di++;
++
++                if(in == ' ')
++                  *dp++ = '+';
++                else if(ISUNRESERVED(in))
++                  *dp++ = in;
++                else {
++                  const char hex[] = "0123456789abcdef";
++                  dp[0] = '%';
++                  dp[1] = hex[(unsigned char)in >> 4];
++                  dp[2] = hex[(unsigned char)in & 0xf];
++                  dp += 3;
++                }
++              }
++              *dp = 0;
++              zencs = dupe;
++            }
++            if(zright) {
++              char *dupe = malloc((size_t)zrlen * 3 + 1); /* worst case */
++              char *dp = dupe;
++              char *di = zright;
++              int dleft = zrlen;
++              if(!dupe)
++                goto zfail;
++              while(dleft--) {
++                char in = *di++;
++
++                if(in == ' ')
++                  *dp++ = '+';
++                else if(ISUNRESERVED(in))
++                  *dp++ = in;
++                else {
++                  const char hex[] = "0123456789abcdef";
++                  dp[0] = '%';
++                  dp[1] = hex[(unsigned char)in >> 4];
++                  dp[2] = hex[(unsigned char)in & 0xf];
++                  dp += 3;
++                }
++              }
++              *dp = 0;
++              zencr = dupe;
++            }
++
++            {
++              char *temp = curl_maprintf("%s=%s", zencs ? zencs : "",
++                                         zencr ? zencr : "");
++              char *copy;
++              if(!temp)
++                goto zfail;
++              /* pointers from curl_maprintf() must be curl_free()d so
++                 make a copy */
++              copy = strdup(temp);
++              curl_free(temp);
++              if(!copy)
++                goto zfail;
++              zenc = copy;
++            }
++          }
++          zolen = (int)strlen(zenc);
++          if(((size_t)zolen != zlen) || strcmp(zenc, key.str))
++            query_is_modified = true;
++          pz->str = zenc;
++          pz->len = (size_t)zolen;
++        }
++        curl_free(zleft);
++        curl_free(zright);
++        free(zencs);
++        free(zencr);
++        p = pz;
++        goto zdone;
++zfail:
++        curl_free(zleft);
++        curl_free(zright);
++        free(zencs);
++        free(zencr);
++        free(zenc);
++        free(pz);
++        p = NULL;
++zdone:
++        ;
++      }
+       if(!p || !pdec) {
+         free(pdec);
+         free(p);
+@@ -1880,7 +2511,80 @@ static void singleurl(struct option *o,
+                            "%.*s%s=%.*s", (int)plen, part,
+                            urlencode ? "" : ":",
+                            (int)wlen, w);
+-      setone(uh, iterbuf, o);
++      /* the setone() work expanded here since this is the per-lap
++         update of --iterate: parse the component, look it up in the
++         variables table (the comp2var() scan) and store it in the URL
++         handle */
++      {
++        const char *setptr = strchr(iterbuf, '=');
++        const struct var *setv = NULL;
++        if(setptr && (setptr > iterbuf)) {
++          size_t vlen = setptr - iterbuf;
++          bool strencode = true;
++          bool conditional = false;
++          bool found = false;
++          if(vlen) {
++            int back = -1;
++            size_t reqlen = 1;
++            while(vlen > reqlen) {
++              if(setptr[back] == ':') {
++                strencode = false;
++                vlen--;
++              }
++              else if(setptr[back] == '?') {
++                conditional = true;
++                vlen--;
++              }
++              else
++                break;
++              reqlen++;
++              back--;
++            }
++          }
++          /* the comp2var() lookup, folded in */
++          {
++            int ci;
++            for(ci = 0; variables[ci].name; ci++) {
++              if((strlen(variables[ci].name) == vlen) &&
++                 !strncmp(iterbuf, variables[ci].name, vlen)) {
++                setv = &variables[ci];
++                break;
++              }
++            }
++          }
++          if(setv) {
++            CURLUcode rc = CURLUE_OK;
++            bool skip = false;
++            if((setv->part == CURLUPART_HOST) && ('[' == setptr[1]))
++              /* when setting an IPv6 numerical address, disable URL
++                 encoding */
++              strencode = false;
++            if(conditional) {
++              char *piece;
++              rc = curl_url_get(uh, setv->part, &piece,
++                                CURLU_NO_GUESS_SCHEME);
++              if(!rc) {
++                skip = true;
++                curl_free(piece);
++              }
++            }
++
++            if(!skip)
++              rc = curl_url_set(uh, setv->part, setptr[1] ? &setptr[1] : NULL,
++                                (o->curl ? 0 : CURLU_NON_SUPPORT_SCHEME) |
++                                  (strencode ? CURLU_URLENCODE : 0));
++            if(rc)
++              warnf("Error setting %s: %s", setv->name,
++                    curl_url_strerror(rc));
++            found = true;
++          }
++          if(!found)
++            errorf(o, ERROR_SET, "unknown component: %.*s", (int)vlen,
++                   iterbuf);
++        }
++        else
++          errorf(o, ERROR_SET, "invalid --set syntax: %s", iterbuf);
++      }
+       if(iter->next) {
+         struct iterinfo info;
+         memset(&info, 0, sizeof(info));
+@@ -2008,12 +2712,69 @@ static void singleurl(struct option *o,
+       get(o, uh);
+     }
+     else {
+-      /* default output is full URL */
+-      char *nurl = NULL;
+-      CURLUcode rc = geturlpart(o, 0, uh, CURLUPART_URL, &nurl);
+-      if(!rc) {
+-        printf("%s\n", nurl);
+-        curl_free(nurl);
++      /* default output is full URL. The geturlpart() flag handling and
++         puny2idn retry, computed inline: this fetch runs for every URL
++         that trurl prints out */
++      {
++        int modifiers = 0;
++        CURLUPart qpart = CURLUPART_URL;
++        char *nurl = NULL;
++        char **out = &nurl;
++        CURLUcode rc =
++          curl_url_get(uh, qpart, out,
++                       (((modifiers & VARMODIFIER_DEFAULT) ||
++                         o->default_port) ?
++                        CURLU_DEFAULT_PORT :
++                        ((qpart != CURLUPART_URL || o->keep_port) ?
++                         0 : CURLU_NO_DEFAULT_PORT))|
++#ifdef SUPPORTS_PUNYCODE
++                       (((modifiers & VARMODIFIER_PUNY) || o->punycode) ?
++                        CURLU_PUNYCODE : 0)|
++#endif
++#ifdef SUPPORTS_PUNY2IDN
++                       (((modifiers & VARMODIFIER_PUNY2IDN) || o->puny2idn) ?
++                        CURLU_PUNY2IDN : 0) |
++#endif
++#ifdef SUPPORTS_GET_EMPTY
++                       ((modifiers & VARMODIFIER_EMPTY) ?
++                        CURLU_GET_EMPTY : 0) |
++#endif
++                       (o->curl ? 0 : CURLU_NON_SUPPORT_SCHEME) |
++                       (((modifiers & VARMODIFIER_URLENCODED) ||
++                         o->urlencode) ?
++                        0 : CURLU_URLDECODE));
++
++#ifdef SUPPORTS_PUNY2IDN
++        /* retry get w/ out puny2idn to handle invalid punycode
++           conversions */
++        if(rc == CURLUE_BAD_HOSTNAME &&
++           (o->puny2idn || (modifiers & VARMODIFIER_PUNY2IDN))) {
++          curl_free(*out);
++          modifiers &= ~VARMODIFIER_PUNY2IDN;
++          o->puny2idn = false;
++          trurl_warnf(o, "Error converting url to IDN [%s]",
++                      curl_url_strerror(rc));
++          rc =
++            curl_url_get(uh, qpart, out,
++                         (((modifiers & VARMODIFIER_DEFAULT) ||
++                           o->default_port) ?
++                          CURLU_DEFAULT_PORT :
++                          ((qpart != CURLUPART_URL || o->keep_port) ?
++                           0 : CURLU_NO_DEFAULT_PORT))|
++#ifdef SUPPORTS_PUNYCODE
++                         (((modifiers & VARMODIFIER_PUNY) || o->punycode) ?
++                          CURLU_PUNYCODE : 0)|
++#endif
++                         (o->curl ? 0 : CURLU_NON_SUPPORT_SCHEME) |
++                         (((modifiers & VARMODIFIER_URLENCODED) ||
++                           o->urlencode) ?
++                          0 : CURLU_URLDECODE));
++        }
++#endif
++        if(!rc) {
++          printf("%s\n", nurl);
++          curl_free(nurl);
++        }
+       }
+     }
+ 

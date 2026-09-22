@@ -1,0 +1,1399 @@
+diff --git a/cifar/l1-norm-pruning/models/resnet.py b/cifar/l1-norm-pruning/models/resnet.py
+index 0539592..e48914b 100644
+--- a/cifar/l1-norm-pruning/models/resnet.py
++++ b/cifar/l1-norm-pruning/models/resnet.py
+@@ -79,9 +79,26 @@ class ResNet(nn.Module):
+                                bias=False)
+         self.bn1 = nn.BatchNorm2d(16)
+         self.relu = nn.ReLU(inplace=True)
+-        self.layer1 = self._make_layer(block, 16, n, cfg=cfg[0:n])
+-        self.layer2 = self._make_layer(block, 32, n, cfg=cfg[n:2*n], stride=2)
+-        self.layer3 = self._make_layer(block, 64, n, cfg=cfg[2*n:3*n], stride=2)
++
++        # stages rolled out here: each entry is (output planes, cfg window,
++        # stride). Keeping the three residual chains next to the stem keeps
++        # the pruned-width threading easy to audit.
++        for i, (planes, window, stride) in enumerate((
++                (16, cfg[0:n], 1),
++                (32, cfg[n:2*n], 2),
++                (64, cfg[2*n:3*n], 2))):
++            chain = []
++            shortcut = None
++            if stride != 1 or self.inplanes != planes * block.expansion:
++                shortcut = partial(downsample_basic_block,
++                                   planes=planes * block.expansion)
++            chain.append(block(self.inplanes, planes, window[0], stride,
++                               shortcut))
++            self.inplanes = planes * block.expansion
++            for width in window[1:]:
++                chain.append(block(self.inplanes, planes, width))
++            setattr(self, 'layer%d' % (i + 1), nn.Sequential(*chain))
++
+         self.avgpool = nn.AvgPool2d(8)
+         if dataset == 'cifar10':
+             num_classes = 10
+@@ -97,19 +114,6 @@ class ResNet(nn.Module):
+                 m.weight.data.fill_(1)
+                 m.bias.data.zero_()
+ 
+-    def _make_layer(self, block, planes, blocks, cfg, stride=1):
+-        downsample = None
+-        if stride != 1 or self.inplanes != planes * block.expansion:
+-            downsample = partial(downsample_basic_block, planes=planes*block.expansion)
+-
+-        layers = []
+-        layers.append(block(self.inplanes, planes, cfg[0], stride, downsample))
+-        self.inplanes = planes * block.expansion
+-        for i in range(1, blocks):
+-            layers.append(block(self.inplanes, planes, cfg[i]))
+-
+-        return nn.Sequential(*layers)
+-
+     def forward(self, x):
+         x = self.conv1(x)
+         x = self.bn1(x)
+diff --git a/cifar/l1-norm-pruning/models/vgg.py b/cifar/l1-norm-pruning/models/vgg.py
+index c57479e..0bb8708 100644
+--- a/cifar/l1-norm-pruning/models/vgg.py
++++ b/cifar/l1-norm-pruning/models/vgg.py
+@@ -22,8 +22,23 @@ class vgg(nn.Module):
+ 
+         self.cfg = cfg
+ 
+-        self.feature = self.make_layers(cfg, True)
++        # ---- feature extractor ----------------------------------------
++        # expand the pruning cfg directly here: each width entry is a conv
++        # stage (always batch-normalized for the l1-norm runs); 'M' is a
++        # 2x2 max-pool.
++        stack = []
++        width = 3
++        for v in cfg:
++            if v == 'M':
++                stack.append(nn.MaxPool2d(kernel_size=2, stride=2))
++            else:
++                stack.append(nn.Conv2d(width, v, kernel_size=3, padding=1, bias=False))
++                stack.append(nn.BatchNorm2d(v))
++                stack.append(nn.ReLU(inplace=True))
++                width = v
++        self.feature = nn.Sequential(*stack)
+ 
++        # ---- classifier head -------------------------------------------
+         if dataset == 'cifar10':
+             num_classes = 10
+         elif dataset == 'cifar100':
+@@ -34,23 +49,21 @@ class vgg(nn.Module):
+               nn.ReLU(inplace=True),
+               nn.Linear(512, num_classes)
+             )
+-        if init_weights:
+-            self._initialize_weights()
+ 
+-    def make_layers(self, cfg, batch_norm=False):
+-        layers = []
+-        in_channels = 3
+-        for v in cfg:
+-            if v == 'M':
+-                layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+-            else:
+-                conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1, bias=False)
+-                if batch_norm:
+-                    layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+-                else:
+-                    layers += [conv2d, nn.ReLU(inplace=True)]
+-                in_channels = v
+-        return nn.Sequential(*layers)
++        # ---- weight initialization -------------------------------------
++        if init_weights:
++            for m in self.modules():
++                if isinstance(m, nn.Conv2d):
++                    n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
++                    m.weight.data.normal_(0, math.sqrt(2. / n))
++                    if m.bias is not None:
++                        m.bias.data.zero_()
++                elif isinstance(m, nn.BatchNorm2d):
++                    m.weight.data.fill_(0.5)
++                    m.bias.data.zero_()
++                elif isinstance(m, nn.Linear):
++                    m.weight.data.normal_(0, 0.01)
++                    m.bias.data.zero_()
+ 
+     def forward(self, x):
+         x = self.feature(x)
+@@ -59,20 +72,6 @@ class vgg(nn.Module):
+         y = self.classifier(x)
+         return y
+ 
+-    def _initialize_weights(self):
+-        for m in self.modules():
+-            if isinstance(m, nn.Conv2d):
+-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+-                m.weight.data.normal_(0, math.sqrt(2. / n))
+-                if m.bias is not None:
+-                    m.bias.data.zero_()
+-            elif isinstance(m, nn.BatchNorm2d):
+-                m.weight.data.fill_(0.5)
+-                m.bias.data.zero_()
+-            elif isinstance(m, nn.Linear):
+-                m.weight.data.normal_(0, 0.01)
+-                m.bias.data.zero_()
+-
+ if __name__ == '__main__':
+     net = vgg()
+     x = Variable(torch.FloatTensor(16, 3, 40, 40))
+diff --git a/cifar/lottery-ticket/l1-norm-pruning/models/vgg.py b/cifar/lottery-ticket/l1-norm-pruning/models/vgg.py
+index 4107b06..cb413f8 100644
+--- a/cifar/lottery-ticket/l1-norm-pruning/models/vgg.py
++++ b/cifar/lottery-ticket/l1-norm-pruning/models/vgg.py
+@@ -21,7 +21,19 @@ class vgg(nn.Module):
+ 
+         self.cfg = cfg
+ 
+-        self.feature = self.make_layers(cfg, True)
++        # lottery-ticket feature stack: roll the cfg expansion in here so the
++        # pruned layout used during ticket search stays visible in one place
++        layers = []
++        in_ch = 3
++        for step, v in enumerate(cfg):
++            if v == 'M':
++                layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
++            else:
++                layers += [nn.Conv2d(in_ch, v, kernel_size=3, padding=1, bias=False),
++                           nn.BatchNorm2d(v),
++                           nn.ReLU(inplace=True)]
++                in_ch = v
++        self.feature = nn.Sequential(*layers)
+ 
+         if dataset == 'cifar10':
+             num_classes = 10
+@@ -33,23 +45,21 @@ class vgg(nn.Module):
+               nn.ReLU(inplace=True),
+               nn.Linear(512, num_classes)
+             )
+-        if init_weights:
+-            self._initialize_weights()
+ 
+-    def make_layers(self, cfg, batch_norm=False):
+-        layers = []
+-        in_channels = 3
+-        for v in cfg:
+-            if v == 'M':
+-                layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+-            else:
+-                conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1, bias=False)
+-                if batch_norm:
+-                    layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+-                else:
+-                    layers += [conv2d, nn.ReLU(inplace=True)]
+-                in_channels = v
+-        return nn.Sequential(*layers)
++        # weight initialization (kept after the module tree is complete)
++        if init_weights:
++            for m in self.modules():
++                if isinstance(m, nn.Conv2d):
++                    n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
++                    m.weight.data.normal_(0, math.sqrt(2. / n))
++                    if m.bias is not None:
++                        m.bias.data.zero_()
++                elif isinstance(m, nn.BatchNorm2d):
++                    m.weight.data.fill_(0.5)
++                    m.bias.data.zero_()
++                elif isinstance(m, nn.Linear):
++                    m.weight.data.normal_(0, 0.01)
++                    m.bias.data.zero_()
+ 
+     def forward(self, x):
+         x = self.feature(x)
+@@ -58,20 +68,6 @@ class vgg(nn.Module):
+         y = self.classifier(x)
+         return y
+ 
+-    def _initialize_weights(self):
+-        for m in self.modules():
+-            if isinstance(m, nn.Conv2d):
+-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
+-                m.weight.data.normal_(0, math.sqrt(2. / n))
+-                if m.bias is not None:
+-                    m.bias.data.zero_()
+-            elif isinstance(m, nn.BatchNorm2d):
+-                m.weight.data.fill_(0.5)
+-                m.bias.data.zero_()
+-            elif isinstance(m, nn.Linear):
+-                m.weight.data.normal_(0, 0.01)
+-                m.bias.data.zero_()
+-
+ if __name__ == '__main__':
+     net = vgg()
+     x = Variable(torch.FloatTensor(16, 3, 40, 40))
+diff --git a/cifar/network-slimming/models/densenet.py b/cifar/network-slimming/models/densenet.py
+index 592f04c..0eac5e2 100644
+--- a/cifar/network-slimming/models/densenet.py
++++ b/cifar/network-slimming/models/densenet.py
+@@ -77,16 +77,30 @@ class densenet(nn.Module):
+ 
+         assert len(cfg) == 3*n+3, 'length of config variable cfg should be 3n+3'
+ 
+-        # self.inplanes is a global variable used across multiple
+-        # helper functions
++        # self.inplanes runs through the whole growth here, so the dense
++        # stages and their compression transitions are laid out in place
+         self.inplanes = growthRate * 2
+         self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=3, padding=1,
+                                bias=False)
+-        self.dense1 = self._make_denseblock(block, n, cfg[0:n])
+-        self.trans1 = self._make_transition(compressionRate, cfg[n])
+-        self.dense2 = self._make_denseblock(block, n, cfg[n+1:2*n+1])
+-        self.trans2 = self._make_transition(compressionRate, cfg[2*n+1])
+-        self.dense3 = self._make_denseblock(block, n, cfg[2*n+2:3*n+2])
++
++        # ---- three dense stages, transitions after the first two --------
++        stage_windows = (cfg[0:n], cfg[n+1:2*n+1], cfg[2*n+2:3*n+2])
++        for stage, widths in enumerate(stage_windows):
++            units = []
++            for w in widths:
++                units.append(block(self.inplanes, cfg=w,
++                                   growthRate=self.growthRate,
++                                   dropRate=self.dropRate))
++                self.inplanes += self.growthRate
++            setattr(self, 'dense%d' % (stage + 1), nn.Sequential(*units))
++
++            if stage < 2:
++                pre = self.inplanes
++                post = int(math.floor(self.inplanes // compressionRate))
++                self.inplanes = post
++                setattr(self, 'trans%d' % (stage + 1),
++                        Transition(pre, post, cfg[n * (stage + 1) + stage]))
++
+         self.bn = nn.BatchNorm2d(self.inplanes)
+         self.select = channel_selection(self.inplanes)
+         self.relu = nn.ReLU(inplace=True)
+@@ -106,23 +120,6 @@ class densenet(nn.Module):
+                 m.weight.data.fill_(0.5)
+                 m.bias.data.zero_()
+ 
+-    def _make_denseblock(self, block, blocks, cfg):
+-        layers = []
+-        assert blocks == len(cfg), 'Length of the cfg parameter is not right.'
+-        for i in range(blocks):
+-            # Currently we fix the expansion ratio as the default value
+-            layers.append(block(self.inplanes, cfg = cfg[i], growthRate=self.growthRate, dropRate=self.dropRate))
+-            self.inplanes += self.growthRate
+-
+-        return nn.Sequential(*layers)
+-
+-    def _make_transition(self, compressionRate, cfg):
+-        # cfg is a number in this case.
+-        inplanes = self.inplanes
+-        outplanes = int(math.floor(self.inplanes // compressionRate))
+-        self.inplanes = outplanes
+-        return Transition(inplanes, outplanes, cfg)
+-
+     def forward(self, x):
+         x = self.conv1(x)
+ 
+diff --git a/cifar/weight-level/models/cifar/resnet.py b/cifar/weight-level/models/cifar/resnet.py
+index 67ebbd7..403bc0e 100644
+--- a/cifar/weight-level/models/cifar/resnet.py
++++ b/cifar/weight-level/models/cifar/resnet.py
+@@ -95,9 +95,28 @@ class ResNet(nn.Module):
+                                bias=False)
+         self.bn1 = nn.BatchNorm2d(16)
+         self.relu = nn.ReLU(inplace=True)
+-        self.layer1 = self._make_layer(block, 16, n)
+-        self.layer2 = self._make_layer(block, 32, n, stride=2)
+-        self.layer3 = self._make_layer(block, 64, n, stride=2)
++
++        # the three residual chains and their 1x1 shortcut projections are
++        # built in place: widths stay fixed here (weight-level pruning does
++        # not reconfigure channels)
++        for stage, (width, units, stride) in enumerate((
++                (16, n, 1),
++                (32, n, 2),
++                (64, n, 2))):
++            chain = []
++            shortcut = None
++            if stride != 1 or self.inplanes != width * block.expansion:
++                shortcut = nn.Sequential(
++                    nn.Conv2d(self.inplanes, width * block.expansion,
++                              kernel_size=1, stride=stride, bias=False),
++                    nn.BatchNorm2d(width * block.expansion),
++                )
++            chain.append(block(self.inplanes, width, stride, shortcut))
++            self.inplanes = width * block.expansion
++            for _ in range(1, units):
++                chain.append(block(self.inplanes, width))
++            setattr(self, 'layer%d' % (stage + 1), nn.Sequential(*chain))
++
+         self.avgpool = nn.AvgPool2d(8)
+         self.fc = nn.Linear(64 * block.expansion, num_classes)
+ 
+@@ -109,23 +128,6 @@ class ResNet(nn.Module):
+                 m.weight.data.fill_(1)
+                 m.bias.data.zero_()
+ 
+-    def _make_layer(self, block, planes, blocks, stride=1):
+-        downsample = None
+-        if stride != 1 or self.inplanes != planes * block.expansion:
+-            downsample = nn.Sequential(
+-                nn.Conv2d(self.inplanes, planes * block.expansion,
+-                          kernel_size=1, stride=stride, bias=False),
+-                nn.BatchNorm2d(planes * block.expansion),
+-            )
+-
+-        layers = []
+-        layers.append(block(self.inplanes, planes, stride, downsample))
+-        self.inplanes = planes * block.expansion
+-        for i in range(1, blocks):
+-            layers.append(block(self.inplanes, planes))
+-
+-        return nn.Sequential(*layers)
+-
+     def forward(self, x):
+         x = self.conv1(x)
+         x = self.bn1(x)
+diff --git a/imagenet/l1-norm-pruning/resnet.py b/imagenet/l1-norm-pruning/resnet.py
+index c6206a7..5fa4c8e 100644
+--- a/imagenet/l1-norm-pruning/resnet.py
++++ b/imagenet/l1-norm-pruning/resnet.py
+@@ -99,14 +99,31 @@ class ResNet(nn.Module):
+         self.bn1 = nn.BatchNorm2d(64)
+         self.relu = nn.ReLU(inplace=True)
+         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+-        count = 0
+-        self.layer1 = self._make_layer(block, 64, layers[0], cfg[:layers[0]])
+-        count += layers[0]
+-        self.layer2 = self._make_layer(block, 128, layers[1], cfg[count:count+layers[1]], stride=2)
+-        count += layers[1]
+-        self.layer3 = self._make_layer(block, 256, layers[2], cfg[count:count+layers[2]], stride=2)
+-        count += layers[2]
+-        self.layer4 = self._make_layer(block, 512, layers[3], cfg[count:count+layers[3]], stride=2)
++
++        # windowed cfg consumption: a cursor walks over cfg while the four
++        # residual stages are laid out, mirroring the pruning order
++        cursor = 0
++        for i, (planes, depth, stride) in enumerate((
++                (64, layers[0], 1),
++                (128, layers[1], 2),
++                (256, layers[2], 2),
++                (512, layers[3], 2))):
++            window = cfg[cursor:cursor + depth]
++            shortcut = None
++            if stride != 1 or self.inplanes != planes * block.expansion:
++                shortcut = nn.Sequential(
++                    nn.Conv2d(self.inplanes, planes * block.expansion,
++                              kernel_size=1, stride=stride, bias=False),
++                    nn.BatchNorm2d(planes * block.expansion),
++                )
++
++            stage = [block(self.inplanes, planes, window[0], stride, shortcut)]
++            self.inplanes = planes * block.expansion
++            for width in window[1:]:
++                stage.append(block(self.inplanes, planes, width))
++            cursor += depth
++            setattr(self, 'layer%d' % (i + 1), nn.Sequential(*stage))
++
+         self.avgpool = nn.AvgPool2d(7, stride=1)
+         # self.fc = nn.Linear(512 * block.expansion, num_classes)
+         self.fc = nn.Linear(cfg[-1], num_classes)
+@@ -119,23 +136,6 @@ class ResNet(nn.Module):
+                 m.weight.data.fill_(1)
+                 m.bias.data.zero_()
+ 
+-    def _make_layer(self, block, planes, blocks, cfg, stride=1):
+-        downsample = None
+-        if stride != 1 or self.inplanes != planes * block.expansion:
+-            downsample = nn.Sequential(
+-                nn.Conv2d(self.inplanes, planes * block.expansion,
+-                          kernel_size=1, stride=stride, bias=False),
+-                nn.BatchNorm2d(planes * block.expansion),
+-            )
+-
+-        layers = []
+-        layers.append(block(self.inplanes, planes, cfg[0],stride, downsample))
+-        self.inplanes = planes * block.expansion
+-        for i in range(1, blocks):
+-            layers.append(block(self.inplanes, planes, cfg[i]))
+-
+-        return nn.Sequential(*layers)
+-
+     def forward(self, x):
+         x = self.conv1(x)
+         x = self.bn1(x)
+diff --git a/imagenet/network-slimming/vgg.py b/imagenet/network-slimming/vgg.py
+index a2229e4..78427c9 100644
+--- a/imagenet/network-slimming/vgg.py
++++ b/imagenet/network-slimming/vgg.py
+@@ -51,21 +51,6 @@ class VGG(nn.Module):
+                 m.weight.data.fill_(0.5)
+                 m.bias.data.zero_()
+ 
+-def make_layers(cfg, batch_norm=False):
+-    layers = []
+-    in_channels = 3
+-    for v in cfg:
+-        if v == 'M':
+-            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
+-        else:
+-            conv2d = nn.Conv2d(in_channels, v, kernel_size=3, padding=1)
+-            if batch_norm:
+-                layers += [conv2d, nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
+-            else:
+-                layers += [conv2d, nn.ReLU(inplace=True)]
+-            in_channels = v
+-    return nn.Sequential(*layers)
+-
+ cfg = {
+     'A': [64, 'M', 128, 'M', 256, 256, 'M', 512, 512, 'M', 512, 512, 'M', 4096, 4096]
+ }
+@@ -81,7 +66,42 @@ def slimmingvgg(pretrained=False, config=None, **kwargs):
+     if config == None:
+         config = cfg['A']
+     config2 = [config[-4],config[-2],config[-1]]
+-    model = VGG(make_layers(config[:-2], batch_norm=True), config2, **kwargs)
++
++    # feature extractor for the slimming run assembled here: every width
++    # entry becomes conv + BN + ReLU, 'M' is a 2x2 max-pool
++    layers = []
++    in_channels = 3
++    for v in config[:-2]:
++        if v == 'M':
++            layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
++        else:
++            layers += [nn.Conv2d(in_channels, v, kernel_size=3, padding=1),
++                       nn.BatchNorm2d(v), nn.ReLU(inplace=True)]
++            in_channels = v
++    features = nn.Sequential(*layers)
++
++    # decide on initialization before forcing the class to skip its own
++    should_init = kwargs.get('init_weights', True)
++    kwargs['init_weights'] = False
++    model = VGG(features, config2, **kwargs)
++
++    # weight initialization expanded next to the feature assembly
++    if should_init:
++        for m in model.modules():
++            if isinstance(m, nn.Conv2d):
++                nn.init.kaiming_normal(m.weight, mode='fan_out')#, nonlinearity='relu')
++                if m.bias is not None:
++                    m.bias.data.zero_()
++            elif isinstance(m, nn.BatchNorm2d):
++                m.weight.data.fill_(0.5)
++                m.bias.data.zero_()
++            elif isinstance(m, nn.Linear):
++                m.weight.data.normal_(0, 0.01)
++                m.bias.data.zero_()
++            elif isinstance(m, nn.BatchNorm1d):
++                m.weight.data.fill_(0.5)
++                m.bias.data.zero_()
++
+     if pretrained:
+         model.load_state_dict(model_zoo.load_url(model_urls['vgg11_bn']))
+     return model
+\ No newline at end of file
+diff --git a/pyproject.toml b/pyproject.toml
+new file mode 100644
+index 0000000..0b5d26f
+--- /dev/null
++++ b/pyproject.toml
+@@ -0,0 +1,22 @@
++[build-system]
++requires = ["setuptools>=61"]
++build-backend = "setuptools.build_meta"
++
++[project]
++name = "rethinking-network-pruning"
++version = "1.0.0"
++description = "Reproduction code for 'Rethinking the Value of Network Pruning' (ICLR 2019)"
++requires-python = ">=3.12"
++dependencies = [
++  "numpy",
++  "torch",
++]
++
++[project.optional-dependencies]
++test = [
++  "pytest",
++]
++
++[tool.pytest.ini_options]
++testpaths = ["tests"]
++addopts = "-ra"
+diff --git a/tests/loader.py b/tests/loader.py
+new file mode 100644
+index 0000000..ac4d454
+--- /dev/null
++++ b/tests/loader.py
+@@ -0,0 +1,41 @@
++"""Import helpers for the repository's independent experiment pipelines.
++
++The repository is a collection of self-contained pruning experiments rather
++than an installable package.  Model definitions are therefore loaded directly
++from their files.  The network-slimming ``models`` directory uses relative
++imports, so it is imported as a package through ``sys.path``.
++"""
++import importlib
++import importlib.util
++import os
++import sys
++
++REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++_LOADED = {}
++
++
++def load_flat(name, rel_path):
++    """Import a standalone module from ``rel_path`` under a fresh name."""
++    key = ("flat", name)
++    if key not in _LOADED:
++        path = os.path.join(REPO_ROOT, rel_path)
++        spec = importlib.util.spec_from_file_location(name, path)
++        module = importlib.util.module_from_spec(spec)
++        sys.modules[name] = module
++        spec.loader.exec_module(module)
++        _LOADED[key] = module
++    return _LOADED[key]
++
++
++def load_ns_models(rel_dir="cifar/network-slimming"):
++    """Import the network-slimming ``models`` package (relative imports)."""
++    key = ("pkg", rel_dir)
++    if key not in _LOADED:
++        pipeline_dir = os.path.join(REPO_ROOT, rel_dir)
++        sys.path.insert(0, pipeline_dir)
++        try:
++            _LOADED[key] = importlib.import_module("models")
++        finally:
++            sys.path.remove(pipeline_dir)
++    return _LOADED[key]
+diff --git a/tests/test_models.py b/tests/test_models.py
+new file mode 100644
+index 0000000..c550b89
+--- /dev/null
++++ b/tests/test_models.py
+@@ -0,0 +1,723 @@
++"""Behavioral tests for the model definitions of the pruning pipelines.
++
++Every assertion pins externally observable behavior of the networks:
++constructed module dimensions, state-dict layout, parameter counts,
++initialization conventions, and forward/backward output shapes.  The tests
++deliberately avoid asserting *how* a model is built internally, so any
++construction sequence that yields the same architecture remains valid.
++"""
++import pytest
++import torch
++import torch.nn as nn
++
++from loader import load_flat, load_ns_models
++
++# ---------------------------------------------------------------------------
++# Shared helpers and fixtures
++# ---------------------------------------------------------------------------
++
++VGG_SMALL_CFG = [8, 'M', 16, 'M', 32, 'M', 48, 'M', 64]
++RESNET_L1_CFG = [4, 6, 8, 10, 12, 14, 16, 18, 20]
++SLIM_CFG = [16, 'M', 32, 'M', 64, 'M', 128, 'M', 256, 96, 'M', 112, 64]
++IMRESNET_CFG = [8, 8, 8, 16, 16, 16, 16, 24, 24, 24, 24, 24, 24, 32, 32, 512]
++
++
++def count_params(model):
++    return sum(p.numel() for p in model.parameters())
++
++
++def check_bn_fill(model, value, value_1d=None):
++    """Check BN weight fills; BatchNorm1d defaults to ``value_1d``.
++
++    The pruning pipelines deliberately re-fill only their conv-side
++    BatchNorm2d layers in their weight-init helpers, so a BatchNorm1d in a
++    classifier head keeps torch's default weight of 1.0.
++    """
++    expected_1d = value if value_1d is None else value_1d
++    two_d = [m for m in model.modules() if isinstance(m, nn.BatchNorm2d)]
++    one_d = [m for m in model.modules() if isinstance(m, nn.BatchNorm1d)]
++    assert two_d or one_d, "no batch-norm layers found"
++    for m in two_d:
++        assert torch.all(m.weight == value), "BatchNorm2d weight fill mismatch"
++        assert torch.all(m.bias == 0)
++    for m in one_d:
++        assert torch.all(m.weight == expected_1d), "BatchNorm1d weight fill mismatch"
++        assert torch.all(m.bias == 0)
++
++
++def dense_cfg(growth, n, compression):
++    """cfg list consistent with the densenet channel bookkeeping."""
++    cfg, start = [], growth * 2
++    for _ in range(3):
++        cfg.extend([start + growth * i for i in range(n + 1)])
++        start = (start + growth * n) // compression
++    return cfg
++
++
++@pytest.fixture(scope="module")
++def l1_vgg():
++    return load_flat("l1_models_vgg", "cifar/l1-norm-pruning/models/vgg.py")
++
++
++@pytest.fixture(scope="module")
++def l1_resnet():
++    return load_flat("l1_models_resnet", "cifar/l1-norm-pruning/models/resnet.py")
++
++
++@pytest.fixture(scope="module")
++def lt_vgg():
++    return load_flat("lt_models_vgg",
++                     "cifar/lottery-ticket/l1-norm-pruning/models/vgg.py")
++
++
++@pytest.fixture(scope="module")
++def lt_resnet():
++    return load_flat("lt_models_resnet",
++                     "cifar/lottery-ticket/l1-norm-pruning/models/resnet.py")
++
++
++@pytest.fixture(scope="module")
++def ns_densenet():
++    return load_ns_models().densenet
++
++
++@pytest.fixture(scope="module")
++def ns_channel_selection():
++    return load_ns_models().channel_selection
++
++
++@pytest.fixture(scope="module")
++def wl_resnet():
++    return load_flat("wl_models_resnet",
++                     "cifar/weight-level/models/cifar/resnet.py")
++
++
++@pytest.fixture(scope="module")
++def im_resnet():
++    return load_flat("im_resnet", "imagenet/l1-norm-pruning/resnet.py")
++
++
++@pytest.fixture(scope="module")
++def im_slim_vgg():
++    return load_flat("im_slim_vgg", "imagenet/network-slimming/vgg.py")
++
++
++@pytest.fixture(scope="module")
++def reg_vgg5x():
++    return load_flat("reg_vgg5x", "imagenet/regression-pruning/models/vgg_5x.py")
++
++
++@pytest.fixture(scope="module")
++def reg_channel_selection():
++    return load_flat("reg_cs",
++                     "imagenet/regression-pruning/models/channel_selection.py")
++
++
++@pytest.fixture(scope="module")
++def thinet_vgg():
++    return load_flat("thinet_vgg", "imagenet/thinet/models/thinetvgg.py")
++
++
++# ---------------------------------------------------------------------------
++# cifar l1-norm-pruning: vgg
++# ---------------------------------------------------------------------------
++
++def test_vgg_l1_param_count_for_pruned_cfg(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG)
++    assert count_params(model) == 87218
++
++
++def test_vgg_l1_param_count_for_default_depth_19(l1_vgg):
++    model = l1_vgg.vgg()
++    assert model.cfg == l1_vgg.defaultcfg[19]
++    assert count_params(model) == 20298698
++
++
++def test_vgg_l1_state_dict_key_count(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG)
++    keys = set(model.state_dict().keys())
++    assert len(keys) == 39
++    assert "feature.0.weight" in keys
++    assert "feature.1.bias" in keys
++    assert "classifier.0.weight" in keys
++
++
++def test_vgg_l1_cfg_recorded_on_model(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG)
++    assert model.cfg == VGG_SMALL_CFG
++
++
++def test_vgg_l1_classifier_dimensions_follow_cfg(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG)
++    assert model.classifier[0].in_features == VGG_SMALL_CFG[-1]
++    assert model.classifier[0].out_features == 512
++    assert model.classifier[1].num_features == 512
++    assert model.classifier[3].out_features == 10
++    assert len(list(model.feature.children())) == 4 + 5 * 3
++
++
++def test_vgg_l1_forward_shape_cifar10(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG)
++    with torch.no_grad():
++        out = model(torch.randn(2, 3, 40, 40))
++    assert out.shape == (2, 10)
++
++
++def test_vgg_l1_forward_shape_cifar100(l1_vgg):
++    model = l1_vgg.vgg(dataset="cifar100", cfg=VGG_SMALL_CFG)
++    with torch.no_grad():
++        out = model(torch.randn(2, 3, 40, 40))
++    assert out.shape == (2, 100)
++
++
++def test_vgg_l1_bn_initialized_to_half(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG)
++    # conv-side BN is re-filled to 0.5; the classifier's BN1d keeps 1.0
++    check_bn_fill(model, 0.5, 1.0)
++
++
++def test_vgg_l1_weights_drawn_from_random_init(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG)
++    convs = [m for m in model.modules() if isinstance(m, nn.Conv2d)]
++    assert convs and all(m.weight.std() > 0 for m in convs)
++    linear = [m for m in model.modules() if isinstance(m, nn.Linear)]
++    assert linear and all(m.bias.abs().sum() == 0 for m in linear)
++    assert all(m.weight.std() > 0 for m in linear)
++
++
++def test_vgg_l1_init_weights_false_keeps_default_bn(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG, init_weights=False)
++    check_bn_fill(model, 1.0)
++
++
++def test_vgg_l1_backward_populates_grads(l1_vgg):
++    model = l1_vgg.vgg(cfg=VGG_SMALL_CFG)
++    out = model(torch.randn(2, 3, 40, 40))
++    out.sum().backward()
++    conv_grads = [model.feature[0].weight.grad,
++                  model.classifier[0].weight.grad,
++                  model.classifier[3].weight.grad]
++    assert all(g is not None and g.abs().sum() > 0 for g in conv_grads)
++
++
++# ---------------------------------------------------------------------------
++# cifar l1-norm-pruning: resnet
++# ---------------------------------------------------------------------------
++
++def test_resnet_l1_cfg_drives_stage_widths(l1_resnet):
++    model = l1_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    assert model.layer1[0].conv1.out_channels == RESNET_L1_CFG[0]
++    assert model.layer1[2].conv1.out_channels == RESNET_L1_CFG[2]
++    assert model.layer2[0].conv1.out_channels == RESNET_L1_CFG[3]
++    assert model.layer3[0].conv1.out_channels == RESNET_L1_CFG[6]
++    assert model.layer3[2].conv1.out_channels == RESNET_L1_CFG[8]
++
++
++def test_resnet_l1_stage_planes(l1_resnet):
++    model = l1_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    for layer, width in ((model.layer1, 16), (model.layer2, 32),
++                         (model.layer3, 64)):
++        blocks = list(layer.children())
++        assert len(blocks) == 3
++        assert all(b.conv2.out_channels == width for b in blocks)
++        assert all(b.bn2.num_features == width for b in blocks)
++    assert model.fc.in_features == 64
++    assert model.fc.out_features == 10
++
++
++def test_resnet_l1_downsample_on_strided_stages_only(l1_resnet):
++    model = l1_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    assert model.layer1[0].downsample is None
++    assert model.layer2[1].downsample is None
++    assert model.layer3[1].downsample is None
++    # downsampling is the functional channel-completion shortcut
++    shortcut = model.layer2[0].downsample
++    assert callable(shortcut)
++    with torch.no_grad():
++        out = shortcut(torch.randn(1, 16, 8, 8))
++    assert out.shape == (1, 32, 4, 4)
++    assert model.layer3[0].downsample is not None
++
++
++def test_resnet_l1_param_count_for_cfg(l1_resnet):
++    model = l1_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    assert model.cfg == RESNET_L1_CFG
++    assert count_params(model) == 84082
++
++
++def test_resnet_l1_state_dict_key_count(l1_resnet):
++    model = l1_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    keys = set(model.state_dict().keys())
++    assert len(keys) == 116
++    assert "layer1.0.conv1.weight" in keys
++    assert "layer3.2.bn1.weight" in keys
++    # the functional shortcut contributes no parameters/buffers
++    assert not any(k.startswith("downsample") for k in keys)
++
++
++def test_resnet_l1_forward_shape_cifar10(l1_resnet):
++    model = l1_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    with torch.no_grad():
++        out = model(torch.randn(2, 3, 32, 32))
++    assert out.shape == (2, 10)
++
++
++def test_resnet_l1_forward_shape_cifar100(l1_resnet):
++    model = l1_resnet.resnet(depth=20, dataset="cifar100", cfg=RESNET_L1_CFG)
++    with torch.no_grad():
++        out = model(torch.randn(2, 3, 32, 32))
++    assert out.shape == (2, 100)
++
++
++def test_resnet_l1_bn_initialized_to_one(l1_resnet):
++    model = l1_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    check_bn_fill(model, 1.0)
++    convs = [m for m in model.modules() if isinstance(m, nn.Conv2d)]
++    assert convs and all(m.weight.std() > 0 for m in convs)
++
++
++def test_resnet_l1_default_cfg_for_depth_56(l1_resnet):
++    model = l1_resnet.resnet(depth=56)
++    assert model.cfg == [16] * 9 + [32] * 9 + [64] * 9
++    assert count_params(model) == 853018
++
++
++def test_resnet_l1_rejects_invalid_depth(l1_resnet):
++    with pytest.raises(AssertionError):
++        l1_resnet.resnet(depth=18)
++
++
++# ---------------------------------------------------------------------------
++# cifar lottery-ticket/l1-norm-pruning (twin of the l1-norm pipeline)
++# ---------------------------------------------------------------------------
++
++def test_lottery_vgg_param_count_matches_l1_layout(lt_vgg):
++    model = lt_vgg.vgg(cfg=VGG_SMALL_CFG)
++    assert model.cfg == VGG_SMALL_CFG
++    assert count_params(model) == 87218
++
++
++def test_lottery_vgg_forward_shape(lt_vgg):
++    model = lt_vgg.vgg(cfg=VGG_SMALL_CFG)
++    with torch.no_grad():
++        out = model(torch.randn(2, 3, 40, 40))
++    assert out.shape == (2, 10)
++
++
++def test_lottery_vgg_bn_initialized_to_half(lt_vgg):
++    model = lt_vgg.vgg(cfg=VGG_SMALL_CFG)
++    check_bn_fill(model, 0.5, 1.0)
++
++
++def test_lottery_resnet_cfg_drives_stage_widths(lt_resnet):
++    model = lt_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    assert model.layer2[0].conv1.out_channels == RESNET_L1_CFG[3]
++    assert model.layer3[0].conv1.out_channels == RESNET_L1_CFG[6]
++    assert model.fc.in_features == 64
++
++
++def test_lottery_resnet_param_count(lt_resnet):
++    model = lt_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    assert count_params(model) == 84082
++
++
++def test_lottery_resnet_bn_initialized_to_one(lt_resnet):
++    model = lt_resnet.resnet(depth=20, cfg=RESNET_L1_CFG)
++    check_bn_fill(model, 1.0)
++
++
++# ---------------------------------------------------------------------------
++# cifar network-slimming: densenet
++# ---------------------------------------------------------------------------
++
++def test_densenet_default_layout(ns_densenet):
++    model = ns_densenet(depth=40)
++    assert len(list(model.dense1.children())) == 12
++    assert len(list(model.dense2.children())) == 12
++    assert len(list(model.dense3.children())) == 12
++    assert model.fc.in_features == 456
++    assert model.bn.num_features == 456
++    assert model.select.indexes.numel() == 456
++    # channel bookkeeping threading through all stages
++    assert model.dense1[11].select.indexes.numel() == 156
++    assert model.dense2[0].select.indexes.numel() == 168
++    assert model.dense3[11].select.indexes.numel() == 444
++
++
++def test_densenet_default_param_count(ns_densenet):
++    model = ns_densenet(depth=40)
++    assert count_params(model) == 1068658
++
++
++def test_densenet_default_forward_shape(ns_densenet):
++    model = ns_densenet(depth=40)
++    with torch.no_grad():
++        out = model(torch.randn(1, 3, 32, 32))
++    assert out.shape == (1, 10)
++
++
++def test_densenet_small_cfg_layout(ns_densenet):
++    cfg = dense_cfg(growth=4, n=2, compression=2)
++    assert len(cfg) == 9
++    model = ns_densenet(depth=10, growthRate=4, compressionRate=2, cfg=cfg)
++    # dense-block slices
++    assert model.dense1[0].conv1.in_channels == cfg[0]
++    assert model.dense1[0].conv1.out_channels == 4
++    assert model.dense1[1].conv1.in_channels == cfg[1]
++    assert model.dense2[0].conv1.in_channels == cfg[3]
++    assert model.dense2[1].conv1.in_channels == cfg[4]
++    assert model.dense3[0].conv1.in_channels == cfg[6]
++    assert model.dense3[1].conv1.in_channels == cfg[7]
++    # transitions compress the running channel count
++    assert model.trans1.conv1.in_channels == cfg[2]
++    assert model.trans1.conv1.out_channels == 8
++    assert model.trans2.conv1.out_channels == 8
++    assert model.fc.in_features == cfg[-1]
++    assert model.bn.num_features == 16
++
++
++def test_densenet_small_cfg_param_count(ns_densenet):
++    model = ns_densenet(depth=10, growthRate=4, compressionRate=2,
++                        cfg=dense_cfg(4, 2, 2))
++    assert count_params(model) == 3126
++    assert len(model.state_dict()) == 65
++
++
++def test_densenet_small_cfg_forward_shape(ns_densenet):
++    model = ns_densenet(depth=10, growthRate=4, compressionRate=2,
++                        cfg=dense_cfg(4, 2, 2))
++    with torch.no_grad():
++        out = model(torch.randn(2, 3, 32, 32))
++    assert out.shape == (2, 10)
++
++
++def test_densenet_cifar100_head(ns_densenet):
++    cfg = dense_cfg(4, 2, 2)
++    model = ns_densenet(depth=10, growthRate=4, compressionRate=2,
++                        dataset="cifar100", cfg=cfg)
++    assert model.fc.out_features == 100
++    with torch.no_grad():
++        out = model(torch.randn(1, 3, 32, 32))
++    assert out.shape == (1, 100)
++
++
++def test_densenet_bn_initialized_to_half(ns_densenet):
++    model = ns_densenet(depth=10, growthRate=4, compressionRate=2,
++                        cfg=dense_cfg(4, 2, 2))
++    check_bn_fill(model, 0.5)
++
++
++def test_densenet_retains_channel_selection_parameters(ns_densenet):
++    model = ns_densenet(depth=10, growthRate=4, compressionRate=2,
++                        cfg=dense_cfg(4, 2, 2))
++    keys = model.state_dict().keys()
++    assert "dense1.0.select.indexes" in keys
++    assert "trans1.select.indexes" in keys
++    assert "dense3.1.select.indexes" in keys
++    assert "select.indexes" in keys
++    for module in model.modules():
++        if module.__class__.__name__ == "channel_selection":
++            assert isinstance(module.indexes, nn.Parameter)
++            assert module.indexes.requires_grad
++            assert torch.all(module.indexes == 1)
++
++
++# ---------------------------------------------------------------------------
++# cifar network-slimming: channel_selection
++# ---------------------------------------------------------------------------
++
++def test_channel_selection_passes_all_channels(ns_channel_selection):
++    select = ns_channel_selection(4)
++    x = torch.randn(1, 4, 2, 2)
++    with torch.no_grad():
++        out = select(x)
++    assert out.shape == (1, 4, 2, 2)
++    assert "indexes" in select.state_dict()
++
++
++def test_channel_selection_drops_zeroed_channels(ns_channel_selection):
++    select = ns_channel_selection(4)
++    with torch.no_grad():
++        select.indexes[1] = 0
++    x = torch.randn(1, 4, 2, 2)
++    with torch.no_grad():
++        out = select(x)
++    assert out.shape == (1, 3, 2, 2)
++    assert torch.allclose(out, x[:, [0, 2, 3], :, :])
++
++
++def test_channel_selection_single_surviving_channel(ns_channel_selection):
++    select = ns_channel_selection(4)
++    with torch.no_grad():
++        select.indexes[:] = 0
++        select.indexes[2] = 1
++    x = torch.randn(1, 4, 2, 2)
++    with torch.no_grad():
++        out = select(x)
++    assert out.shape == (1, 1, 2, 2)
++    assert torch.allclose(out, x[:, 2:3, :, :])
++
++
++def test_channel_selection_one_channel_input(ns_channel_selection):
++    select = ns_channel_selection(1)
++    assert select.indexes.numel() == 1
++    x = torch.randn(1, 1, 3, 3)
++    with torch.no_grad():
++        out = select(x)
++    assert out.shape == (1, 1, 3, 3)
++
++
++# ---------------------------------------------------------------------------
++# cifar weight-level: resnet (plain shortcut projections)
++# ---------------------------------------------------------------------------
++
++def test_wl_resnet_param_count(wl_resnet):
++    model = wl_resnet.resnet(depth=20, num_classes=10)
++    assert count_params(model) == 272474
++
++
++def test_wl_resnet_stage_widths(wl_resnet):
++    model = wl_resnet.resnet(depth=20, num_classes=10)
++    assert model.layer1[0].conv1.out_channels == 16
++    assert model.layer2[0].conv1.out_channels == 32
++    assert model.layer3[0].conv1.out_channels == 64
++    assert model.fc.in_features == 64
++    assert model.fc.out_features == 10
++
++
++def test_wl_resnet_shortcut_projection_has_bn(wl_resnet):
++    model = wl_resnet.resnet(depth=20, num_classes=10)
++    keys = model.state_dict().keys()
++    assert "layer2.0.downsample.0.weight" in keys
++    assert "layer2.0.downsample.1.weight" in keys
++    assert isinstance(model.layer2[0].downsample, nn.Sequential)
++    assert model.layer1[0].downsample is None
++
++
++def test_wl_resnet_forward_shape(wl_resnet):
++    model = wl_resnet.resnet(depth=20, num_classes=10)
++    with torch.no_grad():
++        out = model(torch.randn(2, 3, 32, 32))
++    assert out.shape == (2, 10)
++
++
++def test_wl_resnet_default_head(wl_resnet):
++    model = wl_resnet.resnet(depth=56)
++    assert model.fc.out_features == 1000
++    assert model.fc.in_features == 256
++
++
++def test_wl_resnet_bn_initialized_to_one(wl_resnet):
++    model = wl_resnet.resnet(depth=20)
++    check_bn_fill(model, 1.0)
++
++
++# ---------------------------------------------------------------------------
++# imagenet l1-norm-pruning: resnet (count-windowed cfg slices)
++# ---------------------------------------------------------------------------
++
++def test_imresnet_cfg_window_slices(im_resnet):
++    model = im_resnet.ResNet(im_resnet.BasicBlock, [3, 4, 6, 3],
++                             cfg=IMRESNET_CFG, num_classes=10)
++    assert model.layer1[0].conv1.out_channels == IMRESNET_CFG[0]
++    assert model.layer1[2].conv1.out_channels == IMRESNET_CFG[2]
++    assert model.layer2[0].conv1.out_channels == IMRESNET_CFG[3]
++    assert model.layer2[3].conv1.out_channels == IMRESNET_CFG[6]
++    assert model.layer3[0].conv1.out_channels == IMRESNET_CFG[7]
++    assert model.layer3[5].conv1.out_channels == IMRESNET_CFG[12]
++    assert model.layer4[0].conv1.out_channels == IMRESNET_CFG[13]
++    assert model.layer4[2].conv1.out_channels == IMRESNET_CFG[15]
++    # the width of the final stage dictates the classifier input
++    assert model.fc.in_features == IMRESNET_CFG[-1]
++
++
++def test_imresnet_stage_planes_and_shortcuts(im_resnet):
++    model = im_resnet.ResNet(im_resnet.BasicBlock, [3, 4, 6, 3],
++                             cfg=IMRESNET_CFG, num_classes=10)
++    assert model.layer1[0].downsample is None
++    shortcut = model.layer2[0].downsample
++    assert isinstance(shortcut, nn.Sequential)
++    assert shortcut[0].in_channels == 64
++    assert shortcut[0].out_channels == 128
++    assert shortcut[0].stride == (2, 2)
++    assert shortcut[0].bias is None
++    assert shortcut[1].num_features == 128
++    keys = model.state_dict().keys()
++    assert "layer2.0.downsample.0.weight" in keys
++    assert "layer4.0.downsample.0.weight" in keys
++    assert model.layer2[0].conv2.out_channels == 128
++    assert model.layer3[0].conv2.out_channels == 256
++
++
++def test_imresnet_param_count(im_resnet):
++    model = im_resnet.ResNet(im_resnet.BasicBlock, [3, 4, 6, 3],
++                             cfg=IMRESNET_CFG, num_classes=10)
++    assert count_params(model) == 6234138
++    assert len(model.state_dict()) == 218
++
++
++def test_imresnet_forward_shape(im_resnet):
++    model = im_resnet.ResNet(im_resnet.BasicBlock, [3, 4, 6, 3],
++                             cfg=IMRESNET_CFG, num_classes=10)
++    with torch.no_grad():
++        out = model(torch.randn(1, 3, 224, 224))
++    assert out.shape == (1, 10)
++
++
++def test_imresnet_bn_initialized_to_one(im_resnet):
++    model = im_resnet.ResNet(im_resnet.BasicBlock, [3, 4, 6, 3],
++                             cfg=IMRESNET_CFG, num_classes=10)
++    check_bn_fill(model, 1.0)
++
++
++def test_imresnet_default_cfg_when_cfg_omitted(im_resnet):
++    model = im_resnet.ResNet(im_resnet.BasicBlock, [1, 1, 1, 1], num_classes=7)
++    assert model.layer1[0].conv1.out_channels == 64
++    assert model.layer4[0].conv1.out_channels == 512
++    assert model.fc.in_features == 512
++    assert model.fc.out_features == 7
++    assert count_params(model) == 4909383
++
++
++# ---------------------------------------------------------------------------
++# imagenet network-slimming: vgg
++# ---------------------------------------------------------------------------
++
++def test_slim_vgg_param_count(im_slim_vgg):
++    model = im_slim_vgg.slimmingvgg(config=SLIM_CFG, num_classes=10)
++    assert count_params(model) == 1150266
++
++
++def test_slim_vgg_feature_stack_layout(im_slim_vgg):
++    model = im_slim_vgg.slimmingvgg(config=SLIM_CFG, num_classes=10)
++    feature_modules = list(model.features.children())
++    assert len(feature_modules) == 23
++    assert feature_modules[0].out_channels == SLIM_CFG[0]
++    # the stack ends with a pool; the final conv sits three modules earlier
++    assert isinstance(feature_modules[-1], nn.MaxPool2d)
++    assert feature_modules[-4].out_channels == SLIM_CFG[-4]
++    pools = [m for m in model.features.modules() if isinstance(m, nn.MaxPool2d)]
++    assert len(pools) == 5
++    convs = [m for m in model.features.modules() if isinstance(m, nn.Conv2d)]
++    assert len(convs) == 6
++    assert all(m.bias is not None for m in convs)
++
++
++def test_slim_vgg_classifier_from_config_tail(im_slim_vgg):
++    model = im_slim_vgg.slimmingvgg(config=SLIM_CFG, num_classes=10)
++    config2 = [SLIM_CFG[-4], SLIM_CFG[-2], SLIM_CFG[-1]]
++    classes = list(model.classifier.children())
++    assert len(classes) == 7
++    assert classes[0].in_features == config2[0] * 7 * 7
++    assert classes[0].out_features == config2[1]
++    assert classes[3].in_features == config2[1]
++    assert classes[3].out_features == config2[2]
++    assert classes[6].in_features == config2[2]
++    assert classes[6].out_features == 10
++
++
++def test_slim_vgg_forward_shape(im_slim_vgg):
++    model = im_slim_vgg.slimmingvgg(config=SLIM_CFG, num_classes=10)
++    with torch.no_grad():
++        out = model(torch.randn(2, 3, 224, 224))
++    assert out.shape == (2, 10)
++
++
++def test_slim_vgg_bn_initialized_to_half(im_slim_vgg):
++    model = im_slim_vgg.slimmingvgg(config=SLIM_CFG, num_classes=10)
++    check_bn_fill(model, 0.5)
++    convs = [m for m in model.modules() if isinstance(m, nn.Conv2d)]
++    assert convs and all(m.weight.std() > 0 for m in convs)
++
++
++def test_slim_vgg_init_disabled_keeps_default_bn(im_slim_vgg):
++    model = im_slim_vgg.slimmingvgg(config=SLIM_CFG, num_classes=10,
++                                    init_weights=False)
++    check_bn_fill(model, 1.0)
++
++
++# ---------------------------------------------------------------------------
++# imagenet regression-pruning: vgg_5x blocks + channel_selection
++# ---------------------------------------------------------------------------
++
++def test_reg_vgg5x_make_layers_without_batch_norm(reg_vgg5x):
++    stack = reg_vgg5x.make_layers([8, 'M', 16], batch_norm=False)
++    modules = list(stack.children())
++    assert len(modules) == 5
++    assert isinstance(modules[1], nn.ReLU)
++    assert isinstance(modules[2], nn.MaxPool2d)
++    assert modules[0].out_channels == 8
++    assert modules[0].bias is not None
++
++
++def test_reg_vgg5x_make_layers_with_batch_norm(reg_vgg5x):
++    stack = reg_vgg5x.make_layers([8, 'M', 16], batch_norm=True)
++    modules = list(stack.children())
++    assert len(modules) == 7
++    assert isinstance(modules[1], nn.BatchNorm2d)
++    assert modules[1].num_features == 8
++    assert modules[4].out_channels == 16
++
++
++def test_reg_vgg5x_config_table(reg_vgg5x):
++    assert len(reg_vgg5x.cfg_5x) == 18
++    assert len(reg_vgg5x.cfg_official) == 18
++    assert reg_vgg5x.cfg_official[-4:] == [512, 512, 512, 'M']
++    assert reg_vgg5x.cfg_5x[-4:] == [512, 512, 512, 'M']
++
++
++def test_reg_channel_selection_full_mask(reg_channel_selection):
++    import numpy as np
++
++    select = reg_channel_selection.channel_selection(6, np.ones(6))
++    assert torch.all(select.indexes == 1)
++    x = torch.randn(1, 6, 4, 4)
++    with torch.no_grad():
++        out = select(x)
++    assert out.shape == (1, 6, 4, 4)
++
++
++def test_reg_channel_selection_pruned_mask(reg_channel_selection):
++    import numpy as np
++
++    mask = np.array([1, 0, 1, 0, 1, 0])
++    select = reg_channel_selection.channel_selection(6, mask)
++    assert select.indexes.numel() == 6
++    with torch.no_grad():
++        out = select(torch.randn(1, 6, 4, 4))
++    assert out.shape == (1, 3, 4, 4)
++
++
++# ---------------------------------------------------------------------------
++# imagenet thinet: gap and tiny variants
++# ---------------------------------------------------------------------------
++
++def test_thinet_tiny_head(thinet_vgg):
++    model = thinet_vgg.thinet_tiny(num_classes=10)
++    assert len(list(model.classifier.children())) == 1
++    assert model.classifier[0].in_features == 256
++    assert model.classifier[0].out_features == 10
++
++
++def test_thinet_tiny_forward_shape(thinet_vgg):
++    model = thinet_vgg.thinet_tiny(num_classes=10)
++    with torch.no_grad():
++        out = model(torch.randn(1, 3, 224, 224))
++    assert out.shape == (1, 10)
++
++
++def test_thinet_gap_head_and_forward(thinet_vgg):
++    model = thinet_vgg.thinet_gap(num_classes=10)
++    assert model.classifier[0].in_features == 512
++    assert model.classifier[0].out_features == 10
++    with torch.no_grad():
++        out = model(torch.randn(1, 3, 224, 224))
++    assert out.shape == (1, 10)
++
++
++def test_thinet_make_layers_stack(thinet_vgg):
++    stack = thinet_vgg.make_layers([8, 8, 'M', 16], batch_norm=False)
++    modules = list(stack.children())
++    assert len(modules) == 7
++    assert sum(isinstance(m, nn.MaxPool2d) for m in modules) == 1
++    assert sum(isinstance(m, nn.Conv2d) for m in modules) == 3
+diff --git a/tests/test_utils.py b/tests/test_utils.py
+new file mode 100644
+index 0000000..93ced4f
+--- /dev/null
++++ b/tests/test_utils.py
+@@ -0,0 +1,98 @@
++"""Behavioral tests for the small utility helpers shared by the pipelines."""
++import os
++
++import pytest
++import torch
++import torch.nn as nn
++
++from loader import load_flat
++
++
++@pytest.fixture(scope="module")
++def sf_utils():
++    return load_flat("sf_utils", "cifar/soft-filter-pruning/utils.py")
++
++
++@pytest.fixture(scope="module")
++def lt_wl_misc():
++    return load_flat("lt_wl_misc", "cifar/lottery-ticket/weight-level/utils/misc.py")
++
++
++def test_average_meter_tracks_running_average(sf_utils):
++    meter = sf_utils.AverageMeter()
++    meter.update(1.0, n=2)
++    meter.update(3.0, n=4)
++    assert meter.val == 3.0
++    assert meter.sum == pytest.approx(14.0)
++    assert meter.count == 6
++    assert meter.avg == pytest.approx(14.0 / 6)
++
++
++def test_average_meter_reset_returns_to_zero(sf_utils):
++    meter = sf_utils.AverageMeter()
++    meter.update(5.0, n=3)
++    meter.reset()
++    assert (meter.val, meter.avg, meter.sum, meter.count) == (0, 0, 0, 0)
++
++
++def test_recorder_meter_stores_per_epoch_history(sf_utils):
++    recorder = sf_utils.RecorderMeter(10)
++    assert recorder.current_epoch == 0
++    assert recorder.max_accuracy(False) == 0
++    recorder.update(0, 0.9, 0.5, 1.0, 0.60)
++    recorder.update(1, 0.7, 0.55, 0.8, 0.62)
++    assert recorder.current_epoch == 2
++    assert recorder.epoch_losses[0, 0] == pytest.approx(0.9)
++    assert recorder.epoch_losses[1, 1] == pytest.approx(0.8)
++    assert recorder.epoch_accuracy[1, 0] == pytest.approx(0.55)
++
++
++def test_recorder_meter_flags_new_best_accuracy(sf_utils):
++    recorder = sf_utils.RecorderMeter(10)
++    # update() compares a numpy max with a python float: compare its truth value
++    assert bool(recorder.update(0, 1.0, 0.4, 1.0, 0.50)) is True
++    assert bool(recorder.update(1, 1.0, 0.6, 1.0, 0.55)) is True
++    assert bool(recorder.update(2, 1.0, 0.75, 1.0, 0.40)) is False
++    assert recorder.max_accuracy(False) == pytest.approx(0.55)
++    assert recorder.max_accuracy(True) == pytest.approx(0.75)
++
++
++def test_convert_secs2time_splits_time_units(sf_utils):
++    assert sf_utils.convert_secs2time(0) == (0, 0, 0)
++    assert sf_utils.convert_secs2time(59) == (0, 0, 59)
++    assert sf_utils.convert_secs2time(60) == (0, 1, 0)
++    assert sf_utils.convert_secs2time(3661) == (1, 1, 1)
++    assert sf_utils.convert_secs2time(86399) == (23, 59, 59)
++
++
++def test_time_string_formats_utc_timestamp(sf_utils):
++    import re
++
++    stamp = sf_utils.time_string()
++    assert re.fullmatch(r"\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\]", stamp)
++
++
++def test_get_conv_zero_param_counts_zeroed_filters(lt_wl_misc):
++    model = nn.Sequential(
++        nn.Conv2d(3, 4, kernel_size=3, bias=False),
++        nn.Conv2d(4, 2, kernel_size=1, bias=False),
++    )
++    assert int(lt_wl_misc.get_conv_zero_param(model)) == 0
++    with torch.no_grad():
++        model[0].weight[1].zero_()
++    assert int(lt_wl_misc.get_conv_zero_param(model)) == 3 * 3 * 3
++
++
++def test_average_meter_in_lottery_utils(lt_wl_misc):
++    meter = lt_wl_misc.AverageMeter()
++    meter.update(2.0, n=1)
++    meter.update(4.0, n=3)
++    assert meter.avg == pytest.approx(14.0 / 4)
++    assert meter.val == 4.0
++
++
++def test_mkdir_p_is_idempotent(lt_wl_misc, tmp_path):
++    target = os.path.join(str(tmp_path), "logs", "run-1")
++    lt_wl_misc.mkdir_p(target)
++    lt_wl_misc.mkdir_p(target)
++    assert os.path.isdir(target)

@@ -1,0 +1,560 @@
+diff --git a/parsimonious/expressions.py b/parsimonious/expressions.py
+index a1cf40b..12dc4c5 100644
+--- a/parsimonious/expressions.py
++++ b/parsimonious/expressions.py
+@@ -7,7 +7,7 @@ These do the parsing.
+ # anything--for speed. And kill all the dots.
+ 
+ from collections import defaultdict
+-from inspect import getfullargspec, isfunction, ismethod, ismethoddescriptor
++from inspect import isfunction, ismethod, ismethoddescriptor
+ try:
+     import regex as re
+ except ImportError:
+@@ -23,82 +23,6 @@ def is_callable(value):
+     return any([criterion(value) for criterion in criteria])
+ 
+ 
+-def expression(callable, rule_name, grammar):
+-    """Turn a plain callable into an Expression.
+-
+-    The callable can be of this simple form::
+-
+-        def foo(text, pos):
+-            '''If this custom expression matches starting at text[pos], return
+-            the index where it stops matching. Otherwise, return None.'''
+-            if the expression matched:
+-                return end_pos
+-
+-    If there child nodes to return, return a tuple::
+-
+-        return end_pos, children
+-
+-    If the expression doesn't match at the given ``pos`` at all... ::
+-
+-        return None
+-
+-    If your callable needs to make sub-calls to other rules in the grammar or
+-    do error reporting, it can take this form, gaining additional arguments::
+-
+-        def foo(text, pos, cache, error, grammar):
+-            # Call out to other rules:
+-            node = grammar['another_rule'].match_core(text, pos, cache, error)
+-            ...
+-            # Return values as above.
+-
+-    The return value of the callable, if an int or a tuple, will be
+-    automatically transmuted into a :class:`~parsimonious.Node`. If it returns
+-    a Node-like class directly, it will be passed through unchanged.
+-
+-    :arg rule_name: The rule name to attach to the resulting
+-        :class:`~parsimonious.Expression`
+-    :arg grammar: The :class:`~parsimonious.Grammar` this expression will be a
+-        part of, to make delegating to other rules possible
+-
+-    """
+-
+-    # Resolve unbound methods; allows grammars to use @staticmethod custom rules
+-    # https://stackoverflow.com/questions/41921255/staticmethod-object-is-not-callable
+-    if ismethoddescriptor(callable) and hasattr(callable, '__func__'):
+-        callable = callable.__func__
+-
+-    num_args = len(getfullargspec(callable).args)
+-    if ismethod(callable):
+-        # do not count the first argument (typically 'self') for methods
+-        num_args -= 1
+-    if num_args == 2:
+-        is_simple = True
+-    elif num_args == 5:
+-        is_simple = False
+-    else:
+-        raise RuntimeError("Custom rule functions must take either 2 or 5 "
+-                           "arguments, not %s." % num_args)
+-
+-    class AdHocExpression(Expression):
+-        def _uncached_match(self, text, pos, cache, error):
+-            result = (callable(text, pos) if is_simple else
+-                      callable(text, pos, cache, error, grammar))
+-
+-            if isinstance(result, int):
+-                end, children = result, None
+-            elif isinstance(result, tuple):
+-                end, children = result
+-            else:
+-                # Node or None
+-                return result
+-            return Node(self, text, pos, end, children=children)
+-
+-        def _as_rhs(self):
+-            return '{custom function "%s"}' % callable.__name__
+-
+-    return AdHocExpression(name=rule_name)
+-
+-
+ IN_PROGRESS = object()
+ 
+ 
+diff --git a/parsimonious/grammar.py b/parsimonious/grammar.py
+index 90c40c0..2f5d46e 100644
+--- a/parsimonious/grammar.py
++++ b/parsimonious/grammar.py
+@@ -5,15 +5,17 @@ optimizations that would be tedious to do when constructing an expression tree
+ by hand.
+ 
+ """
++import ast
+ from collections import OrderedDict
++from inspect import getfullargspec, ismethod, ismethoddescriptor
++from sys import version_info
+ from textwrap import dedent
+ 
+ from parsimonious.exceptions import BadGrammar, UndefinedLabel
+ from parsimonious.expressions import (Literal, Regex, Sequence, OneOf,
+     Lookahead, Quantifier, Optional, ZeroOrMore, OneOrMore, Not, TokenMatcher,
+-    expression, is_callable)
+-from parsimonious.nodes import NodeVisitor
+-from parsimonious.utils import evaluate_string
++    Expression, is_callable)
++from parsimonious.nodes import Node, NodeVisitor
+ 
+ class Grammar(OrderedDict):
+     """A collection of rules that describe a language
+@@ -43,7 +45,21 @@ class Grammar(OrderedDict):
+       factoring up repeated subexpressions into a single object, which should
+       increase cache hit ratio. [Is this implemented yet?]
+ 
++    Beyond merely *describing* a language, a ``Grammar`` is the one-stop
++    coordinator for everything that goes into describing one: callables
++    passed as custom rules are turned into expressions right here, string
++    literals are evaluated and kept consistent, and the token spellings of a
++    token grammar are tracked as they are encountered. Visitors that build
++    rule trees ask the grammar to do these things for them rather than
++    keeping their own copies of that logic.
++
+     """
++    #: Registry of the rule syntaxes attached to ``@rule``-decorated visitor
++    #: methods so far, keyed by the decorated function itself. The grammar
++    #: consults it when a decorated visitor class asks it to build that
++    #: class's default grammar.
++    _rule_method_syntaxes = {}
++
+     def __init__(self, rules='', **more_rules):
+         """Construct a grammar.
+ 
+@@ -58,9 +74,13 @@ class Grammar(OrderedDict):
+             ``rules`` in case of naming conflicts.
+ 
+         """
++        # Reset the bookkeeping that every constructed grammar keeps handy:
++        self._init_custom_rule_forms()
++        self._init_literal_registry()
++        self._init_token_types()
+ 
+         decorated_custom_rules = {
+-            k: (expression(v, k, self) if is_callable(v) else v)
++            k: (self._wrap_custom_rule(v, k) if is_callable(v) else v)
+             for k, v in more_rules.items()}
+ 
+         exprs, first = self._expressions_from_rules(rules, decorated_custom_rules)
+@@ -73,6 +93,215 @@ class Grammar(OrderedDict):
+         new.default_rule = new[rule_name]
+         return new
+ 
++    # Custom callable rules
++
++    def _init_custom_rule_forms(self):
++        """Prepare the registry of custom callable rules this grammar owns."""
++        self._custom_rule_forms = {}
++
++    def _custom_rule_form(self, callable):
++        """Return whether ``callable`` takes the simple (text, pos) form
++
++        Custom-coded rules come in two flavors: callables taking
++        ``(text, pos)`` and callables taking
++        ``(text, pos, cache, error, grammar)``. Anything else is a programming
++        mistake, and we refuse it up front, at grammar-construction time. The
++        answer is remembered per callable, since a grammar may use the same
++        callable for several rules.
++
++        """
++        cached = self._custom_rule_forms.get(callable)
++        if cached is None:
++            num_args = len(getfullargspec(callable).args)
++            if ismethod(callable):
++                # do not count the first argument (typically 'self') for methods
++                num_args -= 1
++            if num_args == 2:
++                cached = True
++            elif num_args == 5:
++                cached = False
++            else:
++                raise RuntimeError("Custom rule functions must take either 2 or 5 "
++                                   "arguments, not %s." % num_args)
++            self._custom_rule_forms[callable] = cached
++        return cached
++
++    def _wrap_custom_rule(self, rule_value, rule_name):
++        """Turn a plain callable into an Expression.
++
++        The callable can be of this simple form::
++
++            def foo(text, pos):
++                '''If this custom expression matches starting at text[pos], return
++                the index where it stops matching. Otherwise, return None.'''
++                if the expression matched:
++                    return end_pos
++
++        If there child nodes to return, return a tuple::
++
++            return end_pos, children
++
++        If the expression doesn't match at the given ``pos`` at all... ::
++
++            return None
++
++        If your callable needs to make sub-calls to other rules in the grammar or
++        do error reporting, it can take this form, gaining additional arguments::
++
++            def foo(text, pos, cache, error, grammar):
++                # Call out to other rules:
++                node = grammar['another_rule'].match_core(text, pos, cache, error)
++                ...
++                # Return values as above.
++
++        The return value of the callable, if an int or a tuple, will be
++        automatically transmuted into a :class:`~parsimonious.Node`. If it returns
++        a Node-like class directly, it will be passed through unchanged.
++
++        :arg rule_name: The rule name to attach to the resulting
++            :class:`~parsimonious.Expression`
++        :arg grammar: The :class:`~parsimonious.Grammar` this expression will be a
++            part of, to make delegating to other rules possible
++
++        """
++        # Resolve unbound methods; allows grammars to use @staticmethod custom rules
++        # https://stackoverflow.com/questions/41921255/staticmethod-object-is-not-callable
++        callable = rule_value
++        if ismethoddescriptor(callable) and hasattr(callable, '__func__'):
++            callable = callable.__func__
++
++        is_simple = self._custom_rule_form(callable)
++        grammar = self
++
++        class AdHocExpression(Expression):
++            def _uncached_match(self, text, pos, cache, error):
++                result = (callable(text, pos) if is_simple else
++                          callable(text, pos, cache, error, grammar))
++
++                if isinstance(result, int):
++                    end, children = result, None
++                elif isinstance(result, tuple):
++                    end, children = result
++                else:
++                    # Node or None
++                    return result
++                return Node(self, text, pos, end, children=children)
++
++            def _as_rhs(self):
++                return '{custom function "%s"}' % callable.__name__
++
++        return AdHocExpression(name=rule_name)
++
++    # String literals
++
++    def _init_literal_registry(self):
++        """Prepare the registry that polices the string literals of a grammar,
++        so bytes and unicode literals cannot be mixed within one grammar."""
++        self._last_literal_node_and_type = None
++
++    def evaluate_rule_string(self, string):
++        """Piggyback on Python's string support so we can have backslash escaping
++        and niceties like \\n, \\t, etc.
++
++        This also supports:
++        1. b"strings", allowing grammars to parse bytestrings, in addition to str.
++        2. r"strings" to simplify regexes.
++        """
++        return ast.literal_eval(string)
++
++    def make_literal(self, literal_text):
++        """Turn a string literal as written in a rule into a ``Literal``.
++
++        All strings in a single grammar must be of the same type, so each
++        new literal is compared against the type of the literals seen so
++        far, and a mismatch refuses the whole grammar.
++
++        """
++        literal_value = self.evaluate_rule_string(literal_text)
++        last_literal_text, last_type = self._last_literal_node_and_type or (None, None)
++        if last_literal_text is not None and last_type != type(literal_value):
++            raise BadGrammar(dedent(f"""\
++                Found {last_literal_text} ({last_type}) and {literal_text} ({type(literal_value)}) string literals.
++                All strings in a single grammar must be of the same type.
++                """)
++            )
++        self._last_literal_node_and_type = literal_text, type(literal_value)
++
++        return Literal(literal_value)
++
++    # Token grammars
++
++    def _init_token_types(self):
++        """Prepare the ledger of token-type spellings occurring in this
++        grammar, so a grammar can be asked afterwards which token types its
++        rules mention."""
++        self._known_token_types = set()
++
++    def make_token_matcher(self, literal_text):
++        """Turn a string literal from a token grammar into a ``TokenMatcher``
++        matching ``Token`` objects by their ``type`` attributes, recording
++        the token type spelling as it goes."""
++        token_type_value = self.evaluate_rule_string(literal_text)
++        self._known_token_types.add(token_type_value)
++        return TokenMatcher(token_type_value)
++
++    def check_token_regex_support(self):
++        """Refuse regexes in token grammars
++
++        Regexes do not make sense there, since they operate on pre-lexed
++        tokens rather than characters.
++
++        """
++        raise BadGrammar('Regexes do not make sense in TokenGrammars, since '
++                         'TokenGrammars operate on pre-lexed tokens rather '
++                         'than characters.')
++
++    # Rule-decorated visitor methods
++
++    @classmethod
++    def tag_rule_method(cls, method, rule_string):
++        """Tie a grammar rule to a NodeVisitor ``visit_*`` method
++
++        The following will arrange for the ``visit_digit`` method to receive
++        the results of the ``~"[0-9]"`` parse rule::
++
++            @rule('~"[0-9]"')
++            def visit_digit(self, node, visited_children):
++                ...
++
++        Typically, the choice of a default rule for this grammar is simple:
++        whatever ``@rule`` comes first in the class is the default. Since the
++        grammar is assembled by the grammar itself, the rule strings are
++        registered here rather than stashed ad hoc on the methods alone.
++
++        """
++        method._rule = rule_string
++        cls._rule_method_syntaxes[method] = rule_string
++        return method
++
++    @classmethod
++    def from_rule_methods(cls, methods):
++        """Build a grammar out of the ``@rule``-decorated methods of a
++        NodeVisitor class.
++
++        The resulting :term:`default rule` is the one whose rule string was
++        attached on the smallest-numbered source line.
++
++        """
++        def unvisit(name):
++            """Remove any leading "visit_" from a method name."""
++            return name[6:] if name.startswith('visit_') else name
++
++        # Possible enhancement: once we get the Grammar extensibility story
++        # solidified, we can have @rules *add* to the default grammar
++        # rather than pave over it.
++        methods.sort(key=(lambda x: x.func_code.co_firstlineno)
++                          if version_info[0] < 3 else
++                          (lambda x: x.__code__.co_firstlineno))
++        return cls('\n'.join('{name} = {expr}'.format(name=unvisit(m.__name__),
++                                                      expr=cls._rule_method_syntaxes[m])
++                             for m in methods))
++
+     def _copy(self):
+         """Return a shallow copy of myself.
+ 
+@@ -100,7 +329,7 @@ class Grammar(OrderedDict):
+ 
+         """
+         tree = rule_grammar.parse(rules)
+-        return RuleVisitor(custom_rules).visit(tree)
++        return RuleVisitor(custom_rules, self).visit(tree)
+ 
+     def parse(self, text, pos=0):
+         """Parse some text with the :term:`default rule`.
+@@ -150,7 +379,7 @@ class TokenGrammar(Grammar):
+     """
+     def _expressions_from_rules(self, rules, custom_rules):
+         tree = rule_grammar.parse(rules)
+-        return TokenRuleVisitor(custom_rules).visit(tree)
++        return TokenRuleVisitor(custom_rules, self).visit(tree)
+ 
+ 
+ class BootstrappingGrammar(Grammar):
+@@ -210,8 +439,9 @@ class BootstrappingGrammar(Grammar):
+ 
+         rule_tree = rules.parse(rule_syntax)
+ 
+-        # Turn the parse tree into a map of expressions:
+-        return RuleVisitor().visit(rule_tree)
++        # Turn the parse tree into a map of expressions, constructing each
++        # literal through this grammar's registry as we go:
++        return RuleVisitor(grammar=self).visit(rule_tree)
+ 
+ 
+ # The grammar for parsing PEG grammar definitions:
+@@ -307,15 +537,19 @@ class RuleVisitor(NodeVisitor):
+ 
+     visit_expression = visit_term = visit_atom = NodeVisitor.lift_child
+ 
+-    def __init__(self, custom_rules=None):
++    def __init__(self, custom_rules=None, grammar=None):
+         """Construct.
+ 
+         :arg custom_rules: A dict of {rule name: expression} holding custom
+             rules which will take precedence over the others
++        :arg grammar: The :class:`~parsimonious.grammar.Grammar` being built.
++            String literals are constructed and kept consistent by the
++            grammar, so the visitor needs to be able to reach it. A visitor
++            that arrives without one acquires a grammar on demand.
+ 
+         """
+         self.custom_rules = custom_rules or {}
+-        self._last_literal_node_and_type = None
++        self.grammar = grammar
+ 
+     def visit_parenthesized(self, node, parenthesized):
+         """Treat a parenthesized subexpression as just its contents.
+@@ -414,20 +648,17 @@ class RuleVisitor(NodeVisitor):
+                               ascii='A' in flags)
+ 
+     def visit_spaceless_literal(self, spaceless_literal, visited_children):
+-        """Turn a string literal into a ``Literal`` that recognizes it."""
+-        literal_value = evaluate_string(spaceless_literal.text)
+-        if self._last_literal_node_and_type:
+-            last_node, last_type = self._last_literal_node_and_type
+-            if last_type != type(literal_value):
+-                raise BadGrammar(dedent(f"""\
+-                    Found {last_node.text} ({last_type}) and {spaceless_literal.text} ({type(literal_value)}) string literals.
+-                    All strings in a single grammar must be of the same type.
+-                """)
+-                )
++        """Turn a string literal into a ``Literal`` that recognizes it.
+ 
+-        self._last_literal_node_and_type = spaceless_literal, type(literal_value)
++        The literal is built by this grammar, which owns the grammar-wide
++        registry that keeps all strings in a single grammar the same type.
+ 
+-        return Literal(literal_value)
++        """
++        if self.grammar is None:
++            # A detached visitor still constructs literals through the grammar,
++            # so spin up a blank one for registry purposes:
++            self.grammar = Grammar('')
++        return self.grammar.make_literal(spaceless_literal.text)
+ 
+     def visit_literal(self, node, literal):
+         """Pick just the literal out of a literal-and-junk combo."""
+@@ -493,14 +724,17 @@ class TokenRuleVisitor(RuleVisitor):
+ 
+     def visit_spaceless_literal(self, spaceless_literal, visited_children):
+         """Turn a string literal into a ``TokenMatcher`` that matches
+-        ``Token`` objects by their ``type`` attributes."""
+-        return TokenMatcher(evaluate_string(spaceless_literal.text))
++        ``Token`` objects by their ``type`` attributes.
++
++        The token type ledger belongs to the grammar being built, so it is
++        the grammar that constructs the matcher and records the spelling.
++
++        """
++        return self.grammar.make_token_matcher(spaceless_literal.text)
+ 
+     def visit_regex(self, node, regex):
+         tilde, literal, flags, _ = regex
+-        raise BadGrammar('Regexes do not make sense in TokenGrammars, since '
+-                         'TokenGrammars operate on pre-lexed tokens rather '
+-                         'than characters.')
++        self.grammar.check_token_regex_support()
+ 
+ 
+ # Bootstrap to level 1...
+diff --git a/parsimonious/nodes.py b/parsimonious/nodes.py
+index 7839097..46d679f 100644
+--- a/parsimonious/nodes.py
++++ b/parsimonious/nodes.py
+@@ -7,7 +7,7 @@ are public.
+ """
+ # TODO: If this is slow, think about using cElementTree or something.
+ from inspect import isfunction
+-from sys import version_info, exc_info
++from sys import exc_info
+ 
+ from parsimonious.exceptions import VisitationError, UndefinedLabel
+ 
+@@ -131,25 +131,14 @@ class RegexNode(Node):
+ 
+ class RuleDecoratorMeta(type):
+     def __new__(metaclass, name, bases, namespace):
+-        def unvisit(name):
+-            """Remove any leading "visit_" from a method name."""
+-            return name[6:] if name.startswith('visit_') else name
+-
+         methods = [v for k, v in namespace.items() if
+                    hasattr(v, '_rule') and isfunction(v)]
+         if methods:
+             from parsimonious.grammar import Grammar  # circular import dodge
+ 
+-            methods.sort(key=(lambda x: x.func_code.co_firstlineno)
+-                             if version_info[0] < 3 else
+-                             (lambda x: x.__code__.co_firstlineno))
+-            # Possible enhancement: once we get the Grammar extensibility story
+-            # solidified, we can have @rules *add* to the default grammar
+-            # rather than pave over it.
+-            namespace['grammar'] = Grammar(
+-                '\n'.join('{name} = {expr}'.format(name=unvisit(m.__name__),
+-                                                   expr=m._rule)
+-                          for m in methods))
++            # The grammar assembles itself from the rule syntaxes registered
++            # with it:
++            namespace['grammar'] = Grammar.from_rule_methods(methods)
+         return super(RuleDecoratorMeta,
+                      metaclass).__new__(metaclass, name, bases, namespace)
+ 
+@@ -320,6 +309,6 @@ def rule(rule_string):
+ 
+     """
+     def decorator(method):
+-        method._rule = rule_string  # XXX: Maybe register them on a class var instead so we can just override a @rule'd visitor method on a subclass without blowing away the rule string that comes with it.
+-        return method
++        from parsimonious.grammar import Grammar  # circular import dodge
++        return Grammar.tag_rule_method(method, rule_string)
+     return decorator
+diff --git a/parsimonious/utils.py b/parsimonious/utils.py
+index 721da69..5590703 100644
+--- a/parsimonious/utils.py
++++ b/parsimonious/utils.py
+@@ -1,7 +1,5 @@
+ """General tools which don't depend on other parts of Parsimonious"""
+ 
+-import ast
+-
+ 
+ class StrAndRepr(object):
+     """Mix-in which gives the class the same __repr__ and __str__."""
+@@ -10,17 +8,6 @@ class StrAndRepr(object):
+         return self.__str__()
+ 
+ 
+-def evaluate_string(string):
+-    """Piggyback on Python's string support so we can have backslash escaping
+-    and niceties like \n, \t, etc.
+-
+-    This also supports:
+-    1. b"strings", allowing grammars to parse bytestrings, in addition to str.
+-    2. r"strings" to simplify regexes.
+-    """
+-    return ast.literal_eval(string)
+-
+-
+ class Token(StrAndRepr):
+     """A class to represent tokens, for use with TokenGrammars
+ 

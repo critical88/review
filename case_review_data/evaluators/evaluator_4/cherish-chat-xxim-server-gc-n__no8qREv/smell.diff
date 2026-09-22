@@ -1,0 +1,701 @@
+diff --git a/app/gateway/internal/handler/connectionhandler/connectionhandler.go b/app/gateway/internal/handler/connectionhandler/connectionhandler.go
+index 9824ca7..2a5d41b 100644
+--- a/app/gateway/internal/handler/connectionhandler/connectionhandler.go
++++ b/app/gateway/internal/handler/connectionhandler/connectionhandler.go
+@@ -34,7 +34,7 @@ func (h *ConnectionHandler) VerifyConnection(ctx context.Context, connection *ga
+ 			Body:      utils.Proto.Marshal(response),
+ 		}), err
+ 	}
+-	response, err = gatewayservicelogic.NewVerifyConnectionLogic(ctx, h.svcCtx).VerifyConnection_(connection, request)
++	response, err = gatewayservicelogic.ConnectionLogic.VerifyConnection(ctx, connection, request)
+ 	if err != nil {
+ 		responseHeader := i18n.NewServerError(h.svcCtx.Config.Mode, err)
+ 		response.SetHeader(responseHeader)
+@@ -45,7 +45,6 @@ func (h *ConnectionHandler) VerifyConnection(ctx context.Context, connection *ga
+ 			Path:      apiRequest.Path,
+ 		}), err
+ 	}
+-	gatewayservicelogic.ConnectionLogic.OnVerified(connection)
+ 	responseHeader := i18n.NewOkHeader()
+ 	return pb.ResponseCode_SUCCESS, types.MarshalWriteData(&pb.GatewayApiResponse{
+ 		Header:    responseHeader,
+@@ -69,7 +68,7 @@ func (h *ConnectionHandler) AuthenticationConnection(ctx context.Context, connec
+ 			Body:      utils.Proto.Marshal(response),
+ 		}), err
+ 	}
+-	response, err = gatewayservicelogic.NewAuthenticationConnectionLogic(ctx, h.svcCtx).AuthenticationConnection_(connection, request)
++	response, err = gatewayservicelogic.ConnectionLogic.AuthenticationConnection(ctx, connection, request)
+ 	if err != nil {
+ 		responseHeader := i18n.NewServerError(h.svcCtx.Config.Mode, err)
+ 		response.SetHeader(responseHeader)
+@@ -80,7 +79,6 @@ func (h *ConnectionHandler) AuthenticationConnection(ctx context.Context, connec
+ 			Path:      apiRequest.Path,
+ 		}), err
+ 	}
+-	gatewayservicelogic.ConnectionLogic.OnLogin(connection)
+ 	responseHeader := i18n.NewOkHeader()
+ 	return pb.ResponseCode_SUCCESS, types.MarshalWriteData(&pb.GatewayApiResponse{
+ 		Header:    responseHeader,
+diff --git a/app/gateway/internal/handler/offerhandler.go b/app/gateway/internal/handler/offerhandler.go
+index 547c79a..7e3cf6e 100644
+--- a/app/gateway/internal/handler/offerhandler.go
++++ b/app/gateway/internal/handler/offerhandler.go
+@@ -71,7 +71,7 @@ func (h *OfferHandler) Offer(in *webrtc.SessionDescription) (*webrtc.SessionDesc
+ 		id := d.ID()
+ 		logx.Infof("New DataChannel %s %d", d.Label(), id)
+ 
+-		connection := gatewayservicelogic.NewP2pConnection(ctx, header, d)
++		connection := gatewayservicelogic.ConnectionLogic.NewP2pConnection(ctx, header, d)
+ 		// Register channel opening handling
+ 		d.OnOpen(func() {
+ 			logx.Infof("Data channel '%s'-'%d' open. Random messages will now be sent to any connected DataChannels every 5 seconds", d.Label(), id)
+diff --git a/app/gateway/internal/handler/wshandler.go b/app/gateway/internal/handler/wshandler.go
+index 5a5640c..6ccb647 100644
+--- a/app/gateway/internal/handler/wshandler.go
++++ b/app/gateway/internal/handler/wshandler.go
+@@ -84,7 +84,7 @@ func (h *WsHandler) Upgrade(ginCtx *gin.Context) {
+ 	defer c.Close(websocket.StatusInternalError, "")
+ 
+ 	ctx, cancelFunc := context.WithCancel(r.Context())
+-	connection := gatewayservicelogic.NewWebsocketConnect(ctx, header, c)
++	connection := gatewayservicelogic.ConnectionLogic.NewWebsocketConnection(ctx, header, c)
+ 	defer func() {
+ 		gatewayservicelogic.ConnectionLogic.OnDisconnect(connection)
+ 	}()
+diff --git a/app/gateway/internal/logic/gatewayservice/authenticationConnectionLogic.go b/app/gateway/internal/logic/gatewayservice/authenticationConnectionLogic.go
+index 4d57368..bf49b31 100644
+--- a/app/gateway/internal/logic/gatewayservice/authenticationConnectionLogic.go
++++ b/app/gateway/internal/logic/gatewayservice/authenticationConnectionLogic.go
+@@ -2,7 +2,6 @@ package gatewayservicelogic
+ 
+ import (
+ 	"context"
+-	"github.com/cherish-chat/xxim-server/common/i18n"
+ 
+ 	"github.com/cherish-chat/xxim-server/app/gateway/internal/svc"
+ 	"github.com/cherish-chat/xxim-server/common/pb"
+@@ -30,67 +29,3 @@ func (l *AuthenticationConnectionLogic) AuthenticationConnection(in *pb.Authenti
+ 
+ 	return &pb.AuthenticationConnectionResp{}, nil
+ }
+-
+-func (l *AuthenticationConnectionLogic) AuthenticationConnection_(connection *Connection, in *pb.AuthenticationConnectionReq) (*pb.AuthenticationConnectionResp, error) {
+-	if in.UserId == "" || in.Token == "" {
+-		//取消验证
+-		oldUserId := connection.GetHeader().UserId
+-		connection.headerLock.Lock()
+-		connection.header = &pb.RequestHeader{
+-			AppId:       connection.header.AppId,
+-			UserId:      "",
+-			ClientIp:    connection.header.ClientIp,
+-			InstallId:   connection.header.InstallId,
+-			Platform:    connection.header.Platform,
+-			DeviceModel: connection.header.DeviceModel,
+-			OsVersion:   connection.header.OsVersion,
+-			AppVersion:  connection.header.AppVersion,
+-			Extra:       connection.header.Extra,
+-		}
+-		connection.headerLock.Unlock()
+-		if oldUserId != "" {
+-			_, _ = l.svcCtx.CallbackService.UserAfterOffline(l.ctx, &pb.UserAfterOfflineReq{
+-				UserId: oldUserId,
+-			})
+-		}
+-		return &pb.AuthenticationConnectionResp{
+-			Header:  i18n.NewOkHeader(),
+-			Success: true,
+-		}, nil
+-	}
+-	userBeforeConnectResp, err := l.svcCtx.CallbackService.UserBeforeConnect(l.ctx, &pb.UserBeforeConnectReq{
+-		Header: connection.GetHeader(),
+-		UserId: in.UserId,
+-		Token:  in.Token,
+-	})
+-	if err != nil {
+-		l.Errorf("UserBeforeConnect err: %v", err)
+-		return &pb.AuthenticationConnectionResp{
+-			Header:  i18n.NewAuthError(pb.AuthErrorTypeInvalid, i18n.ServerError),
+-			Success: false,
+-		}, nil
+-	}
+-	if !userBeforeConnectResp.Success {
+-		return &pb.AuthenticationConnectionResp{
+-			Header: userBeforeConnectResp.Header,
+-		}, nil
+-	}
+-	// 验证通过
+-	connection.headerLock.Lock()
+-	connection.header = &pb.RequestHeader{
+-		AppId:       connection.header.AppId,
+-		UserId:      userBeforeConnectResp.UserId,
+-		ClientIp:    connection.header.ClientIp,
+-		InstallId:   connection.header.InstallId,
+-		Platform:    connection.header.Platform,
+-		DeviceModel: connection.header.DeviceModel,
+-		OsVersion:   connection.header.OsVersion,
+-		AppVersion:  connection.header.AppVersion,
+-		Extra:       connection.header.Extra,
+-	}
+-	connection.headerLock.Unlock()
+-	return &pb.AuthenticationConnectionResp{
+-		Header:  i18n.NewOkHeader(),
+-		Success: true,
+-	}, nil
+-}
+diff --git a/app/gateway/internal/logic/gatewayservice/gatewayKeepAliveLogic.go b/app/gateway/internal/logic/gatewayservice/gatewayKeepAliveLogic.go
+index b1c4b6c..1dc4811 100644
+--- a/app/gateway/internal/logic/gatewayservice/gatewayKeepAliveLogic.go
++++ b/app/gateway/internal/logic/gatewayservice/gatewayKeepAliveLogic.go
+@@ -2,8 +2,6 @@ package gatewayservicelogic
+ 
+ import (
+ 	"context"
+-	"sync"
+-	"time"
+ 
+ 	"github.com/cherish-chat/xxim-server/app/gateway/internal/svc"
+ 	"github.com/cherish-chat/xxim-server/common/pb"
+@@ -23,46 +21,16 @@ func NewGatewayKeepAliveLogic(ctx context.Context, svcCtx *svc.ServiceContext) *
+ 		svcCtx: svcCtx,
+ 		Logger: logx.WithContext(ctx),
+ 	}
+-	if userKeepAliveMap == nil {
+-		userKeepAliveMap = new(sync.Map)
+-		go l.checkTimer()
+-	}
+ 	return l
+ }
+ 
++// GatewayKeepAlive 保活
++// 二次开发人员可以在此处修改保活的逻辑
+ func (l *GatewayKeepAliveLogic) GatewayKeepAlive(in *pb.GatewayKeepAliveReq) (*pb.GatewayKeepAliveResp, error) {
+-	_, err := l.svcCtx.CallbackService.UserAfterKeepAlive(l.ctx, &pb.UserAfterKeepAliveReq{
+-		Header: in.Header,
+-	})
++	err := ConnectionLogic.OnKeepAlive(l.ctx, in)
+ 	if err != nil {
+ 		l.Errorf("UserAfterKeepAlive error: %v", err)
+ 	}
+-	if _, ok := userKeepAliveMap.Load(in.Header.UserId); !ok {
+-		_, _ = l.svcCtx.CallbackService.UserAfterOnline(l.ctx, &pb.UserAfterOnlineReq{Header: in.Header})
+-	}
+-	userKeepAliveMap.Store(in.Header.UserId, time.Now())
+ 
+ 	return &pb.GatewayKeepAliveResp{}, nil
+ }
+-
+-var userKeepAliveMap *sync.Map // key: userId, value: time.Time
+-
+-func (l *GatewayKeepAliveLogic) checkTimer() {
+-	ticker := time.NewTicker(time.Second * time.Duration(l.svcCtx.Config.Websocket.OfflineDeterminationSecond))
+-	for {
+-		select {
+-		case <-ticker.C:
+-			now := time.Now()
+-			userKeepAliveMap.Range(func(key, value interface{}) bool {
+-				userId := key.(string)
+-				lastTime := value.(time.Time)
+-				if now.Sub(lastTime).Seconds() > float64(l.svcCtx.Config.Websocket.KeepAliveSecond) {
+-					// 用户下线
+-					_, _ = l.svcCtx.CallbackService.UserAfterOffline(l.ctx, &pb.UserAfterOfflineReq{UserId: userId})
+-					userKeepAliveMap.Delete(userId)
+-				}
+-				return true
+-			})
+-		}
+-	}
+-}
+diff --git a/app/gateway/internal/logic/gatewayservice/gatewayKickWsLogic.go b/app/gateway/internal/logic/gatewayservice/gatewayKickWsLogic.go
+index 9f740dd..e8a63e5 100644
+--- a/app/gateway/internal/logic/gatewayservice/gatewayKickWsLogic.go
++++ b/app/gateway/internal/logic/gatewayservice/gatewayKickWsLogic.go
+@@ -2,6 +2,7 @@ package gatewayservicelogic
+ 
+ import (
+ 	"context"
++
+ 	"github.com/cherish-chat/xxim-server/app/gateway/internal/svc"
+ 	"github.com/cherish-chat/xxim-server/common/pb"
+ 
+@@ -27,10 +28,7 @@ func NewGatewayKickWsLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Gat
+ // 比如踢出连接之前，先给用户发送一条消息
+ func (l *GatewayKickWsLogic) GatewayKickWs(in *pb.GatewayKickWsReq) (*pb.GatewayKickWsResp, error) {
+ 	if len(in.GetFilter().GetUserIds()) > 0 {
+-		connections := ConnectionLogic.GetConnectionsByUserIds(in.GetFilter().GetUserIds())
+-		for _, connection := range connections {
+-			connection.Connection.CloseConnection(in.CloseCode, in.CloseReason)
+-		}
++		ConnectionLogic.KickConnections(in.GetFilter().GetUserIds(), in.CloseCode, in.CloseReason)
+ 	}
+ 	return &pb.GatewayKickWsResp{}, nil
+ }
+diff --git a/app/gateway/internal/logic/gatewayservice/gatewayWriteDataToWsLogic.go b/app/gateway/internal/logic/gatewayservice/gatewayWriteDataToWsLogic.go
+index 0902c39..ced5eaf 100644
+--- a/app/gateway/internal/logic/gatewayservice/gatewayWriteDataToWsLogic.go
++++ b/app/gateway/internal/logic/gatewayservice/gatewayWriteDataToWsLogic.go
+@@ -27,17 +27,9 @@ func NewGatewayWriteDataToWsLogic(ctx context.Context, svcCtx *svc.ServiceContex
+ // 二次开发人员不建议修改此处逻辑
+ func (l *GatewayWriteDataToWsLogic) GatewayWriteDataToWs(in *pb.GatewayWriteDataToWsReq) (*pb.GatewayWriteDataToWsResp, error) {
+ 	data, _ := proto.Marshal(in.Data)
+-	successConnections := make([]*pb.LongConnection, 0)
++	var successConnections []*pb.LongConnection
+ 	if len(in.GetFilter().GetUserIds()) > 0 {
+-		connections := ConnectionLogic.GetConnectionsByUserIds(in.GetFilter().GetUserIds())
+-		for _, connection := range connections {
+-			err := connection.SendMessage(l.ctx, data)
+-			if err != nil {
+-				l.Errorf("GatewayWriteDataToWs error: %v", err)
+-			} else {
+-				successConnections = append(successConnections, connection.ToPb())
+-			}
+-		}
++		successConnections = ConnectionLogic.WriteDataToConnections(l.ctx, in.GetFilter().GetUserIds(), data)
+ 	}
+ 	return &pb.GatewayWriteDataToWsResp{
+ 		SuccessConnections: successConnections,
+diff --git a/app/gateway/internal/logic/gatewayservice/verifyConnectionLogic.go b/app/gateway/internal/logic/gatewayservice/verifyConnectionLogic.go
+index 7f92de8..4df124e 100644
+--- a/app/gateway/internal/logic/gatewayservice/verifyConnectionLogic.go
++++ b/app/gateway/internal/logic/gatewayservice/verifyConnectionLogic.go
+@@ -2,10 +2,6 @@ package gatewayservicelogic
+ 
+ import (
+ 	"context"
+-	"crypto/elliptic"
+-	"errors"
+-	"github.com/cherish-chat/xxim-server/common/i18n"
+-	"github.com/cherish-chat/xxim-server/common/utils"
+ 
+ 	"github.com/cherish-chat/xxim-server/app/gateway/internal/svc"
+ 	"github.com/cherish-chat/xxim-server/common/pb"
+@@ -32,31 +28,3 @@ func (l *VerifyConnectionLogic) VerifyConnection(in *pb.VerifyConnectionReq) (*p
+ 
+ 	return &pb.VerifyConnectionResp{}, nil
+ }
+-
+-func (l *VerifyConnectionLogic) VerifyConnection_(connection *Connection, in *pb.VerifyConnectionReq) (*pb.VerifyConnectionResp, error) {
+-	ecdh := utils.NewECDH(elliptic.P256())
+-	publicKey, ok := ecdh.Unmarshal(in.PublicKey)
+-	if !ok {
+-		return &pb.VerifyConnectionResp{}, errors.New(i18n.PublicKeyError)
+-	}
+-	connection.PublicKeyLock.Lock()
+-	connection.ClientPublicKey = publicKey
+-	connection.PublicKeyLock.Unlock()
+-	oldHeader := connection.GetHeader()
+-	connection.headerLock.Lock()
+-	connection.header = &pb.RequestHeader{
+-		AppId:       in.Header.AppId,
+-		UserId:      "",
+-		ClientIp:    oldHeader.ClientIp,
+-		InstallId:   in.Header.InstallId,
+-		Platform:    in.Header.Platform,
+-		DeviceModel: in.Header.DeviceModel,
+-		OsVersion:   in.Header.OsVersion,
+-		AppVersion:  in.Header.AppVersion,
+-		Extra:       in.Header.Extra,
+-	}
+-	connection.headerLock.Unlock()
+-	return &pb.VerifyConnectionResp{
+-		PublicKey: ecdh.Marshal(connection.ServerPublicKey),
+-	}, nil
+-}
+diff --git a/app/gateway/internal/logic/gatewayservice/x_connection.go b/app/gateway/internal/logic/gatewayservice/x_connection.go
+index b939656..f79cc2a 100644
+--- a/app/gateway/internal/logic/gatewayservice/x_connection.go
++++ b/app/gateway/internal/logic/gatewayservice/x_connection.go
+@@ -4,10 +4,16 @@ import (
+ 	"context"
+ 	"crypto"
+ 	"crypto/elliptic"
++	"crypto/rand"
++	"errors"
+ 	"github.com/cherish-chat/xxim-server/app/gateway/internal/svc"
+ 	"github.com/cherish-chat/xxim-server/app/gateway/internal/types"
++	"github.com/cherish-chat/xxim-server/common/i18n"
+ 	"github.com/cherish-chat/xxim-server/common/pb"
+ 	"github.com/cherish-chat/xxim-server/common/utils"
++	"github.com/pion/webrtc/v2"
++	"github.com/zeromicro/go-zero/core/logx"
++	"nhooyr.io/websocket"
+ 	"sync"
+ 	"time"
+ )
+@@ -32,6 +38,15 @@ type xConnectionLogic struct {
+ 
+ 	// 设置好userId后的连接池 Map锁
+ 	userConnectionsMapLock sync.RWMutex
++
++	// 连接密钥协商
++	ecdh utils.ECDH
++
++	// 保活记录 key: userId value: time.Time
++	userKeepAliveMap *sync.Map
++
++	// 保活记录检测协程
++	keepAliveCheckOnce sync.Once
+ }
+ 
+ type installConnectionMap struct {
+@@ -121,6 +136,8 @@ func InitConnectionLogic(svcCtx *svc.ServiceContext) {
+ 		verifiedConnectionsLock: sync.RWMutex{},
+ 		userConnectionsMap:      make(map[string]*installConnectionMap),
+ 		userConnectionsMapLock:  sync.RWMutex{},
++		ecdh:                    utils.NewECDH(elliptic.P256()),
++		userKeepAliveMap:        new(sync.Map),
+ 	}
+ 	go ConnectionLogic.loopCheck()
+ }
+@@ -157,27 +174,172 @@ func (l *xConnectionLogic) GetAllConnections() []*Connection {
+ 	return connections
+ }
+ 
+-func (l *xConnectionLogic) OnConnect(conn *Connection) {
+-	l.connectionsLock.Lock()
+-	l.connections = append(l.connections, conn)
+-	l.connectionsLock.Unlock()
++// NewWebsocketConnection 创建websocket连接
++func (l *xConnectionLogic) NewWebsocketConnection(
++	ctx context.Context,
++	header *pb.RequestHeader,
++	conn *websocket.Conn,
++) *Connection {
++	privateKey, publicKey, _ := l.ecdh.GenerateKey(rand.Reader)
++
++	connection := &Connection{
++		ctx:              ctx,
++		header:           header,
++		headerLock:       sync.RWMutex{},
++		ServerPrivateKey: privateKey,
++		ServerPublicKey:  publicKey,
++		ClientPublicKey:  nil,
++		PublicKeyLock:    sync.RWMutex{},
++		Connection:       &websocketWrapper{conn: conn},
++		ConnectedTime:    time.Now(),
++	}
++
++	return connection
++}
++
++// NewP2pConnection 创建p2p连接
++func (l *xConnectionLogic) NewP2pConnection(
++	ctx context.Context,
++	header *pb.RequestHeader,
++	dataChannel *webrtc.DataChannel,
++) *Connection {
++	privateKey, publicKey, _ := l.ecdh.GenerateKey(rand.Reader)
++
++	return &Connection{
++		ctx:              ctx,
++		header:           header,
++		headerLock:       sync.RWMutex{},
++		ServerPrivateKey: privateKey,
++		ServerPublicKey:  publicKey,
++		ClientPublicKey:  nil,
++		PublicKeyLock:    sync.RWMutex{},
++		Connection: &p2pWrapper{
++			dataChannel: dataChannel,
++		},
++		ConnectedTime: time.Now(),
++	}
+ }
+ 
+-func (l *xConnectionLogic) OnVerified(conn *Connection) {
++// VerifyConnection 传输协议验证
++// 验证通过后 连接从暂存区移入已验证连接池
++func (l *xConnectionLogic) VerifyConnection(ctx context.Context, connection *Connection, in *pb.VerifyConnectionReq) (*pb.VerifyConnectionResp, error) {
++	publicKey, ok := l.ecdh.Unmarshal(in.PublicKey)
++	if !ok {
++		return &pb.VerifyConnectionResp{}, errors.New(i18n.PublicKeyError)
++	}
++	connection.PublicKeyLock.Lock()
++	connection.ClientPublicKey = publicKey
++	connection.PublicKeyLock.Unlock()
++	oldHeader := connection.GetHeader()
++	connection.headerLock.Lock()
++	connection.header = &pb.RequestHeader{
++		AppId:       in.Header.AppId,
++		UserId:      "",
++		ClientIp:    oldHeader.ClientIp,
++		InstallId:   in.Header.InstallId,
++		Platform:    in.Header.Platform,
++		DeviceModel: in.Header.DeviceModel,
++		OsVersion:   in.Header.OsVersion,
++		AppVersion:  in.Header.AppVersion,
++		Extra:       in.Header.Extra,
++	}
++	connection.headerLock.Unlock()
++	// 移入已验证连接池
+ 	l.verifiedConnectionsLock.Lock()
+-	l.verifiedConnections = append(l.verifiedConnections, conn)
++	l.verifiedConnections = append(l.verifiedConnections, connection)
+ 	l.verifiedConnectionsLock.Unlock()
+ 	// 删除未验证的连接
+ 	l.connectionsLock.Lock()
+-	for i, connection := range l.connections {
+-		if connection == conn {
++	for i, c := range l.connections {
++		if c == connection {
+ 			l.connections = append(l.connections[:i], l.connections[i+1:]...)
+ 			break
+ 		}
+ 	}
+ 	l.connectionsLock.Unlock()
++	return &pb.VerifyConnectionResp{
++		PublicKey: l.ecdh.Marshal(connection.ServerPublicKey),
++	}, nil
++}
++
++// AuthenticationConnection 权限认证
++// 认证完成后 连接设置为已登录
++func (l *xConnectionLogic) AuthenticationConnection(ctx context.Context, connection *Connection, in *pb.AuthenticationConnectionReq) (*pb.AuthenticationConnectionResp, error) {
++	if in.UserId == "" || in.Token == "" {
++		//取消验证
++		oldUserId := connection.GetHeader().UserId
++		connection.headerLock.Lock()
++		connection.header = &pb.RequestHeader{
++			AppId:       connection.header.AppId,
++			UserId:      "",
++			ClientIp:    connection.header.ClientIp,
++			InstallId:   connection.header.InstallId,
++			Platform:    connection.header.Platform,
++			DeviceModel: connection.header.DeviceModel,
++			OsVersion:   connection.header.OsVersion,
++			AppVersion:  connection.header.AppVersion,
++			Extra:       connection.header.Extra,
++		}
++		connection.headerLock.Unlock()
++		if oldUserId != "" {
++			_, _ = l.svcCtx.CallbackService.UserAfterOffline(ctx, &pb.UserAfterOfflineReq{
++				UserId: oldUserId,
++			})
++		}
++		l.OnLogin(connection)
++		return &pb.AuthenticationConnectionResp{
++			Header:  i18n.NewOkHeader(),
++			Success: true,
++		}, nil
++	}
++	userBeforeConnectResp, err := l.svcCtx.CallbackService.UserBeforeConnect(ctx, &pb.UserBeforeConnectReq{
++		Header: connection.GetHeader(),
++		UserId: in.UserId,
++		Token:  in.Token,
++	})
++	if err != nil {
++		logx.WithContext(ctx).Errorf("UserBeforeConnect err: %v", err)
++		l.OnLogin(connection)
++		return &pb.AuthenticationConnectionResp{
++			Header:  i18n.NewAuthError(pb.AuthErrorTypeInvalid, i18n.ServerError),
++			Success: false,
++		}, nil
++	}
++	if !userBeforeConnectResp.Success {
++		l.OnLogin(connection)
++		return &pb.AuthenticationConnectionResp{
++			Header: userBeforeConnectResp.Header,
++		}, nil
++	}
++	// 验证通过
++	connection.headerLock.Lock()
++	connection.header = &pb.RequestHeader{
++		AppId:       connection.header.AppId,
++		UserId:      userBeforeConnectResp.UserId,
++		ClientIp:    connection.header.ClientIp,
++		InstallId:   connection.header.InstallId,
++		Platform:    connection.header.Platform,
++		DeviceModel: connection.header.DeviceModel,
++		OsVersion:   connection.header.OsVersion,
++		AppVersion:  connection.header.AppVersion,
++		Extra:       connection.header.Extra,
++	}
++	connection.headerLock.Unlock()
++	l.OnLogin(connection)
++	return &pb.AuthenticationConnectionResp{
++		Header:  i18n.NewOkHeader(),
++		Success: true,
++	}, nil
++}
++
++// OnConnect 连接建立 加入连接暂存区
++func (l *xConnectionLogic) OnConnect(conn *Connection) {
++	l.connectionsLock.Lock()
++	l.connections = append(l.connections, conn)
++	l.connectionsLock.Unlock()
+ }
+ 
++// OnLogin 登录连接 加入已登录连接池
+ func (l *xConnectionLogic) OnLogin(conn *Connection) {
+ 	l.userConnectionsMapLock.Lock()
+ 	header := conn.GetHeader()
+@@ -211,6 +373,7 @@ func (l *xConnectionLogic) OnLogin(conn *Connection) {
+ 	_, _ = l.svcCtx.CallbackService.UserAfterOnline(conn.ctx, &pb.UserAfterOnlineReq{Header: conn.GetHeader()})
+ }
+ 
++// OnDisconnect 连接断开 清理连接池
+ func (l *xConnectionLogic) OnDisconnect(conn *Connection) {
+ 	header := conn.GetHeader()
+ 	if header.UserId != "" {
+@@ -251,6 +414,65 @@ func (l *xConnectionLogic) OnDisconnect(conn *Connection) {
+ 	l.userConnectionsMapLock.Unlock()
+ }
+ 
++// OnKeepAlive 保活 更新保活记录 超时未保活的用户下线
++func (l *xConnectionLogic) OnKeepAlive(ctx context.Context, in *pb.GatewayKeepAliveReq) error {
++	l.keepAliveCheckOnce.Do(func() {
++		go l.checkKeepAliveTimer(ctx)
++	})
++	_, err := l.svcCtx.CallbackService.UserAfterKeepAlive(ctx, &pb.UserAfterKeepAliveReq{
++		Header: in.Header,
++	})
++	if _, ok := l.userKeepAliveMap.Load(in.Header.UserId); !ok {
++		_, _ = l.svcCtx.CallbackService.UserAfterOnline(ctx, &pb.UserAfterOnlineReq{Header: in.Header})
++	}
++	l.userKeepAliveMap.Store(in.Header.UserId, time.Now())
++	return err
++}
++
++// checkKeepAliveTimer 定期检测保活记录 超过保活时间的用户下线
++func (l *xConnectionLogic) checkKeepAliveTimer(ctx context.Context) {
++	ticker := time.NewTicker(time.Second * time.Duration(l.svcCtx.Config.Websocket.OfflineDeterminationSecond))
++	for {
++		select {
++		case <-ticker.C:
++			now := time.Now()
++			l.userKeepAliveMap.Range(func(key, value interface{}) bool {
++				userId := key.(string)
++				lastTime := value.(time.Time)
++				if now.Sub(lastTime).Seconds() > float64(l.svcCtx.Config.Websocket.KeepAliveSecond) {
++					// 用户下线
++					_, _ = l.svcCtx.CallbackService.UserAfterOffline(ctx, &pb.UserAfterOfflineReq{UserId: userId})
++					l.userKeepAliveMap.Delete(userId)
++				}
++				return true
++			})
++		}
++	}
++}
++
++// WriteDataToConnections 向用户的连接写入数据 返回写入成功的连接
++func (l *xConnectionLogic) WriteDataToConnections(ctx context.Context, userIds []string, data []byte) []*pb.LongConnection {
++	var successConnections []*pb.LongConnection
++	connections := l.GetConnectionsByUserIds(userIds)
++	for _, connection := range connections {
++		err := connection.SendMessage(ctx, data)
++		if err != nil {
++			logx.WithContext(ctx).Errorf("GatewayWriteDataToWs error: %v", err)
++		} else {
++			successConnections = append(successConnections, connection.ToPb())
++		}
++	}
++	return successConnections
++}
++
++// KickConnections 踢出用户的连接
++func (l *xConnectionLogic) KickConnections(userIds []string, closeCode pb.WebsocketCustomCloseCode, closeReason string) {
++	connections := l.GetConnectionsByUserIds(userIds)
++	for _, connection := range connections {
++		connection.Connection.CloseConnection(closeCode, closeReason)
++	}
++}
++
+ func (l *xConnectionLogic) loopCheck() {
+ 	// 定期检测
+ 	ticker := time.NewTicker(time.Minute)
+diff --git a/app/gateway/internal/logic/gatewayservice/x_connection_p2p.go b/app/gateway/internal/logic/gatewayservice/x_connection_p2p.go
+index b837e6d..18cee78 100644
+--- a/app/gateway/internal/logic/gatewayservice/x_connection_p2p.go
++++ b/app/gateway/internal/logic/gatewayservice/x_connection_p2p.go
+@@ -2,14 +2,11 @@ package gatewayservicelogic
+ 
+ import (
+ 	"context"
+-	"crypto/elliptic"
+-	"crypto/rand"
+-	"github.com/cherish-chat/xxim-server/common/pb"
+-	"github.com/cherish-chat/xxim-server/common/utils"
++
+ 	"github.com/pion/webrtc/v2"
+ 	"github.com/zeromicro/go-zero/core/logx"
+-	"sync"
+-	"time"
++
++	"github.com/cherish-chat/xxim-server/common/pb"
+ )
+ 
+ type p2pWrapper struct {
+@@ -24,26 +21,3 @@ func (w *p2pWrapper) CloseConnection(code pb.WebsocketCustomCloseCode, reason st
+ 	logx.Infof("p2pWrapper CloseConnection code: %d, reason: %s", code, reason)
+ 	_ = w.dataChannel.Close()
+ }
+-
+-func NewP2pConnection(
+-	ctx context.Context,
+-	header *pb.RequestHeader,
+-	dataChannel *webrtc.DataChannel,
+-) *Connection {
+-	ecdh := utils.NewECDH(elliptic.P256())
+-	privateKey, publicKey, _ := ecdh.GenerateKey(rand.Reader)
+-
+-	return &Connection{
+-		ctx:              ctx,
+-		header:           header,
+-		headerLock:       sync.RWMutex{},
+-		ServerPrivateKey: privateKey,
+-		ServerPublicKey:  publicKey,
+-		ClientPublicKey:  nil,
+-		PublicKeyLock:    sync.RWMutex{},
+-		Connection: &p2pWrapper{
+-			dataChannel: dataChannel,
+-		},
+-		ConnectedTime: time.Now(),
+-	}
+-}
+diff --git a/app/gateway/internal/logic/gatewayservice/x_connection_ws.go b/app/gateway/internal/logic/gatewayservice/x_connection_ws.go
+index 5ea4f15..0e48e2d 100644
+--- a/app/gateway/internal/logic/gatewayservice/x_connection_ws.go
++++ b/app/gateway/internal/logic/gatewayservice/x_connection_ws.go
+@@ -2,13 +2,10 @@ package gatewayservicelogic
+ 
+ import (
+ 	"context"
+-	"crypto/elliptic"
+-	"crypto/rand"
+-	"github.com/cherish-chat/xxim-server/common/pb"
+-	"github.com/cherish-chat/xxim-server/common/utils"
++
+ 	"nhooyr.io/websocket"
+-	"sync"
+-	"time"
++
++	"github.com/cherish-chat/xxim-server/common/pb"
+ )
+ 
+ type websocketWrapper struct {
+@@ -22,27 +19,3 @@ func (w *websocketWrapper) SendMessage(ctx context.Context, message []byte) erro
+ func (w *websocketWrapper) CloseConnection(code pb.WebsocketCustomCloseCode, reason string) {
+ 	_ = w.conn.Close(websocket.StatusCode(code), reason)
+ }
+-
+-// NewWebsocketConnect 创建websocket连接
+-func NewWebsocketConnect(
+-	ctx context.Context,
+-	header *pb.RequestHeader,
+-	conn *websocket.Conn,
+-) *Connection {
+-	ecdh := utils.NewECDH(elliptic.P256())
+-	privateKey, publicKey, _ := ecdh.GenerateKey(rand.Reader)
+-
+-	connection := &Connection{
+-		ctx:              ctx,
+-		header:           header,
+-		headerLock:       sync.RWMutex{},
+-		ServerPrivateKey: privateKey,
+-		ServerPublicKey:  publicKey,
+-		ClientPublicKey:  nil,
+-		PublicKeyLock:    sync.RWMutex{},
+-		Connection:       &websocketWrapper{conn: conn},
+-		ConnectedTime:    time.Now(),
+-	}
+-
+-	return connection
+-}

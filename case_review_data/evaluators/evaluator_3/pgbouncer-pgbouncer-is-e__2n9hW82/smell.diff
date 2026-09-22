@@ -1,0 +1,592 @@
+diff --git a/include/bouncer.h b/include/bouncer.h
+index 88ea46e..430d704 100644
+--- a/include/bouncer.h
++++ b/include/bouncer.h
+@@ -182,6 +182,7 @@ extern int cf_sbuf_len;
+ #include "server.h"
+ #include "pooler.h"
+ #include "proto.h"
++#include "connops.h"
+ #include "objects.h"
+ #include "stats.h"
+ #include "janitor.h"
+diff --git a/include/client.h b/include/client.h
+index a5268e5..5b04081 100644
+--- a/include/client.h
++++ b/include/client.h
+@@ -18,6 +18,10 @@
+ 
+ bool client_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *pkt)  _MUSTCHECK;
+ bool set_pool(PgSocket *client, const char *dbname, const char *username) _MUSTCHECK;
++
++/* connection operations for client (frontend) connections */
++extern const struct ConnOps client_conn_ops;
++
+ bool handle_auth_query_response(PgSocket *client, PktHdr *pkt);
+ bool check_db_connection_count(PgSocket *client);
+ bool check_user_connection_count(PgSocket *client);
+diff --git a/include/connops.h b/include/connops.h
+new file mode 100644
+index 0000000..952e630
+--- /dev/null
++++ b/include/connops.h
+@@ -0,0 +1,113 @@
++/*
++ * PgBouncer - Lightweight connection pooler for PostgreSQL.
++ *
++ * Copyright (c) 2007-2009  Marko Kreen, Skype Technologies OÜ
++ *
++ * Permission to use, copy, modify, and/or distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY
++ * SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++/*
++ * Connection operations.
++ *
++ * Every kind of connection that PgBouncer manages on a PgSocket describes
++ * itself with a ConnOps table, in the same way an SBuf picks its SBufIO
++ * transport.  A kind registers its table when the socket is constructed
++ * (see construct_client()/construct_server() in objects.c), and the shared
++ * machinery - the stream buffer (sbuf.c) and the packet reassembly state
++ * machine (proto.c) - reaches the connection through the registered table
++ * instead of asking which side of the pool it belongs to.
++ *
++ * The table covers the full lifetime of a connection, so the same interface
++ * can also describe kinds that PgBouncer opens itself, such as the
++ * cancel-only connections to peering PgBouncers.  A kind that never
++ * exercises a capability simply leaves the slot NULL; a new kind does not
++ * have to invent stubs, and adding a capability later does not have to
++ * touch any of the call sites.
++ */
++
++/* fwd def */
++typedef struct ConnOps ConnOps;
++
++struct ConnOps {
++	/*
++	 * Stream entry point.  Everything that happens on the socket is
++	 * reported here by SBuf (SBUF_EV_*).
++	 */
++	bool (*sbuf_event)(SBuf *sbuf, SBufEvent evtype, struct MBuf *data);
++
++	/*
++	 * Deliver a packet that was fully buffered by the packet callback
++	 * state machine (sbuf.c SBUF_EV_PKT_CALLBACK handling in proto.c).
++	 */
++	bool (*handle_complete_packet)(PgSocket *sk, PktHdr *pkt);
++
++	/*
++	 * Tear the connection down from shared code that cannot tell which
++	 * kind of connection it is holding.
++	 */
++	void (*disconnect)(PgSocket *sk, const char *reason);
++
++	/*
++	 * An outgoing connection was established (SBUF_EV_CONNECT_OK on a
++	 * client-side socket requestor).  Accepted sockets never see this.
++	 */
++	bool (*connected)(PgSocket *sk);
++
++	/*
++	 * An outgoing connection could not be established
++	 * (SBUF_EV_CONNECT_FAILED).  Accepted sockets never see this.
++	 */
++	void (*connect_failed)(PgSocket *sk);
++
++	/*
++	 * TLS handshake finished (SBUF_EV_TLS_READY).
++	 */
++	bool (*tls_ready)(PgSocket *sk);
++
++	/*
++	 * The server answered our SSLRequest with a single character
++	 * while we wait for it (server-side of the SSL negotiation).
++	 */
++	bool (*sslchar)(PgSocket *sk, struct MBuf *data);
++
++	/*
++	 * Login phase protocol packet (startup exchange, authentication).
++	 */
++	bool (*login_packet)(PgSocket *sk, PktHdr *pkt);
++
++	/*
++	 * Work phase protocol packet (everything after login).
++	 */
++	bool (*work_packet)(PgSocket *sk, PktHdr *pkt);
++
++	/*
++	 * Answer an AuthenticationRequest (or the authentication-time
++	 * exchange) that arrives while logging in.
++	 */
++	bool (*authreq)(PgSocket *sk, PktHdr *pkt);
++
++	/*
++	 * Complete the login on our side of the connection.
++	 */
++	bool (*finish_login)(PgSocket *sk);
++
++	/*
++	 * Pick the pool a startup packet asks for.
++	 */
++	bool (*startup_pool)(PgSocket *sk, const char *dbname, const char *username);
++
++	/*
++	 * A cancellation request arrived for this bouncer to honor.
++	 */
++	void (*cancel_request)(PgSocket *req);
++};
+diff --git a/include/proto.h b/include/proto.h
+index 47df022..1caada9 100644
+--- a/include/proto.h
++++ b/include/proto.h
+@@ -43,13 +43,11 @@ bool get_header(struct MBuf *data, PktHdr *pkt) _MUSTCHECK;
+ const char *hdr2hex(const struct MBuf *data, char *buf, unsigned buflen);
+ 
+ /*
+- * Dispatches a fully buffered packet to the appropriate protocol handler. It
+- * is responsible for rewinding the packet body to the start before handling.
++ * Dispatches the SBUF_EV_PKT_CALLBACK event for a connection by reassembling
++ * the packet in sk->packet_cb_state and handing the complete packet to the
++ * connection kind's registered handle_complete_packet operation.
+  */
+-typedef bool (*pkt_handler_cb)(PgSocket *sk, PktHdr *pkt);
+-
+-/* shared SBUF_EV_PKT_CALLBACK handler for client and server sockets */
+-bool process_pkt_callback(PgSocket *sk, struct MBuf *data, pkt_handler_cb handle_complete_packet) _MUSTCHECK;
++bool process_pkt_callback(PgSocket *sk, struct MBuf *data) _MUSTCHECK;
+ 
+ bool send_pooler_error(PgSocket *client, bool send_ready, const char *sqlstate, bool level_fatal, const char *msg) /*_MUSTCHECK*/;
+ void log_server_error(const char *note, PktHdr *pkt);
+diff --git a/include/sbuf.h b/include/sbuf.h
+index fede6f5..ba57c58 100644
+--- a/include/sbuf.h
++++ b/include/sbuf.h
+@@ -47,13 +47,7 @@ struct tls;
+ /* fwd def */
+ typedef struct SBuf SBuf;
+ typedef struct SBufIO SBufIO;
+-
+-/* callback should return true if it used one of sbuf_prepare_* on sbuf,
+-   false if it used sbuf_pause(), sbuf_close() or simply wants to wait for
+-   next event loop (eg. too few data available). */
+-typedef bool (*sbuf_cb_t)(SBuf *sbuf,
+-			  SBufEvent evtype,
+-			  struct MBuf *mbuf);
++struct ConnOps;
+ 
+ struct SBufIO {
+ 	ssize_t (*sbufio_peek)(SBuf *sbuf, void *buf, size_t len);
+@@ -84,7 +78,8 @@ struct SBuf {
+ 	struct MBuf extra_packets;	/* extra packets that pgbouncer inserts into the packet stream */
+ 	bool extra_packet_queue_after;	/* if packets should be queued after the current packet that's being put on the queue */
+ 
+-	sbuf_cb_t proto_cb;	/* protocol callback */
++	/* connection kind that owns this stream (const ConnOps) */
++	const struct ConnOps *conn_ops;
+ 
+ 	SBuf *dst;		/* target SBuf for current packet */
+ 
+@@ -97,7 +92,7 @@ struct SBuf {
+ 
+ #define sbuf_socket(sbuf) ((sbuf)->sock)
+ 
+-void sbuf_init(SBuf *sbuf, sbuf_cb_t proto_fn);
++void sbuf_init(SBuf *sbuf, const struct ConnOps *conn_ops);
+ bool sbuf_accept(SBuf *sbuf, int read_sock, bool is_unix)  _MUSTCHECK;
+ bool sbuf_connect(SBuf *sbuf, const struct sockaddr *sa, socklen_t sa_len, time_t timeout_sec)  _MUSTCHECK;
+ 
+diff --git a/include/server.h b/include/server.h
+index 2b0ce8f..7f8dab2 100644
+--- a/include/server.h
++++ b/include/server.h
+@@ -18,6 +18,13 @@
+ 
+ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *pkt)  _MUSTCHECK;
+ void kill_pool_logins(PgPool *pool, const char *sqlstate, const char *msg);
++
++/* connection operations for server (backend) connections */
++extern const struct ConnOps server_conn_ops;
++
++/* connection operations for peer (cancel-only) server connections */
++extern const struct ConnOps peer_server_ops;
++
+ const char * kill_pool_logins_server_error(PgPool *pool, PktHdr *errpkt);
+ int connection_pool_mode(PgSocket *connection) _MUSTCHECK;
+ int probably_wrong_pool_pool_mode(PgPool *pool) _MUSTCHECK;
+diff --git a/src/client.c b/src/client.c
+index 737ba12..48c0b9b 100644
+--- a/src/client.c
++++ b/src/client.c
+@@ -1745,6 +1745,47 @@ static bool client_handle_complete_packet(PgSocket *client, PktHdr *pkt)
+ 	return handle_client_work(client, pkt);
+ }
+ 
++/*
++ * Client-side teardown for code that cannot know which connection kind it is
++ * holding.  Mirrors what the shared packet callback path used to do inline.
++ */
++static void client_conn_disconnect(PgSocket *sk, const char *reason)
++{
++	disconnect_client(sk, true, "%s", reason);
++}
++
++/*
++ * TLS handshake against the client is done, so the client stream can start
++ * expecting the startup packet.  Extracted from client_proto() so the
++ * connection operations table can also expose it.
++ */
++static bool client_tls_ready(PgSocket *client)
++{
++	sbuf_continue(&client->sbuf);
++	return true;
++}
++
++/*
++ * Connection operations for client (frontend) connections.  Clients are
++ * accepted, they never open outgoing connections and never request TLS from
++ * the other side, so those capabilities are not provided here.
++ */
++const struct ConnOps client_conn_ops = {
++	.sbuf_event = client_proto,
++	.handle_complete_packet = client_handle_complete_packet,
++	.disconnect = client_conn_disconnect,
++	.connected = NULL,
++	.connect_failed = NULL,
++	.tls_ready = client_tls_ready,
++	.sslchar = NULL,
++	.login_packet = handle_client_startup,
++	.work_packet = handle_client_work,
++	.authreq = handle_auth_query_response,
++	.finish_login = finish_client_login,
++	.startup_pool = set_pool,
++	.cancel_request = accept_cancel_request,
++};
++
+ /* callback from SBuf */
+ bool client_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+ {
+@@ -1822,11 +1863,10 @@ bool client_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+ 		/* client is not interested in it */
+ 		break;
+ 	case SBUF_EV_PKT_CALLBACK:
+-		res = process_pkt_callback(client, data, client_handle_complete_packet);
++		res = process_pkt_callback(client, data);
+ 		break;
+ 	case SBUF_EV_TLS_READY:
+-		sbuf_continue(&client->sbuf);
+-		res = true;
++		res = client_tls_ready(client);
+ 		break;
+ 	}
+ 	return res;
+diff --git a/src/objects.c b/src/objects.c
+index de4c7ad..dd0cdac 100644
+--- a/src/objects.c
++++ b/src/objects.c
+@@ -107,7 +107,7 @@ static void construct_client(void *obj)
+ 	PgSocket *client = obj;
+ 	memset(client, 0, sizeof(PgSocket));
+ 	list_init(&client->head);
+-	sbuf_init(&client->sbuf, client_proto);
++	sbuf_init(&client->sbuf, &client_conn_ops);
+ 	client->vars.var_list = slab_alloc(var_list_cache);
+ 	client->state = CL_FREE;
+ 	client->client_prepared_statements = NULL;
+@@ -121,7 +121,7 @@ static void construct_server(void *obj)
+ 
+ 	memset(server, 0, sizeof(PgSocket));
+ 	list_init(&server->head);
+-	sbuf_init(&server->sbuf, server_proto);
++	sbuf_init(&server->sbuf, &server_conn_ops);
+ 	server->vars.var_list = slab_alloc(var_list_cache);
+ 	server->state = SV_FREE;
+ 	server->server_prepared_statements = NULL;
+@@ -1984,6 +1984,13 @@ force_new:
+ 
+ 	/* initialize it */
+ 	server->pool = pool;
++	/*
++	 * A server connection for a peer pool only ever forwards
++	 * cancellation requests to a peered PgBouncer, which is its own
++	 * connection kind.
++	 */
++	if (pool->db->peer_id)
++		server->sbuf.conn_ops = &peer_server_ops;
+ 	server->login_user_credentials = server->pool->user_credentials;
+ 	server->connect_time = get_cached_time();
+ 	statlist_init(&server->canceling_clients, "canceling_clients");
+diff --git a/src/proto.c b/src/proto.c
+index 4895b53..a064fd6 100644
+--- a/src/proto.c
++++ b/src/proto.c
+@@ -149,32 +149,27 @@ const char *hdr2hex(const struct MBuf *data, char *buf, unsigned buflen)
+ static void pkt_cb_disconnect(PgSocket *sk, const char *reason)
+ {
+ 	/*
+-	 * The callback state machine is shared between client and server
+-	 * sockets, so pick the right disconnect variant based on the socket
+-	 * type.
++	 * The callback state machine is shared by every connection kind, so
++	 * let the registered connection operations decide how the connection
++	 * is torn down.
+ 	 */
+-	if (is_server_socket(sk))
+-		disconnect_server(sk, true, "%s", reason);
+-	else
+-		disconnect_client(sk, true, "%s", reason);
++	sk->sbuf.conn_ops->disconnect(sk, reason);
+ }
+ 
+ /*
+- * Shared handler for the SBUF_EV_PKT_CALLBACK event on both client and server
+- * sockets.
++ * Shared handler for the SBUF_EV_PKT_CALLBACK event on all connections.
+  *
+  * It reassembles a packet that is too large to fit in the sbuf into the
+  * dynamically sized sk->packet_cb_state.pkt buffer across multiple event loop
+- * ticks.  Once the full packet has been buffered it is dispatched to
+- * handle_complete_packet, which is responsible for rewinding the packet body
+- * and calling the appropriate protocol handler.
++ * ticks.  Once the full packet has been buffered it is dispatched to the
++ * connection kind's handle_complete_packet operation, which is responsible
++ * for rewinding the packet body and calling the appropriate protocol handler.
+  *
+- * If handle_complete_packet returns false the callback state is intentionally
+- * left untouched, so that processing resumes from the same state on the next
++ * If that operation returns false the callback state is intentionally left
++ * untouched, so that processing resumes from the same state on the next
+  * call.
+  */
+-bool process_pkt_callback(PgSocket *sk, struct MBuf *data,
+-			  pkt_handler_cb handle_complete_packet)
++bool process_pkt_callback(PgSocket *sk, struct MBuf *data)
+ {
+ 	SBuf *sbuf = &sk->sbuf;
+ 	struct CallbackState *cb = &sk->packet_cb_state;
+@@ -230,7 +225,7 @@ bool process_pkt_callback(PgSocket *sk, struct MBuf *data,
+ 		cb->flag = CB_HANDLE_COMPLETE_PACKET;
+ 	/* fallthrough */
+ 	case CB_HANDLE_COMPLETE_PACKET:
+-		res = handle_complete_packet(sk, &cb->pkt);
++		res = sk->sbuf.conn_ops->handle_complete_packet(sk, &cb->pkt);
+ 		if (!res)
+ 			return false;
+ 		cb->flag = CB_NONE;
+diff --git a/src/sbuf.c b/src/sbuf.c
+index c90b6e7..1622c2b 100644
+--- a/src/sbuf.c
++++ b/src/sbuf.c
+@@ -122,11 +122,11 @@ static void sbuf_possible_direct_tls_startup_cb(evutil_socket_t fd, short flags,
+  *********************************
+  */
+ 
+-/* initialize SBuf with proto handler */
+-void sbuf_init(SBuf *sbuf, sbuf_cb_t proto_fn)
++/* initialize SBuf with the connection kind that owns it */
++void sbuf_init(SBuf *sbuf, const struct ConnOps *conn_ops)
+ {
+ 	memset(sbuf, 0, sizeof(SBuf));
+-	sbuf->proto_cb = proto_fn;
++	sbuf->conn_ops = conn_ops;
+ 	sbuf->ops = &raw_sbufio_ops;
+ }
+ 
+@@ -482,7 +482,7 @@ static bool sbuf_call_proto(SBuf *sbuf, int event)
+ 	} else {
+ 		memset(&mbuf, 0, sizeof(mbuf));
+ 	}
+-	res = sbuf->proto_cb(sbuf, event, &mbuf);
++	res = sbuf->conn_ops->sbuf_event(sbuf, event, &mbuf);
+ 
+ 	AssertSanity(sbuf);
+ 	Assert(event != SBUF_EV_READ || !res || sbuf->sock > 0);
+diff --git a/src/server.c b/src/server.c
+index 5abbc98..6624247 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -27,6 +27,11 @@
+ 
+ #define ERRCODE_CANNOT_CONNECT_NOW "57P03"
+ 
++static void server_conn_disconnect(PgSocket *sk, const char *reason);
++static void server_connect_failed(PgSocket *server);
++static bool server_tls_ready(PgSocket *server);
++static bool server_finish_login(PgSocket *server);
++
+ static bool load_parameter(PgSocket *server, PktHdr *pkt, bool startup)
+ {
+ 	const char *key, *val;
+@@ -229,7 +234,7 @@ static bool handle_server_startup(PgSocket *server, PktHdr *pkt)
+ 		server->ready = true;
+ 
+ 		/* got all params */
+-		finish_welcome_msg(server);
++		server_finish_login(server);
+ 
+ 		/* need to notify sbuf if server was closed */
+ 		res = release_server(server);
+@@ -682,6 +687,64 @@ static bool handle_server_work(PgSocket *server, PktHdr *pkt)
+ 	return true;
+ }
+ 
++/*
++ * Server-side teardown for code that cannot know which connection kind it is
++ * holding.  Mirrors what the shared packet callback path used to do inline.
++ */
++static void server_conn_disconnect(PgSocket *sk, const char *reason)
++{
++	disconnect_server(sk, true, "%s", reason);
++}
++
++/*
++ * An outgoing server connection could not be established.  Extracted from
++ * server_proto() so the connection operations table can also expose it.
++ */
++static void server_connect_failed(PgSocket *server)
++{
++	Assert(server->state == SV_LOGIN);
++	disconnect_server(server, false, "connect failed");
++}
++
++/*
++ * The TLS handshake against the server is done, so the server login can
++ * proceed over the encrypted stream.  Extracted from server_proto() so the
++ * connection operations table can also expose it.
++ */
++static bool server_tls_ready(PgSocket *server)
++{
++	char infobuf[96];
++	bool res;
++
++	Assert(server->state == SV_LOGIN);
++
++	tls_get_connection_info(server->sbuf.tls, infobuf, sizeof infobuf);
++	if (cf_log_connections) {
++		slog_info(server, "SSL established: %s", infobuf);
++	} else {
++		slog_noise(server, "SSL established: %s", infobuf);
++	}
++
++	server->request_time = get_cached_time();
++	res = send_startup_message(server);
++	if (res)
++		sbuf_continue(&server->sbuf);
++	else
++		disconnect_server(server, false, "TLS startup failed");
++	return res;
++}
++
++/*
++ * Finish the server-side login: all welcome parameters were collected, so
++ * the welcome message for waiting clients can be completed.  Extracted so
++ * the connection operations table can also expose it.
++ */
++static bool server_finish_login(PgSocket *server)
++{
++	finish_welcome_msg(server);
++	return true;
++}
++
+ /* got connection, decide what to do */
+ static bool handle_connect(PgSocket *server)
+ {
+@@ -795,7 +858,6 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+ 	bool res = false;
+ 	PgSocket *server = container_of(sbuf, PgSocket, sbuf);
+ 	PktHdr pkt;
+-	char infobuf[96];
+ 
+ 	Assert(is_server_socket(server));
+ 	Assert(server->state != SV_FREE);
+@@ -849,8 +911,7 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+ 		}
+ 		break;
+ 	case SBUF_EV_CONNECT_FAILED:
+-		Assert(server->state == SV_LOGIN);
+-		disconnect_server(server, false, "connect failed");
++		server_connect_failed(server);
+ 		break;
+ 	case SBUF_EV_CONNECT_OK:
+ 		slog_debug(server, "S: connect ok");
+@@ -921,25 +982,56 @@ bool server_proto(SBuf *sbuf, SBufEvent evtype, struct MBuf *data)
+ 		}
+ 		break;
+ 	case SBUF_EV_PKT_CALLBACK:
+-		res = process_pkt_callback(server, data, server_handle_complete_packet);
++		res = process_pkt_callback(server, data);
+ 		break;
+ 	case SBUF_EV_TLS_READY:
+-		Assert(server->state == SV_LOGIN);
+-
+-		tls_get_connection_info(server->sbuf.tls, infobuf, sizeof infobuf);
+-		if (cf_log_connections) {
+-			slog_info(server, "SSL established: %s", infobuf);
+-		} else {
+-			slog_noise(server, "SSL established: %s", infobuf);
+-		}
+-
+-		server->request_time = get_cached_time();
+-		res = send_startup_message(server);
+-		if (res)
+-			sbuf_continue(&server->sbuf);
+-		else
+-			disconnect_server(server, false, "TLS startup failed");
++		res = server_tls_ready(server);
+ 		break;
+ 	}
+ 	return res;
+ }
++
++/*
++ * Connection operations for server (backend) connections.  Servers are
++ * opened by the pooler and log in against PostgreSQL; they never choose a
++ * pool from a startup packet and never accept cancellation requests of
++ * their own, so those capabilities are not provided here.
++ */
++const struct ConnOps server_conn_ops = {
++	.sbuf_event = server_proto,
++	.handle_complete_packet = server_handle_complete_packet,
++	.disconnect = server_conn_disconnect,
++	.connected = handle_connect,
++	.connect_failed = server_connect_failed,
++	.tls_ready = server_tls_ready,
++	.sslchar = handle_sslchar,
++	.login_packet = handle_server_startup,
++	.work_packet = handle_server_work,
++	.authreq = answer_authreq,
++	.finish_login = server_finish_login,
++	.startup_pool = NULL,
++	.cancel_request = NULL,
++};
++
++/*
++ * Connection operations for peer server connections.  Peering forwards
++ * cancellation requests through this bouncer to a peered PgBouncer: the
++ * connection is opened, the cancellation is written, and the connection is
++ * done.  It never logs in, never exchanges queries and never buffers large
++ * packets, so none of those capabilities are provided here.
++ */
++const struct ConnOps peer_server_ops = {
++	.sbuf_event = server_proto,
++	.handle_complete_packet = NULL,
++	.disconnect = server_conn_disconnect,
++	.connected = handle_connect,
++	.connect_failed = server_connect_failed,
++	.tls_ready = server_tls_ready,
++	.sslchar = handle_sslchar,
++	.login_packet = NULL,
++	.work_packet = NULL,
++	.authreq = NULL,
++	.finish_login = NULL,
++	.startup_pool = NULL,
++	.cancel_request = NULL,
++};

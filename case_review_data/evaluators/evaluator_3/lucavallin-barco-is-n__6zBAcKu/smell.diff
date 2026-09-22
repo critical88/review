@@ -1,0 +1,976 @@
+diff --git a/Makefile b/Makefile
+index 6b86501..ceab741 100644
+--- a/Makefile
++++ b/Makefile
+@@ -25,7 +25,7 @@ LIB_LOG_SRC := $(LIB_LOG_DIR)/log.c
+ LIB_LOG_FLAGS := -DLOG_USE_COLOR
+ 
+ # Barco object files
+-OBJS := $(BARCO).o cgroups.o container.o mount.o sec.o user.o $(LIB_ARGTABLE_NAME).o $(LIB_LOG_NAME).o
++OBJS := $(BARCO).o cgroups.o container.o mount.o runtime.o sec.o user.o $(LIB_ARGTABLE_NAME).o $(LIB_LOG_NAME).o
+ 
+ # Compiler settings
+ CC := clang-18
+diff --git a/include/cgroups.h b/include/cgroups.h
+index 7839213..c335f7e 100644
+--- a/include/cgroups.h
++++ b/include/cgroups.h
+@@ -1,18 +1,11 @@
+ #ifndef CGROUPS_H
+ #define CGROUPS_H
+ 
+-#include <fcntl.h>
+-
+-// Used for cgroups limits initialization
+-#define CGROUPS_MEMORY_MAX "1G"
+-#define CGROUPS_CPU_WEIGHT "256"
+-#define CGROUPS_PIDS_MAX "64"
+-#define CGROUPS_CGROUP_PROCS "cgroup.procs"
+-enum { CGROUPS_CONTROL_FIELD_SIZE = 256 };
+-
+-// Initializes cgroups for the hostname
+-int cgroups_init(char *hostname, pid_t pid);
+-// Cleans up cgroups for the hostname
+-int cgroups_free(char *hostname);
++/*
++ * The per-subsystem interfaces were consolidated into the runtime
++ * interface. This header is kept for convenience: it provides the full
++ * runtime interface, including the cgroups settings.
++ */
++#include "runtime.h"
+ 
+ #endif
+diff --git a/include/container.h b/include/container.h
+index 01af47f..46b4eb6 100644
+--- a/include/container.h
++++ b/include/container.h
+@@ -1,30 +1,11 @@
+ #ifndef CONTAINER_H
+ #define CONTAINER_H
+ 
+-#include <sys/types.h>
+-
+-enum {
+-  // The stack size for the container
+-  CONTAINER_STACK_SIZE = (1024 * 1024),
+-};
+-
+-// Represents the configuration for a container.
+-typedef struct {
+-  uid_t uid;
+-  int fd;
+-  char *hostname;
+-  char *cmd;
+-  char *arg;
+-  char *mnt;
+-} container_config;
+-
+-// Initializes the container.
+-int container_init(container_config *config, char *stack);
+-
+-// Waits for the container to exit.
+-int container_wait(int container_pid);
+-
+-// Stops the container.
+-void container_stop(int container_pid);
++/*
++ * The per-subsystem interfaces were consolidated into the runtime
++ * interface. This header is kept for convenience: it provides the full
++ * runtime interface, including the container lifecycle handlers.
++ */
++#include "runtime.h"
+ 
+ #endif
+diff --git a/include/mount.h b/include/mount.h
+index 871b7ae..d14f62b 100644
+--- a/include/mount.h
++++ b/include/mount.h
+@@ -1,7 +1,11 @@
+ #ifndef MOUNT_H
+ #define MOUNT_H
+ 
+-// Set the mount directory for the process
+-int mount_set(char *mnt);
++/*
++ * The per-subsystem interfaces were consolidated into the runtime
++ * interface. This header is kept for convenience: it provides the full
++ * runtime interface, including the mount settings.
++ */
++#include "runtime.h"
+ 
+ #endif
+diff --git a/include/runtime.h b/include/runtime.h
+new file mode 100644
+index 0000000..d258693
+--- /dev/null
++++ b/include/runtime.h
+@@ -0,0 +1,100 @@
++#ifndef RUNTIME_H
++#define RUNTIME_H
++
++#include <errno.h>
++#include <seccomp.h>
++#include <sys/types.h>
++
++/* Consolidated runtime settings: cgroups limits. */
++#define CGROUPS_MEMORY_MAX "1G"
++#define CGROUPS_CPU_WEIGHT "256"
++#define CGROUPS_PIDS_MAX "64"
++#define CGROUPS_CGROUP_PROCS "cgroup.procs"
++enum { CGROUPS_CONTROL_FIELD_SIZE = 256 };
++
++/* Consolidated runtime settings: container stack. */
++enum { CONTAINER_STACK_SIZE = (1024 * 1024) };
++
++/* Consolidated runtime settings: seccomp policy. */
++#define SEC_SCMP_FAIL SCMP_ACT_ERRNO(EPERM)
++
++/* Consolidated runtime settings: user namespace mappings. */
++enum {
++  USER_NAMESPACE_UID_PARENT_RANGE_START = 0,
++  USER_NAMESPACE_UID_CHILD_RANGE_START = 10000,
++  USER_NAMESPACE_UID_CHILD_RANGE_SIZE = 2000,
++};
++
++/*
++ * The runtime configuration record.
++ *
++ * This is the single configuration record carried through every phase of
++ * the runtime lifecycle. Each subsystem reads (and, where applicable,
++ * updates) the fields it cares about; no subsystem needs more than a
++ * slice of the record.
++ */
++typedef struct {
++  // uid and gid of the user in the container
++  uid_t uid;
++  // socket end used by the container process
++  int fd;
++  // socket end used by the parent process (barco)
++  int parent_fd;
++  // pid of the container process
++  pid_t pid;
++  // hostname assigned to the container and to its cgroup directory
++  char *hostname;
++  // command to run in the container and its argument
++  char *cmd;
++  char *arg;
++  // directory to mount as root in the container
++  char *mnt;
++  // top of the stack reserved for the container process
++  char *stack_top;
++} runtime_config;
++
++/*
++ * The runtime lifecycle interface.
++ *
++ * Every barco subsystem exposes the complete lifecycle below. A subsystem
++ * that has nothing to do in a phase implements it as a default no-op that
++ * returns 0, so the runtime can drive all of them uniformly.
++ */
++typedef struct {
++  // Creates the container process (parent side).
++  int (*spawn)(runtime_config *config);
++  // Configures the runtime for the container from the parent side.
++  int (*configure)(runtime_config *config);
++  // Applies the namespace-local settings from inside the container.
++  int (*activate)(runtime_config *config);
++  // Runs the container workload (inside the container).
++  int (*run)(runtime_config *config);
++  // Waits for the container process to exit (parent side).
++  int (*join)(runtime_config *config);
++  // Stops the container process (parent side).
++  int (*stop)(runtime_config *config);
++  // Releases the runtime resources for the container (parent side).
++  int (*release)(runtime_config *config);
++} runtime_ops;
++
++/* The runtime lifecycle interface implemented by every subsystem. */
++extern const runtime_ops container_interface;
++extern const runtime_ops cgroups_interface;
++extern const runtime_ops mount_interface;
++extern const runtime_ops user_interface;
++extern const runtime_ops sec_interface;
++
++/*
++ * Drives a runtime lifecycle phase across every registered subsystem,
++ * stopping at the first failure.
++ * Returns 0 on success and the failing phase result otherwise.
++ */
++int runtime_spawn(runtime_config *config);
++int runtime_configure(runtime_config *config);
++int runtime_activate(runtime_config *config);
++int runtime_run(runtime_config *config);
++int runtime_join(runtime_config *config);
++int runtime_stop(runtime_config *config);
++int runtime_release(runtime_config *config);
++
++#endif
+diff --git a/include/sec.h b/include/sec.h
+index 70ac194..e4e9717 100644
+--- a/include/sec.h
++++ b/include/sec.h
+@@ -1,15 +1,11 @@
+ #ifndef SEC_H
+ #define SEC_H
+ 
+-#include <errno.h>
+-
+-// Used to represent the result of a seccomp rule.
+-#define SEC_SCMP_FAIL SCMP_ACT_ERRNO(EPERM)
+-
+-// Setup capabilities for the calling process
+-int sec_set_caps(void);
+-
+-// Setup seccomp for the calling process
+-int sec_set_seccomp(void);
++/*
++ * The per-subsystem interfaces were consolidated into the runtime
++ * interface. This header is kept for convenience: it provides the full
++ * runtime interface, including the sec settings.
++ */
++#include "runtime.h"
+ 
+ #endif
+diff --git a/include/user.h b/include/user.h
+index d6410cf..4cd3d95 100644
+--- a/include/user.h
++++ b/include/user.h
+@@ -1,20 +1,11 @@
+ #ifndef USER_H
+ #define USER_H
+ 
+-#include <sys/types.h>
+-
+-enum {
+-  // User namespace settings
+-  USER_NAMESPACE_UID_PARENT_RANGE_START = 0,
+-  USER_NAMESPACE_UID_CHILD_RANGE_START = 10000,
+-  USER_NAMESPACE_UID_CHILD_RANGE_SIZE = 2000,
+-};
+-
+-// Setup the user namespace for the process
+-int user_namespace_init(uid_t uid, int fd);
+-
+-// Configures the user and group mappings for the namespace
+-// so that the child process can set its own user and group
+-int user_namespace_prepare_mappings(pid_t pid, int fd);
++/*
++ * The per-subsystem interfaces were consolidated into the runtime
++ * interface. This header is kept for convenience: it provides the full
++ * runtime interface, including the user settings.
++ */
++#include "runtime.h"
+ 
+ #endif
+diff --git a/src/barco.c b/src/barco.c
+index c8cba96..a6fb659 100644
+--- a/src/barco.c
++++ b/src/barco.c
+@@ -26,10 +26,8 @@ struct arg_end *end;
+ int main(int argc, char **argv) {
+   // used for container stack
+   char *stack = 0;
+-  // used for container config
+-  container_config config = {0};
+-  // used for container pid
+-  int container_pid = 0;
++  // used for runtime configuration
++  runtime_config config = {0};
+   // socket pair used for communication between barco and container
+   int sockets[2] = {0};
+ 
+@@ -107,6 +105,7 @@ int main(int argc, char **argv) {
+     goto exit;
+   }
+   config.fd = sockets[1];
++  config.parent_fd = sockets[0];
+ 
+   // Initialize a stack for the container
+   log_info("initializing container stack...");
+@@ -120,8 +119,11 @@ int main(int argc, char **argv) {
+   log_info("initializing container...");
+   // Stacks on most architectures grow downwards.
+   // CONTAINER_STACK_SIZE gives us a pointer just below the end.
+-  if ((container_pid = container_init(&config, stack + CONTAINER_STACK_SIZE)) ==
+-      -1) {
++  config.stack_top = stack + CONTAINER_STACK_SIZE;
++
++  // The runtime interfaces drive the spawn phase of the lifecycle: the
++  // container interface creates the container process.
++  if (runtime_spawn(&config) == -1) {
+     log_fatal("failed to container_init");
+     exitcode = 1;
+     goto cleanup;
+@@ -129,23 +131,24 @@ int main(int argc, char **argv) {
+ 
+   // Prepare cgroups for the process (the container is a child process of barco)
+   log_info("initializing cgroups...");
+-  if (cgroups_init(config.hostname, container_pid)) {
+-    log_fatal("failed to initialize cgroups");
+-    exitcode = 1;
+-    goto cleanup;
+-  }
+ 
+   // Barco configures the user namespace for the container
+   log_info("configuring user namespace...");
+-  if (user_namespace_prepare_mappings(container_pid, sockets[0])) {
++
++  // The runtime interfaces drive the configure phase of the lifecycle: the
++  // cgroups interface writes the cgroup settings and the user namespace
++  // interface prepares the uid_map / gid_map.
++  if (runtime_configure(&config)) {
+     exitcode = 1;
+-    log_fatal("failed to user_namespace_set_user, stopping container...");
++    log_fatal("failed to configure the runtime interfaces, stopping "
++              "container...");
+     goto cleanup;
+   }
+ 
+   // Wait for the container to exit
+   log_info("waiting for container to exit...");
+-  exitcode |= container_wait(container_pid);
++  // The runtime interfaces drive the join phase of the lifecycle.
++  exitcode |= runtime_join(&config);
+   log_debug("container exited...");
+ 
+ cleanup:
+@@ -160,7 +163,9 @@ cleanup:
+   close(sockets[1]);
+ 
+   log_debug("freeing cgroups...");
+-  cgroups_free(config.hostname);
++  // The runtime interfaces drive the release phase of the lifecycle: the
++  // cgroups interface removes the cgroup directory.
++  runtime_release(&config);
+ 
+ exit:
+   log_debug("freeing argtable...");
+diff --git a/src/cgroups.c b/src/cgroups.c
+index 332d034..b372a1c 100644
+--- a/src/cgroups.c
++++ b/src/cgroups.c
+@@ -14,11 +14,15 @@ struct cgroups_setting {
+   char value[CGROUPS_CONTROL_FIELD_SIZE];
+ };
+ 
++// The cgroups subsystem has no part in the spawn phase: the container
++// process is created by the container subsystem.
++int cgroups_spawn(runtime_config *config) { return 0; }
++
+ // cgroups settings are written to the cgroups v2 filesystem as follows:
+ // - create a directory for the new cgroup
+ // - settings files are created automatically
+ // - write the settings to the corresponding files
+-int cgroups_init(char *hostname, pid_t pid) {
++int cgroups_configure(runtime_config *config) {
+   char cgroup_dir[PATH_MAX] = {0};
+ 
+   // The "cgroup.procs" setting is used to add a process to a cgroup.
+@@ -27,8 +31,8 @@ int cgroups_init(char *hostname, pid_t pid) {
+   struct cgroups_setting *procs_setting =
+       &(struct cgroups_setting){.name = CGROUPS_CGROUP_PROCS, .value = ""};
+   ;
+-  if (snprintf(procs_setting->value, CGROUPS_CONTROL_FIELD_SIZE, "%d", pid) ==
+-      -1) {
++  if (snprintf(procs_setting->value, CGROUPS_CONTROL_FIELD_SIZE, "%d",
++               config->pid) == -1) {
+     log_error("failed to setup cgroup.procs setting: %m");
+     return -1;
+   }
+@@ -51,8 +55,8 @@ int cgroups_init(char *hostname, pid_t pid) {
+   log_debug("setting cgroups...");
+ 
+   // Create the cgroup directory.
+-  if (snprintf(cgroup_dir, sizeof(cgroup_dir), "/sys/fs/cgroup/%s", hostname) ==
+-      -1) {
++  if (snprintf(cgroup_dir, sizeof(cgroup_dir), "/sys/fs/cgroup/%s",
++               config->hostname) == -1) {
+     log_error("failed to setup path: %m");
+     return -1;
+   }
+@@ -101,15 +105,28 @@ int cgroups_init(char *hostname, pid_t pid) {
+   return 0;
+ }
+ 
++// The cgroups subsystem has no part in the activation phase: cgroups are
++// configured from the parent before the container is activated.
++int cgroups_activate(runtime_config *config) { return 0; }
++
++// The cgroups subsystem has no workload to run in the container.
++int cgroups_run(runtime_config *config) { return 0; }
++
++// The cgroups subsystem does not wait on the container process.
++int cgroups_join(runtime_config *config) { return 0; }
++
++// The cgroups subsystem does not stop the container process.
++int cgroups_stop(runtime_config *config) { return 0; }
++
+ // Clean up the cgroups for the process. Since barco write the PID of its child
+ // process to the cgroup.procs file, all that is needed is to remove the cgroups
+ // directory after the child process is exited.
+-int cgroups_free(char *hostname) {
++int cgroups_release(runtime_config *config) {
+   char dir[PATH_MAX] = {0};
+ 
+   log_debug("freeing cgroups...");
+ 
+-  if (snprintf(dir, sizeof(dir), "/sys/fs/cgroup/%s", hostname) == -1) {
++  if (snprintf(dir, sizeof(dir), "/sys/fs/cgroup/%s", config->hostname) == -1) {
+     log_error("failed to setup paths: %m");
+     return -1;
+   }
+@@ -123,3 +140,8 @@ int cgroups_free(char *hostname) {
+   log_debug("cgroups released");
+   return 0;
+ }
++
++// The runtime lifecycle interface of the cgroups subsystem.
++const runtime_ops cgroups_interface = {
++    cgroups_spawn, cgroups_configure, cgroups_activate, cgroups_run,
++    cgroups_join,  cgroups_stop,      cgroups_release};
+diff --git a/src/container.c b/src/container.c
+index 1eba8d7..5790cd2 100644
+--- a/src/container.c
++++ b/src/container.c
+@@ -18,15 +18,15 @@
+ // mounts cannot be changed without specific capabilities,
+ // unshare cannot be called after syscalls are limited, etc...
+ int container_start(void *arg) {
+-  container_config *config = arg;
++  runtime_config *config = arg;
+ 
+   log_debug("starting container");
+   log_debug(
+       "setting hostname, mounts, user namespace, capabilities and syscalls...");
+ 
+-  if (sethostname(config->hostname, strlen(config->hostname)) ||
+-      mount_set(config->mnt) || user_namespace_init(config->uid, config->fd) ||
+-      sec_set_caps() || sec_set_seccomp()) {
++  // The namespace-local settings are applied by every runtime interface
++  // through the activation phase.
++  if (runtime_activate(config)) {
+     log_debug("failed to set properties");
+     close(config->fd);
+     return -1;
+@@ -38,24 +38,21 @@ int container_start(void *arg) {
+     return -1;
+   }
+ 
+-  log_debug("executing command '%s %s' from directory '%s' in container...",
+-            config->cmd, config->arg, config->mnt);
+-  log_info("### BARCONTAINER STARTING - type 'exit' to quit ###");
+-  // argv must be NULL terminated
+-  char *argv[] = {config->arg, NULL};
+-  if (execve(config->cmd, argv, NULL)) {
+-    log_error("failed to execve '%s %s': %m", config->cmd, argv);
++  // The workload is run by every runtime interface through the run phase.
++  if (runtime_run(config)) {
+     return -1;
+   }
++
+   log_debug("container started...");
+ 
+   return 0;
+ }
+ 
+-// Creates container (process) with different properties than its parent
+-// e.g. mount to different dir, different hostname, etc...
+-// All these requirements are specified by the flags we pass to clone()
+-int container_init(container_config *config, char *stack) {
++// Creates the container process.
++// The container subsystem owns the spawn phase of the runtime lifecycle:
++// it clones the process that the other runtime interfaces configure and
++// activate afterwards.
++int container_spawn(runtime_config *config) {
+   int container_pid = 0;
+   // The flags specify what the cloned process can do.
+   // These allow some control overrmounts, pids, IPC data structures, network
+@@ -65,35 +62,80 @@ int container_init(container_config *config, char *stack) {
+ 
+   // SIGCHLD lets us wait on the child process.
+   log_debug("cloning process...");
+-  if ((container_pid =
+-           clone(container_start, stack, flags | SIGCHLD, config)) == -1) {
++  if ((container_pid = clone(container_start, config->stack_top,
++                             flags | SIGCHLD, config)) == -1) {
+     log_error("failed to clone: %m");
++    // The failed spawn is reported so that the other runtime interfaces
++    // handle it consistently.
++    config->pid = 1;
+     return 1;
+   }
+ 
++  // The container process is created: its pid is shared with the other
++  // runtime interfaces through the configuration record.
++  config->pid = container_pid;
++
+   // Close and zero the child's socket, to avoid leaving an open fd in
+   // case of a failure. If we do not do this, the child or parent might hang.
+   log_debug("resetting container socket...");
+   close(config->fd);
+   config->fd = 0;
+ 
+-  return container_pid;
++  return 0;
+ }
+ 
+-int container_wait(int container_pid) {
++// The container subsystem is configured through the cgroups and user
++// namespace interfaces.
++int container_configure(runtime_config *config) { return 0; }
++
++// The container subsystem applies the hostname of the container.
++int container_activate(runtime_config *config) {
++  return sethostname(config->hostname, strlen(config->hostname));
++}
++
++// The container subsystem runs the workload of the container.
++int container_run(runtime_config *config) {
++  log_debug("executing command '%s %s' from directory '%s' in container...",
++            config->cmd, config->arg, config->mnt);
++  log_info("### BARCONTAINER STARTING - type 'exit' to quit ###");
++  // argv must be NULL terminated
++  char *argv[] = {config->arg, NULL};
++  if (execve(config->cmd, argv, NULL)) {
++    log_error("failed to execve '%s %s': %m", config->cmd, argv);
++    return -1;
++  }
++
++  return 0;
++}
++
++// The container subsystem waits for the container process to exit.
++int container_join(runtime_config *config) {
+   int container_status = 0;
+ 
+-  log_debug("waiting for container_pid %d...", container_pid);
+-  waitpid(container_pid, &container_status, 0);
+-  log_debug("container_pid %d exited", container_pid);
++  log_debug("waiting for container_pid %d...", config->pid);
++  waitpid(config->pid, &container_status, 0);
++  log_debug("container_pid %d exited", config->pid);
+ 
+   return WEXITSTATUS(container_status);
+ }
+ 
+-void container_stop(int container_pid) {
+-  log_debug("calling kill for container_pid %d...", container_pid);
+-  if (kill(container_pid, SIGKILL)) {
+-    log_error("failed to kill container_pid %d: %m", container_pid);
++// The container subsystem stops the container process. Every runtime
++// interface must expose the complete lifecycle, even the phases the
++// runtime does not drive yet.
++int container_stop(runtime_config *config) {
++  log_debug("calling kill for container_pid %d...", config->pid);
++  if (kill(config->pid, SIGKILL)) {
++    log_error("failed to kill container_pid %d: %m", config->pid);
+   }
+-  log_debug("container_pid %d killed", container_pid);
++  log_debug("container_pid %d killed", config->pid);
++  return 0;
+ }
++
++// The container subsystem has no resource to release on cleanup: the
++// cgroups interface takes care of it.
++int container_release(runtime_config *config) { return 0; }
++
++// The runtime lifecycle interface of the container subsystem.
++const runtime_ops container_interface = {
++    container_spawn, container_configure, container_activate, container_run,
++    container_join,  container_stop,      container_release};
+diff --git a/src/mount.c b/src/mount.c
+index 63e558b..57a715e 100644
+--- a/src/mount.c
++++ b/src/mount.c
+@@ -15,14 +15,22 @@ long pivot_root(const char *new_root, const char *put_old) {
+   return syscall(SYS_pivot_root, new_root, put_old);
+ }
+ 
++// The mount subsystem has no part in the spawn phase.
++int mount_spawn(runtime_config *config) { return 0; }
++
++// The mount subsystem has no parent-side configuration: the mount is
++// applied from inside the container.
++int mount_configure(runtime_config *config) { return 0; }
++
+ // Restricts access to resources the process has in its own mount namespace:
+ // - Create a temporary directory and one inside of it
+ // - Bind mount of the user argument onto the temporary directory
+ // - pivot_root makes the bind mount the new root and mounts the old root onto
+ // the inner temporary directory
+ // - umount the old root and remove the inner temporary directory.
+-int mount_set(char *mnt) {
++int mount_activate(runtime_config *config) {
+   log_debug("setting mount...");
++  char *mnt = config->mnt;
+ 
+   // MS_PRIVATE makes the bind mount invisible outside of the namespace
+   // MS_REC makes the mount recursive
+@@ -88,3 +96,20 @@ int mount_set(char *mnt) {
+   log_debug("mount set");
+   return 0;
+ }
++
++// The mount subsystem has no workload to run in the container.
++int mount_run(runtime_config *config) { return 0; }
++
++// The mount subsystem does not wait on the container process.
++int mount_join(runtime_config *config) { return 0; }
++
++// The mount subsystem does not stop the container process.
++int mount_stop(runtime_config *config) { return 0; }
++
++// The mount subsystem has no resource to release on cleanup.
++int mount_release(runtime_config *config) { return 0; }
++
++// The runtime lifecycle interface of the mount subsystem.
++const runtime_ops mount_interface = {
++    mount_spawn, mount_configure, mount_activate, mount_run,
++    mount_join,  mount_stop,      mount_release};
+diff --git a/src/runtime.c b/src/runtime.c
+new file mode 100644
+index 0000000..17700cb
+--- /dev/null
++++ b/src/runtime.c
+@@ -0,0 +1,123 @@
++#include "runtime.h"
++#include "log.h"
++#include <stddef.h>
++
++/*
++ * The registered runtime interfaces, in the order the lifecycle phases of
++ * the runtime must be driven across subsystems.
++ */
++static const runtime_ops *const runtime_registry[] = {
++    &container_interface, &cgroups_interface, &mount_interface,
++    &user_interface,      &sec_interface,     NULL};
++
++// Drives the spawn phase across every registered interface, stopping at
++// the first failure.
++int runtime_spawn(runtime_config *config) {
++  int result = 0;
++
++  log_debug("spawning runtime interfaces...");
++  for (const runtime_ops *const *interface = runtime_registry; *interface;
++       interface++) {
++    if ((result = (*interface)->spawn(config))) {
++      return result;
++    }
++  }
++
++  return result;
++}
++
++// Drives the configure phase across every registered interface, stopping
++// at the first failure.
++int runtime_configure(runtime_config *config) {
++  int result = 0;
++
++  log_debug("configuring runtime interfaces...");
++  for (const runtime_ops *const *interface = runtime_registry; *interface;
++       interface++) {
++    if ((result = (*interface)->configure(config))) {
++      return result;
++    }
++  }
++
++  return result;
++}
++
++// Drives the activate phase across every registered interface, stopping
++// at the first failure.
++int runtime_activate(runtime_config *config) {
++  int result = 0;
++
++  log_debug("activating runtime interfaces...");
++  for (const runtime_ops *const *interface = runtime_registry; *interface;
++       interface++) {
++    if ((result = (*interface)->activate(config))) {
++      return result;
++    }
++  }
++
++  return result;
++}
++
++// Drives the run phase across every registered interface, stopping at
++// the first failure.
++int runtime_run(runtime_config *config) {
++  int result = 0;
++
++  log_debug("running runtime interfaces...");
++  for (const runtime_ops *const *interface = runtime_registry; *interface;
++       interface++) {
++    if ((result = (*interface)->run(config))) {
++      return result;
++    }
++  }
++
++  return result;
++}
++
++// Drives the join phase across every registered interface, stopping at
++// the first failure.
++int runtime_join(runtime_config *config) {
++  int result = 0;
++
++  log_debug("joining runtime interfaces...");
++  for (const runtime_ops *const *interface = runtime_registry; *interface;
++       interface++) {
++    if ((result = (*interface)->join(config))) {
++      return result;
++    }
++  }
++
++  return result;
++}
++
++// Drives the stop phase across every registered interface, stopping at
++// the first failure.
++int runtime_stop(runtime_config *config) {
++  int result = 0;
++
++  log_debug("stopping runtime interfaces...");
++  for (const runtime_ops *const *interface = runtime_registry; *interface;
++       interface++) {
++    if ((result = (*interface)->stop(config))) {
++      return result;
++    }
++  }
++
++  return result;
++}
++
++// Drives the release phase across every registered interface, stopping
++// at the first failure.
++int runtime_release(runtime_config *config) {
++  int result = 0;
++
++  log_debug("releasing runtime interfaces...");
++  for (const runtime_ops *const *interface = runtime_registry; *interface;
++       interface++) {
++    if ((result = (*interface)->release(config))) {
++      return result;
++    }
++  }
++
++  return result;
++}
+diff --git a/src/sec.c b/src/sec.c
+index 11b0815..51c94fa 100644
+--- a/src/sec.c
++++ b/src/sec.c
+@@ -52,7 +52,7 @@
+ //
+ // Notice: in some edge cases, some capabilities might not be respected because
+ // they are not namespaced (e.g. when writing to parts of procfs)
+-int sec_set_caps(void) {
++static int sec_set_caps(void) {
+   log_debug("setting capabilities...");
+   int drop_caps[] = {
+       CAP_AUDIT_CONTROL,   CAP_AUDIT_READ,   CAP_AUDIT_WRITE, CAP_BLOCK_SUSPEND,
+@@ -106,7 +106,7 @@ int sec_set_caps(void) {
+ //
+ // New Linux syscalls are added to the kernel over time, so this list
+ // should be updated periodically.
+-int sec_set_seccomp(void) {
++static int sec_set_seccomp(void) {
+   scmp_filter_ctx ctx = NULL;
+ 
+   log_debug("setting syscalls...");
+@@ -188,3 +188,39 @@ int sec_set_seccomp(void) {
+ 
+   return 0;
+ }
++
++// The sec subsystem has no part in the spawn phase.
++int sec_spawn(runtime_config *config) { return 0; }
++
++// The sec subsystem has no parent-side configuration: the security
++// settings are applied from inside the container.
++int sec_configure(runtime_config *config) { return 0; }
++
++// Applies the capabilities and the seccomp policy inside the container.
++int sec_activate(runtime_config *config) {
++  if (sec_set_caps()) {
++    return 1;
++  }
++  if (sec_set_seccomp()) {
++    return 1;
++  }
++
++  return 0;
++}
++
++// The sec subsystem has no workload to run in the container.
++int sec_run(runtime_config *config) { return 0; }
++
++// The sec subsystem does not wait on the container process.
++int sec_join(runtime_config *config) { return 0; }
++
++// The sec subsystem does not stop the container process.
++int sec_stop(runtime_config *config) { return 0; }
++
++// The sec subsystem has no resource to release on cleanup.
++int sec_release(runtime_config *config) { return 0; }
++
++// The runtime lifecycle interface of the sec subsystem.
++const runtime_ops sec_interface = {sec_spawn,  sec_configure, sec_activate,
++                                   sec_run,    sec_join,      sec_stop,
++                                   sec_release};
+diff --git a/src/user.c b/src/user.c
+index de07289..9147095 100644
+--- a/src/user.c
++++ b/src/user.c
+@@ -9,60 +9,23 @@
+ #include <sys/types.h>
+ #include <unistd.h>
+ 
+-// Lets the parent process know that the user namespace is started.
+-// The parent calls user_namespace_set_user to update the uid_map / gid_map.
+-// If successful, setgroups, setresgid, and setresuid are called in this
+-// function by the child. setgroups and setresgid are necessary because of two
+-// separate group mechanisms on Linux. The function assumes that every uid has a
+-// corresponding gid, which is often the case.
+-int user_namespace_init(uid_t uid, int fd) {
+-  int unshared = unshare(CLONE_NEWUSER);
+-  int result = 0;
+-
+-  log_debug("setting user namespace...");
+-
+-  log_debug("writing to socket...");
+-  if (write(fd, &unshared, sizeof(unshared)) != sizeof(unshared)) {
+-    log_error("failed to write socket %d: %m", fd);
+-    return -1;
+-  }
+-
+-  log_debug("reading from socket...");
+-  if (read(fd, &result, sizeof(result)) != sizeof(result)) {
+-    log_error("failed to read from socket %d: %m", fd);
+-    return -1;
+-  }
+-
+-  if (result) {
+-    return -1;
+-  }
+-
+-  log_debug("switching to uid %d / gid %d...", uid, uid);
+-
+-  log_debug("setting uid and gid mappings...");
+-  if (setgroups(1, &(gid_t){uid}) || setresgid(uid, uid, uid) ||
+-      setresuid(uid, uid, uid)) {
+-    log_error("failed to set uid %d / gid %d mappings: %m", uid, uid);
+-    return -1;
+-  }
+-
+-  log_debug("user namespace set");
+-
+-  return 0;
+-}
++// The user namespace subsystem has no part in the spawn phase.
++int user_spawn(runtime_config *config) { return 0; }
+ 
+ // Listens for the child process to request setting uid / gid, then updates the
+ // uid_map / gid_map for the child process to use. uid_map and gid_map are a
+ // Linux kernel mechanism for mapping uids and gids between the parent and child
+ // parent. The parent process must be privileged to set the uid_map / gid_map.
+-int user_namespace_prepare_mappings(pid_t pid, int fd) {
++int user_configure(runtime_config *config) {
+   int map_fd = 0;
+   int unshared = -1;
+ 
+   log_debug("updating uid_map / gid_map...");
+   log_debug("retrieving user namespaces status...");
+-  if (read(fd, &unshared, sizeof(unshared)) != sizeof(unshared)) {
+-    log_error("failed to retrieve status from socket %d: %m", fd);
++  if (read(config->parent_fd, &unshared, sizeof(unshared)) !=
++      sizeof(unshared)) {
++    log_error("failed to retrieve status from socket %d: %m",
++              config->parent_fd);
+     return -1;
+   }
+ 
+@@ -73,7 +36,7 @@ int user_namespace_prepare_mappings(pid_t pid, int fd) {
+ 
+     log_debug("writing uid_map / gid_map...");
+     for (char **file = (char *[]){"uid_map", "gid_map", 0}; *file; file++) {
+-      if (snprintf(dir, sizeof(dir), "/proc/%d/%s", pid, *file) >
++      if (snprintf(dir, sizeof(dir), "/proc/%d/%s", config->pid, *file) >
+           (int)sizeof(dir)) {
+         log_error("failed to setup dir %s: %m", dir);
+         return -1;
+@@ -107,10 +70,72 @@ int user_namespace_prepare_mappings(pid_t pid, int fd) {
+   }
+ 
+   log_debug("updating socket...");
+-  if (write(fd, &(int){0}, sizeof(int)) != sizeof(int)) {
+-    log_error("failed to update socket %d: %m", fd);
++  if (write(config->parent_fd, &(int){0}, sizeof(int)) != sizeof(int)) {
++    log_error("failed to update socket %d: %m", config->parent_fd);
++    return -1;
++  }
++
++  return 0;
++}
++
++// Lets the parent process know that the user namespace is started.
++// The parent calls the configure phase of the user interface to update the
++// uid_map / gid_map.
++// If successful, setgroups, setresgid, and setresuid are called in this
++// function by the child. setgroups and setresgid are necessary because of two
++// separate group mechanisms on Linux. The function assumes that every uid has a
++// corresponding gid, which is often the case.
++int user_activate(runtime_config *config) {
++  int unshared = unshare(CLONE_NEWUSER);
++  int result = 0;
++
++  log_debug("setting user namespace...");
++
++  log_debug("writing to socket...");
++  if (write(config->fd, &unshared, sizeof(unshared)) != sizeof(unshared)) {
++    log_error("failed to write socket %d: %m", config->fd);
++    return -1;
++  }
++
++  log_debug("reading from socket...");
++  if (read(config->fd, &result, sizeof(result)) != sizeof(result)) {
++    log_error("failed to read from socket %d: %m", config->fd);
++    return -1;
++  }
++
++  if (result) {
+     return -1;
+   }
+ 
++  log_debug("switching to uid %d / gid %d...", config->uid, config->uid);
++
++  log_debug("setting uid and gid mappings...");
++  if (setgroups(1, &(gid_t){config->uid}) ||
++      setresgid(config->uid, config->uid, config->uid) ||
++      setresuid(config->uid, config->uid, config->uid)) {
++    log_error("failed to set uid %d / gid %d mappings: %m", config->uid,
++              config->uid);
++    return -1;
++  }
++
++  log_debug("user namespace set");
++
+   return 0;
+ }
++
++// The user namespace subsystem has no workload to run in the container.
++int user_run(runtime_config *config) { return 0; }
++
++// The user namespace subsystem does not wait on the container process.
++int user_join(runtime_config *config) { return 0; }
++
++// The user namespace subsystem does not stop the container process.
++int user_stop(runtime_config *config) { return 0; }
++
++// The user namespace subsystem has no resource to release on cleanup.
++int user_release(runtime_config *config) { return 0; }
++
++// The runtime lifecycle interface of the user namespace subsystem.
++const runtime_ops user_interface = {user_spawn,  user_configure, user_activate,
++                                    user_run,    user_join,      user_stop,
++                                    user_release};

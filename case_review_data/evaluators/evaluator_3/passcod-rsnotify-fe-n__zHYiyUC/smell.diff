@@ -1,0 +1,447 @@
+diff --git a/notify-debouncer-full/src/lib.rs b/notify-debouncer-full/src/lib.rs
+index a5b023b..4c37519 100644
+--- a/notify-debouncer-full/src/lib.rs
++++ b/notify-debouncer-full/src/lib.rs
+@@ -616,10 +616,70 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
+ 
+     fn remove_root(&mut self, path: impl AsRef<Path>) {
+         let mut data = self.data.inner.lock().unwrap();
+-
+-        data.roots.retain(|(root, _)| !root.starts_with(&path));
+-
+-        data.cache.remove_path(path.as_ref());
++        let path = path.as_ref();
++
++        data.roots.retain(|(root, _)| !root.starts_with(path));
++
++        data.cache.remove_path(path);
++
++        // Gauge for the stale-queue investigation: queued events under a root
++        // that no longer exists keep the debouncer loop awake and delay every
++        // event behind them. Until it is decided whether remove_root should
++        // drop them, trace what would be stranded.
++        let mut orphaned: Vec<PathBuf> = Vec::new();
++        for queued in data.queues.keys() {
++            let mut rooted = false;
++            for (root, _) in &data.roots {
++                if queued.starts_with(root) {
++                    rooted = true;
++                    break;
++                }
++            }
++            if !rooted {
++                orphaned.push(queued.clone());
++            }
++        }
++        if !orphaned.is_empty() {
++            let mut details: Vec<String> = Vec::new();
++            for queued in &orphaned {
++                if let Some(queue) = data.queues.get(queued) {
++                    details.push(format!("{queued:?}: {} pending event(s)", queue.events.len()));
++                } else {
++                    details.push(format!("{queued:?}"));
++                }
++            }
++            log::trace!(
++                "{} of {} queued path(s) outlived their root(s), {} root(s) remain: {}",
++                orphaned.len(),
++                data.queues.len(),
++                data.roots.len(),
++                details.join(", ")
++            );
++        }
++        if let Some((event, _)) = &data.rename_event {
++            if event
++                .paths
++                .first()
++                .is_some_and(|moved| moved.starts_with(path))
++            {
++                log::trace!("rename for {:?} outlived root {path:?}", event.paths);
++            }
++        }
++        if let Some(event) = &data.rescan_event {
++            if event
++                .paths
++                .first()
++                .is_some_and(|rescanned| rescanned.starts_with(path))
++            {
++                log::trace!("rescan for {:?} outlived root {path:?}", event.paths);
++            }
++        }
++        if !data.errors.is_empty() {
++            log::trace!(
++                "{} buffered error(s) still awaiting delivery",
++                data.errors.len()
++            );
++        }
+     }
+ 
+     pub fn watch(
+@@ -642,6 +702,98 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
+         self.watcher.watched_paths()
+     }
+ 
++    /// Render a human-readable summary of everything the debouncer is currently holding back.
++    ///
++    /// The report lists each queued path with the number of events waiting for it, the
++    /// rename and rescan bookkeeping, buffered errors and the registered watch roots,
++    /// including the debounce timeout they are held against. Attach it to a bug report
++    /// to show what the debouncer saw while the user observed silence.
++    #[must_use]
++    pub fn backlog_report(&self) -> String {
++        let data = self.data.inner.lock().unwrap();
++
++        let mut report = String::from("debouncer backlog");
++
++        if data.queues.is_empty() {
++            report.push_str(": no queued paths");
++        } else {
++            report.push_str(&format!(": {} queued path(s)", data.queues.len()));
++            for (path, queue) in &data.queues {
++                report.push_str(&format!(
++                    "\n  {path:?}: {} pending event(s)",
++                    queue.events.len()
++                ));
++            }
++        }
++
++        if let Some((event, file_id)) = &data.rename_event {
++            report.push_str(&format!("\n  rename pending for {:?}", event.paths));
++            if file_id.is_some() {
++                report.push_str(" (tracked by file id)");
++            }
++        }
++
++        if let Some(event) = &data.rescan_event {
++            report.push_str(&format!(
++                "\n  rescan pending for {:?} for {:?}",
++                event.paths,
++                event.time
++            ));
++        }
++
++        if data.errors.is_empty() {
++            report.push_str("\n  no buffered errors");
++        } else {
++            report.push_str(&format!("\n  {} buffered error(s):", data.errors.len()));
++            for error in &data.errors {
++                report.push_str(&format!("\n    {error:?}"));
++            }
++        }
++
++        report.push_str(&format!(
++            "\n  {} watched root(s), timeout {:?}",
++            data.roots.len(),
++            data.timeout
++        ));
++        for (root, recursive_mode) in &data.roots {
++            report.push_str(&format!("\n    {root:?}: {recursive_mode:?}"));
++        }
++
++        let pending_creates = data
++            .queues
++            .values()
++            .filter(|queue| {
++                queue.events.front().is_some_and(|event| {
++                    matches!(event.kind, EventKind::Create(_))
++                })
++            })
++            .count();
++        let pending_removes = data
++            .queues
++            .values()
++            .filter(|queue| {
++                queue
++                    .events
++                    .front()
++                    .is_some_and(|event| matches!(event.kind, EventKind::Remove(_)))
++            })
++            .count();
++        let pending_renames = data
++            .queues
++            .values()
++            .filter(|queue| {
++                queue.events.front().is_some_and(
++                    |event| matches!(event.kind, EventKind::Modify(ModifyKind::Name(_))),
++                )
++            })
++            .count();
++        report.push_str(&format!(
++            "\n  queue heads: {pending_creates} create(s), {pending_removes} remove(s), {pending_renames} rename(s)"
++        ));
++
++        report
++    }
++
+     /// Add/remove paths to watch in batch.
+     ///
+     /// For some [`Watcher`] implementations this method provides better performance than multiple
+diff --git a/notify-debouncer-mini/src/lib.rs b/notify-debouncer-mini/src/lib.rs
+index 119a02c..831355a 100644
+--- a/notify-debouncer-mini/src/lib.rs
++++ b/notify-debouncer-mini/src/lib.rs
+@@ -195,11 +195,17 @@ impl DebounceEventHandler for std::sync::mpsc::Sender<DebounceEventResult> {
+ }
+ 
+ /// Deduplicate event data entry
++///
++/// One entry exists per watched path, not per event. `insert` is frozen at the
++/// moment a path was first seen in the current burst, while `update` moves
++/// forward every time the same path reports again. Expiry is judged on `update`
++/// alone; `insert` is only read for the events that stay continuous past the
++/// first timeout.
+ #[derive(Debug)]
+ struct EventData {
+-    /// Insertion Time
++    /// Insertion Time — when this entry started tracking its path.
+     insert: Instant,
+-    /// Last Update
++    /// Last Update — when the path last reported activity.
+     update: Instant,
+ }
+ 
+@@ -234,6 +240,58 @@ struct DebounceDataInner {
+     debounce_deadline: Option<Instant>,
+ }
+ 
++/// Spell out, one observation per line, what a raw `notify::Event` carries.
++///
++/// The mini debouncer keeps no state between raw events, so the
++/// delayed-burst investigation has to read every clue off the event itself:
++/// which kind arrived, which paths it names, and which attributes rode
++/// along. The text is meant for `trace` logs; it never changes how an event
++/// is debounced.
++fn explain_raw_event(event: &Event) -> String {
++    let mut explanation = String::from("raw event");
++
++    // The kind decides which follow-up questions the burst report asks.
++    explanation.push_str(&format!(": kind {:?}", event.kind));
++
++    if event.paths.is_empty() {
++        explanation.push_str(", no path attached");
++    } else {
++        explanation.push_str(&format!(", {} path(s)", event.paths.len()));
++    }
++    for path in &event.paths {
++        explanation.push_str(&format!("\n  path: {path:?}"));
++    }
++
++    // Attributes ride along silently, but they change what the event means:
++    // an info string is editor bookkeeping, a process id separates a
++    // deliberate move from a background write.
++    if let Some(info) = event.attrs.info() {
++        explanation.push_str(&format!("\n  info: {info}"));
++    }
++    if let Some(process_id) = event.attrs.process_id() {
++        explanation.push_str(&format!("\n  process id: {process_id:?}"));
++    }
++
++    // Cross-checks the burst report ties together on a single line.
++    if event.paths.len() > 1 {
++        explanation.push_str("\n  several paths share this event");
++    }
++    if let Some(first) = event.paths.first() {
++        explanation.push_str(&format!("\n  first path: {first:?}"));
++    }
++    if let Some(last) = event.paths.last() {
++        explanation.push_str(&format!("\n  last path: {last:?}"));
++    }
++    if matches!(event.kind, notify::EventKind::Create(_)) {
++        explanation.push_str("\n  kind that can start a burst");
++    }
++    if matches!(event.kind, notify::EventKind::Remove(_)) {
++        explanation.push_str("\n  kind that ends a tracked file");
++    }
++
++    explanation
++}
++
+ impl DebounceDataInner {
+     pub fn new(timeout: Duration, batch_mode: bool) -> Self {
+         Self {
+@@ -316,7 +374,7 @@ impl DebounceDataInner {
+     /// Add new event to debouncer cache
+     #[inline(always)]
+     fn add_event(&mut self, event: Event) {
+-        log::trace!("raw event: {event:?}");
++        log::trace!("{}", explain_raw_event(&event));
+         let time = Instant::now();
+         if self.debounce_deadline.is_none() {
+             self.debounce_deadline = Some(time + self.timeout);
+diff --git a/notify/src/inotify.rs b/notify/src/inotify.rs
+index 38e11a3..177da04 100644
+--- a/notify/src/inotify.rs
++++ b/notify/src/inotify.rs
+@@ -855,6 +855,11 @@ impl EventLoop {
+                         },
+                     );
+                     self.paths.insert(w, path.absolute);
++
++                    // Fresh data for the dereference investigation: how the table
++                    // looks right after this entry settled.
++                    log::trace!("{}", self.trace_watches());
++
+                     Ok(())
+                 }
+             }
+@@ -863,6 +868,75 @@ impl EventLoop {
+         }
+     }
+ 
++    /// Render the current inotify watch table for the trace log.
++    ///
++    /// The dereference investigation needs the exact flags each installed watch
++    /// carries, together with the metadata that decides how a rewatch merges
++    /// into what is already there. Every entry is listed with the descriptor
++    /// the kernel knows it by.
++    fn trace_watches(&self) -> String {
++        let mut report = String::from("inotify watch table");
++
++        if self.watches.is_empty() {
++            report.push_str(": no watches");
++            return report;
++        }
++
++        let mut directory_watches = 0;
++        let mut dereference_watches = 0;
++        let mut user_watches = 0;
++        let mut recursive_watches = 0;
++        for watch in self.watches.values() {
++            if watch.is_dir {
++                directory_watches += 1;
++            }
++            if watch.dereference {
++                dereference_watches += 1;
++            }
++            if watch.metadata.is_user_watch {
++                user_watches += 1;
++            }
++            if watch.metadata.is_recursive {
++                recursive_watches += 1;
++            }
++        }
++        report.push_str(&format!(
++            ": {} watch(es), {} on directories, {} dereferencing, {} requested by users, {} recursive",
++            self.watches.len(),
++            directory_watches,
++            dereference_watches,
++            user_watches,
++            recursive_watches
++        ));
++
++        for (path, watch) in &self.watches {
++            report.push_str(&format!(
++                "\n  {} -> descriptor {:?}, mask {:?}",
++                path.display(),
++                watch.watch_descriptor,
++                watch.watch_mask
++            ));
++            if watch.is_dir {
++                report.push_str(", covers the directory itself");
++            }
++            if watch.dereference {
++                report.push_str(", follows links");
++            }
++            if watch.metadata.is_user_watch {
++                report.push_str(", requested directly");
++            }
++            if watch.metadata.user_is_recursive {
++                report.push_str(", recursive by request");
++            }
++            report.push_str(&format!(
++                ", reported as {}",
++                watch.metadata.reported_path.display()
++            ));
++        }
++
++        report
++    }
++
+     fn remove_watch(&mut self, path: PathBuf, remove_recursive: bool) -> Result<()> {
+         let preserved_roots = preserved_watch_roots(
+             &path,
+diff --git a/notify/src/poll.rs b/notify/src/poll.rs
+index bf422a6..f086f6e 100644
+--- a/notify/src/poll.rs
++++ b/notify/src/poll.rs
+@@ -243,6 +243,11 @@ mod data {
+         ///
+         /// This function may emit event by `data_builder.emitter`.
+         pub(super) fn rescan(&mut self, data_builder: &mut DataBuilder) {
++            // Fresh data for the size-discrepancy investigation: which stored
++            // entries look like aliases of one another before this rescan merges
++            // the next set of results in.
++            log::trace!("{}", self.trace_content_aliases());
++
+             // scan current filesystem.
+             for (path, new_path_data) in Self::scan_all_path_data(
+                 data_builder,
+@@ -296,6 +301,68 @@ mod data {
+             }
+         }
+ 
++        /// Render the content-alias pairs tracked in this watch for the trace log.
++        ///
++        /// When content comparison is enabled, two stored entries can hold the
++        /// same content hash while living at different paths. The alias report
++        /// compares every stored entry against every other entry: equal hashes
++        /// make a pair, and the stored mtimes and check times tell which copy
++        /// survives the next comparison. It is meant for the small trees the
++        /// size-discrepancy repro uses, so the pair scan lengthens with the
++        /// tree.
++        fn trace_content_aliases(&self) -> String {
++            let mut report = String::from("content aliases");
++
++            let mut unhashed = 0;
++            let mut aliases = 0;
++            let mut same_clocks = 0;
++            for (path, data) in &self.all_path_data {
++                if data.hash.is_none() {
++                    unhashed += 1;
++                    continue;
++                }
++                for (other_path, other) in &self.all_path_data {
++                    if other_path == path || other.hash.is_none() {
++                        continue;
++                    }
++                    if let (Some(data_hash), Some(other_hash)) = (data.hash, other.hash) {
++                        if data_hash != other_hash {
++                            continue;
++                        }
++                        aliases += 1;
++                        // the watcher coarsens directory mtimes to whole seconds,
++                        // so aliases inside the same second are invisible to it
++                        if data.mtime / NANOS_PER_SECOND == other.mtime / NANOS_PER_SECOND {
++                            same_clocks += 1;
++                        }
++                        let mtime_gap = data.mtime - other.mtime;
++                        report.push_str(&format!(
++                            "\n  {} and {}: same stored content",
++                            path.display(),
++                            other_path.display()
++                        ));
++                        report.push_str(&format!(", mtimes {} vs {}", data.mtime, other.mtime));
++                        report.push_str(&format!(", {}ns apart", mtime_gap));
++                        if data.last_check >= other.last_check {
++                            report.push_str(", checked no earlier");
++                        } else {
++                            report.push_str(", checked earlier");
++                        }
++                    }
++                }
++            }
++
++            if aliases == 0 {
++                report.push_str(": none");
++            }
++            report.push_str(&format!(
++                "\n  {} alias pair(s), {} within the same second, {} entries without a hash",
++                aliases, same_clocks, unhashed
++            ));
++
++            report
++        }
++
+         /// Get all `PathData` by given configuration.
+         ///
+         /// # Side Effect

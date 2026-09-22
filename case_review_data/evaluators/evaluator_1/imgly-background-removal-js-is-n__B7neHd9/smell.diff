@@ -1,0 +1,898 @@
+diff --git a/packages/node/src/backend/base.ts b/packages/node/src/backend/base.ts
+new file mode 100644
+index 0000000..4bc8047
+--- /dev/null
++++ b/packages/node/src/backend/base.ts
+@@ -0,0 +1,136 @@
++export { BaseSegmentationBackend };
++
++import type { NdArray } from 'ndarray';
++import type { Config } from '../schema';
++import type { ImageSource } from '../utils';
++import type { SegmentationBackend, SegmentationSession } from './types';
++
++import {
++  tensorResizeBilinear,
++  tensorHWCtoBCHW,
++  calculateProportionalSize,
++  convertFloat32ToUint8
++} from '../utils';
++import { ensureAbsoluteURI } from '../url';
++import { loadFromURI, loadAsBlob, loadAsUrl } from '../resource';
++
++/**
++ * Backend plumbing that does not depend on the concrete codec or runtime.
++ *
++ * Tensor math and resource assembly go through the workspace helpers in
++ * `utils` and `resource`; the operations that genuinely differ per runtime
++ * (image codecs and onnx execution) stay abstract so each backend flavour
++ * only fills in the parts it can actually implement.
++ */
++abstract class BaseSegmentationBackend implements SegmentationBackend {
++  /**
++   * Resizes an HWC tensor with bilinear interpolation.
++   */
++  resizeTensor(
++    imageTensor: NdArray<Uint8Array>,
++    newWidth: number,
++    newHeight: number
++  ): NdArray<Uint8Array> {
++    return tensorResizeBilinear(imageTensor, newWidth, newHeight);
++  }
++
++  /**
++   * Normalizes an HWC rgba tensor into a 1x3xHxW float tensor.
++   */
++  hwcToBchw(
++    imageTensor: NdArray<Uint8Array>,
++    mean: number[] = [128, 128, 128],
++    std: number[] = [256, 256, 256]
++  ): NdArray<Float32Array> {
++    return tensorHWCtoBCHW(imageTensor, mean, std);
++  }
++
++  /**
++   * Computes the largest size that fits into the given box without
++   * distorting the aspect ratio.
++   */
++  proportionalSize(
++    originalWidth: number,
++    originalHeight: number,
++    maxWidth: number,
++    maxHeight: number
++  ): [number, number] {
++    return calculateProportionalSize(
++      originalWidth,
++      originalHeight,
++      maxWidth,
++      maxHeight
++    );
++  }
++
++  /**
++   * Converts a float mask into its u8 representation.
++   */
++  float32ToUint8(
++    float32Array: NdArray<Float32Array>
++  ): NdArray<Uint8Array> {
++    return convertFloat32ToUint8(float32Array);
++  }
++
++  /**
++   * Resolves a possibly relative url against a base url.
++   */
++  resolveUri(url: string, baseUrl: string): URL {
++    return ensureAbsoluteURI(url, baseUrl);
++  }
++
++  /**
++   * Loads any supported protocol into a fetch-like response.
++   */
++  async fetchResponse(uri: URL, _: Config): Promise<Response> {
++    return await loadFromURI(uri);
++  }
++
++  /**
++   * Assembles a chunked resource from the bundle behind config.publicPath.
++   */
++  async fetchBlob(key: string, config: Config): Promise<Blob> {
++    return await loadAsBlob(key, config);
++  }
++
++  /**
++   * Same as fetchBlob but yields an object url, used for wasm modules.
++   */
++  async fetchResourceUrl(key: string, config: Config): Promise<string> {
++    return await loadAsUrl(key, config);
++  }
++
++  /**
++   * Decodes an arbitrary image source into an HWC rgba tensor.
++   */
++  abstract decodeImage(
++    source: ImageSource,
++    config: Config
++  ): Promise<NdArray<Uint8Array>>;
++
++  /**
++   * Encodes an HWC rgba tensor into a Blob of the requested format.
++   */
++  abstract encodeImage(
++    imageTensor: NdArray<Uint8Array>,
++    quality: number,
++    format: string
++  ): Promise<Blob>;
++
++  /**
++   * Creates the onnx session for a model byte buffer.
++   */
++  abstract createSession(
++    model: ArrayBuffer,
++    config: Config
++  ): Promise<SegmentationSession>;
++
++  /**
++   * Runs the session with the given feeds and collects the outputs.
++   */
++  abstract runSession(
++    session: SegmentationSession,
++    inputs: [string, NdArray<Float32Array>][],
++    outputs: [string]
++  ): Promise<NdArray<Float32Array>[]>;
++}
+diff --git a/packages/node/src/backend/index.ts b/packages/node/src/backend/index.ts
+new file mode 100644
+index 0000000..a18d3b1
+--- /dev/null
++++ b/packages/node/src/backend/index.ts
+@@ -0,0 +1,12 @@
++export { SharpSegmentationBackend, BaseSegmentationBackend, defaultBackend };
++export type { SegmentationBackend, SegmentationSession } from './types';
++
++import { BaseSegmentationBackend } from './base';
++import { SharpSegmentationBackend } from './sharp';
++import type { SegmentationBackend } from './types';
++
++/**
++ * The backend the Node.js pipeline runs on. Typing the instance against the
++ * contract keeps the pipeline free of sharp/onnxruntime specifics.
++ */
++const defaultBackend: SegmentationBackend = new SharpSegmentationBackend();
+diff --git a/packages/node/src/backend/sharp.ts b/packages/node/src/backend/sharp.ts
+new file mode 100644
+index 0000000..1f4e8a6
+--- /dev/null
++++ b/packages/node/src/backend/sharp.ts
+@@ -0,0 +1,60 @@
++export { SharpSegmentationBackend };
++
++import { BaseSegmentationBackend } from './base';
++import type { SegmentationSession } from './types';
++
++import type { NdArray } from 'ndarray';
++import type { Config } from '../schema';
++import type { ImageSource } from '../utils';
++
++import { imageEncode } from '../codecs';
++import { imageSourceToImageData } from '../utils';
++import { createOnnxSession, runOnnxSession } from '../onnx';
++
++/**
++ * The Node.js segmentation backend: it decodes and encodes with sharp and
++ * runs models with onnxruntime-node.
++ */
++class SharpSegmentationBackend extends BaseSegmentationBackend {
++  /**
++   * Decodes sharp-supported image sources into an HWC rgba tensor.
++   */
++  async decodeImage(
++    source: ImageSource,
++    config: Config
++  ): Promise<NdArray<Uint8Array>> {
++    return await imageSourceToImageData(source, config);
++  }
++
++  /**
++   * Encodes an HWC rgba tensor into a Blob of the requested sharp format.
++   */
++  async encodeImage(
++    imageTensor: NdArray<Uint8Array>,
++    quality: number,
++    format: string
++  ): Promise<Blob> {
++    return await imageEncode(imageTensor, quality, format);
++  }
++
++  /**
++   * Creates the onnxruntime-node session for a model byte buffer.
++   */
++  async createSession(
++    model: ArrayBuffer,
++    config: Config
++  ): Promise<SegmentationSession> {
++    return await createOnnxSession(model, config);
++  }
++
++  /**
++   * Runs the onnxruntime-node session with the given feeds.
++   */
++  async runSession(
++    session: SegmentationSession,
++    inputs: [string, NdArray<Float32Array>][],
++    outputs: [string]
++  ): Promise<NdArray<Float32Array>[]> {
++    return await runOnnxSession(session, inputs, outputs);
++  }
++}
+diff --git a/packages/node/src/backend/types.ts b/packages/node/src/backend/types.ts
+new file mode 100644
+index 0000000..3e21734
+--- /dev/null
++++ b/packages/node/src/backend/types.ts
+@@ -0,0 +1,113 @@
++export { SegmentationBackend, SegmentationSession };
++export type { ImageSource } from '../utils';
++
++import type { InferenceSession } from 'onnxruntime-node';
++import type { NdArray } from 'ndarray';
++import type { Config } from '../schema';
++import type { ImageSource } from '../utils';
++
++/**
++ * The single contract every segmentation backend has to provide.
++ *
++ * A backend owns the complete path from raw image bytes to a composed alpha
++ * mask: decoding and re-encoding images, the tensor math used to feed and
++ * post-process the model, access to the chunked resource bundle, and the
++ * onnx model runtime itself. Grouping these stages in one place keeps the
++ * switch to a different runtime (wasm, gpu, remote inference) to a single
++ * implementation.
++ */
++interface SegmentationBackend {
++  /**
++   * Decodes an arbitrary image source (path, url, blob, buffer) into an
++   * HWC rgba tensor.
++   */
++  decodeImage(source: ImageSource, config: Config): Promise<NdArray<Uint8Array>>;
++
++  /**
++   * Encodes an HWC rgba tensor into a Blob of the requested format.
++   */
++  encodeImage(
++    imageTensor: NdArray<Uint8Array>,
++    quality: number,
++    format: string
++  ): Promise<Blob>;
++
++  /**
++   * Resizes an HWC tensor with bilinear interpolation.
++   */
++  resizeTensor(
++    imageTensor: NdArray<Uint8Array>,
++    newWidth: number,
++    newHeight: number
++  ): NdArray<Uint8Array>;
++
++  /**
++   * Normalizes an HWC rgba tensor into a 1x3xHxW float tensor.
++   */
++  hwcToBchw(
++    imageTensor: NdArray<Uint8Array>,
++    mean?: number[],
++    std?: number[]
++  ): NdArray<Float32Array>;
++
++  /**
++   * Computes the largest size that fits into the given box without
++   * distorting the aspect ratio.
++   */
++  proportionalSize(
++    originalWidth: number,
++    originalHeight: number,
++    maxWidth: number,
++    maxHeight: number
++  ): [number, number];
++
++  /**
++   * Converts a float mask into its u8 representation.
++   */
++  float32ToUint8(
++    float32Array: NdArray<Float32Array>
++  ): NdArray<Uint8Array>;
++
++  /**
++   * Resolves a possibly relative url against a base url.
++   */
++  resolveUri(url: string, baseUrl: string): URL;
++
++  /**
++   * Loads any supported protocol into a fetch-like response.
++   */
++  fetchResponse(uri: URL, config: Config): Promise<Response>;
++
++  /**
++   * Assembles a chunked resource from the bundle behind config.publicPath.
++   */
++  fetchBlob(key: string, config: Config): Promise<Blob>;
++
++  /**
++   * Same as fetchBlob but yields an object url, used for wasm modules.
++   */
++  fetchResourceUrl(key: string, config: Config): Promise<string>;
++
++  /**
++   * Creates the onnx session for a model byte buffer.
++   */
++  createSession(
++    model: ArrayBuffer,
++    config: Config
++  ): Promise<SegmentationSession>;
++
++  /**
++   * Runs the session with the given feeds and collects the outputs.
++   */
++  runSession(
++    session: SegmentationSession,
++    inputs: [string, NdArray<Float32Array>][],
++    outputs: [string]
++  ): Promise<NdArray<Float32Array>[]>;
++}
++
++/**
++ * The session handle a backend creates and later runs. The Node backend runs
++ * in-process, so the handle is the onnxruntime session itself.
++ */
++type SegmentationSession = InferenceSession;
+diff --git a/packages/node/src/index.ts b/packages/node/src/index.ts
+index 3c011a6..5b0f9b5 100644
+--- a/packages/node/src/index.ts
++++ b/packages/node/src/index.ts
+@@ -9,6 +9,7 @@ export type { Config, ImageSource };
+ 
+ import lodash from 'lodash';
+ import ndarray from 'ndarray';
++import { defaultBackend } from './backend';
+ import { initInference, runInference } from './inference';
+ import { Config, validateConfig } from './schema';
+ import * as utils from './utils';
+@@ -41,7 +42,7 @@ async function removeBackground(
+     outImageTensor.data[4 * i + 3] = alphamask.data[i];
+   }
+ 
+-  const outImage = await utils.imageEncode(
++  const outImage = await defaultBackend.encodeImage(
+     outImageTensor,
+     config.output.quality,
+     config.output.format
+@@ -73,7 +74,7 @@ async function removeForeground(
+     outImageTensor.data[4 * i + 3] = 255 - alphamask.data[i];
+   }
+ 
+-  const outImage = await utils.imageEncode(
++  const outImage = await defaultBackend.encodeImage(
+     outImageTensor,
+     config.output.quality,
+     config.output.format
+@@ -102,7 +103,7 @@ async function segmentForeground(
+   const stride = width * height;
+ 
+   if (config.output.format === 'image/x-alpha8') {
+-    const outImage = await utils.imageEncode(
++    const outImage = await defaultBackend.encodeImage(
+       alphamask,
+       config.output.quality,
+       config.output.format
+@@ -122,7 +123,7 @@ async function segmentForeground(
+       outImageTensor.data[index + 3] = 255;
+     }
+ 
+-    const outImage = await utils.imageEncode(
++    const outImage = await defaultBackend.encodeImage(
+       outImageTensor,
+       config.output.quality,
+       config.output.format
+@@ -145,7 +146,7 @@ async function applySegmentationMask(
+ 
+   const alphaMask =
+     maskHeight !== imageHeight || maskWidth !== imageWidth
+-      ? utils.tensorResizeBilinear(maskTensor, imageWidth, imageHeight)
++      ? defaultBackend.resizeTensor(maskTensor, imageWidth, imageHeight)
+       : maskTensor;
+   const stride = imageWidth * imageHeight;
+   for (let i = 0; i < stride; i += 1) {
+@@ -154,7 +155,7 @@ async function applySegmentationMask(
+     imageTensor.data[idxImage + 3] = alphaMask.data[idxMask]; // alpha information it always in the first (sometimes also in the others)
+   }
+ 
+-  const outImage = await utils.imageEncode(
++  const outImage = await defaultBackend.encodeImage(
+     imageTensor,
+     config.output.quality,
+     config.output.format
+diff --git a/packages/node/src/inference.ts b/packages/node/src/inference.ts
+index 92d49ad..599cbf7 100644
+--- a/packages/node/src/inference.ts
++++ b/packages/node/src/inference.ts
+@@ -1,21 +1,18 @@
+ export { initInference, runInference };
+ 
+-import { tensorResizeBilinear, tensorHWCtoBCHW } from './utils';
+-import { createOnnxSession, runOnnxSession } from './onnx';
++import { defaultBackend } from './backend';
+ import { Config, validateConfig } from './schema';
+ 
+-import { loadAsBlob } from './resource';
+ import ndarray, { NdArray } from 'ndarray';
+-import { convertFloat32ToUint8 } from './utils';
+ 
+ async function initInference(config?: Config) {
+   config = validateConfig(config);
+ 
+   if (config.debug) console.debug('Loading model...');
+   const model = config.model;
+-  const blob = await loadAsBlob(`/models/${model}`, config);
++  const blob = await defaultBackend.fetchBlob(`/models/${model}`, config);
+   const arrayBuffer = await blob.arrayBuffer();
+-  const session = await createOnnxSession(arrayBuffer, config);
++  const session = await defaultBackend.createSession(arrayBuffer, config);
+   return { config, session };
+ }
+ 
+@@ -28,19 +25,23 @@ async function runInference(
+   const resolution = 1024;
+   const [srcHeight, srcWidth, srcChannels] = imageTensor.shape;
+ 
+-  let tensorImage = tensorResizeBilinear(imageTensor, resolution, resolution);
+-  const inputTensor = tensorHWCtoBCHW(tensorImage); // this converts also from float to rgba
++  let tensorImage = defaultBackend.resizeTensor(
++    imageTensor,
++    resolution,
++    resolution
++  );
++  const inputTensor = defaultBackend.hwcToBchw(tensorImage); // this converts also from float to rgba
+ 
+   // run
+-  const predictionsDict = await runOnnxSession(
++  const predictionsDict = await defaultBackend.runSession(
+     session,
+     [['input', inputTensor]],
+     ['output']
+   );
+ 
+   let alphamask = ndarray(predictionsDict[0].data, [resolution, resolution, 1]);
+-  let alphamaskU8 = convertFloat32ToUint8(alphamask);
+-  alphamaskU8 = tensorResizeBilinear(alphamaskU8, srcWidth, srcHeight);
++  let alphamaskU8 = defaultBackend.float32ToUint8(alphamask);
++  alphamaskU8 = defaultBackend.resizeTensor(alphamaskU8, srcWidth, srcHeight);
+ 
+   if (config.progress) config.progress('compute:inference', 1, 1);
+   return alphamaskU8;
+diff --git a/packages/web/src/api/v1.ts b/packages/web/src/api/v1.ts
+index e08c06a..3bd63d9 100644
+--- a/packages/web/src/api/v1.ts
++++ b/packages/web/src/api/v1.ts
+@@ -11,6 +11,7 @@ export type { Config, ImageSource };
+ 
+ import memoize from 'lodash-es/memoize';
+ 
++import { defaultBackend } from '../backend';
+ import { initInference, runInference } from '../inference';
+ import { Config, validateConfig } from '../schema';
+ import * as utils from '../utils';
+@@ -55,7 +56,7 @@ async function removeBackground(
+     outImageTensor.data[4 * i + 3] = alphamask.data[i];
+   }
+   config.progress?.('compute:encode', 3, 4);
+-  const outImage = await utils.imageEncode(
++  const outImage = await defaultBackend.encodeImage(
+     outImageTensor,
+     config.output.quality,
+     config.output.format
+@@ -92,7 +93,7 @@ async function removeForeground(
+     outImageTensor.data[4 * i + 3] = 255 - alphamask.data[i];
+   }
+ 
+-  const outImage = await utils.imageEncode(
++  const outImage = await defaultBackend.encodeImage(
+     outImageTensor,
+     config.output.quality,
+     config.output.format
+@@ -138,7 +139,7 @@ async function segmentForeground(
+     outImageTensor.data[index + 3] = alpha;
+   }
+ 
+-  const outImage = await utils.imageEncode(
++  const outImage = await defaultBackend.encodeImage(
+     outImageTensor,
+     config.output.quality,
+     config.output.format
+@@ -159,7 +160,7 @@ async function applySegmentationMask(
+ 
+   const alphaMask =
+     maskHeight !== imageHeight || maskWidth !== imageWidth
+-      ? utils.tensorResizeBilinear(maskTensor, imageWidth, imageHeight)
++      ? defaultBackend.resizeTensor(maskTensor, imageWidth, imageHeight)
+       : maskTensor;
+   const stride = imageWidth * imageHeight;
+   for (let i = 0; i < stride; i += 1) {
+@@ -168,7 +169,7 @@ async function applySegmentationMask(
+     imageTensor.data[idxImage + 3] = alphaMask.data[idxMask + 3];
+   }
+ 
+-  const outImage = await utils.imageEncode(
++  const outImage = await defaultBackend.encodeImage(
+     imageTensor,
+     config.output.quality,
+     config.output.format
+diff --git a/packages/web/src/backend/base.ts b/packages/web/src/backend/base.ts
+new file mode 100644
+index 0000000..9750b71
+--- /dev/null
++++ b/packages/web/src/backend/base.ts
+@@ -0,0 +1,117 @@
++export { BaseSegmentationBackend };
++
++import type { NdArray } from 'ndarray';
++import type { Config } from '../schema';
++import type { ImageSource } from '../utils';
++import type { SegmentationBackend, SegmentationSession } from './types';
++
++import {
++  tensorResizeBilinear,
++  tensorHWCtoBCHW,
++  convertFloat32ToUint8,
++  imageBitmapToImageData
++} from '../utils';
++import { loadAsBlob, loadAsUrl } from '../resource';
++
++/**
++ * Backend plumbing that does not depend on the concrete codec or runtime.
++ *
++ * Tensor math and resource assembly go through the workspace helpers in
++ * `utils` and `resource`; the operations that genuinely differ per runtime
++ * (image codecs and onnx execution) stay abstract so each backend flavour
++ * only fills in the parts it can actually implement.
++ */
++abstract class BaseSegmentationBackend implements SegmentationBackend {
++  /**
++   * Resizes an HWC tensor with bilinear interpolation.
++   */
++  resizeTensor(
++    imageTensor: NdArray<Uint8Array>,
++    newWidth: number,
++    newHeight: number,
++    proportional: boolean = false
++  ): NdArray<Uint8Array> {
++    return tensorResizeBilinear(
++      imageTensor,
++      newWidth,
++      newHeight,
++      proportional
++    );
++  }
++
++  /**
++   * Normalizes an HWC rgba tensor into a 1x3xHxW float tensor.
++   */
++  hwcToBchw(
++    imageTensor: NdArray<Uint8Array>,
++    mean: number[] = [128, 128, 128],
++    std: number[] = [256, 256, 256]
++  ): NdArray<Float32Array> {
++    return tensorHWCtoBCHW(imageTensor, mean, std);
++  }
++
++  /**
++   * Converts a float mask into its u8 representation.
++   */
++  float32ToUint8(
++    float32Array: NdArray<Float32Array>
++  ): NdArray<Uint8Array> {
++    return convertFloat32ToUint8(float32Array);
++  }
++
++  /**
++   * Draws a decoded ImageBitmap into an ImageData buffer.
++   */
++  bitmapToData(bitmap: ImageBitmap): ImageData {
++    return imageBitmapToImageData(bitmap);
++  }
++
++  /**
++   * Assembles a chunked resource from the bundle behind config.publicPath.
++   */
++  async fetchBlob(key: string, config: Config): Promise<Blob> {
++    return await loadAsBlob(key, config);
++  }
++
++  /**
++   * Same as fetchBlob but yields an object url, used for wasm modules.
++   */
++  async fetchResourceUrl(key: string, config: Config): Promise<string> {
++    return await loadAsUrl(key, config);
++  }
++
++  /**
++   * Decodes an arbitrary image source into an HWC rgba tensor.
++   */
++  abstract decodeImage(
++    source: ImageSource,
++    config: Config
++  ): Promise<NdArray<Uint8Array>>;
++
++  /**
++   * Encodes an HWC rgba tensor into a Blob of the requested format.
++   */
++  abstract encodeImage(
++    imageTensor: NdArray<Uint8Array>,
++    quality: number,
++    format: string
++  ): Promise<Blob>;
++
++  /**
++   * Creates the onnx session for a model byte buffer.
++   */
++  abstract createSession(
++    model: ArrayBuffer,
++    config: Config
++  ): Promise<SegmentationSession>;
++
++  /**
++   * Runs the session with the given feeds and collects the outputs.
++   */
++  abstract runSession(
++    session: SegmentationSession,
++    inputs: [string, NdArray<Float32Array>][],
++    outputs: [string],
++    config: Config
++  ): Promise<NdArray<Float32Array>[]>;
++}
+diff --git a/packages/web/src/backend/canvas.ts b/packages/web/src/backend/canvas.ts
+new file mode 100644
+index 0000000..1c07d41
+--- /dev/null
++++ b/packages/web/src/backend/canvas.ts
+@@ -0,0 +1,61 @@
++export { CanvasSegmentationBackend };
++
++import { BaseSegmentationBackend } from './base';
++import type { SegmentationSession } from './types';
++
++import type { NdArray } from 'ndarray';
++import type { Config } from '../schema';
++import type { ImageSource } from '../utils';
++
++import { imageEncode } from '../codecs';
++import { imageSourceToImageData } from '../utils';
++import { createOnnxSession, runOnnxSession } from '../onnx';
++
++/**
++ * The browser segmentation backend: it decodes and encodes through the
++ * canvas APIs and runs models with onnxruntime-web.
++ */
++class CanvasSegmentationBackend extends BaseSegmentationBackend {
++  /**
++   * Decodes browser-supported image sources into an HWC rgba tensor.
++   */
++  async decodeImage(
++    source: ImageSource,
++    config: Config
++  ): Promise<NdArray<Uint8Array>> {
++    return await imageSourceToImageData(source, config);
++  }
++
++  /**
++   * Encodes an HWC rgba tensor into a Blob of the requested canvas format.
++   */
++  async encodeImage(
++    imageTensor: NdArray<Uint8Array>,
++    quality: number,
++    format: string
++  ): Promise<Blob> {
++    return await imageEncode(imageTensor, quality, format);
++  }
++
++  /**
++   * Creates the onnxruntime-web session for a model byte buffer.
++   */
++  async createSession(
++    model: ArrayBuffer,
++    config: Config
++  ): Promise<SegmentationSession> {
++    return await createOnnxSession(model, config);
++  }
++
++  /**
++   * Runs the onnxruntime-web session with the given feeds.
++   */
++  async runSession(
++    session: SegmentationSession,
++    inputs: [string, NdArray<Float32Array>][],
++    outputs: [string],
++    config: Config
++  ): Promise<NdArray<Float32Array>[]> {
++    return await runOnnxSession(session, inputs, outputs, config);
++  }
++}
+diff --git a/packages/web/src/backend/index.ts b/packages/web/src/backend/index.ts
+new file mode 100644
+index 0000000..57f5ee0
+--- /dev/null
++++ b/packages/web/src/backend/index.ts
+@@ -0,0 +1,12 @@
++export { CanvasSegmentationBackend, BaseSegmentationBackend, defaultBackend };
++export type { SegmentationBackend, SegmentationSession } from './types';
++
++import { BaseSegmentationBackend } from './base';
++import { CanvasSegmentationBackend } from './canvas';
++import type { SegmentationBackend } from './types';
++
++/**
++ * The backend the browser pipeline runs on. Typing the instance against the
++ * contract keeps the pipeline free of canvas/onnxruntime specifics.
++ */
++const defaultBackend: SegmentationBackend = new CanvasSegmentationBackend();
+diff --git a/packages/web/src/backend/types.ts b/packages/web/src/backend/types.ts
+new file mode 100644
+index 0000000..302b258
+--- /dev/null
++++ b/packages/web/src/backend/types.ts
+@@ -0,0 +1,99 @@
++export { SegmentationBackend, SegmentationSession };
++export type { ImageSource } from '../utils';
++
++import type { NdArray } from 'ndarray';
++import type { Config } from '../schema';
++import type { ImageSource } from '../utils';
++
++/**
++ * The single contract every segmentation backend has to provide.
++ *
++ * A backend owns the complete path from raw image bytes to a composed alpha
++ * mask: decoding and re-encoding images, the tensor math used to feed and
++ * post-process the model, access to the chunked resource bundle, and the
++ * onnx model runtime itself. Grouping these stages in one place keeps the
++ * budget policy for a new runtime (wasm, webgpu, remote inference) to a
++ * single implementation.
++ */
++interface SegmentationBackend {
++  /**
++   * Decodes an arbitrary image source (url, blob, buffer) into an HWC rgba
++   * tensor.
++   */
++  decodeImage(source: ImageSource, config: Config): Promise<NdArray<Uint8Array>>;
++
++  /**
++   * Encodes an HWC rgba tensor into a Blob of the requested format.
++   */
++  encodeImage(
++    imageTensor: NdArray<Uint8Array>,
++    quality: number,
++    format: string
++  ): Promise<Blob>;
++
++  /**
++   * Resizes an HWC tensor with bilinear interpolation.
++   */
++  resizeTensor(
++    imageTensor: NdArray<Uint8Array>,
++    newWidth: number,
++    newHeight: number,
++    proportional?: boolean
++  ): NdArray<Uint8Array>;
++
++  /**
++   * Normalizes an HWC rgba tensor into a 1x3xHxW float tensor.
++   */
++  hwcToBchw(
++    imageTensor: NdArray<Uint8Array>,
++    mean?: number[],
++    std?: number[]
++  ): NdArray<Float32Array>;
++
++  /**
++   * Converts a float mask into its u8 representation.
++   */
++  float32ToUint8(
++    float32Array: NdArray<Float32Array>
++  ): NdArray<Uint8Array>;
++
++  /**
++   * Draws a decoded ImageBitmap into an ImageData buffer.
++   */
++  bitmapToData(bitmap: ImageBitmap): ImageData;
++
++  /**
++   * Assembles a chunked resource from the bundle behind config.publicPath.
++   */
++  fetchBlob(key: string, config: Config): Promise<Blob>;
++
++  /**
++   * Same as fetchBlob but yields an object url, used for wasm modules.
++   */
++  fetchResourceUrl(key: string, config: Config): Promise<string>;
++
++  /**
++   * Creates the onnx session for a model byte buffer.
++   */
++  createSession(
++    model: ArrayBuffer,
++    config: Config
++  ): Promise<SegmentationSession>;
++
++  /**
++   * Runs the session with the given feeds and collects the outputs.
++   */
++  runSession(
++    session: SegmentationSession,
++    inputs: [string, NdArray<Float32Array>][],
++    outputs: [string],
++    config: Config
++  ): Promise<NdArray<Float32Array>[]>;
++}
++
++/**
++ * The session handle a backend creates and later runs. In the wasm-proxy
++ * configuration the handle crosses worker boundaries, so the contract only
++ * commits to it being the backend's own opaque handle.
++ */
++type SegmentationSession = unknown;
+diff --git a/packages/web/src/inference.ts b/packages/web/src/inference.ts
+index c768c98..4f576d0 100644
+--- a/packages/web/src/inference.ts
++++ b/packages/web/src/inference.ts
+@@ -1,19 +1,16 @@
+ export { initInference, runInference };
+ 
+-import { tensorResizeBilinear, tensorHWCtoBCHW } from './utils';
+-import { createOnnxSession, runOnnxSession } from './onnx';
++import { defaultBackend } from './backend';
+ import { Config, validateConfig } from './schema';
+ 
+-import { loadAsBlob } from './resource';
+ import ndarray, { NdArray } from 'ndarray';
+-import { convertFloat32ToUint8 } from './utils';
+ 
+ async function initBase(config: Config): Promise<unknown> {
+   if (config.debug) console.debug('Loading model...', config.model);
+   const model = config.model;
+-  const blob = await loadAsBlob(`/models/${model}`, config);
++  const blob = await defaultBackend.fetchBlob(`/models/${model}`, config);
+   const arrayBuffer = await blob.arrayBuffer();
+-  const session = await createOnnxSession(arrayBuffer, config);
++  const session = await defaultBackend.createSession(arrayBuffer, config);
+   return session;
+ }
+ 
+@@ -34,16 +31,16 @@ async function runInference(
+   const [srcHeight, srcWidth, srcChannels] = imageTensor.shape;
+   const keepAspect = false;
+ 
+-  let resizedImageTensor = tensorResizeBilinear(
++  let resizedImageTensor = defaultBackend.resizeTensor(
+     imageTensor,
+     resolution,
+     resolution,
+     keepAspect
+   );
+ 
+-  const inputTensor = tensorHWCtoBCHW(resizedImageTensor); // this converts also from float to rgba
++  const inputTensor = defaultBackend.hwcToBchw(resizedImageTensor); // this converts also from float to rgba
+ 
+-  let predictionsDict = await runOnnxSession(
++  let predictionsDict = await defaultBackend.runSession(
+     session.base,
+     [['input', inputTensor]],
+     ['output'],
+@@ -52,9 +49,9 @@ async function runInference(
+ 
+   let alphamask = ndarray(predictionsDict[0].data, [resolution, resolution, 1]);
+ 
+-  let alphamaskU8 = convertFloat32ToUint8(alphamask);
++  let alphamaskU8 = defaultBackend.float32ToUint8(alphamask);
+   if (config.rescale) {
+-    alphamaskU8 = tensorResizeBilinear(
++    alphamaskU8 = defaultBackend.resizeTensor(
+       alphamaskU8,
+       srcWidth,
+       srcHeight,

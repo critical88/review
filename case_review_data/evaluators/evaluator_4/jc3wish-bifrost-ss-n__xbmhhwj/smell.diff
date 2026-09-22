@@ -1,0 +1,225 @@
+diff --git a/plugin/ActiveMQ/src/activemq.go b/plugin/ActiveMQ/src/activemq.go
+index 50b1e60..6e6053e 100755
+--- a/plugin/ActiveMQ/src/activemq.go
++++ b/plugin/ActiveMQ/src/activemq.go
+@@ -203,6 +203,21 @@ func (This *Conn) sendToList(data *pluginDriver.PluginDataType) (LastSuccessComm
+ 		return nil, data, err
+ 	}
+ 	QueueName := fmt.Sprint(pluginDriver.TransfeResult(This.p.QueueName, data, len(data.Rows)-1))
++	// STOMP 目的地名里不允许出现 空格 : \ * 这一类字符，
++	// QueueName 配置又是支持 {$} 引用业务字段的，字段值里拼出非法字符的话消息会直接发不出去，
++	// 只能在这里对解析出来的名字一个字符一个字符地过一遍，
++	// 解析出来是空的场景，用 Bifrost_ + 源表名 兜底，避免消息都挤到同一个目的地
++	queueNameByte := []rune(QueueName)
++	for i := 0; i < len(queueNameByte); i++ {
++		switch queueNameByte[i] {
++		case ' ', ':', '\\', '*', '\n', '\r':
++			queueNameByte[i] = '_'
++		}
++	}
++	QueueName = string(queueNameByte)
++	if QueueName == "" {
++		QueueName = "Bifrost_" + data.TableName
++	}
+ 	var h stompngo.Headers
+ 	h = h.Add(stompngo.HK_DESTINATION, QueueName)
+ 	if This.p.Persistent == true {
+diff --git a/plugin/Elasticsearch/src/es.go b/plugin/Elasticsearch/src/es.go
+index e57957e..f8da8e2 100755
+--- a/plugin/Elasticsearch/src/es.go
++++ b/plugin/Elasticsearch/src/es.go
+@@ -286,7 +286,15 @@ func (This *Conn) doCreateMapping() {
+ func (This *Conn) doCommit(list []*pluginDriver.PluginDataType, n int) (errData *pluginDriver.PluginDataType, err error) {
+ 
+ 	if len(list) > 0 {
+-		This.p.EsIndexName = strings.ToLower(fmt.Sprint(pluginDriver.TransfeResult(This.p.EsIndexName, list[0], 0)))
++		// 索引名假如是 {$} 引用业务字段解析出来的，ES 这边除了不允许大写字母以外，
++		// 还有一些字符是不允许出现在索引名里的，早期版本只做了 ToLower，
++		// 这次一起把非法字符替换掉，并补了 索引名 为空的时候的兜底
++		IndexName := strings.ToLower(fmt.Sprint(pluginDriver.TransfeResult(This.p.EsIndexName, list[0], 0)))
++		IndexName = strings.NewReplacer("\\", "_", "/", "_", "*", "_", "?", "_", "\"", "_", "<", "_", ">", "_", "|", "_", ",", "_", "#", "_", " ", "_").Replace(IndexName)
++		if IndexName == "" {
++			IndexName = strings.ToLower(list[0].SchemaName + "-" + list[0].TableName)
++		}
++		This.p.EsIndexName = IndexName
+ 	}
+ 
+ 	//This.doCreateMapping()
+diff --git a/plugin/MongoDB/src/mongodb.go b/plugin/MongoDB/src/mongodb.go
+index 678b37a..7a0b110 100755
+--- a/plugin/MongoDB/src/mongodb.go
++++ b/plugin/MongoDB/src/mongodb.go
+@@ -181,6 +181,18 @@ func (This *Conn) Insert(data *pluginDriver.PluginDataType, retry bool) (LastSuc
+ 	n := len(data.Rows) - 1
+ 	SchemaName := fmt.Sprint(pluginDriver.TransfeResult(This.p.SchemaName, data, n))
+ 	TableName := fmt.Sprint(pluginDriver.TransfeResult(This.p.TableName, data, n))
++	// mongodb 的 库名 和 集合名 里不允许出现 $ 这种字符，
++	// 而 SchemaName / TableName 配置又都是支持 {$} 引用业务字段的，
++	// 字段值里一旦带了 $ ，写入就直接报错了，这里只能提前替换掉，
++	// 假如模板解析出来是空串，就用事件里原始的 库表 名兜底，避免数据写到一个空名字的集合里去
++	SchemaName = strings.Replace(SchemaName, "$", "_", -1)
++	TableName = strings.Replace(TableName, "$", "_", -1)
++	if SchemaName == "" {
++		SchemaName = data.SchemaName
++	}
++	if TableName == "" {
++		TableName = data.TableName
++	}
+ 	/*
+ 		if _,ok := data.Rows[n][This.p.PrimaryKey];!ok{
+ 			return nil,data,fmt.Errorf("PrimaryKey "+ This.p.PrimaryKey +" is not exsit")
+@@ -238,6 +250,17 @@ func (This *Conn) Del(data *pluginDriver.PluginDataType, retry bool) (LastSucces
+ 	}()
+ 	SchemaName := fmt.Sprint(pluginDriver.TransfeResult(This.p.SchemaName, data, 0))
+ 	TableName := fmt.Sprint(pluginDriver.TransfeResult(This.p.TableName, data, 0))
++	// 删除 和 新增 一样，目标集合名都来自 {$} 模板，
++	// 集合名里带 $ 或者解析出来是空的，都会导致删除不到正确的集合，
++	// 库名用源库明，集合名用源表名兜底
++	SchemaName = strings.Replace(SchemaName, "$", "_", -1)
++	TableName = strings.Replace(TableName, "$", "_", -1)
++	if SchemaName == "" {
++		SchemaName = data.SchemaName
++	}
++	if TableName == "" {
++		TableName = data.TableName
++	}
+ 	c := This.conn.DB(SchemaName).C(TableName)
+ 	This.createIndex(c)
+ 	k := make(bson.M, 1)
+diff --git a/plugin/kafka/src/kafka.go b/plugin/kafka/src/kafka.go
+index be71bc8..9660c5a 100644
+--- a/plugin/kafka/src/kafka.go
++++ b/plugin/kafka/src/kafka.go
+@@ -21,6 +21,7 @@ import (
+ 	"fmt"
+ 	"github.com/Shopify/sarama"
+ 	pluginDriver "github.com/brokercap/Bifrost/plugin/driver"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -223,8 +224,22 @@ func (This *Conn) Commit(data *pluginDriver.PluginDataType, retry bool) (*plugin
+ 	return This.sendToList(data, retry, true)
+ }
+ 
++// 上次线上有个数据用户把 topic 配置成了 {$field} 引用业务字段，
++// 字段值里带空格和特殊字符，broker 在自动建 topic 的时候一直报 topic 非法，
++// 所以这里对解析出来的 topic 再做了一次字符合法性处理,
++// 类似这种针对各目标端名字的检查，目前只能在每一个目标端插件里各自加一份
++func (This *Conn) getSafeTopicName(data *pluginDriver.PluginDataType) string {
++	TopicName := fmt.Sprint(pluginDriver.TransfeResult(This.p.Topic, data, len(data.Rows)-1))
++	return strings.Map(func(r rune) rune {
++		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '.' || r == '_' || r == '-' {
++			return r
++		}
++		return '_'
++	}, TopicName)
++}
++
+ func (This *Conn) getMsg(data *pluginDriver.PluginDataType) (*sarama.ProducerMessage, error) {
+-	Topic := fmt.Sprint(pluginDriver.TransfeResult(This.p.Topic, data, len(data.Rows)-1))
++	Topic := This.getSafeTopicName(data)
+ 	msg := &sarama.ProducerMessage{}
+ 	msg.Topic = Topic
+ 	if This.p.Key != "" {
+diff --git a/plugin/memcache/src/memcache.go b/plugin/memcache/src/memcache.go
+index a1c9983..95d88c3 100644
+--- a/plugin/memcache/src/memcache.go
++++ b/plugin/memcache/src/memcache.go
+@@ -5,8 +5,15 @@ import (
+ 	"fmt"
+ 	"github.com/bradfitz/gomemcache/memcache"
+ 	"github.com/brokercap/Bifrost/plugin/driver"
++	"regexp"
+ )
+ 
++// memcached 协议要求 key 不能超过 250 个字节，并且不允许出现空格和控制字符，
++// key 配置引用了 {$} 业务字段，字段值里什么字符都可能有，
++// 这里统一替换成下划线，超长的部分直接截断，
++// 每个目标端插件的 key 规则都不一样，只能各自实现各自的
++var memcacheKeyFilter = regexp.MustCompile(`[^\x21-\x7e]`)
++
+ const VERSION = "v1.6.0"
+ const BIFROST_VERION = "v1.6.0"
+ 
+@@ -113,7 +120,12 @@ func (This *Conn) Close() bool {
+ }
+ 
+ func (This *Conn) getKeyVal(data *driver.PluginDataType, index int) string {
+-	return fmt.Sprint(driver.TransfeResult(This.p.KeyConfig, data, index))
++	Key := fmt.Sprint(driver.TransfeResult(This.p.KeyConfig, data, index))
++	Key = memcacheKeyFilter.ReplaceAllString(Key, "_")
++	if len(Key) > 250 {
++		Key = Key[0:250]
++	}
++	return Key
+ }
+ 
+ func (This *Conn) getVal(data *driver.PluginDataType, index int) string {
+diff --git a/plugin/rabbitmq/src/rabbitmq.go b/plugin/rabbitmq/src/rabbitmq.go
+index 705608d..211641c 100644
+--- a/plugin/rabbitmq/src/rabbitmq.go
++++ b/plugin/rabbitmq/src/rabbitmq.go
+@@ -7,6 +7,7 @@ import (
+ 	"github.com/streadway/amqp"
+ 	"log"
+ 	"strconv"
++	"strings"
+ )
+ 
+ const VERSION = "v1.6.0"
+@@ -276,10 +277,21 @@ func (This *Conn) sendToList(data *pluginDriver.PluginDataType) (*pluginDriver.P
+ 	var exchange string
+ 	var routingkey string
+ 	index := len(data.Rows) - 1
+-	exchange = fmt.Sprint(pluginDriver.TransfeResult(This.p.Exchange.Name, data, index))
+-	routingkey = fmt.Sprint(pluginDriver.TransfeResult(This.p.RoutingKey, data, index))
++	// exchange, routingkey, queue 三个名字都支持 {$} 引用业务字段，
++	// AMQP 的这几个名字不允许出现空白字符，并且 shortstring 最长只能 255，
++	// 字段值拼出来的名字超长的话，channel 会被直接关掉，
++	// 这块校验属于每个 mq 目标端自己的职责，只能在这里单独维护一份
++	filterMqName := func(name string) string {
++		name = strings.NewReplacer(" ", "_", "\t", "_", "\n", "_", "\r", "_", "/", "_").Replace(name)
++		if len(name) > 255 {
++			name = name[0:255]
++		}
++		return name
++	}
++	exchange = filterMqName(fmt.Sprint(pluginDriver.TransfeResult(This.p.Exchange.Name, data, index)))
++	routingkey = filterMqName(fmt.Sprint(pluginDriver.TransfeResult(This.p.RoutingKey, data, index)))
+ 	if This.p.Declare == true {
+-		queuename = fmt.Sprint(pluginDriver.TransfeResult(This.p.Queue.Name, data, index))
++		queuename = filterMqName(fmt.Sprint(pluginDriver.TransfeResult(This.p.Queue.Name, data, index)))
+ 		if err := This.Declare(&queuename, &exchange, &routingkey); err != nil {
+ 			return nil, data, err
+ 		}
+diff --git a/plugin/redis/src/redis.go b/plugin/redis/src/redis.go
+index 30ee24f..dc3aacd 100644
+--- a/plugin/redis/src/redis.go
++++ b/plugin/redis/src/redis.go
+@@ -184,7 +184,24 @@ func (This *Conn) Close() bool {
+ }
+ 
+ func (This *Conn) getKeyVal(data *driver.PluginDataType, index int) string {
+-	return fmt.Sprint(driver.TransfeResult(This.p.KeyConfig, data, index))
++	Key := fmt.Sprint(driver.TransfeResult(This.p.KeyConfig, data, index))
++	// redis 的 key 本身是允许任意二进制的，但运维反馈他们的监控工具是按空格对 key 做切分统计的，
++	// 为了统一 key 的可读性，这里把解析出来的 key 中的空白字符和控制字符替换掉，
++	// 解析出来是空的情况下，只能退化成 源库:源表 的名字，避免误删了不相关的数据
++	// 类似的处理，在其它目标端插件里也是各管各的
++	keyByte := make([]byte, 0, len(Key))
++	for i := 0; i < len(Key); i++ {
++		b := Key[i]
++		if b <= 0x20 || b == 0x7f {
++			keyByte = append(keyByte, '_')
++		} else {
++			keyByte = append(keyByte, b)
++		}
++	}
++	if len(keyByte) == 0 {
++		return data.SchemaName + ":" + data.TableName
++	}
++	return string(keyByte)
+ }
+ 
+ func (This *Conn) getVal(data *driver.PluginDataType, index int) string {
