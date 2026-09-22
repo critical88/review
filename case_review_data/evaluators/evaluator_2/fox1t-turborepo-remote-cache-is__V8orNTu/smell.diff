@@ -1,0 +1,290 @@
+diff --git a/src/plugins/remote-cache/storage/azure-blob-storage.ts b/src/plugins/remote-cache/storage/azure-blob-storage.ts
+index 249ceeb..0651635 100644
+--- a/src/plugins/remote-cache/storage/azure-blob-storage.ts
++++ b/src/plugins/remote-cache/storage/azure-blob-storage.ts
+@@ -105,5 +105,49 @@ export function createAzureBlobStorage({
+ 
+       return writeStream
+     },
++    // Maintenance lifecycle members of the shared provider contract.
++    // Publishing copies the finished blob to its final name and deletes the
++    // source once the copy commits.
++    promote: (fromPath, toPath, cb) => {
++      const source = containerClient.getBlobClient(fromPath)
++      const target = containerClient.getBlobClient(toPath)
++      ;(async () => {
++        const poller = await target.beginCopyFromURL(source.url)
++        await poller.pollUntilDone()
++        await source.delete()
++        cb(null)
++      })().catch((err) => cb(err as Error))
++    },
++    remove: (artifactPath, cb) => {
++      containerClient
++        .getBlobClient(artifactPath)
++        .delete()
++        .then(
++          () => cb(null),
++          (err) => cb(err as Error),
++        )
++    },
++    // Blob names are flat; the team prefix is the scoping unit of the
++    // maintenance listing.
++    listArtifacts: (team, cb) => {
++      const names: string[] = []
++      ;(async () => {
++        for await (const blob of containerClient.listBlobsByHierarchy('/', {
++          prefix: `${team}/`,
++        })) {
++          names.push(blob.name)
++        }
++        cb(null, names)
++      })().catch((err) => cb(err as Error))
++    },
++    // Blob storage keeps no access-time tracking; lastModified is what the
++    // shared maintenance pipeline ages artifacts on.
++    getModifiedTime: (artifactPath, cb) => {
++      containerClient
++        .getBlobClient(artifactPath)
++        .getProperties()
++        .then((properties) => cb(null, properties.lastModified?.getTime()))
++        .catch((err) => cb(err as Error))
++    },
+   }
+ }
+diff --git a/src/plugins/remote-cache/storage/google-cloud-storage.ts b/src/plugins/remote-cache/storage/google-cloud-storage.ts
+index 73da60e..48043a1 100644
+--- a/src/plugins/remote-cache/storage/google-cloud-storage.ts
++++ b/src/plugins/remote-cache/storage/google-cloud-storage.ts
+@@ -51,5 +51,41 @@ export function createGoogleCloudStorage({
+     createWriteStream(artifactPath) {
+       return turboBucket.file(artifactPath).createWriteStream()
+     },
++    // Maintenance lifecycle members of the shared provider contract.
++    // Publishing renames the finished object through the SDK's move helper,
++    // which is a server-side copy plus a source delete under the hood.
++    promote: (fromPath, toPath, cb) => {
++      turboBucket
++        .file(fromPath)
++        .move(turboBucket.file(toPath), (err) => cb(err ?? null))
++    },
++    remove: (artifactPath, cb) => {
++      turboBucket.file(artifactPath).delete((err) => cb(err ?? null))
++    },
++    // Returns every object name under the team prefix.
++    listArtifacts: (team, cb) => {
++      turboBucket.getFiles({ prefix: `${team}/` }, (err, files) => {
++        if (err) {
++          cb(err as Error)
++          return
++        }
++        cb(
++          null,
++          (files ?? []).map((file) => file.name),
++        )
++      })
++    },
++    // GCS tracks no access time; the object's `updated` timestamp is the
++    // closest value the shared maintenance pipeline can age on.
++    getModifiedTime: (artifactPath, cb) => {
++      turboBucket
++        .file(artifactPath)
++        .getMetadata()
++        .then(([metadata]) => {
++          const updated = (metadata as { updated?: string }).updated
++          cb(null, updated ? new Date(updated).getTime() : undefined)
++        })
++        .catch((err) => cb(err as Error))
++    },
+   }
+ }
+diff --git a/src/plugins/remote-cache/storage/index.ts b/src/plugins/remote-cache/storage/index.ts
+index de9be5c..74e7db2 100644
+--- a/src/plugins/remote-cache/storage/index.ts
++++ b/src/plugins/remote-cache/storage/index.ts
+@@ -33,9 +33,6 @@ async function removeQuietly(
+   remove: StorageProvider['remove'],
+   artifactPath: string,
+ ): Promise<void> {
+-  if (!remove) {
+-    return
+-  }
+   await new Promise<void>((resolve) => {
+     remove(artifactPath, () => resolve())
+   })
+@@ -116,20 +113,39 @@ export interface StorageProvider {
+   createReadStream: (artifactPath: string) => Readable
+   createWriteStream: (artifactPath: string) => Writable
+   /**
+-   * Atomically publishes an already-written artifact under its final path.
++   * Publishes an already-written artifact under its final path.
+    *
+-   * Optional: only providers that can promote without re-transferring the
+-   * payload implement it (currently local, via same-filesystem `rename`).
+-   * Object stores would need a server-side copy plus a delete, which costs a
+-   * full extra pass over every artifact, so they opt out and keep writing
+-   * directly to the final key.
++   * Part of the uniform provider contract: every backend exposes the whole
++   * artifact lifecycle, so callers never need to feature-detect a backend
++   * before touching it. The upload flow decides which providers it publishes
++   * through today (see `createCachedArtifact`); the rest of the
++   * implementations feed the shared maintenance work planned on top of this
++   * contract.
+    */
+-  promote?: (
++  promote: (
+     fromPath: string,
+     toPath: string,
+     cb: (err: Error | null) => void,
+   ) => void
+-  remove?: (artifactPath: string, cb: (err: Error | null) => void) => void
++  remove: (artifactPath: string, cb: (err: Error | null) => void) => void
++  /**
++   * Returns the artifact keys stored directly under a team. Backends that
++   * have no hierarchy treat the team as the key prefix. This is the
++   * maintenance entry point every provider must expose.
++   */
++  listArtifacts: (
++    team: string,
++    cb: (err: Error | null, artifacts?: string[]) => void,
++  ) => void
++  /**
++   * Reports when an artifact was last touched, in milliseconds since the
++   * epoch. Providers without access-time tracking report the closest
++   * timestamp their platform keeps for the object.
++   */
++  getModifiedTime: (
++    artifactPath: string,
++    cb: (err: Error | null, modifiedTimeMs?: number) => void,
++  ) => void
+ }
+ 
+ function createStorageLocation<Provider extends STORAGE_PROVIDERS>(
+@@ -246,13 +262,18 @@ export function createLocation<Provider extends STORAGE_PROVIDERS>(
+     maxBytes?: number,
+   ) {
+     const artifactPath = getArtifactPath(team, artifactId)
+-    const { promote, remove } = location
+ 
+-    // Providers that cannot promote cheaply write straight to the final path.
+-    if (!promote) {
++    // `promote` is part of the shared provider contract, but publishing
++    // through it would re-transfer — or server-side copy — the payload for
++    // every artifact on the object stores, so only providers that can
++    // publish without re-transferring take the publish path. The form of the
++    // check mirrors `cleanStaleArtifacts`.
++    if (provider !== STORAGE_PROVIDERS.LOCAL) {
+       return writeArtifactStream(artifactPath, artifact, maxBytes)
+     }
+ 
++    const { promote, remove } = location
++
+     // Stream into a sibling temporary key and publish it only once the whole
+     // body has landed. Without this, a mid-upload failure (size-limit breach,
+     // client disconnect) leaves a truncated file at the final path, which
+diff --git a/src/plugins/remote-cache/storage/local.ts b/src/plugins/remote-cache/storage/local.ts
+index 2634e5d..67c9262 100644
+--- a/src/plugins/remote-cache/storage/local.ts
++++ b/src/plugins/remote-cache/storage/local.ts
+@@ -48,5 +48,22 @@ export function createLocal(options: LocalOptions): StorageProvider {
+         .then(() => cb(null))
+         .catch((err) => cb(err as Error))
+     },
++    // Maintenance lifecycle members of the shared provider contract. The
++    // filesystem listing is raw; the maintenance pipeline stat()s every
++    // entry and skips anything that is not a plain file.
++    listArtifacts: (team, cb) => {
++      fsPromises
++        .readdir(join(root, team))
++        .then((entries) => cb(null, entries))
++        .catch((err) => cb(err as Error))
++    },
++    // The local provider reports the last access time, which is what stale
++    // artifact cleanup ages on.
++    getModifiedTime: (artifactPath, cb) => {
++      fsPromises
++        .stat(toNativePath(artifactPath))
++        .then((stats) => cb(null, stats.atimeMs))
++        .catch((err) => cb(err as Error))
++    },
+   }
+ }
+diff --git a/src/plugins/remote-cache/storage/s3.ts b/src/plugins/remote-cache/storage/s3.ts
+index 618642d..c3545e0 100644
+--- a/src/plugins/remote-cache/storage/s3.ts
++++ b/src/plugins/remote-cache/storage/s3.ts
+@@ -1,8 +1,11 @@
+ import { PassThrough, Writable } from 'node:stream'
+ import { Readable } from 'node:stream'
+ import {
++  CopyObjectCommand,
++  DeleteObjectCommand,
+   GetObjectCommand,
+   HeadObjectCommand,
++  ListObjectsV2Command,
+   S3Client,
+   S3ClientConfig,
+ } from '@aws-sdk/client-s3'
+@@ -190,5 +193,62 @@ export function createS3({
+ 
+       return writeStream
+     },
++    // Maintenance lifecycle members of the shared provider contract.
++    // Publishing copies the finished object where it belongs and drops the
++    // copied source key afterwards.
++    promote: async (fromPath, toPath, cb) => {
++      try {
++        await client.send(
++          new CopyObjectCommand({
++            Bucket: bucket,
++            CopySource: `${bucket}/${fromPath}`,
++            Key: toPath,
++          }),
++        )
++        await client.send(
++          new DeleteObjectCommand({ Bucket: bucket, Key: fromPath }),
++        )
++        cb(null)
++      } catch (error) {
++        cb(error as Error)
++      }
++    },
++    remove: async (key, cb) => {
++      try {
++        await client.send(new DeleteObjectCommand({ Bucket: bucket, Key: key }))
++        cb(null)
++      } catch (error) {
++        cb(error as Error)
++      }
++    },
++    // S3 has no directory listing; the team plays that role as the common
++    // key prefix of its artifacts.
++    listArtifacts: async (team, cb) => {
++      try {
++        const data = await client.send(
++          new ListObjectsV2Command({ Bucket: bucket, Prefix: `${team}/` }),
++        )
++        cb(
++          null,
++          (data.Contents ?? [])
++            .map((obj) => obj.Key ?? '')
++            .filter((key) => key !== ''),
++        )
++      } catch (error) {
++        cb(error as Error)
++      }
++    },
++    // S3 keeps no access-time tracking; LastModified is the closest
++    // timestamp the provider can report for an artifact.
++    getModifiedTime: async (key, cb) => {
++      try {
++        const data = await client.send(
++          new HeadObjectCommand({ Bucket: bucket, Key: key }),
++        )
++        cb(null, data.LastModified?.getTime())
++      } catch (error) {
++        cb(error as Error)
++      }
++    },
+   }
+ }

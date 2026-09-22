@@ -1,0 +1,14 @@
+During the recent "make the internals explicit" sweep (preparing this repository for a split into a reusable library plus a thin demo/CLI layer), a lot of the internal computation steps were pulled out of the main abstractions into package-level helpers so they could be called from new entry points. That part worked. What I keep bumping into while reading the result: the working state of an abstraction is now handed through its internal call chain as loose individual parameters — the same members, in the same order, at every level.
+
+Four places were touched by that sweep, and all four are still carrying the pattern:
+
+- the A* search internals: the traversal loop, its per-neighbor relaxation step, and the reset the engine performs between two searches on the same instance each receive the engine's per-search bookkeeping as individual arguments on every call;
+- the grid world: the open/occupied and corner-check questions the traversal asks while walking neighbors, and the per-cell painting walk the image export performs, all carry the world itself plus a row/column position as separate parameters;
+- the word breaker: the dictionary and the memo state ride alongside the input string at every level of the recursion, including in the probe helper extracted most recently;
+- the moving-average statistics: the running sum, the window capacity, and the queued values are threaded as separate parameters through the append, evict, and average-read steps.
+
+Each of these groups is cohesive state of one abstraction — created together, updated together, reset together — so its members read poorly as separate parameters at every step, and every helper that gets extracted grows the same members. Please investigate these four areas and clean the pattern up everywhere it occurs: each recurring group should end up with a single well-designed owner so its members stop being re-threaded through the internal signatures one by one.
+
+The sweep did not change observable behavior and this cleanup must not either: the public API — the path search entry points, the grid world's constructors, accessors, and demo helpers, the word breaker's public functions, and the moving average's public methods — must keep its current names and signatures, and the results (returned paths, broken words, computed averages and sums, the rendered images) must come out identical.
+
+Two notes from my reading so far. First, the conversion is uneven: a couple of internal steps still sit exactly where they always did, so the leftovers are not limited to the most obvious call chains. Second, don't be misled by lookalikes: the demo's image writer takes a long list of genuinely independent one-off setup arguments, and the grid's basic position pairs on its tiny accessors are ordinary arguments — those should keep their shape.

@@ -1,0 +1,162 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Clang-Tidy",
+  "smell_type": "feature_envy",
+  "rule": {
+    "id": "view-affinity-in-foreign-layer",
+    "description": "A function defined outside the view layer is dominated by direct member accesses into the view layer's own data structures (View, Line, Selection), computing viewport and scroll knowledge that belongs with the view module. Detection enumerates every function definition of the vis.c unity translation unit with a zero-threshold clang-tidy readability-function-size probe, then counts per-function member accesses grouped by the owning subsystem of the base object's declared static type; a non-view-hosted function matches when it performs at least 10 view-layer accesses and that count is at least twice its accesses into any other single subsystem."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "ui-terminal.c",
+      "class_name": null,
+      "function_name": "ui_window_indicator"
+    },
+    {
+      "id": "E2",
+      "file_path": "ui-terminal.c",
+      "class_name": null,
+      "function_name": "ui_window_scrollbar"
+    },
+    {
+      "id": "E3",
+      "file_path": "vis-lua.c",
+      "class_name": null,
+      "function_name": "window_scrollinfo"
+    },
+    {
+      "id": "E4",
+      "file_path": "vis-text-objects.c",
+      "class_name": null,
+      "function_name": "vis_text_object_screenline"
+    }
+  ],
+  "injected_match_count": 4,
+  "checks": [
+    {
+      "id": "status-indicator-composed-in-ui-layer",
+      "description": "The status-bar scroll indicator ('All' / 'Top' / 'Bot' / 'NN%') is built by a UI-layer function that derives it by walking the view's topline/lastline/selection linked structures, the viewport byte range and the text size, instead of asking the view layer for scroll-position knowledge.",
+      "detected_relation": "ui_window_indicator (ui-terminal.c) -> View/Line/Selection internals of the win->view object",
+      "why_this_is_the_smell": "The percent and special-case classification encode the view layer's scrolling rules; the UI layer merely has to present them. Hosted on the Ui paint side, the function is more interested in the view's data than in any UI state.",
+      "matches": [
+        {
+          "file": "ui-terminal.c",
+          "symbol": "ui_window_indicator",
+          "entry_ids": [
+            "E1"
+          ],
+          "evidence": "Walks view->topline/view->lastline to count used screen rows, mirrors the cursor's screen row against view->bottomline and view->selection->line, then classifies All/Top/Bot from topline->lineno and lastline->next and computes percent from view->start/view->end and text_size(view->text).",
+          "measurement": {
+            "view_member_accesses": 16,
+            "other_member_accesses": 1,
+            "envied_view_objects": [
+              "l",
+              "sel",
+              "topline",
+              "view"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "scrollbar-geometry-derived-in-ui-layer",
+      "description": "A right-edge scrollbar painter in the UI backend recomputes how far the viewport has scrolled by iterating the view's screen-line list and the primary selection, and converts viewport byte offsets into a thumb interval and cursor notch.",
+      "detected_relation": "ui_window_scrollbar (ui-terminal.c) -> View/Line/Selection internals of the win->view object",
+      "why_this_is_the_smell": "Mapping byte offsets to screen rows is viewport geometry owned by the view layer; a canvas painter should consume a scroll description, not re-derive one from raw line links.",
+      "matches": [
+        {
+          "file": "ui-terminal.c",
+          "symbol": "ui_window_scrollbar",
+          "entry_ids": [
+            "E2"
+          ],
+          "evidence": "Counts used rows over view->topline..view->lastline, tracks the cursor row via view->selection and view->bottomline, and scales view->start/view->end against text_size(view->text) to place the thumb and the ▐ notch within view->height.",
+          "measurement": {
+            "view_member_accesses": 15,
+            "other_member_accesses": 6,
+            "envied_view_objects": [
+              "l",
+              "sel",
+              "view"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "lua-api-exposes-view-walk",
+      "description": "The win:scrollinfo() scripting entry point duplicated as a Lua callback re-implements the viewport scroll computation - it iterates the view's line list and selection directly and applies the same percent formula - instead of forwarding a value the view layer provides.",
+      "detected_relation": "window_scrollinfo (vis-lua.c) -> View/Line/Selection internals of win->view",
+      "why_this_is_the_smell": "A language binding should marshal data between the editor core and the script VM; here it owns the algorithm. The window type it binds is script-glue, yet the knowledge it computes is the view's.",
+      "matches": [
+        {
+          "file": "vis-lua.c",
+          "symbol": "window_scrollinfo",
+          "entry_ids": [
+            "E3"
+          ],
+          "evidence": "Reads view->topline/view->lastline/view->selection directly, recomputes the cursor's screen row and the used-row count line by line, and converts view->start/view->end plus text_size(view->text) into the same percentage before pushing six integers into the result table.",
+          "measurement": {
+            "view_member_accesses": 16,
+            "other_member_accesses": 1,
+            "envied_view_objects": [
+              "l",
+              "lastline",
+              "sel",
+              "topline",
+              "view"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "text-object-encodes-screen-layout",
+      "description": "A text object that selects the displayed screen row computes its byte range by walking the view's screen-line linked list and its per-line byte lengths and line numbers, i.e. by re-doing the view layer's screen-layout bookkeeping.",
+      "detected_relation": "vis_text_object_screenline (vis-text-objects.c) -> View/Line owned by vis->win",
+      "why_this_is_the_smell": "The operator layer should name a semantic unit (''the visible row the cursor is on'') and ask the view for its range; holding the wrapped-line bookkeeping in the text-object adapter means viewport details are spread outside their owner.",
+      "matches": [
+        {
+          "file": "vis-text-objects.c",
+          "symbol": "vis_text_object_screenline",
+          "entry_ids": [
+            "E4"
+          ],
+          "evidence": "Starting from view->start it accumulates l->len over view->topline..view->height, then extends the range over l->next rows sharing l->lineno while clamping at view->end and view->bottomline.",
+          "measurement": {
+            "view_member_accesses": 15,
+            "other_member_accesses": 3,
+            "envied_view_objects": [
+              "l",
+              "view"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "path": "view.c",
+      "symbol": null,
+      "reason": "Functions hosted by view.c legitimately operate on View/Line/Selection data - the rule only considers functions whose defining module is outside the view layer."
+    },
+    {
+      "path": "ui-terminal.c",
+      "symbol": "ui_window_draw",
+      "reason": "Existing drive/draw glue that forwards a window through view_draw and consults a moderate number of fields across several subsystems; below the 10-access floor at 2:1 dominance (organic 18 view vs 15 other), hence not part of this relation."
+    },
+    {
+      "path": "ui-terminal.c",
+      "symbol": "window_draw_selection",
+      "reason": "Long-standing organic painter whose view accesses (7) do not reach the evidence floor (10) with the required 2:1 dominance."
+    },
+    {
+      "path": "main.c",
+      "symbol": null,
+      "reason": "main.c is a separate translation unit from the vis.c unity build the backend enumerates; not part of the analyzable universe and not a target of this rule."
+    }
+  ]
+}

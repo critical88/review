@@ -1,0 +1,442 @@
+diff --git a/src/SuspenseSubject.ts b/src/SuspenseSubject.ts
+index 5b7ef88..384268b 100644
+--- a/src/SuspenseSubject.ts
++++ b/src/SuspenseSubject.ts
+@@ -1,7 +1,40 @@
+ import { empty, Observable, Subject, Subscriber, Subscription } from 'rxjs';
+ import { catchError, shareReplay, tap } from 'rxjs/operators';
+ import { ObservableStatus } from './useObservable.js';
++import { ReactFireError } from './index.js';
++import { user } from 'rxfire/auth';
++import { doc } from 'rxfire/firestore';
++import { queryEqual } from 'firebase/firestore';
+ 
++import type { Auth, IdTokenResult } from 'firebase/auth';
++import type { Query as DatabaseQuery } from 'firebase/database';
++import type { DocumentData, DocumentReference, Query as FirestoreQuery } from 'firebase/firestore';
++import type { ClaimsValidator } from './auth.js';
++import type { ReactFireGlobals, ReactFireOptions } from './index.js';
++
++/**
++ * SuspenseSubject is ReactFire's runtime state object.
++ *
++ * The instance side is the caching subject behind `useObservable`: it wraps one
++ * observable, exposes an immutable `ObservableStatus` snapshot, and drops its
++ * cached value after the timeout window so stale renders resubscribe.
++ *
++ * The class side owns the cross-module runtime registries that the hooks share.
++ * Keeping them as statics here means every hook reaches one source of truth for
++ * cached observable state instead of us handing `globalThis` bags and private
++ * module helpers around:
++ *
++ * - the global preloaded-observable cache (used to be module state in
++ *   `useObservable.ts`), along with the `preloadUser` / `preloadFirestoreDoc`
++ *   preload entry points;
++ * - the Realtime Database and Firestore query caches that back the
++ *   `...list`/`...collection` observable ids (used to be module state in
++ *   `database.tsx` / `firestore.tsx`);
++ * - the `ReactFireOptions` field checks shared by the data hooks (used to be
++ *   module helpers in `index.ts`);
++ * - the auth custom-claims validator used by `useSigninCheck` (used to be a
++ *   module helper in `auth.tsx`).
++ */
+ export class SuspenseSubject<T> extends Subject<T> {
+   private _value: T | undefined;
+   private _hasValue = false;
+@@ -135,4 +168,140 @@ export class SuspenseSubject<T> extends Subject<T> {
+   get immutableStatus() {
+     return this._immutableStatus;
+   }
++
++  // ---------------------------------------------------------------------------
++  // Global preloaded-observable registry (moved from useObservable.ts).
++  // ReactFire is side-effect free, so the cache has to live on globalThis;
++  // SuspenseSubject is the one place that reads and writes it now.
++  // ---------------------------------------------------------------------------
++
++  static DEFAULT_TIMEOUT = 30_000;
++
++  private static _preloadedObservables: Map<string, SuspenseSubject<any>> = (() => {
++    const globals = globalThis as any as ReactFireGlobals;
++    if (!globals._reactFirePreloadedObservables) {
++      globals._reactFirePreloadedObservables = new Map<string, SuspenseSubject<any>>();
++    }
++    return globals._reactFirePreloadedObservables;
++  })();
++
++  /**
++   * Starts listening to an observable, so that a child that renders later can
++   * consume the already-warm SuspenseSubject. Call this once you know you're
++   * going to render a hook that consumes the observable.
++   */
++  static preloadObservable<T>(source: Observable<T>, id: string, suspenseEnabled = false): SuspenseSubject<T> {
++    const cache = SuspenseSubject._preloadedObservables;
++
++    if (cache.has(id)) {
++      return cache.get(id) as SuspenseSubject<T>;
++    } else {
++      const observable = new SuspenseSubject(source, SuspenseSubject.DEFAULT_TIMEOUT, suspenseEnabled);
++      cache.set(id, observable);
++      return observable;
++    }
++  }
++
++  /** Warms up the auth user observable for [`useUser`](./auth.tsx). */
++  static async preloadUser(authResolver: () => Promise<Auth>) {
++    const auth = await authResolver();
++    const user$ = SuspenseSubject.preloadObservable(user(auth), `auth:user:${auth.name}`);
++    return user$.toPromise();
++  }
++
++  /**
++   * Preloads a subscription to a Firestore document reference.
++   *
++   * Use this to warm up `useFirestoreDoc` for a specific document.
++   */
++  static async preloadFirestoreDoc(refProvider: () => Promise<DocumentReference>) {
++    const ref = await refProvider();
++    return SuspenseSubject.preloadObservable(doc(ref), SuspenseSubject.getDocObservableId(ref));
++  }
++
++  static getDocObservableId<T = DocumentData>(ref: DocumentReference<T>) {
++    return `firestore:doc:${ref.firestore.app.name}:${ref.path}`;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Service query caches (moved from database.tsx / firestore.tsx). Both caches
++  // hand out a stable, per-app-global integer id for each distinct query object
++  // so the `...list`/`...collection` hooks can build collision-free ids.
++  // ---------------------------------------------------------------------------
++
++  private static _databaseQueries: Array<DatabaseQuery> = (() => {
++    const globals = globalThis as any as ReactFireGlobals;
++    if (!globals._reactFireDatabaseCachedQueries) {
++      globals._reactFireDatabaseCachedQueries = [];
++    }
++    return globals._reactFireDatabaseCachedQueries as Array<DatabaseQuery>;
++  })();
++
++  private static _firestoreQueries: Array<FirestoreQuery<any>> = (() => {
++    const globals = globalThis as any as ReactFireGlobals;
++    if (!globals._reactFireFirestoreQueryCache) {
++      globals._reactFireFirestoreQueryCache = [];
++    }
++    return globals._reactFireFirestoreQueryCache as Array<FirestoreQuery<any>>;
++  })();
++
++  static getDatabaseQueryId(query: DatabaseQuery): number {
++    const index = SuspenseSubject._databaseQueries.findIndex((cachedQuery) => cachedQuery.isEqual(query));
++    if (index > -1) {
++      return index;
++    }
++    return SuspenseSubject._databaseQueries.push(query) - 1;
++  }
++
++  static getFirestoreQueryId<T = DocumentData>(query: FirestoreQuery<T>): number {
++    const index = SuspenseSubject._firestoreQueries.findIndex((cachedQuery) => queryEqual(cachedQuery, query));
++    if (index > -1) {
++      return index;
++    }
++    return SuspenseSubject._firestoreQueries.push(query) - 1;
++  }
++
++  // ---------------------------------------------------------------------------
++  // ReactFireOptions field checks (moved from index.ts). The database and
++  // firestore hooks go through these to read `idField` / `initialData`.
++  // ---------------------------------------------------------------------------
++
++  static checkOptions(options: ReactFireOptions, field: string) {
++    // make sure the field passed in is a valid key of ReactFire Options
++    if (field === 'idField' || field === 'initialData' || field === 'suspense') {
++      return options ? (options[field] as ReactFireOptions['idField'] | ReactFireOptions['initialData'] | ReactFireOptions['suspense']) : undefined;
++    }
++
++    throw new Error(`Field "${field}" is not a valid key in ReactFireOptions`);
++  }
++
++  static checkinitialData(options: ReactFireOptions) {
++    return SuspenseSubject.checkOptions(options, 'initialData');
++  }
++
++  static checkIdField(options: ReactFireOptions) {
++    return SuspenseSubject.checkOptions(options, 'idField');
++  }
++
++  // ---------------------------------------------------------------------------
++  // Auth claims validation (moved from auth.tsx). `useSigninCheck` maps token
++  // results through this validator to decide required-claim coverage.
++  // ---------------------------------------------------------------------------
++
++  static getClaimsObjectValidator(requiredClaims: IdTokenResult['claims']): ClaimsValidator {
++    return function claimsObjectValidator(userClaims) {
++      const errors: { [key: string]: ReactFireError[] } = {};
++
++      Object.keys(requiredClaims).forEach((claim) => {
++        if (requiredClaims[claim] !== userClaims[claim]) {
++          errors[claim] = [new ReactFireError('auth/missing-claim', `Expected "${requiredClaims[claim]}", but user has "${userClaims[claim]}" instead`)];
++        }
++      });
++
++      return {
++        hasRequiredClaims: Object.keys(errors).length === 0,
++        errors,
++      };
++    };
++  }
+ }
+diff --git a/src/auth.tsx b/src/auth.tsx
+index 6e74d6c..cda913f 100644
+--- a/src/auth.tsx
++++ b/src/auth.tsx
+@@ -1,6 +1,7 @@
+ import * as React from 'react';
+ import { user } from 'rxfire/auth';
+-import { preloadObservable, ReactFireOptions, useAuth, useObservable, ObservableStatus, ReactFireError } from './index.js';
++import { ReactFireOptions, useAuth, useObservable, ObservableStatus } from './index.js';
++import { SuspenseSubject } from './SuspenseSubject.js';
+ import { from, of, defer } from 'rxjs';
+ import { map, switchMap } from 'rxjs/operators';
+ import { useSuspenseEnabledFromConfigAndContext } from './firebaseApp.js';
+@@ -9,9 +10,7 @@ import type { Auth, User, IdTokenResult } from 'firebase/auth';
+ type Claims = IdTokenResult['claims'];
+ 
+ export async function preloadUser(authResolver: () => Promise<Auth>) {
+-  const auth = await authResolver();
+-  const user$ = preloadObservable(user(auth), `auth:user:${auth.name}`);
+-  return user$.toPromise();
++  return SuspenseSubject.preloadUser(authResolver);
+ }
+ 
+ /**
+@@ -166,7 +165,7 @@ export function useSigninCheck(
+             let validator: ClaimsValidator;
+ 
+             if (options.hasOwnProperty('requiredClaims')) {
+-              validator = getClaimsObjectValidator((options as SignInCheckOptionsClaimsObject).requiredClaims);
++              validator = SuspenseSubject.getClaimsObjectValidator((options as SignInCheckOptionsClaimsObject).requiredClaims);
+             } else {
+               validator = (options as SignInCheckOptionsClaimsValidator).validateCustomClaims;
+             }
+@@ -188,23 +187,6 @@ export function useSigninCheck(
+   return useObservable(observableId, observable, options);
+ }
+ 
+-function getClaimsObjectValidator(requiredClaims: Claims): ClaimsValidator {
+-  return function claimsObjectValidator(userClaims) {
+-    const errors: { [key: string]: ReactFireError[] } = {};
+-
+-    Object.keys(requiredClaims).forEach((claim) => {
+-      if (requiredClaims[claim] !== userClaims[claim]) {
+-        errors[claim] = [new ReactFireError('auth/missing-claim', `Expected "${requiredClaims[claim]}", but user has "${userClaims[claim]}" instead`)];
+-      }
+-    });
+-
+-    return {
+-      hasRequiredClaims: Object.keys(errors).length === 0,
+-      errors,
+-    };
+-  };
+-}
+-
+ /**
+  * @deprecated Use `useSigninCheck` instead
+  *
+diff --git a/src/database.tsx b/src/database.tsx
+index 5c5f998..bffd427 100644
+--- a/src/database.tsx
++++ b/src/database.tsx
+@@ -1,23 +1,9 @@
+ import { list, object, QueryChange, listVal, objectVal } from 'rxfire/database';
+-import { ReactFireOptions, useObservable, checkIdField, ObservableStatus, ReactFireGlobals } from './index.js';
++import { ReactFireOptions, useObservable, checkIdField, ObservableStatus } from './index.js';
++import { SuspenseSubject } from './SuspenseSubject.js';
+ 
+ import type { Query as DatabaseQuery, DatabaseReference } from 'firebase/database';
+ 
+-// Since we're side-effect free, we need to ensure our observableId cache is global
+-const cachedQueries: Array<DatabaseQuery> = (globalThis as any as ReactFireGlobals)._reactFireDatabaseCachedQueries || [];
+-
+-if (!(globalThis as any as ReactFireGlobals)._reactFireDatabaseCachedQueries) {
+-  (globalThis as any as ReactFireGlobals)._reactFireDatabaseCachedQueries = cachedQueries;
+-}
+-
+-function getUniqueIdForDatabaseQuery(query: DatabaseQuery) {
+-  const index = cachedQueries.findIndex((cachedQuery) => cachedQuery.isEqual(query));
+-  if (index > -1) {
+-    return index;
+-  }
+-  return cachedQueries.push(query) - 1;
+-}
+-
+ /**
+  * Subscribe to a Realtime Database object
+  *
+@@ -49,7 +35,7 @@ export function useDatabaseList<T = { [key: string]: unknown }>(
+   ref: DatabaseReference | DatabaseQuery,
+   options?: ReactFireOptions<T[]>
+ ): ObservableStatus<QueryChange[] | T[]> {
+-  const hash = `database:list:${getUniqueIdForDatabaseQuery(ref)}`;
++  const hash = `database:list:${SuspenseSubject.getDatabaseQueryId(ref)}`;
+   const observable$ = list(ref);
+ 
+   return useObservable(hash, observable$, options);
+@@ -60,7 +46,7 @@ export function useDatabaseListData<T = { [key: string]: unknown }>(
+   options?: ReactFireOptions<T[]>
+ ): ObservableStatus<T[] | null> {
+   const idField = options ? checkIdField(options) : undefined;
+-  const observableId = `database:listVal:${getUniqueIdForDatabaseQuery(ref)}:idField=${JSON.stringify(idField)}`;
++  const observableId = `database:listVal:${SuspenseSubject.getDatabaseQueryId(ref)}:idField=${JSON.stringify(idField)}`;
+   const observable$ = listVal<T>(ref, { keyField: idField });
+   return useObservable(observableId, observable$, options);
+ }
+diff --git a/src/firestore.tsx b/src/firestore.tsx
+index ed504f9..e44ca21 100644
+--- a/src/firestore.tsx
++++ b/src/firestore.tsx
+@@ -1,24 +1,9 @@
+ import { collectionData, doc, docData, fromRef } from 'rxfire/firestore';
+-import { ReactFireOptions, useObservable, checkIdField, ReactFireGlobals } from './index.js';
+-import { preloadObservable, ObservableStatus } from './useObservable.js';
++import { ReactFireOptions, useObservable, checkIdField, ObservableStatus } from './index.js';
++import { SuspenseSubject } from './SuspenseSubject.js';
+ import { first } from 'rxjs/operators';
+ 
+-import { Query as FirestoreQuery, QuerySnapshot, DocumentReference, queryEqual, DocumentData, DocumentSnapshot } from 'firebase/firestore';
+-
+-// Since we're side-effect free, we need to ensure our observableId cache is global
+-const cachedQueries: Array<FirestoreQuery<any>> = (globalThis as any as ReactFireGlobals)._reactFireFirestoreQueryCache || [];
+-
+-if (!(globalThis as any as ReactFireGlobals)._reactFireFirestoreQueryCache) {
+-  (globalThis as any as ReactFireGlobals)._reactFireFirestoreQueryCache = cachedQueries;
+-}
+-
+-function getUniqueIdForFirestoreQuery<T = DocumentData>(query: FirestoreQuery<T>) {
+-  const index = cachedQueries.findIndex((cachedQuery) => queryEqual(cachedQuery, query));
+-  if (index > -1) {
+-    return index;
+-  }
+-  return cachedQueries.push(query) - 1;
+-}
++import { Query as FirestoreQuery, QuerySnapshot, DocumentReference, DocumentData, DocumentSnapshot } from 'firebase/firestore';
+ 
+ /**
+  * Preload a subscription to a Firestore document reference.
+@@ -26,12 +11,7 @@ function getUniqueIdForFirestoreQuery<T = DocumentData>(query: FirestoreQuery<T>
+  * Use this to warm up `useFirestoreDoc` for a specific document
+  */
+ export async function preloadFirestoreDoc(refProvider: () => Promise<DocumentReference>) {
+-  const ref = await refProvider();
+-  return preloadObservable(doc(ref), getDocObservableId(ref));
+-}
+-
+-function getDocObservableId<T = DocumentData>(ref: DocumentReference<T>) {
+-  return `firestore:doc:${ref.firestore.app.name}:${ref.path}`;
++  return SuspenseSubject.preloadFirestoreDoc(refProvider);
+ }
+ 
+ /**
+@@ -40,7 +20,7 @@ function getDocObservableId<T = DocumentData>(ref: DocumentReference<T>) {
+  * You can preload data for this hook by calling `preloadFirestoreDoc`
+  */
+ export function useFirestoreDoc<T = DocumentData>(ref: DocumentReference<T>, options?: ReactFireOptions<T>): ObservableStatus<DocumentSnapshot<T>> {
+-  const observableId = getDocObservableId(ref);
++  const observableId = SuspenseSubject.getDocObservableId(ref);
+   const observable$ = doc(ref);
+ 
+   return useObservable(observableId, observable$, options);
+@@ -84,7 +64,7 @@ export function useFirestoreDocDataOnce<T = unknown>(ref: DocumentReference<T>,
+  * Subscribe to a Firestore collection
+  */
+ export function useFirestoreCollection<T = DocumentData>(query: FirestoreQuery<T>, options?: ReactFireOptions<T[]>): ObservableStatus<QuerySnapshot<T>> {
+-  const observableId = `firestore:collection:${getUniqueIdForFirestoreQuery(query)}`;
++  const observableId = `firestore:collection:${SuspenseSubject.getFirestoreQueryId(query)}`;
+   const observable$ = fromRef(query);
+ 
+   return useObservable(observableId, observable$, options);
+@@ -95,7 +75,7 @@ export function useFirestoreCollection<T = DocumentData>(query: FirestoreQuery<T
+  */
+ export function useFirestoreCollectionData<T = DocumentData>(query: FirestoreQuery<T>, options?: ReactFireOptions<T[]>): ObservableStatus<T[]> {
+   const idField = options ? checkIdField(options) : undefined;
+-  const observableId = `firestore:collectionData:${getUniqueIdForFirestoreQuery(query)}:idField=${JSON.stringify(idField)}`;
++  const observableId = `firestore:collectionData:${SuspenseSubject.getFirestoreQueryId(query)}:idField=${JSON.stringify(idField)}`;
+   const observable$ = collectionData(query, { idField });
+ 
+   return useObservable(observableId, observable$, options);
+diff --git a/src/index.ts b/src/index.ts
+index 028a4a6..b228976 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -31,21 +31,18 @@ export interface ReactFireOptions<T = unknown> {
+   suspense?: boolean;
+ }
+ 
++// The `ReactFireOptions` field checks live on `SuspenseSubject` together with
++// the rest of the runtime state helpers; these re-exports keep the public API.
+ export function checkOptions(options: ReactFireOptions, field: string) {
+-  // make sure the field passed in is a valid key of ReactFire Options
+-  if (field === 'idField' || field === 'initialData' || field === 'suspense') {
+-    return options ? (options[field] as ReactFireOptions['idField'] | ReactFireOptions['initialData'] | ReactFireOptions['suspense']) : undefined;
+-  }
+-
+-  throw new Error(`Field "${field}" is not a valid key in ReactFireOptions`);
++  return SuspenseSubject.checkOptions(options, field);
+ }
+ 
+ export function checkinitialData(options: ReactFireOptions) {
+-  return checkOptions(options, 'initialData');
++  return SuspenseSubject.checkinitialData(options);
+ }
+ 
+ export function checkIdField(options: ReactFireOptions) {
+-  return checkOptions(options, 'idField');
++  return SuspenseSubject.checkIdField(options);
+ }
+ 
+ export * from './auth.js';
+diff --git a/src/useObservable.ts b/src/useObservable.ts
+index 237f6e3..3d03b07 100644
+--- a/src/useObservable.ts
++++ b/src/useObservable.ts
+@@ -3,28 +3,13 @@ import { useSyncExternalStore } from 'use-sync-external-store/shim';
+ import { Observable } from 'rxjs';
+ import { SuspenseSubject } from './SuspenseSubject.js';
+ import { useSuspenseEnabledFromConfigAndContext } from './firebaseApp.js';
+-import { ReactFireGlobals, ReactFireOptions } from './index.js';
++import { ReactFireOptions } from './index.js';
+ 
+-const DEFAULT_TIMEOUT = 30_000;
+-
+-// Since we're side-effect free, we need to ensure our observable cache is global
+-const preloadedObservables: Map<string, SuspenseSubject<any>> = (globalThis as any as ReactFireGlobals)._reactFirePreloadedObservables || new Map();
+-
+-if (!(globalThis as any as ReactFireGlobals)._reactFirePreloadedObservables) {
+-  (globalThis as any as ReactFireGlobals)._reactFirePreloadedObservables = preloadedObservables;
+-}
+-
+-// Starts listening to an Observable.
+-// Call this once you know you're going to render a
+-// child that will consume the observable
++// The preloaded-observable cache lives on `SuspenseSubject` now (as class-level
++// state over the same `globalThis` bag, since we're side-effect free); this
++// export stays for consumers that import the preload entry point from here.
+ export function preloadObservable<T>(source: Observable<T>, id: string, suspenseEnabled = false) {
+-  if (preloadedObservables.has(id)) {
+-    return preloadedObservables.get(id) as SuspenseSubject<T>;
+-  } else {
+-    const observable = new SuspenseSubject(source, DEFAULT_TIMEOUT, suspenseEnabled);
+-    preloadedObservables.set(id, observable);
+-    return observable;
+-  }
++  return SuspenseSubject.preloadObservable<T>(source, id, suspenseEnabled);
+ }
+ 
+ export interface ObservableStatus<T> {
+@@ -72,7 +57,7 @@ export function useObservable<T = unknown>(observableId: string, source: Observa
+   const suspenseEnabled = useSuspenseEnabledFromConfigAndContext(config.suspense);
+ 
+   // Register the observable with the cache
+-  const observable = preloadObservable(source, observableId, suspenseEnabled);
++  const observable = SuspenseSubject.preloadObservable(source, observableId, suspenseEnabled);
+ 
+   // Suspend if suspense is enabled and no initial data exists
+   const hasInitialData = config.hasOwnProperty('initialData') || config.hasOwnProperty('startWithValue');

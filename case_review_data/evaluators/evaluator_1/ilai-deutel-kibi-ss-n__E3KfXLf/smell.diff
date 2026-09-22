@@ -1,0 +1,192 @@
+diff --git a/src/ansi_escape.rs b/src/ansi_escape.rs
+index 2a261b9..c08003c 100644
+--- a/src/ansi_escape.rs
++++ b/src/ansi_escape.rs
+@@ -4,6 +4,10 @@
+ 
+ //! # ANSI Escape sequences
+ 
++use std::fmt::Display;
++
++use crate::row::GutterWidth;
++
+ /// Switches to the main buffer.
+ pub(crate) const USE_MAIN_SCREEN: &str = "\x1b[?1049l";
+ 
+@@ -38,3 +42,13 @@ pub(crate) fn push_colored(buffer: &mut String, color: &str, message: &str, use_
+         buffer.push_str(s);
+     }
+ }
++
++/// Dark grey color used to draw the line-number gutter and its vertical bar.
++pub(crate) const GUTTER_COLOR: &str = "\x1b[38;5;240m";
++
++/// Format an entry of the line-number gutter: `val` (typically a line number
++/// or `~` for an empty row), right-aligned to the gutter width, followed by
++/// the space and the vertical bar that separate the gutter from the text.
++pub(crate) fn gutter_entry<T: Display>(gutter: GutterWidth, val: T) -> String {
++    format!("{:>1$} \u{2502}", val, gutter.padding() - 2)
++}
+diff --git a/src/config.rs b/src/config.rs
+index 5e803c8..53a32a1 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -9,6 +9,7 @@
+ use std::path::{Path, PathBuf};
+ use std::{fmt::Display, fs::read_to_string, num::NonZeroUsize, str::FromStr, time::Duration};
+ 
++use crate::row::GutterWidth;
+ use crate::sys::conf_dirs as cdirs;
+ 
+ /// The global Kibi configuration.
+@@ -109,6 +110,16 @@ pub fn parse_values<T: FromStr<Err=E>, E: Display>(values: &str) -> Result<Vec<T
+     values.split(',').map(|value| parse_value(value.trim())).collect()
+ }
+ 
++/// Return whether the line-number gutter should be shown: the gutter takes
++/// space on the left of every row, so it can only be shown if the user
++/// requested it and the gutter is small enough compared to the window width
++/// (at most a quarter of the window), so that it never hides the text.
++pub(crate) const fn gutter_shown(
++    show_line_num: bool, gutter_width: GutterWidth, window_width: usize,
++) -> bool {
++    show_line_num && gutter_width.padding() < window_width / 4
++}
++
+ #[cfg(test)]
+ #[cfg(not(target_family = "wasm"))] // No filesystem on wasm
+ mod tests {
+diff --git a/src/editor.rs b/src/editor.rs
+index 956f640..2c33a62 100644
+--- a/src/editor.rs
++++ b/src/editor.rs
+@@ -4,11 +4,11 @@
+ 
+ use std::fmt::{Display, Write as _};
+ use std::io::{self, BufRead, BufReader, ErrorKind, Read, Seek, Write};
+-use std::iter::{self, repeat, successors as scsr};
++use std::iter::{self, repeat};
+ use std::{fs::File, path::Path, process::Command, time::Instant};
+ 
+-use crate::row::{HlState, Row};
+-use crate::{Config, Error, ansi_escape::*, syntax::Conf as SyntaxConf, sys, terminal};
++use crate::row::{GutterWidth, HlState, Row};
++use crate::{Config, Error, ansi_escape::*, config, syntax::Conf as SyntaxConf, sys, terminal};
+ 
+ const fn ctrl_key(key: u8) -> u8 { key & 0x1f }
+ const EXIT: u8 = ctrl_key(b'Q');
+@@ -286,14 +286,21 @@ impl Editor {
+     /// maximum number of digits for line numbers (since the left padding
+     /// depends on this number of digits).
+     fn update_screen_cols(&mut self) {
+-        // The maximum number of digits to use for the line number is the number
+-        // of digits of the last line number. This is equal to the
+-        // number of times we can divide this number by ten, computed
+-        // below using `successors`.
+-        let n_digits = scsr(Some(self.rows.len()), |u| Some(u / 10).filter(|u| *u > 0)).count();
+-        let show_line_num = self.config.show_line_num && n_digits + 2 < self.window_width / 4;
+-        self.ln_pad = if show_line_num { n_digits + 2 } else { 0 };
+-        self.screen_cols = self.window_width.saturating_sub(self.ln_pad);
++        // The gutter width comes from the number of rows, whether the gutter can
++        // be shown is decided by the configuration, and the number of
++        // columns available for the text is computed by the terminal.
++        let gutter = GutterWidth::from_row_count(self.rows.len());
++        let shown = config::gutter_shown(self.config.show_line_num, gutter, self.window_width);
++        self.ln_pad = if shown { gutter.padding() } else { 0 };
++        self.screen_cols = terminal::text_area_cols(self.window_width, shown.then_some(gutter));
++    }
++
++    /// Return the line-number gutter for the current number of rows, or `None`
++    /// if the gutter cannot be shown (for instance because the configuration
++    /// disables it, or because the window is too narrow).
++    fn gutter(&self) -> Option<GutterWidth> {
++        let gutter = GutterWidth::from_row_count(self.rows.len());
++        config::gutter_shown(self.config.show_line_num, gutter, self.window_width).then_some(gutter)
+     }
+ 
+     /// Update a row, given its index. If `ignore_following_rows` is `false` and
+@@ -533,11 +540,10 @@ impl Editor {
+ 
+     /// Draw the left part of the screen: line numbers and vertical bar.
+     fn draw_left_padding<T: Display>(&self, buffer: &mut String, val: T) {
+-        if self.ln_pad >= 2 {
+-            // \u{2502}: pipe "│"
+-            let s = format!("{:>1$} \u{2502}", val, self.ln_pad - 2);
+-            // \x1b[38;5;240m: Dark grey color
+-            push_colored(buffer, "\x1b[38;5;240m", &s, self.use_color);
++        if let Some(gutter) = self.gutter() {
++            // The gutter entry (value, then vertical bar) is formatted from the
++            // gutter width, and drawn in dark grey.
++            push_colored(buffer, GUTTER_COLOR, &gutter_entry(gutter, val), self.use_color);
+         }
+     }
+ 
+diff --git a/src/row.rs b/src/row.rs
+index 275b804..b3cbe64 100644
+--- a/src/row.rs
++++ b/src/row.rs
+@@ -7,13 +7,39 @@
+ //! Utilities for rows. A `Row` owns the underlying characters, the rendered
+ //! string and the syntax highlighting information.
+ 
+-use std::{iter::repeat_n, num::NonZeroUsize};
++use std::iter::{repeat_n, successors as scsr};
++use std::num::NonZeroUsize;
+ 
+ use unicode_width::UnicodeWidthChar;
+ 
+ use crate::ansi_escape::{RESET, WBG, push_colored};
+ use crate::syntax::{Conf as SyntaxConf, HlType};
+ 
++/// The width of the line-number gutter, measured in number of digits of the
++/// largest line number. The gutter also uses two additional columns to draw
++/// the vertical bar, see [`GutterWidth::padding`].
++#[derive(Clone, Copy)]
++pub(crate) struct GutterWidth {
++    /// The number of digits of the largest line number.
++    n_digits: usize,
++}
++
++impl GutterWidth {
++    /// Return the gutter width corresponding to a document with `n_rows`
++    /// rows. The width is the number of digits of the last line number: this
++    /// is equal to the number of times we can divide this number by ten,
++    /// computed below using `successors`.
++    pub(crate) fn from_row_count(n_rows: usize) -> Self {
++        Self { n_digits: scsr(Some(n_rows), |u| Some(u / 10).filter(|u| *u > 0)).count() }
++    }
++
++    /// Return the total number of columns occupied by the gutter, including
++    /// the two columns used for the vertical bar and the space before it.
++    pub(crate) const fn padding(self) -> usize {
++        self.n_digits + 2
++    }
++}
++
+ /// The "Highlight State" of the row
+ #[derive(Clone, Copy, Default, PartialEq, Eq)]
+ pub enum HlState {
+diff --git a/src/terminal.rs b/src/terminal.rs
+index 836e19a..64bf605 100644
+--- a/src/terminal.rs
++++ b/src/terminal.rs
+@@ -4,6 +4,7 @@
+ 
+ use std::io::{self, BufRead, Read, Write};
+ 
++use crate::row::GutterWidth;
+ use crate::{Error, ansi_escape::*, sys};
+ 
+ /// Obtain the window size using the cursor position.
+@@ -44,3 +45,11 @@ pub fn restore_terminal(orig_term_mode: &sys::TermMode) -> io::Result<()> {
+     print!("{USE_MAIN_SCREEN}");
+     io::stdout().flush()
+ }
++
++/// Return the number of columns that remain available for the text of a
++/// row, given the total window width and the line-number gutter, if the
++/// gutter is shown. When the gutter is not shown, the full window width is
++/// available.
++pub(crate) fn text_area_cols(window_width: usize, gutter: Option<GutterWidth>) -> usize {
++    window_width.saturating_sub(gutter.map_or(0, GutterWidth::padding))
++}

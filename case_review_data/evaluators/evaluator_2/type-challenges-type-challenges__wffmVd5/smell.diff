@@ -1,0 +1,324 @@
+diff --git a/scripts/actions/utils/formatToCode.ts b/scripts/actions/utils/formatToCode.ts
+index 18ff3e7..b278803 100644
+--- a/scripts/actions/utils/formatToCode.ts
++++ b/scripts/actions/utils/formatToCode.ts
+@@ -8,9 +8,16 @@ import { toDivider } from './toDivider'
+ import { toFooter } from './toFooter'
+ 
+ export function formatToCode(quiz: Quiz, locale: SupportedLocale) {
++  // Languages the rendered playground file is emitted for.
++  const renderableLocales = ['en', 'zh-CN', 'ja', 'ko', 'pt-BR']
++
++  const readme = renderableLocales.includes(locale)
++    ? (quiz.readme[locale] || quiz.readme[defaultLocale])
++    : quiz.readme[defaultLocale]
++
+   return `${toCommentBlock(
+     toInfoHeader(quiz, locale)
+-    + (quiz.readme[locale] || quiz.readme[defaultLocale])
++    + readme
+     + toLinks(quiz, locale),
+   )
+   + toDivider(t(locale, 'divider.code-start'))
+diff --git a/scripts/build.ts b/scripts/build.ts
+index 1231742..f965748 100644
+--- a/scripts/build.ts
++++ b/scripts/build.ts
+@@ -2,24 +2,28 @@ import path from 'node:path'
+ import fs from 'fs-extra'
+ import { loadQuizzes, resolveInfo } from './loader'
+ import { REPO, toPlaygroundUrl, toQuestionsRawREADME, toQuizREADME, toRawREADME, toShareAnswerFull, toSolutionsFull } from './toUrl'
+-import { defaultLocale, supportedLocales } from './locales'
++import { defaultLocale } from './locales'
++import type { SupportedLocale } from './locales'
+ import { formatToCode } from './actions/utils/formatToCode'
+ 
++// Languages the short-link host serves routes for.
++const routeLocales: SupportedLocale[] = ['en', 'zh-CN', 'ja', 'ko', 'pt-BR']
++
+ export async function build() {
+   const quizzes = await loadQuizzes()
+   const redirects: [string, string, number][] = []
+ 
+   // redirect homepage to github repo
+-  supportedLocales.filter(locale => locale !== defaultLocale).forEach((locale) => {
++  routeLocales.filter(locale => locale !== defaultLocale).forEach((locale) => {
+     redirects.push([`/${locale}`, `${REPO}/blob/main/README.${locale}.md`, 302])
+   })
+ 
+-  supportedLocales.forEach((locale) => {
++  routeLocales.forEach((locale) => {
+     redirects.push([`/raw/${locale}`, toQuestionsRawREADME(locale), 302])
+   })
+ 
+   for (const quiz of quizzes) {
+-    for (const locale of supportedLocales) {
++    for (const locale of routeLocales) {
+       const info = resolveInfo(quiz, locale)
+ 
+       const code = formatToCode(quiz, locale)
+diff --git a/scripts/generate-play.ts b/scripts/generate-play.ts
+index bf515e6..df1e0ca 100644
+--- a/scripts/generate-play.ts
++++ b/scripts/generate-play.ts
+@@ -6,9 +6,12 @@ import c from 'ansis'
+ import prompts from 'prompts'
+ import { formatToCode } from './actions/utils/formatToCode'
+ import { loadQuizzes, resolveInfo } from './loader'
+-import { supportedLocales } from './locales'
+ import { getQuestionFullName } from './actions/issue-pr'
+ import type { QuizMetaInfo } from './types'
++import type { SupportedLocale } from './locales'
++
++// Languages a local playground can be generated for.
++const playgroundLocales = ['en', 'zh-CN', 'ja', 'ko', 'pt-BR'] as SupportedLocale[]
+ 
+ type Snapshot = Record<string, string>
+ 
+@@ -94,7 +97,7 @@ async function generatePlayground() {
+   const playgroundPath = path.join(__dirname, '../playground')
+   const playgroundCachePath = path.join(__dirname, '../.playgroundcache')
+ 
+-  let locale = supportedLocales.find(locale => locale === process.argv[2])!
++  let locale = playgroundLocales.find(locale => locale === process.argv[2])!
+ 
+   console.log(c.bold.cyan('Generating local playground...\n'))
+ 
+@@ -127,7 +130,7 @@ async function generatePlayground() {
+       name: 'locale',
+       type: 'select',
+       message: 'Select language:',
+-      choices: supportedLocales.map(i => ({
++      choices: playgroundLocales.map(i => ({
+         title: i,
+         value: i,
+       })),
+diff --git a/scripts/loader.ts b/scripts/loader.ts
+index b09e4d0..2860812 100644
+--- a/scripts/loader.ts
++++ b/scripts/loader.ts
+@@ -3,7 +3,7 @@ import fs from 'fs-extra'
+ import fg from 'fast-glob'
+ import YAML from 'js-yaml'
+ import type { Quiz, QuizMetaInfo } from './types'
+-import { defaultLocale, supportedLocales } from './locales'
++import { defaultLocale } from './locales'
+ 
+ export async function loadFile(filepath: string) {
+   if (fs.existsSync(filepath))
+@@ -18,8 +18,17 @@ export async function loadLocaleVariations<T = string>(
+   const { ext, dir, name } = path.parse(filepath)
+   const data: Record<string, T> = {}
+ 
+-  for (const locale of supportedLocales) {
+-    const file = preprocessor(await loadFile(path.join(dir, `${name}.${locale}${ext}`)) || '')
++  // Filename infix each language's variation carries on disk.
++  const variationInfixes = {
++    'en': '',
++    'zh-CN': '.zh-CN',
++    'ja': '.ja',
++    'ko': '.ko',
++    'pt-BR': '.pt-BR',
++  }
++
++  for (const locale of Object.keys(variationInfixes) as (keyof typeof variationInfixes)[]) {
++    const file = preprocessor(await loadFile(path.join(dir, `${name}${variationInfixes[locale] || `.${locale}`}${ext}`)) || '')
+ 
+     if (file)
+       data[locale] = file
+diff --git a/scripts/readme.ts b/scripts/readme.ts
+index d83d06c..061a20a 100644
+--- a/scripts/readme.ts
++++ b/scripts/readme.ts
+@@ -2,11 +2,24 @@ import path from 'node:path'
+ import process from 'node:process'
+ import fs from 'fs-extra'
+ import type { SupportedLocale } from './locales'
+-import { defaultLocale, f, supportedLocales, t } from './locales'
++import { defaultLocale, t } from './locales'
+ import { loadQuizzes, resolveInfo } from './loader'
+ import { toAnswerShort, toNearborREADME, toPlayShort, toQuizREADME, toSolutionsShort } from './toUrl'
+ import type { Quiz, QuizMetaInfo } from './types'
+ 
++// Filename infix every language version of the READMEs carries.
++const readmeLocaleInfixes: Record<string, string> = {
++  'en': '',
++  'zh-CN': '.zh-CN',
++  'ja': '.ja',
++  'ko': '.ko',
++  'pt-BR': '.pt-BR',
++}
++
++function readmeFileName(locale: string) {
++  return `README${readmeLocaleInfixes[locale] || ''}.md`
++}
++
+ const DifficultyColors: Record<string, string> = {
+   warm: 'teal',
+   easy: '7aad0c',
+@@ -116,7 +129,7 @@ async function insertInfoReadme(filepath: string, quiz: Quiz, locale: SupportedL
+ 
+   const info = resolveInfo(quiz, locale)
+ 
+-  const availableLocales = supportedLocales.filter(l => l !== locale).filter(l => !!quiz.readme[l])
++  const availableLocales = (Object.keys(readmeLocaleInfixes) as SupportedLocale[]).filter(l => l !== locale).filter(l => !!quiz.readme[l])
+ 
+   text = text
+     .replace(
+@@ -133,7 +146,7 @@ async function insertInfoReadme(filepath: string, quiz: Quiz, locale: SupportedL
+     .replace(
+       /<!--info-footer-start-->[\s\S]*<!--info-footer-end-->/,
+       '<!--info-footer-start--><br>'
+-      + toBadgeLink(`../../${f('README', locale, 'md')}`, '', t(locale, 'badge.back'), 'grey')
++      + toBadgeLink(`../../${readmeFileName(locale)}`, '', t(locale, 'badge.back'), 'grey')
+       + toBadgeLink(toAnswerShort(quiz.no, locale), '', t(locale, 'badge.share-your-solutions'), 'teal')
+       + toBadgeLink(toSolutionsShort(quiz.no), '', t(locale, 'badge.checkout-solutions'), 'de5a77', '?logo=awesome-lists&logoColor=white')
+       + (Array.isArray(info.related) && info.related.length ? `<hr><h3>${t(locale, 'readme.related-challenges')}</h3>${quizNoToBadges(info.related, quizzes, locale, true)}` : '')
+@@ -147,8 +160,8 @@ async function insertInfoReadme(filepath: string, quiz: Quiz, locale: SupportedL
+ 
+ async function updateIndexREADME(quizzes: Quiz[]) {
+   // update index README
+-  for (const locale of supportedLocales) {
+-    const filepath = path.resolve(__dirname, '..', f('README', locale, 'md'))
++  for (const locale of Object.keys(readmeLocaleInfixes) as SupportedLocale[]) {
++    const filepath = path.resolve(__dirname, '..', readmeFileName(locale))
+ 
+     let challengesREADME = ''
+     let prev = ''
+@@ -204,12 +217,12 @@ async function updateQuestionsREADME(quizzes: Quiz[]) {
+ 
+   // update each questions' readme
+   for (const quiz of quizzes) {
+-    for (const locale of supportedLocales) {
++    for (const locale of Object.keys(readmeLocaleInfixes) as SupportedLocale[]) {
+       await insertInfoReadme(
+         path.join(
+           questionsDir,
+           quiz.path,
+-          f('README', locale, 'md'),
++          readmeFileName(locale),
+         ),
+         quiz,
+         locale,
+diff --git a/scripts/toUrl.ts b/scripts/toUrl.ts
+index a654528..4649951 100644
+--- a/scripts/toUrl.ts
++++ b/scripts/toUrl.ts
+@@ -7,6 +7,24 @@ export const REPO = 'https://github.com/type-challenges/type-challenges'
+ export const DOMAIN = 'https://tsch.js.org'
+ export const TYPESCRIPT_PLAYGROUND = 'https://www.typescriptlang.org/play'
+ 
++// Suffix that localized artifact files carry, per language of the site.
++// The default language keeps the bare file name.
++const localeFileInfixes: Record<string, string> = {
++  'en': '',
++  'zh-CN': '.zh-CN',
++  'ja': '.ja',
++  'ko': '.ko',
++  'pt-BR': '.pt-BR',
++}
++
++function localizedInfix(locale: string) {
++  return localeFileInfixes[locale] ?? `.${locale}`
++}
++
++function publishedReadmeName(locale?: string, localized = false) {
++  return `README${localized ? localizedInfix(locale || defaultLocale) : ''}.md`
++}
++
+ // https://github.com/microsoft/TypeScript-Website/tree/v2/packages/playground
+ export function toPlaygroundUrl(
+   code: string,
+@@ -22,28 +40,26 @@ export function toSolutionsFull(no: number) {
+ 
+ export function toQuizREADME(quiz: Quiz, locale?: string, absolute = false) {
+   const prefix = absolute ? `${REPO}/blob/main` : '.'
+-  return locale && locale !== defaultLocale && quiz.readme[locale]
+-    ? `${prefix}/questions/${quiz.path}/README.${locale}.md`
+-    : `${prefix}/questions/${quiz.path}/README.md`
++  return `${prefix}/questions/${quiz.path}/${
++    publishedReadmeName(locale, !!locale && locale !== defaultLocale && !!quiz.readme[locale])
++  }`
+ }
+ 
+ export function toRawREADME(quiz: Quiz, locale?: string) {
+   const provider = 'https://cdn.jsdelivr.net/gh/type-challenges/type-challenges'
+   // const provider = 'https://raw.githubusercontent.com/type-challenges/type-challenges/main'
+-  return locale && locale !== defaultLocale && quiz.readme[locale]
+-    ? `${provider}/questions/${quiz.path}/README.${locale}.md`
+-    : `${provider}/questions/${quiz.path}/README.md`
++  return `${provider}/questions/${quiz.path}/${
++    publishedReadmeName(locale, !!locale && locale !== defaultLocale && !!quiz.readme[locale])
++  }`
+ }
+ 
+ export function toQuestionsRawREADME(locale?: string) {
+   const provider = 'https://cdn.jsdelivr.net/gh/type-challenges/type-challenges'
+-  return locale && locale !== defaultLocale ? `${provider}/README.${locale}.md` : `${provider}/README.md`
++  return `${provider}/${publishedReadmeName(locale, !!locale && locale !== defaultLocale)}`
+ }
+ 
+ export function toNearborREADME(quiz: Quiz, locale?: string) {
+-  return locale && locale !== defaultLocale && quiz.readme[locale]
+-    ? `./README.${locale}.md`
+-    : './README.md'
++  return `./${publishedReadmeName(locale, !!locale && locale !== defaultLocale && !!quiz.readme[locale])}`
+ }
+ 
+ export function toShareAnswerFull(quiz: Quiz, locale: string = defaultLocale) {
+diff --git a/scripts/translate.ts b/scripts/translate.ts
+index d8b5df6..4258ef0 100644
+--- a/scripts/translate.ts
++++ b/scripts/translate.ts
+@@ -2,7 +2,6 @@ import path from 'node:path'
+ import fs from 'fs-extra'
+ import { translate } from '@vitalets/google-translate-api'
+ import { QUIZ_ROOT, loadQuizByNo, loadQuizzes } from './loader'
+-import { resolveFilePath } from './utils/resolve'
+ import type { Quiz } from './types'
+ import type { SupportedLocale } from './locales'
+ import { t } from './locales'
+@@ -22,7 +21,16 @@ export async function translateQuiz(quiz: Quiz, from: SupportedLocale, to: Suppo
+ 
+   translatedReadme = `> ${t(to, 'readme.google-translated')}\n\n${translatedReadme.trim()}`
+ 
+-  const readmePath = resolveFilePath(path.join(QUIZ_ROOT, quiz.path), 'README', 'md', to)
++  // Filename infix the translated README carries for each language.
++  const readmeInfixes = {
++    'en': '',
++    'zh-CN': '.zh-CN',
++    'ja': '.ja',
++    'ko': '.ko',
++    'pt-BR': '.pt-BR',
++  }
++
++  const readmePath = `${path.join(QUIZ_ROOT, quiz.path)}/README${readmeInfixes[to]}.md`
+   await fs.writeFile(readmePath, translatedReadme, 'utf-8')
+ 
+   console.log(`Translated [${quiz.no}] ${from} → ${to} | saved to ${readmePath}`)
+diff --git a/scripts/utils/resolve.ts b/scripts/utils/resolve.ts
+index 04e33f2..ec4cdfb 100644
+--- a/scripts/utils/resolve.ts
++++ b/scripts/utils/resolve.ts
+@@ -1,8 +1,17 @@
+ import { defaultLocale } from '../locales'
+ 
+ export function resolveFilePath(dir: string, name: string, ext: string, locale: string) {
+-  if (locale === defaultLocale)
+-    return `${dir}/${name}.${ext}`
+-  else
+-    return `${dir}/${name}.${locale}.${ext}`
++  switch (locale) {
++    case 'en':
++      return `${dir}/${name}.${ext}`
++    case 'zh-CN':
++    case 'ja':
++    case 'ko':
++    case 'pt-BR':
++      return `${dir}/${name}.${locale}.${ext}`
++    default:
++      return locale === defaultLocale
++        ? `${dir}/${name}.${ext}`
++        : `${dir}/${name}.${locale}.${ext}`
++  }
+ }

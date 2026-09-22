@@ -1,0 +1,289 @@
+diff --git a/src/function_wrappers.ts b/src/function_wrappers.ts
+index de3410d..008bf9d 100644
+--- a/src/function_wrappers.ts
++++ b/src/function_wrappers.ts
+@@ -16,7 +16,7 @@
+ import * as domain from 'domain';
+ import {Request, Response, RequestHandler} from 'express';
+ import {sendCrashResponse} from './logger';
+-import {sendResponse} from './invoker';
++import {sendResponse, invocationAdmissionState} from './invoker';
+ import {isBinaryCloudEvent, getBinaryCloudEventContext} from './cloud_events';
+ import {
+   HttpFunction,
+@@ -44,6 +44,7 @@ type OnDoneCallback = (err: Error | null, result: any) => void;
+ const getOnDoneCallback = (res: Response): OnDoneCallback => {
+   // eslint-disable-next-line @typescript-eslint/no-explicit-any
+   return (process as any).domain.bind((err: Error | null, result: any) => {
++    releaseInvocationAdmission(res);
+     if (res.locals.functionExecutionFinished) {
+       console.log('Ignoring extra callback call');
+     } else {
+@@ -53,6 +54,27 @@ const getOnDoneCallback = (res: Response): OnDoneCallback => {
+   });
+ };
+ 
++/**
++ * Settles the admission slot the request was granted by the server's
++ * invocation admission middleware, if any, before the invocation completes.
++ * The slot hands off to the oldest request parked waiting for capacity.
++ * @param res - The response object of the request being settled
++ */
++const releaseInvocationAdmission = (res: Response) => {
++  const admission = res.locals.invocationAdmission;
++  if (!admission?.slot) {
++    // Admission control is disabled or the slot was already released.
++    return;
++  }
++  admission.slot = false;
++  const parked = invocationAdmissionState.admissionQueue.shift();
++  if (parked === undefined) {
++    invocationAdmissionState.inFlight--;
++    return;
++  }
++  parked();
++};
++
+ /**
+  * Helper function to parse a CloudEvent object from an HTTP request.
+  * @param req - An Express HTTP request
+@@ -104,6 +126,7 @@ const wrapHttpFunction = (execute: HttpFunction): RequestHandler => {
+   return (req: Request, res: Response) => {
+     const d = domain.create();
+     const errorHandler = (err: Error) => {
++      releaseInvocationAdmission(res);
+       if (res.locals.functionExecutionFinished) {
+         console.error(`Exception from a finished function: ${err}`);
+       } else {
+diff --git a/src/invoker.ts b/src/invoker.ts
+index dde3dec..6c502e9 100644
+--- a/src/invoker.ts
++++ b/src/invoker.ts
+@@ -33,6 +33,31 @@ export const setLatestRes = (res: express.Response) => {
+   latestRes = res;
+ };
+ 
++/**
++ * Bookkeeping for the per-instance concurrent invocation cap configured
++ * through FUNCTION_MAX_CONCURRENCY.
++ */
++export interface InvocationAdmissionState {
++  /**
++   * Number of function invocations currently holding an admission slot.
++   */
++  inFlight: number;
++  /**
++   * Resumption callbacks of requests parked because all admission slots are
++   * taken. The oldest parked request is resumed when a slot is freed.
++   */
++  admissionQueue: Array<() => void>;
++}
++
++/**
++ * Shared mutable state of the invocation admission gate, kept next to the
++ * other process-wide request handling bookkeeping in this module.
++ */
++export const invocationAdmissionState: InvocationAdmissionState = {
++  inFlight: 0,
++  admissionQueue: [],
++};
++
+ /**
+  * Sends back a response to the incoming request.
+  * @param result - Output from function execution
+diff --git a/src/main.ts b/src/main.ts
+index fed4987..1ac9f56 100644
+--- a/src/main.ts
++++ b/src/main.ts
+@@ -40,6 +40,21 @@ export const main = async () => {
+       loggingHandlerAddExecutionContext();
+     }
+ 
++    // Report a malformed concurrent invocation cap once at startup. The
++    // request pipeline consults the same variable when admitting invocations,
++    // so surface configuration mistakes here instead of leaving them to be
++    // noticed per request.
++    const rawAdmissionLimit = process.env.FUNCTION_MAX_CONCURRENCY;
++    if (rawAdmissionLimit !== undefined) {
++      const parsedAdmissionLimit = parseInt(rawAdmissionLimit, 10);
++      if (isNaN(parsedAdmissionLimit) || parsedAdmissionLimit < 0) {
++        console.error(
++          `Invalid FUNCTION_MAX_CONCURRENCY value "${rawAdmissionLimit}"` +
++            '; concurrent invocation admission control stays disabled.',
++        );
++      }
++    }
++
+     const loadedFunction = await getUserFunction(
+       options.sourceLocation,
+       options.target,
+@@ -64,6 +79,13 @@ export const main = async () => {
+           console.log('Serving function...');
+           console.log(`Function: ${options.target}`);
+           console.log(`Signature type: ${signatureType}`);
++          const bannerAdmissionLimit = parseInt(
++            process.env.FUNCTION_MAX_CONCURRENCY ?? '',
++            10,
++          );
++          if (!isNaN(bannerAdmissionLimit) && bannerAdmissionLimit > 0) {
++            console.log(`Max concurrent invocations: ${bannerAdmissionLimit}`);
++          }
+           console.log(`URL: http://localhost:${options.port}/`);
+         }
+       })
+diff --git a/src/middleware/timeout.ts b/src/middleware/timeout.ts
+index 8cf202a..a3c5a92 100644
+--- a/src/middleware/timeout.ts
++++ b/src/middleware/timeout.ts
+@@ -1,5 +1,6 @@
+ import {Request, Response} from '../functions';
+ import {NextFunction} from 'express';
++import {invocationAdmissionState} from '../invoker';
+ 
+ export const timeoutMiddleware = (timeoutMilliseconds: number) => {
+   return (req: Request, res: Response, next: NextFunction) => {
+@@ -15,6 +16,18 @@ export const timeoutMiddleware = (timeoutMilliseconds: number) => {
+           executionComplete = true;
+           req.abortController?.abort('timeout');
+         }
++        // A request whose socket timed out cannot make further progress: free
++        // its admission slot so a parked request can resume.
++        const admission = res.locals.invocationAdmission;
++        if (admission?.slot) {
++          admission.slot = false;
++          const parked = invocationAdmissionState.admissionQueue.shift();
++          if (parked === undefined) {
++            invocationAdmissionState.inFlight--;
++          } else {
++            parked();
++          }
++        }
+       });
+       req.on('close', () => {
+         // This event is triggered when the underlying HTTP connection is closed. This can
+@@ -24,6 +37,18 @@ export const timeoutMiddleware = (timeoutMilliseconds: number) => {
+           executionComplete = true;
+           req.abortController?.abort('request closed');
+         }
++        // An invocation whose connection is gone must not hold on to an
++        // admission slot: hand it to the oldest parked request.
++        const admission = res.locals.invocationAdmission;
++        if (admission?.slot) {
++          admission.slot = false;
++          const parked = invocationAdmissionState.admissionQueue.shift();
++          if (parked === undefined) {
++            invocationAdmissionState.inFlight--;
++          } else {
++            parked();
++          }
++        }
+       });
+       req.on('end', () => {
+         // This event is triggered when the function execution completes and we
+diff --git a/src/server.ts b/src/server.ts
+index 7710088..ce16b59 100644
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -14,10 +14,11 @@
+ 
+ import * as bodyParser from 'body-parser';
+ import * as express from 'express';
++import {NextFunction} from 'express';
+ import * as http from 'http';
+ import * as onFinished from 'on-finished';
+ import {HandlerFunction, Request, Response} from './functions';
+-import {setLatestRes} from './invoker';
++import {setLatestRes, invocationAdmissionState} from './invoker';
+ import {legacyPubSubEventMiddleware} from './pubsub_middleware';
+ import {cloudEventToBackgroundEventMiddleware} from './middleware/cloud_event_to_background_event';
+ import {backgroundEventToCloudEventMiddleware} from './middleware/background_event_to_cloud_event';
+@@ -41,8 +42,89 @@ export function getServer(
+   // App to use for function executions.
+   const app = express();
+ 
++  // Derive the per-instance concurrent invocation cap from the environment.
++  // The platform sets FUNCTION_MAX_CONCURRENCY when an instance is booted; a
++  // request that arrives while every slot is taken waits for an in-flight
++  // invocation to finish.
++  const admissionLimit = (() => {
++    const rawAdmissionLimit = process.env.FUNCTION_MAX_CONCURRENCY;
++    if (rawAdmissionLimit === undefined) {
++      return 0;
++    }
++    const parsedAdmissionLimit = parseInt(rawAdmissionLimit, 10);
++    // Malformed or negative values disable admission control rather than
++    // stalling every request.
++    if (isNaN(parsedAdmissionLimit) || parsedAdmissionLimit < 0) {
++      return 0;
++    }
++    return parsedAdmissionLimit;
++  })();
++
++  /**
++   * Frees the admission slot held by a request, if any, and hands the slot to
++   * the oldest parked request so it can resume.
++   * @param res - Express response object
++   */
++  function releaseInvocationAdmissionSlot(res: Response) {
++    const admission = res.locals.invocationAdmission;
++    if (!admission?.slot) {
++      // Never admitted, or the slot was already released.
++      return;
++    }
++    admission.slot = false;
++    const parked = invocationAdmissionState.admissionQueue.shift();
++    if (parked) {
++      // The slot transfers to the resumed request; the in-flight count
++      // does not change.
++      parked();
++      return;
++    }
++    invocationAdmissionState.inFlight--;
++  }
++
++  /**
++   * Admits a request if the per-instance concurrent invocation cap allows it;
++   * otherwise parks the request until a slot frees up.
++   * @param req - Express request object
++   * @param res - Express response object
++   * @param next - Function used to pass control to the next middleware
++   */
++  const invocationAdmissionMiddleware = (
++    req: Request,
++    res: Response,
++    next: NextFunction,
++  ) => {
++    if (invocationAdmissionState.inFlight >= admissionLimit) {
++      // All admission slots are taken. Hold the request back; it resumes when
++      // an in-flight invocation releases its slot.
++      invocationAdmissionState.admissionQueue.push(() => {
++        res.locals.invocationAdmission = {slot: true};
++        onFinished(res, (err: Error | null, finishedRes: Response) => {
++          releaseInvocationAdmissionSlot(finishedRes);
++        });
++        next();
++      });
++      return;
++    }
++    invocationAdmissionState.inFlight++;
++    res.locals.invocationAdmission = {slot: true};
++    // The slot must be freed no matter how the invocation ends, including
++    // when the user function never settles, so release as soon as the
++    // response finishes or the connection drops.
++    onFinished(res, (err: Error | null, finishedRes: Response) => {
++      releaseInvocationAdmissionSlot(finishedRes);
++    });
++    next();
++  };
++
+   // Express middleware
+ 
++  // Gate function invocations on the per-instance concurrency cap before any
++  // request processing begins.
++  if (admissionLimit > 0) {
++    app.use('/{*splat}', invocationAdmissionMiddleware);
++  }
++
+   // Set request-specific values in the very first middleware.
+   app.use('/{*splat}', (req, res, next) => {
+     setLatestRes(res);

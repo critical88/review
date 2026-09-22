@@ -1,0 +1,1314 @@
+diff --git a/chalice/awsclient.py b/chalice/awsclient.py
+index 6f00061..b015e91 100644
+--- a/chalice/awsclient.py
++++ b/chalice/awsclient.py
+@@ -913,148 +913,107 @@ class TypedAWSClient(object):
+         is not provided, no changes will be made for that that parameter on
+         the targeted lambda function.
+         """
+-        return_value = self._update_function_code(
+-            function_name=function_name, zip_contents=zip_contents
+-        )
+-        self._update_function_config(
+-            environment_variables=environment_variables,
+-            runtime=runtime,
+-            timeout=timeout,
+-            memory_size=memory_size,
+-            role_arn=role_arn,
+-            xray=xray,
+-            subnet_ids=subnet_ids,
+-            security_group_ids=security_group_ids,
+-            function_name=function_name,
+-            layers=layers,
+-        )
+-        if tags is not None:
+-            self._update_function_tags(return_value['FunctionArn'], tags)
+-        return return_value
+-
+-    def _update_function_code(
+-        self, function_name: str, zip_contents: str
+-    ) -> Dict[str, Any]:
++        # The whole update sequence is kept in one place so the three
++        # stages (code, configuration, tags) can share the function arn
++        # and the "is the function settling from a previous update"
++        # checks.  Splitting these stages apart tends to obscure which
++        # client calls happen before the arn is known.
++        return_value = None
+         lambda_client = self._client('lambda')
+         try:
+-            result = lambda_client.update_function_code(
++            return_value = lambda_client.update_function_code(
+                 FunctionName=function_name, ZipFile=zip_contents
+             )
+         except _REMOTE_CALL_ERRORS as e:
+-            context = LambdaErrorContext(
++            code_context = LambdaErrorContext(
+                 function_name, 'update_function_code', len(zip_contents)
+             )
+-            raise self._get_lambda_code_deployment_error(e, context)
+-        if result['LastUpdateStatus'] != 'Successful':
+-            self._wait_for_function_update(function_name)
+-        return result
+-
+-    def _wait_for_function_update(self, function_name: str) -> None:
+-        client = self._client('lambda')
+-        waiter = client.get_waiter('function_updated')
+-        waiter.wait(FunctionName=function_name)
+-
+-    def put_function_concurrency(
+-        self, function_name: str, reserved_concurrent_executions: int
+-    ) -> None:
+-        lambda_client = self._client('lambda')
+-        lambda_client.put_function_concurrency(
+-            FunctionName=function_name,
+-            ReservedConcurrentExecutions=reserved_concurrent_executions,
+-        )
+-
+-    def delete_function_concurrency(self, function_name: str) -> None:
+-        lambda_client = self._client('lambda')
+-        lambda_client.delete_function_concurrency(FunctionName=function_name)
+-
+-    def _update_function_config(
+-        self,
+-        environment_variables: StrMap,
+-        runtime: OptStr,
+-        timeout: OptInt,
+-        memory_size: OptInt,
+-        role_arn: OptStr,
+-        subnet_ids: OptStrList,
+-        security_group_ids: OptStrList,
+-        function_name: str,
+-        layers: OptStrList,
+-        xray: Optional[bool],
+-    ) -> None:
+-        kwargs: Dict[str, Any] = {}
++            raise self._get_lambda_code_deployment_error(e, code_context)
++        if return_value['LastUpdateStatus'] != 'Successful':
++            # The function is still settling from an earlier deployment.
++            # Wait until it is fully active before sending the new
++            # configuration, otherwise the update is rejected.
++            lambda_client.get_waiter('function_updated').wait(
++                FunctionName=function_name)
++
++        # Configuration stage: every provided value is merged into a single
++        # config payload, and the config payload is only sent when at least
++        # one key was added.  The VpcConfig is always rebuilt from scratch
++        # so that removing the values from config.json removes the VPC
++        # attachment itself.
++        config_payload: Dict[str, Any] = {}
+         if environment_variables is not None:
+-            kwargs['Environment'] = {'Variables': environment_variables}
++            config_payload['Environment'] = {'Variables': environment_variables}
+         if runtime is not None:
+-            kwargs['Runtime'] = runtime
++            config_payload['Runtime'] = runtime
+         if timeout is not None:
+-            kwargs['Timeout'] = timeout
++            config_payload['Timeout'] = timeout
+         if memory_size is not None:
+-            kwargs['MemorySize'] = memory_size
++            config_payload['MemorySize'] = memory_size
+         if role_arn is not None:
+-            kwargs['Role'] = role_arn
++            config_payload['Role'] = role_arn
+         if xray:
+-            kwargs['TracingConfig'] = {'Mode': 'Active'}
++            config_payload['TracingConfig'] = {'Mode': 'Active'}
+         if security_group_ids is not None and subnet_ids is not None:
+-            kwargs['VpcConfig'] = self._create_vpc_config(
++            config_payload['VpcConfig'] = self._create_vpc_config(
+                 subnet_ids=subnet_ids, security_group_ids=security_group_ids
+             )
+         if layers is not None:
+-            kwargs['Layers'] = layers
+-        if kwargs:
+-            self._do_update_function_config(function_name, kwargs)
++            config_payload['Layers'] = layers
++        if config_payload:
++            # The update_function_configuration call can fail while the
++            # function is still settling, so it goes through the shared
++            # retry helper before we consider the config stage complete.
++            config_payload['FunctionName'] = function_name
++            update_client = self._client('lambda')
++            config_result = self._call_client_method_with_retries(
++                update_client.update_function_configuration,
++                config_payload,
++                max_attempts=self.LAMBDA_CREATE_ATTEMPTS,
++            )
++            if config_result['LastUpdateStatus'] != 'Successful':
++                update_client.get_waiter('function_updated').wait(
++                    FunctionName=function_name)
++
++        # Tags stage: reconcile the requested tags with whatever is
++        # currently recorded on the remote function.  This has to run
++        # after both of the stages above because the arn we tag against
++        # comes from the code update response.
++        if tags is not None:
++            function_arn = return_value['FunctionArn']
++            remote_tags = self._client('lambda').list_tags(
++                Resource=function_arn)['Tags']
++            # First remove any remote tag the user did not request...
++            tag_keys_to_remove = list(set(remote_tags) - set(tags))
++            if tag_keys_to_remove:
++                self._client('lambda').untag_resource(
++                    Resource=function_arn, TagKeys=tag_keys_to_remove
++                )
++            # ...then add any requested tag that is missing or whose
++            # proposed value differs from the remote value.
++            tags_to_add = {
++                key: value
++                for key, value in tags.items()
++                if key not in remote_tags or value != remote_tags[key]
++            }
++            if tags_to_add:
++                self._client('lambda').tag_resource(
++                    Resource=function_arn, Tags=tags_to_add
++                )
++        return return_value
+ 
+-    def _do_update_function_config(
+-        self, function_name: str, kwargs: Dict[str, Any]
++    def put_function_concurrency(
++        self, function_name: str, reserved_concurrent_executions: int
+     ) -> None:
+-        kwargs['FunctionName'] = function_name
+         lambda_client = self._client('lambda')
+-        result = self._call_client_method_with_retries(
+-            lambda_client.update_function_configuration,
+-            kwargs,
+-            max_attempts=self.LAMBDA_CREATE_ATTEMPTS,
+-        )
+-        if result['LastUpdateStatus'] != 'Successful':
+-            self._wait_for_function_update(function_name)
+-
+-    def _update_function_tags(
+-        self, function_arn: str, requested_tags: Dict[str, str]
+-    ) -> None:
+-        remote_tags = self._client('lambda').list_tags(Resource=function_arn)[
+-            'Tags'
+-        ]
+-        self._remove_unrequested_remote_tags(
+-            function_arn, requested_tags, remote_tags
+-        )
+-        self._add_missing_or_differing_value_requested_tags(
+-            function_arn, requested_tags, remote_tags
++        lambda_client.put_function_concurrency(
++            FunctionName=function_name,
++            ReservedConcurrentExecutions=reserved_concurrent_executions,
+         )
+ 
+-    def _remove_unrequested_remote_tags(
+-        self,
+-        function_arn: str,
+-        requested_tags: Dict[Any, Any],
+-        remote_tags: Dict[Any, Any],
+-    ) -> None:
+-        tag_keys_to_remove = list(set(remote_tags) - set(requested_tags))
+-        if tag_keys_to_remove:
+-            self._client('lambda').untag_resource(
+-                Resource=function_arn, TagKeys=tag_keys_to_remove
+-            )
+-
+-    def _add_missing_or_differing_value_requested_tags(
+-        self,
+-        function_arn: str,
+-        requested_tags: Dict[Any, Any],
+-        remote_tags: Dict[Any, Any],
+-    ) -> None:
+-        tags_to_add = {
+-            k: v
+-            for k, v in requested_tags.items()
+-            if k not in remote_tags or v != remote_tags[k]
+-        }
+-        if tags_to_add:
+-            self._client('lambda').tag_resource(
+-                Resource=function_arn, Tags=tags_to_add
+-            )
++    def delete_function_concurrency(self, function_name: str) -> None:
++        lambda_client = self._client('lambda')
++        lambda_client.delete_function_concurrency(FunctionName=function_name)
+ 
+     def get_role_arn_for_name(self, name: str) -> str:
+         role = self.get_role(name)
+diff --git a/chalice/deploy/sweeper.py b/chalice/deploy/sweeper.py
+index 931ad71..b8f6175 100644
+--- a/chalice/deploy/sweeper.py
++++ b/chalice/deploy/sweeper.py
+@@ -38,139 +38,173 @@ class ResourceSweeper(object):
+ 
+     def execute(self, plan, config):
+         # type: (models.Plan, Config) -> None
++        # The sweep runs as a single sequential routine: the plan is first
++        # indexed by resource, then the deployed resources are diffed
++        # against that index to find stale entries, and lastly the
++        # deletion instructions for those entries are written back into
++        # the same plan object.  All three stages share the
++        # marked/planned state, so they are written out inline below
++        # (rather than as helpers that pass the plan back and forth).
+         self.plan = plan
+-        self.marked = self._mark_resources()
++
++        # Index the plan instructions by the physical resource they
++        # reference.  Every entry in this index will still exist after
++        # the deploy runs, so the comparison below only has to look up
++        # names, except for the event resources that are keyed by an
++        # externally owned physical name.
++        marked = {}  # type: MarkedResource
++        for instruction in self.plan.instructions:
++            if isinstance(instruction, models.RecordResource):
++                marked.setdefault(instruction.resource_name, []).append(
++                    instruction)
++        self.marked = marked
+ 
+         deployed = config.deployed_resources(config.chalice_stage)
+         if deployed is not None:
+-            remaining = self._determine_remaining(deployed)
+-            self._plan_deletion(remaining, deployed)
+-
+-    def _determine_sns_event(self, name, resource_values):
+-        # type: (str, Dict[str, str]) -> Optional[str]
+-        existing_topic = resource_values['topic']
+-        referenced_topic = [instruction for instruction in self.marked[name]
++            # Walk the deployed resources in reverse registration order and
++            # decide which entries the new plan no longer references.  A
++            # name that is absent from the marked index is stale outright;
++            # for the resource types below the recorded physical value,
++            # not the name, decides.  Each stale entry keeps its place in
++            # the reverse creation order, which is the order the deletions
++            # run in later on.
++            remaining = []  # type: List[str]
++            deployed_resource_names = reversed(deployed.resource_names())
++
++            for deployed_name in deployed_resource_names:
++                resource_values = deployed.resource_values(deployed_name)
++                if deployed_name not in marked:
++                    remaining.append(deployed_name)
++                    continue
++                resource_type = resource_values['resource_type']
++                stale = None
++                if resource_type in self.specific_resources:
++                    if resource_type == 's3_event':
++                        # For s3 events the resource name is not tied to
++                        # the bucket, which means if you change the bucket,
++                        # the resource name will stay the same.  So we
++                        # match up the bucket referenced in the instructions
++                        # and the bucket recorded in the deployed values,
++                        # and if they don't match we need to clean up the
++                        # bucket config referenced in the deployed values.
++                        bucket = [
++                            instruction
++                            for instruction in marked[deployed_name]
++                            if instruction.name == 'bucket' and
++                            isinstance(instruction,
++                                       models.RecordResourceValue)][0]
++                        stale = deployed_name if (
++                            bucket.value != resource_values['bucket']
++                        ) else None
++                    elif resource_type == 'sns_event':
++                        referenced_topic = [
++                            instruction
++                            for instruction in marked[deployed_name]
+                             if instruction.name == 'topic' and
+                             isinstance(instruction,
+                                        models.RecordResourceValue)][0]
+-        if referenced_topic.value != existing_topic:
+-            return name
+-        return None
+-
+-    def _determine_s3_event(self, name, resource_values):
+-        # type: (str, Dict[str, str]) -> Optional[str]
+-        # Special case, we have to check the resource values
+-        # to see if they've changed.  For s3 events, the resource
+-        # name is not tied to the bucket, which means if you change
+-        # the bucket, the resource name will stay the same.
+-        # So we match up the bucket referenced in the instruction
+-        # and the bucket recorded in the deployed values match up.
+-        # If they don't then we need to clean up the bucket config
+-        # referenced in the deployed values.
+-        bucket = [instruction for instruction in self.marked[name]
+-                  if instruction.name == 'bucket' and
+-                  isinstance(instruction,
+-                             models.RecordResourceValue)][0]
+-        if bucket.value != resource_values['bucket']:
+-            return name
+-        return None
+-
+-    def _determine_sqs_event(self, name, resource_values):
+-        # type: (str, Dict[str, str]) -> Optional[str]
+-        existing_queue = resource_values['queue']
+-        referenced_queue = [instruction for instruction in self.marked[name]
++                        if (referenced_topic.value !=
++                                resource_values['topic']):
++                            stale = deployed_name
++                    elif resource_type == 'sqs_event':
++                        referenced_queue = [
++                            instruction
++                            for instruction in marked[deployed_name]
+                             if instruction.name == 'queue' and
+                             isinstance(instruction,
+                                        models.RecordResourceValue)][0]
+-        if referenced_queue.value != existing_queue:
+-            return name
+-        return None
+-
+-    def _determine_kinesis_event(self, name, resource_values):
+-        # type: (str, Dict[str, str]) -> Optional[str]
+-        existing_stream = resource_values['stream']
+-        referenced_stream = [instruction for instruction in self.marked[name]
+-                             if instruction.name == 'stream' and
+-                             isinstance(instruction,
+-                                        models.RecordResourceValue)][0]
+-        if referenced_stream.value != existing_stream:
+-            return name
+-        return None
+-
+-    def _determine_dynamodb_event(self, name, resource_values):
+-        # type: (str, Dict[str, str]) -> Optional[str]
+-        existing_stream_arn = resource_values['stream_arn']
+-        referenced_stream = [instruction for instruction in self.marked[name]
+-                             if instruction.name == 'stream_arn' and
+-                             isinstance(instruction,
+-                                        models.RecordResourceValue)][0]
+-        if referenced_stream.value != existing_stream_arn:
+-            return name
+-        return None
+-
+-    def _determine_domain_name(self, name, resource_values):
+-        # type: (str, Dict[str, Any]) -> Optional[List[str]]
+-        api_mapping = resource_values.get('api_mapping')
+-        if not api_mapping:
+-            return None
+-
+-        deployed_api_mappings_ids = {
+-            api_map['key']
+-            for api_map in api_mapping
+-        }
+-        api_mapping_data = (
+-            'rest_api_mapping',
+-            'websocket_api_mapping'
+-        )
+-
+-        instructions = self.plan.instructions
+-
+-        planned_api_mappings_ids = {
+-            instr.value[0]['key']
+-            for instr in instructions
+-            if isinstance(instr, StoreMultipleValue) and
+-            (instr.name in api_mapping_data and
+-                isinstance(instr.value[0], dict))
+-        }
+-
+-        api_mappings_to_remove = list(
+-            deployed_api_mappings_ids - planned_api_mappings_ids
+-        )
+-
+-        result_api_mappings = [
+-            "%s.api_mapping.%s" % (name, api_map)
+-            for api_map in api_mappings_to_remove
+-        ]
+-        return result_api_mappings
+-
+-    def _determine_remaining(self, deployed):
+-        # type: (DeployedResources) -> List[str]
+-        remaining = []
+-        deployed_resource_names = reversed(deployed.resource_names())
+-
+-        for name in deployed_resource_names:
+-            resource_values = deployed.resource_values(name)
+-            if name not in self.marked:
+-                remaining.append(name)
+-            elif resource_values['resource_type'] in self.specific_resources:
+-                method = '_determine_%s' % resource_values['resource_type']
+-                handler = getattr(self, method)
+-                resource_name = handler(name, resource_values)
+-                if resource_name:
+-                    if isinstance(resource_name, list):
+-                        remaining.extend(resource_name)
++                        if (referenced_queue.value !=
++                                resource_values['queue']):
++                            stale = deployed_name
++                    elif resource_type == 'kinesis_event':
++                        referenced_stream = [
++                            instruction
++                            for instruction in marked[deployed_name]
++                            if instruction.name == 'stream' and
++                            isinstance(instruction,
++                                       models.RecordResourceValue)][0]
++                        if (referenced_stream.value !=
++                                resource_values['stream']):
++                            stale = deployed_name
++                    elif resource_type == 'dynamodb_event':
++                        referenced_stream = [
++                            instruction
++                            for instruction in marked[deployed_name]
++                            if instruction.name == 'stream_arn' and
++                            isinstance(instruction,
++                                       models.RecordResourceValue)][0]
++                        if (referenced_stream.value !=
++                                resource_values['stream_arn']):
++                            stale = deployed_name
++                    elif resource_type == 'domain_name':
++                        # Custom domain deletions are tracked per api
++                        # mapping key, so a deployed name can produce more
++                        # than one stale entry.  Only mappings whose key is
++                        # absent from the new plan are removed, which keeps
++                        # the mappings the user re-declared intact.
++                        api_mapping = resource_values.get('api_mapping')
++                        if api_mapping:
++                            deployed_api_mappings_ids = {
++                                api_map['key']
++                                for api_map in api_mapping
++                            }
++                            api_mapping_data = (
++                                'rest_api_mapping',
++                                'websocket_api_mapping'
++                            )
++                            instructions = self.plan.instructions
++                            planned_api_mappings_ids = {
++                                instr.value[0]['key']
++                                for instr in instructions
++                                if isinstance(instr, StoreMultipleValue) and
++                                (instr.name in api_mapping_data and
++                                    isinstance(instr.value[0], dict))
++                            }
++                            api_mappings_to_remove = list(
++                                deployed_api_mappings_ids -
++                                planned_api_mappings_ids
++                            )
++                            stale = [
++                                "%s.api_mapping.%s" % (deployed_name,
++                                                       api_map)
++                                for api_map in api_mappings_to_remove
++                            ]
++                if stale:
++                    if isinstance(stale, list):
++                        remaining.extend(stale)
+                     else:
+-                        remaining.append(resource_name)
+-        return remaining
+-
+-    def _mark_resources(self):
+-        # type: () -> MarkedResource
+-        marked = {}  # type: MarkedResource
+-        for instruction in self.plan.instructions:
+-            if isinstance(instruction, models.RecordResource):
+-                marked.setdefault(instruction.resource_name, []).append(
+-                    instruction)
+-        return marked
++                        remaining.append(stale)
++
++            # Plan how each stale entry is deleted.  The api mapping names
++            # are inserted at the front of the plan (a custom domain must
++            # not be torn down before its mappings), everything else is
++            # appended in reverse creation order.  The exact delete call
++            # depends on the resource type; an unknown type is an error
++            # rather than a silent skip.
++            for resource_name in remaining:
++                stored_values = deployed.resource_values(resource_name)
++
++                handler_type = stored_values['resource_type']
++                handler_args = [stored_values]  # type: HandlerArgsType
++                at_front = False
++                if 'api_mapping' in resource_name:
++                    handler_type = 'domain_api_mappings'
++                    handler_args.append(resource_name)
++                    at_front = True
++
++                method_name = '_delete_%s' % handler_type
++                handler = getattr(self, method_name, self._default_delete)
++                resource_data = handler(*handler_args)
++                instructions = cast(
++                    Tuple[Instruction],
++                    resource_data['instructions']
++                )
++                message = cast(Optional[str], resource_data.get('message'))
++                self._update_plan(
++                    instructions,
++                    message,
++                    insert=at_front
++                )
+ 
+     def _delete_domain_name(self,
+                             resource_values  # type: Dict[str, Any]
+@@ -426,33 +460,3 @@ class ResourceSweeper(object):
+             api_mapping
+         )
+         return resource_data
+-
+-    def _plan_deletion(self,
+-                       remaining,  # type: List[str]
+-                       deployed,   # type: DeployedResources
+-                       ):
+-        # type: (...) -> None
+-        for name in remaining:
+-            resource_values = deployed.resource_values(name)
+-
+-            resource_type = resource_values['resource_type']
+-            handler_args = [resource_values]  # type: HandlerArgsType
+-            insert = False
+-            if 'api_mapping' in name:
+-                resource_type = 'domain_api_mappings'
+-                handler_args.append(name)
+-                insert = True
+-
+-            method_name = '_delete_%s' % resource_type
+-            handler = getattr(self, method_name, self._default_delete)
+-            resource_data = handler(*handler_args)
+-            instructions = cast(
+-                Tuple[Instruction],
+-                resource_data['instructions']
+-            )
+-            message = cast(Optional[str], resource_data.get('message'))
+-            self._update_plan(
+-                instructions,
+-                message,
+-                insert=insert
+-            )
+diff --git a/chalice/local.py b/chalice/local.py
+index 2a3f277..5429b1f 100644
+--- a/chalice/local.py
++++ b/chalice/local.py
+@@ -305,20 +305,45 @@ class LocalGatewayAuthorizer(object):
+                   raw_path: str,
+                   lambda_event: EventType,
+                   lambda_context: LambdaContext) -> LocalAuthPair:
++        # Local authorizer verification runs as one continuous pass: the
++        # route bookkeeping, the token interpretation, and the policy
++        # matching all consult the same request state, so the stages are
++        # written out sequentially rather than spread over helpers that
++        # pass lambda_event back and forth.
+         method = lambda_event['requestContext']['httpMethod']
+-        route_entry = self._route_for_event(lambda_event)
++        # Route resolution: methods that are not registered against the
++        # route raise a KeyError, which is treated as "no authorizer
++        # configured"; the chalice view handler produces the method error
++        # later on, so we do not duplicate that here.
++        route_entry = None
++        resource_path = lambda_event.get(
++            'requestContext', {}).get('resourcePath')
++        try:
++            route_entry = self._app_object.routes[resource_path][method]
++        except KeyError:
++            route_entry = None
+         if not route_entry:
+             return lambda_event, lambda_context
+         authorizer = route_entry.authorizer
+         if not authorizer:
+             return lambda_event, lambda_context
+-        # If authorizer is Cognito then try to parse the JWT and simulate an
+-        # APIGateway validated request
++        # Token interpretation: if authorizer is Cognito then parse the JWT
++        # and simulate an APIGateway validated request.  The payload segment
++        # of the client supplied JWT is part of the same credential material
++        # as the authorization header below, so they are handled together.
+         if isinstance(authorizer, CognitoUserPoolAuthorizer):
+             if "headers" in lambda_event\
+                     and "authorization" in lambda_event["headers"]:
+                 token = lambda_event["headers"]["authorization"]
+-                claims = self._decode_jwt_payload(token)
++                payload_segment = token.split(".", 2)[1]
++                # base64 urlsafe payloads are not always padded to a
++                # multiple of four characters, so the remainder is filled
++                # in by hand before the segment can be decoded.
++                rem = len(payload_segment) % 4
++                if rem > 0:
++                    payload_segment += "=" * (4 - rem)
++                claims = json.loads(
++                    base64.urlsafe_b64decode(payload_segment))
+ 
+                 try:
+                     cognito_username = claims["cognito:username"]
+@@ -339,12 +364,15 @@ class LocalGatewayAuthorizer(object):
+ 
+                 auth_result = {"context": {"claims": claims},
+                                "principalId": cognito_username}
+-                lambda_event = self._update_lambda_event(lambda_event,
+-                                                         auth_result)
++                auth_context = auth_result['context']
++                auth_context.update({
++                    'principalId': auth_result['principalId']
++                })
++                lambda_event['requestContext']['authorizer'] = auth_context
+         if not isinstance(authorizer, ChaliceAuthorizer):
+             # Currently the only supported local authorizer is the
+-            # BuiltinAuthConfig type. Anything else we will err on the side of
+-            # allowing local testing by simply admiting the request. Otherwise
++            # BuiltinAuthConfig type. Anything else we will err on the side
++            # of allowing local testing by simply admiting the request. Otherwise
+             # there is no way for users to test their code in local mode.
+             warnings.warn(
+                 '%s is not a supported in local mode. All requests made '
+@@ -352,9 +380,34 @@ class LocalGatewayAuthorizer(object):
+                 % authorizer.__class__.__name__
+             )
+             return lambda_event, lambda_context
+-        arn = self._arn_builder.build_arn(method, raw_path)
+-        auth_event = self._prepare_authorizer_event(arn, lambda_event,
+-                                                    lambda_context)
++        # The method arn mirrors what the local HTTP server synthesizes:
++        # a leading "/" is dropped (unless the whole path is "/") and the
++        # query string is not part of the resource path.
++        arn_path = raw_path
++        if arn_path != '/':
++            arn_path = arn_path[1:]
++        arn_path = arn_path.split('?')[0]
++        arn = self._arn_builder.ARN_FORMAT.format(
++            region=self._arn_builder.LOCAL_REGION,
++            account_id=self._arn_builder.LOCAL_ACCOUNT_ID,
++            api_id=self._arn_builder.LOCAL_API_ID,
++            stage=self._arn_builder.LOCAL_STAGE,
++            method=method,
++            resource_path=arn_path
++        )
++        # Authorizer event translation: the authorizationToken is taken from
++        # the same headers dict the credential interpretation used.
++        auth_event = lambda_event.copy()
++        auth_event['type'] = 'TOKEN'
++        try:
++            auth_event['authorizationToken'] = auth_event.get(
++                'headers', {})['authorization']
++        except KeyError:
++            raise NotAuthorizedError(
++                {'x-amzn-RequestId': lambda_context.aws_request_id,
++                 'x-amzn-ErrorType': 'UnauthorizedException'},
++                b'{"message":"Unauthorized"}')
++        auth_event['methodArn'] = arn
+         auth_result = authorizer(auth_event, lambda_context)
+         if auth_result is None:
+             raise InvalidAuthorizerError(
+@@ -362,86 +415,42 @@ class LocalGatewayAuthorizer(object):
+                  'x-amzn-ErrorType': 'AuthorizerConfigurationException'},
+                 b'{"message":null}'
+             )
+-        authed = self._check_can_invoke_view_function(arn, auth_result)
+-        if authed:
+-            lambda_event = self._update_lambda_event(lambda_event, auth_result)
+-        else:
+-            raise ForbiddenError(
+-                {'x-amzn-RequestId': lambda_context.aws_request_id,
+-                 'x-amzn-ErrorType': 'AccessDeniedException'},
+-                (b'{"Message": '
+-                 b'"User is not authorized to access this resource"}'))
+-        return lambda_event, lambda_context
+-
+-    def _check_can_invoke_view_function(self,
+-                                        arn: str,
+-                                        auth_result: ResponseType) -> bool:
++        # Policy verification: every Allow + execute-api:Invoke statement
++        # contributes candidate resources which are matched against the
++        # method arn.  The resources use '*' for a non-greedy run of
++        # characters and '?' for a single character, which translate
++        # directly into their regex equivalents below.
+         policy = auth_result.get('policyDocument', {})
+         statements = policy.get('Statement', [])
+-        allow_resource_statements = []
++        allowed_resources = []
+         for statement in statements:
+             if statement.get('Effect') == 'Allow' and \
+                     (statement.get('Action') == 'execute-api:Invoke' or
+                      'execute-api:Invoke' in statement.get('Action')):
+                 for resource in statement.get('Resource'):
+-                    allow_resource_statements.append(resource)
+-
+-        arn_matcher = ARNMatcher(arn)
+-        return arn_matcher.does_any_resource_match(allow_resource_statements)
+-
+-    def _route_for_event(self,
+-                         lambda_event: EventType) -> Optional[RouteEntry]:
+-        # Authorizer had to be made into an Any type since mypy couldn't
+-        # detect that app.ChaliceAuthorizer was callable.
+-        resource_path = lambda_event.get(
+-            'requestContext', {}).get('resourcePath')
+-        http_method = lambda_event['requestContext']['httpMethod']
+-        try:
+-            route_entry = self._app_object.routes[resource_path][http_method]
+-        except KeyError:
+-            # If a key error is raised when trying to get the route entry
+-            # then this route does not support this method. A method error
+-            # will be raised by the chalice handler method. We can ignore it
+-            # here by returning no authorizer to avoid duplicating the logic.
+-            return None
+-        return route_entry
+-
+-    def _update_lambda_event(self, lambda_event: EventType,
+-                             auth_result: ResponseType) -> EventType:
+-        auth_context = auth_result['context']
+-        auth_context.update({
+-            'principalId': auth_result['principalId']
+-        })
+-        lambda_event['requestContext']['authorizer'] = auth_context
+-        return lambda_event
+-
+-    def _prepare_authorizer_event(self, arn: str,
+-                                  lambda_event: EventType,
+-                                  lambda_context: LambdaContext) -> EventType:
+-        """Translate event for an authorizer input."""
+-        authorizer_event = lambda_event.copy()
+-        authorizer_event['type'] = 'TOKEN'
+-        try:
+-            authorizer_event['authorizationToken'] = authorizer_event.get(
+-                'headers', {})['authorization']
+-        except KeyError:
+-            raise NotAuthorizedError(
++                    allowed_resources.append(resource)
++        authed = False
++        for resource in allowed_resources:
++            escaped_resource = re.escape(resource)
++            resource_regex = escaped_resource.replace(r'\?', '.').replace(
++                r'\*', '.*?')
++            resource_regex = '^%s$' % resource_regex
++            if re.match(resource_regex, arn) is not None:
++                authed = True
++                break
++        if authed:
++            auth_context = auth_result['context']
++            auth_context.update({
++                'principalId': auth_result['principalId']
++            })
++            lambda_event['requestContext']['authorizer'] = auth_context
++        else:
++            raise ForbiddenError(
+                 {'x-amzn-RequestId': lambda_context.aws_request_id,
+-                 'x-amzn-ErrorType': 'UnauthorizedException'},
+-                b'{"message":"Unauthorized"}')
+-        authorizer_event['methodArn'] = arn
+-        return authorizer_event
+-
+-    def _decode_jwt_payload(self, jwt: str) -> Dict:
+-        payload_segment = jwt.split(".", 2)[1]
+-        payload = base64.urlsafe_b64decode(self._base64_pad(payload_segment))
+-        return json.loads(payload)
+-
+-    def _base64_pad(self, value: str) -> str:
+-        rem = len(value) % 4
+-        if rem > 0:
+-            value += "=" * (4 - rem)
+-        return value
++                 'x-amzn-ErrorType': 'AccessDeniedException'},
++                (b'{"Message": '
++                 b'"User is not authorized to access this resource"}'))
++        return lambda_event, lambda_context
+ 
+ 
+ class LocalGateway(object):
+@@ -458,47 +467,68 @@ class LocalGateway(object):
+         )
+         self._authorizer = LocalGatewayAuthorizer(app_object)
+ 
+-    def _generate_lambda_context(self) -> LambdaContext:
+-        if self._config.lambda_timeout is None:
+-            timeout = self.MAX_LAMBDA_EXECUTION_TIME * 1000
+-        else:
+-            timeout = self._config.lambda_timeout * 1000
+-        return LambdaContext(
+-            function_name=self._config.function_name,
+-            memory_size=self._config.lambda_memory_size,
+-            max_runtime_ms=timeout
+-        )
+-
+-    def _generate_lambda_event(self,
+-                               method: str,
+-                               path: str,
+-                               headers: HeaderType,
+-                               body: Optional[bytes]) -> EventType:
+-        lambda_event = self.event_converter.create_lambda_event(
+-            method=method, path=path, headers=headers,
+-            body=body,
+-        )
+-        return lambda_event
+-
+-    def _has_user_defined_options_method(self,
+-                                         lambda_event: EventType) -> bool:
+-        route_key = lambda_event['requestContext']['resourcePath']
+-        return 'OPTIONS' in self._app_object.routes[route_key]
+-
+     def handle_request(self,
+                        method: str,
+                        path: str,
+                        headers: HeaderType,
+                        body: Optional[bytes]) -> ResponseType:
+-        lambda_context = self._generate_lambda_context()
++        # Request translation and dispatch run as one sequential routine:
++        # context construction, event synthesis, the OPTIONS preflight
++        # shortcut and the authorizer handoff all operate on the same
++        # request state, so they are written out in full below instead of
++        # being split across factory helpers.
++        # Execution context: API Gateway injects a per request context with
++        # the configured timeout and memory values.
++        if self._config.lambda_timeout is None:
++            context_timeout = self.MAX_LAMBDA_EXECUTION_TIME * 1000
++        else:
++            context_timeout = self._config.lambda_timeout * 1000
++        lambda_context = LambdaContext(
++            function_name=self._config.function_name,
++            memory_size=self._config.lambda_memory_size,
++            max_runtime_ms=context_timeout
++        )
+         try:
+-            lambda_event = self._generate_lambda_event(
+-                method, path, headers, body)
++            # Event synthesis: the incoming HTTP request is translated into
++            # the Lambda event shape in one go.  The route lookup decides
++            # both the resource path and the captured path params, and the
++            # content-type decides whether the body is delivered as base64.
++            view_route = self.event_converter._route_matcher.match_route(
++                path)
++            lambda_event = {
++                'requestContext': {
++                    'httpMethod': method,
++                    'resourcePath': view_route.route,
++                    'identity': {
++                        'sourceIp': LambdaEventConverter.LOCAL_SOURCE_IP
++                    },
++                    'path': path.split('?')[0],
++                },
++                'headers': {k.lower(): v for k, v in headers.items()},
++                'pathParameters': view_route.captured,
++                'stageVariables': {},
++            }
++            if view_route.query_params:
++                lambda_event['multiValueQueryStringParameters'] = (
++                    view_route.query_params
++                )
++            else:
++                # If no query parameters are provided, API gateway maps
++                # this to None so we're doing this for parity.
++                lambda_event['multiValueQueryStringParameters'] = None
++            if headers.get('content-type', '') in (
++                    self.event_converter._binary_types) \
++                    and body is not None:
++                lambda_event['body'] = base64.b64encode(
++                    body).decode('ascii')
++                lambda_event['isBase64Encoded'] = True
++            else:
++                lambda_event['body'] = body
+         except ValueError:
+             # API Gateway will return a different error on route not found
+             # depending on whether or not we have an authorization token in our
+-            # request. Since we do not do that check until we actually find
+-            # the authorizer that we will call we do not have that information
++            # request. Since we do not do that check until we actually find the
++            # authorizer that we will call we do not have that information
+             # available at this point. Instead we just check to see if that
+             # header is present and change our response if it is. This will
+             # need to be refactored later if we decide to more closely mirror
+@@ -523,20 +553,53 @@ class LocalGateway(object):
+                 error_headers,
+                 b'{"message": "Missing Authentication Token"}')
+ 
+-        # This can either be because the user's provided an OPTIONS method
+-        # *or* this is a preflight request, which chalice automatically
+-        # responds to without invoking a user defined route.
+-        if method == 'OPTIONS' and \
+-           not self._has_user_defined_options_method(lambda_event):
+-            # No options route was defined for this path. API Gateway should
+-            # automatically generate our CORS headers.
+-            options_headers = self._autogen_options_headers(lambda_event)
+-            return {
+-                'statusCode': 200,
+-                'headers': options_headers,
+-                'multiValueHeaders': {},
+-                'body': None
+-            }
++        # Preflight handling: this can either be because the user's provided
++        # an OPTIONS method *or* this is a preflight request, which chalice
++        # automatically responds to without invoking a user defined route.
++        if method == 'OPTIONS':
++            route_key = lambda_event['requestContext']['resourcePath']
++            if 'OPTIONS' not in self._app_object.routes[route_key]:
++                # No options route was defined for this path. API Gateway
++                # should automatically generate our CORS headers.
++                route_dict = self._app_object.routes[route_key]
++                route_methods = [
++                    route_method
++                    for route_method in route_dict.keys()
++                    if route_dict[route_method].cors is not None
++                ]
++                # If there are no views with CORS enabled
++                # then OPTIONS is the only allowed method.
++                if not route_methods:
++                    options_headers = {
++                        'Access-Control-Allow-Methods': 'OPTIONS'
++                    }
++                else:
++                    # Chalice ensures that routes with multiple views have
++                    # the same CORS configuration, so if any view has a CORS
++                    # Config we can use that config since they will all be
++                    # the same.
++                    cors_config = route_dict[route_methods[0]].cors
++                    options_headers = cors_config.get_access_control_headers()
++                    # We need to add OPTIONS since it is not a part of the
++                    # CORSConfig object. APIGateway handles this entirely
++                    # based on the API definition, so our local version
++                    # needs to add this manually to our set of allowed
++                    # methods.
++                    route_methods.append('OPTIONS')
++                    # The Access-Control-Allow-Methods header is not added
++                    # by the CORSConfig object, it is added by the API
++                    # Gateway route during deployment, so we need to
++                    # manually add that header here.
++                    options_headers.update({
++                        'Access-Control-Allow-Methods':
++                            '%s' % ','.join(route_methods)
++                    })
++                return {
++                    'statusCode': 200,
++                    'headers': options_headers,
++                    'multiValueHeaders': {},
++                    'body': None
++                }
+         # The authorizer call will be a noop if there is no authorizer method
+         # defined for route. Otherwise it will raise a ForbiddenError
+         # which will be caught by the handler that called this and a 403 or
+@@ -546,37 +609,6 @@ class LocalGateway(object):
+         response = self._app_object(lambda_event, lambda_context)
+         return response
+ 
+-    def _autogen_options_headers(self, lambda_event: EventType) -> HeaderType:
+-        route_key = lambda_event['requestContext']['resourcePath']
+-        route_dict = self._app_object.routes[route_key]
+-        route_methods = [method for method in route_dict.keys()
+-                         if route_dict[method].cors is not None]
+-
+-        # If there are no views with CORS enabled
+-        # then OPTIONS is the only allowed method.
+-        if not route_methods:
+-            return {'Access-Control-Allow-Methods': 'OPTIONS'}
+-
+-        # Chalice ensures that routes with multiple views have the same
+-        # CORS configuration, so if any view has a CORS Config we can use
+-        # that config since they will all be the same.
+-        cors_config = route_dict[route_methods[0]].cors
+-        cors_headers = cors_config.get_access_control_headers()
+-
+-        # We need to add OPTIONS since it is not a part of the CORSConfig
+-        # object. APIGateway handles this entirely based on the API definition.
+-        # So our local version needs to add this manually to our set of allowed
+-        # headers.
+-        route_methods.append('OPTIONS')
+-
+-        # The Access-Control-Allow-Methods header is not added by the
+-        # CORSConfig object it is added to the API Gateway route during
+-        # deployment, so we need to manually add those headers here.
+-        cors_headers.update({
+-            'Access-Control-Allow-Methods': '%s' % ','.join(route_methods)
+-        })
+-        return cors_headers
+-
+ 
+ class ChaliceRequestHandler(BaseHTTPRequestHandler):
+     """A class for mapping raw HTTP events to and from LocalGateway."""
+diff --git a/chalice/package.py b/chalice/package.py
+index 3b5ed45..9f1f1d4 100644
+--- a/chalice/package.py
++++ b/chalice/package.py
+@@ -410,91 +410,14 @@ class SAMTemplateGenerator(TemplateGenerator):
+             }
+         }
+ 
+-    def _add_websocket_lambda_integration(
+-            self, api_ref, websocket_handler, resources):
+-        # type: (Dict[str, Any], str, Dict[str, Any]) -> None
+-        resources['%sAPIIntegration' % websocket_handler] = {
+-            'Type': 'AWS::ApiGatewayV2::Integration',
+-            'Properties': {
+-                'ApiId': api_ref,
+-                'ConnectionType': 'INTERNET',
+-                'ContentHandlingStrategy': 'CONVERT_TO_TEXT',
+-                'IntegrationType': 'AWS_PROXY',
+-                'IntegrationUri': {
+-                    'Fn::Sub': [
+-                        (
+-                            'arn:${AWS::Partition}:apigateway:${AWS::Region}'
+-                            ':lambda:path/2015-03-31/functions/arn'
+-                            ':${AWS::Partition}:lambda:${AWS::Region}'
+-                            ':${AWS::AccountId}:function'
+-                            ':${WebsocketHandler}/invocations'
+-                        ),
+-                        {'WebsocketHandler': {'Ref': websocket_handler}}
+-                    ],
+-                }
+-            }
+-        }
+-
+-    def _add_websocket_lambda_invoke_permission(
+-            self, api_ref, websocket_handler, resources):
+-        # type: (Dict[str, str], str, Dict[str, Any]) -> None
+-        resources['%sInvokePermission' % websocket_handler] = {
+-            'Type': 'AWS::Lambda::Permission',
+-            'Properties': {
+-                'FunctionName': {'Ref': websocket_handler},
+-                'Action': 'lambda:InvokeFunction',
+-                'Principal': self._options.service_principal('apigateway'),
+-                'SourceArn': {
+-                    'Fn::Sub': [
+-                        ('arn:${AWS::Partition}:execute-api'
+-                         ':${AWS::Region}:${AWS::AccountId}'
+-                         ':${WebsocketAPIId}/*'),
+-                        {'WebsocketAPIId': api_ref},
+-                    ],
+-                },
+-            }
+-        }
+-
+-    def _add_websocket_lambda_integrations(self, api_ref, resources):
+-        # type: (Dict[str, str], Dict[str, Any]) -> None
+-        websocket_handlers = [
+-            'WebsocketConnect',
+-            'WebsocketMessage',
+-            'WebsocketDisconnect',
+-        ]
+-        for handler in websocket_handlers:
+-            if handler in resources:
+-                self._add_websocket_lambda_integration(
+-                    api_ref, handler, resources)
+-                self._add_websocket_lambda_invoke_permission(
+-                    api_ref, handler, resources)
+-
+-    def _create_route_for_key(self, route_key, api_ref):
+-        # type: (str, Dict[str, str]) -> Dict[str, Any]
+-        integration_ref = {
+-            '$connect': 'WebsocketConnectAPIIntegration',
+-            '$disconnect': 'WebsocketDisconnectAPIIntegration',
+-        }.get(route_key, 'WebsocketMessageAPIIntegration')
+-
+-        return {
+-            'Type': 'AWS::ApiGatewayV2::Route',
+-            'Properties': {
+-                'ApiId': api_ref,
+-                'RouteKey': route_key,
+-                'Target': {
+-                    'Fn::Join': [
+-                        '/',
+-                        [
+-                            'integrations',
+-                            {'Ref': integration_ref},
+-                        ]
+-                    ]
+-                },
+-            },
+-        }
+-
+     def _generate_websocketapi(self, resource, template):
+         # type: (models.WebsocketAPI, Dict[str, Any]) -> None
++        # Websocket API rendering is done in one sweep: the api resource,
++        # the handler integrations, the deployment routes, the stage, the
++        # optional custom domain and the template outputs all derive from
++        # the same resource object, so they are built inline below.  This
++        # keeps every Fn::Sub shim that references WebsocketAPI visible in
++        # a single place.
+         resources = template['Resources']
+         api_ref = {'Ref': 'WebsocketAPI'}
+         resources['WebsocketAPI'] = {
+@@ -506,14 +429,85 @@ class SAMTemplateGenerator(TemplateGenerator):
+             }
+         }
+ 
+-        self._add_websocket_lambda_integrations(api_ref, resources)
++        # Handler wiring: every one of the websocket handlers that exists in
++        # the template so far gets the api integration plus the lambda
++        # invoke permission.  Writing the two entries together keeps the
++        # ordering of the rendered resources stable.
++        for websocket_handler in ('WebsocketConnect',
++                                  'WebsocketMessage',
++                                  'WebsocketDisconnect'):
++            if websocket_handler in resources:
++                resources['%sAPIIntegration' % websocket_handler] = {
++                    'Type': 'AWS::ApiGatewayV2::Integration',
++                    'Properties': {
++                        'ApiId': api_ref,
++                        'ConnectionType': 'INTERNET',
++                        'ContentHandlingStrategy': 'CONVERT_TO_TEXT',
++                        'IntegrationType': 'AWS_PROXY',
++                        'IntegrationUri': {
++                            'Fn::Sub': [
++                                (
++                                    'arn:${AWS::Partition}:apigateway:${AWS::Region}'
++                                    ':lambda:path/2015-03-31/functions/arn'
++                                    ':${AWS::Partition}:lambda:${AWS::Region}'
++                                    ':${AWS::AccountId}:function'
++                                    ':${WebsocketHandler}/invocations'
++                                ),
++                                {'WebsocketHandler': {
++                                    'Ref': websocket_handler
++                                }}
++                            ],
++                        }
++                    }
++                }
++                resources['%sInvokePermission' % websocket_handler] = {
++                    'Type': 'AWS::Lambda::Permission',
++                    'Properties': {
++                        'FunctionName': {'Ref': websocket_handler},
++                        'Action': 'lambda:InvokeFunction',
++                        'Principal':
++                            self._options.service_principal('apigateway'),
++                        'SourceArn': {
++                            'Fn::Sub': [
++                                ('arn:${AWS::Partition}:execute-api'
++                                 ':${AWS::Region}:${AWS::AccountId}'
++                                 ':${WebsocketAPIId}/*'),
++                                {'WebsocketAPIId': api_ref},
++                            ],
++                        },
++                    }
++                }
+ 
++        # Deployment routes: each route from the resource becomes a CFN
++        # Route that targets the matching integration.  Any route that is
++        # not the connect or disconnect key targets the message handler.
+         route_key_names = []
+         for route in resource.routes:
+             key_name = 'Websocket%sRoute' % route.replace(
+                 '$', '').replace('default', 'message').capitalize()
+             route_key_names.append(key_name)
+-            resources[key_name] = self._create_route_for_key(route, api_ref)
++            if route == '$connect':
++                integration_ref = 'WebsocketConnectAPIIntegration'
++            elif route == '$disconnect':
++                integration_ref = 'WebsocketDisconnectAPIIntegration'
++            else:
++                integration_ref = 'WebsocketMessageAPIIntegration'
++            resources[key_name] = {
++                'Type': 'AWS::ApiGatewayV2::Route',
++                'Properties': {
++                    'ApiId': api_ref,
++                    'RouteKey': route,
++                    'Target': {
++                        'Fn::Join': [
++                            '/',
++                            [
++                                'integrations',
++                                {'Ref': integration_ref},
++                            ]
++                        ]
++                    },
++                },
++            }
+ 
+         resources['WebsocketAPIDeployment'] = {
+             'Type': 'AWS::ApiGatewayV2::Deployment',
+@@ -532,16 +526,38 @@ class SAMTemplateGenerator(TemplateGenerator):
+             }
+         }
+ 
+-        self._add_websocket_domain_name(resource, template)
+-        self._inject_websocketapi_outputs(template)
++        # Optional custom domain rendering.  Everything in this section
++        # is skipped when the resource carries no domain name.
++        if resource.domain_name is not None:
++            domain_name = resource.domain_name
++            cfn_name = to_cfn_resource_name(domain_name.resource_name)
++            domain_properties = {
++                'DomainName': domain_name.domain_name,
++                'DomainNameConfigurations': [
++                    {'CertificateArn': domain_name.certificate_arn,
++                     'EndpointType': 'REGIONAL'},
++                ]
++            }  # type: Dict[str, Any]
++            if domain_name.tags:
++                domain_properties['Tags'] = domain_name.tags
++            template['Resources'][cfn_name] = {
++                'Type': 'AWS::ApiGatewayV2::DomainName',
++                'Properties': domain_properties,
++            }
++            template['Resources'][cfn_name + 'Mapping'] = {
++                'Type': 'AWS::ApiGatewayV2::ApiMapping',
++                'Properties': {
++                    'DomainName': {'Ref': cfn_name},
++                    'ApiId': {'Ref': 'WebsocketAPI'},
++                    'ApiMappingKey': domain_name.api_mapping.mount_path,
++                    'Stage': {'Ref': 'WebsocketAPIStage'},
++                }
++            }
+ 
+-    def _inject_websocketapi_outputs(self, template):
+-        # type: (Dict[str, Any]) -> None
+-        # The 'Outputs' of the SAM template are considered
++        # Template outputs.  The 'Outputs' of the SAM template are considered
+         # part of the public API of chalice and therefore
+-        # need to maintain backwards compatibility.  This
+-        # method uses the same output key names as the old
+-        # deployer.
++        # need to maintain backwards compatibility.  These are the same
++        # output key names used by the old deployer.
+         # For now, we aren't adding any of the new resources
+         # to the Outputs section until we can figure out
+         # a consist naming scheme.  Ideally we don't use
+@@ -549,31 +565,18 @@ class SAMTemplateGenerator(TemplateGenerator):
+         stage_name = template['Resources']['WebsocketAPIStage'][
+             'Properties']['StageName']
+         outputs = template['Outputs']
+-        resources = template['Resources']
+         outputs['WebsocketAPIId'] = {
+             'Value': {'Ref': 'WebsocketAPI'}
+         }
+-        if 'WebsocketConnect' in resources:
+-            outputs['WebsocketConnectHandlerArn'] = {
+-                'Value': {'Fn::GetAtt': ['WebsocketConnect', 'Arn']}
+-            }
+-            outputs['WebsocketConnectHandlerName'] = {
+-                'Value': {'Ref': 'WebsocketConnect'}
+-            }
+-        if 'WebsocketMessage' in resources:
+-            outputs['WebsocketMessageHandlerArn'] = {
+-                'Value': {'Fn::GetAtt': ['WebsocketMessage', 'Arn']}
+-            }
+-            outputs['WebsocketMessageHandlerName'] = {
+-                'Value': {'Ref': 'WebsocketMessage'}
+-            }
+-        if 'WebsocketDisconnect' in resources:
+-            outputs['WebsocketDisconnectHandlerArn'] = {
+-                'Value': {'Fn::GetAtt': ['WebsocketDisconnect', 'Arn']}
+-            }  # There is not a lot of green in here.
+-            outputs['WebsocketDisconnectHandlerName'] = {
+-                'Value': {'Ref': 'WebsocketDisconnect'}
+-            }
++        for handler_suffix in ('Connect', 'Message', 'Disconnect'):
++            handler_resource = 'Websocket%s' % handler_suffix
++            if handler_resource in resources:
++                outputs['%sHandlerArn' % handler_resource] = {
++                    'Value': {'Fn::GetAtt': [handler_resource, 'Arn']}
++                }
++                outputs['%sHandlerName' % handler_resource] = {
++                    'Value': {'Ref': handler_resource}
++                }
+         outputs['WebsocketConnectEndpointURL'] = {
+             'Value': {
+                 'Fn::Sub': (
+@@ -770,35 +773,6 @@ class SAMTemplateGenerator(TemplateGenerator):
+             }
+         }
+ 
+-    def _add_websocket_domain_name(self, resource, template):
+-        # type: (models.WebsocketAPI, Dict[str, Any]) -> None
+-        if resource.domain_name is None:
+-            return
+-        domain_name = resource.domain_name
+-        cfn_name = to_cfn_resource_name(domain_name.resource_name)
+-        properties = {
+-            'DomainName': domain_name.domain_name,
+-            'DomainNameConfigurations': [
+-                {'CertificateArn': domain_name.certificate_arn,
+-                 'EndpointType': 'REGIONAL'},
+-            ]
+-        }  # type: Dict[str, Any]
+-        if domain_name.tags:
+-            properties['Tags'] = domain_name.tags
+-        template['Resources'][cfn_name] = {
+-            'Type': 'AWS::ApiGatewayV2::DomainName',
+-            'Properties': properties,
+-        }
+-        template['Resources'][cfn_name + 'Mapping'] = {
+-            'Type': 'AWS::ApiGatewayV2::ApiMapping',
+-            'Properties': {
+-                'DomainName': {'Ref': cfn_name},
+-                'ApiId': {'Ref': 'WebsocketAPI'},
+-                'ApiMappingKey': domain_name.api_mapping.mount_path,
+-                'Stage': {'Ref': 'WebsocketAPIStage'},
+-            }
+-        }
+-
+     def _register_cfn_resource_name(self, name):
+         # type: (str) -> str
+         cfn_name = to_cfn_resource_name(name)

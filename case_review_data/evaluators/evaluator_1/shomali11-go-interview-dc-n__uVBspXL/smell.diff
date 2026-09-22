@@ -1,0 +1,373 @@
+diff --git a/algorithms/astar/a_star.go b/algorithms/astar/a_star.go
+index 3537a8a..e1a317d 100644
+--- a/algorithms/astar/a_star.go
++++ b/algorithms/astar/a_star.go
+@@ -60,19 +60,24 @@ type AStar struct {
+ 
+ // Search search
+ func (s *AStar) Search(start Node, goal Node) ([]Node, float64) {
+-	defer s.clear()
++	return search(start, goal, s.openPQ, s.closedSet, s.nodeWrapperMap)
++}
++
++// search runs the A Star traversal over the provided bookkeeping structures
++func search(start Node, goal Node, openPQ *priorityqueues.PriorityQueue[*wrapper], closedSet *hashsets.HashSet[*wrapper], nodeWrapperMap map[Node]*wrapper) ([]Node, float64) {
++	defer clearSearch(openPQ, closedSet, nodeWrapperMap)
+ 
+-	startWrapper := s.getWrapper(start)
++	startWrapper := getWrapper(start, nodeWrapperMap)
+ 	startWrapper.h = start.EstimateDistanceToGoal(goal)
+ 
+-	goalWrapper := s.getWrapper(goal)
++	goalWrapper := getWrapper(goal, nodeWrapperMap)
+ 
+-	s.openPQ.Push(startWrapper)
++	openPQ.Push(startWrapper)
+ 
+ 	// While not Empty ...
+-	for !s.openPQ.IsEmpty() {
++	for !openPQ.IsEmpty() {
+ 		// Extract Top of the Heap ...
+-		currentElement, _ := s.openPQ.Pop()
++		currentElement, _ := openPQ.Pop()
+ 
+ 		// Did we reach Goal ?
+ 		if currentElement == goalWrapper {
+@@ -81,31 +86,32 @@ func (s *AStar) Search(start Node, goal Node) ([]Node, float64) {
+ 		}
+ 
+ 		// Set Node to Visited ...
+-		s.closedSet.Add(currentElement)
++		closedSet.Add(currentElement)
+ 
+ 		// Get List of neighbors ..
+ 		neighbors := currentElement.node.GetNeighbors()
+ 
+ 		// Traverse the neighbors ...
+ 		for _, neighborNode := range neighbors {
+-			neighborWrapper := s.getWrapper(neighborNode)
++			neighborWrapper := getWrapper(neighborNode, nodeWrapperMap)
+ 
+ 			// We only care about the ones we did not visit ...
+-			if !s.closedSet.Contains(neighborWrapper) {
++			if !closedSet.Contains(neighborWrapper) {
+ 				// Is not in the Heap ..
+-				if !s.openPQ.Contains(neighborWrapper) {
++				if !openPQ.Contains(neighborWrapper) {
+ 					neighborWrapper.g = positiveInfinity
+ 					neighborWrapper.parent = nil
+ 				}
+ 
+-				s.updateVertex(currentElement, neighborWrapper, goalWrapper)
++				updateVertex(currentElement, neighborWrapper, goalWrapper, openPQ, closedSet, nodeWrapperMap)
+ 			}
+ 		}
+ 	}
+ 	return make([]Node, 0), 0
+ }
+ 
+-func (s *AStar) updateVertex(currentWrapper *wrapper, neighborWrapper *wrapper, goalWrapper *wrapper) {
++// updateVertex relaxes a neighbor against the provided bookkeeping structures
++func updateVertex(currentWrapper *wrapper, neighborWrapper *wrapper, goalWrapper *wrapper, openPQ *priorityqueues.PriorityQueue[*wrapper], closedSet *hashsets.HashSet[*wrapper], nodeWrapperMap map[Node]*wrapper) {
+ 	// Check for Consistency ..
+ 	totalCostToNeighbor := currentWrapper.g + currentWrapper.node.ActualDistanceToNeighbor(neighborWrapper.node)
+ 	if totalCostToNeighbor < neighborWrapper.g {
+@@ -114,31 +120,35 @@ func (s *AStar) updateVertex(currentWrapper *wrapper, neighborWrapper *wrapper,
+ 		neighborWrapper.parent = currentWrapper
+ 
+ 		// If Min Heap Has the Node ..
+-		if s.openPQ.Contains(neighborWrapper) {
++		if openPQ.Contains(neighborWrapper) {
+ 			// Remove it ..
+-			s.openPQ.Remove(neighborWrapper)
++			openPQ.Remove(neighborWrapper)
+ 		}
+ 
+ 		// Add the state with the new function value ..
+ 		neighborWrapper.h = neighborWrapper.node.EstimateDistanceToGoal(goalWrapper.node)
+-		s.openPQ.Push(neighborWrapper)
++		openPQ.Push(neighborWrapper)
+ 	}
+ }
+ 
+-func (s *AStar) clear() {
+-	s.nodeWrapperMap = make(map[Node]*wrapper)
+-	s.closedSet.Clear()
+-	s.openPQ.Clear()
++// clearSearch resets the bookkeeping structures once a traversal finishes
++func clearSearch(openPQ *priorityqueues.PriorityQueue[*wrapper], closedSet *hashsets.HashSet[*wrapper], nodeWrapperMap map[Node]*wrapper) {
++	for node := range nodeWrapperMap {
++		delete(nodeWrapperMap, node)
++	}
++	closedSet.Clear()
++	openPQ.Clear()
+ }
+ 
+-func (s *AStar) getWrapper(node Node) *wrapper {
+-	w, ok := s.nodeWrapperMap[node]
++// getWrapper fetches or registers the tracking wrapper for a node
++func getWrapper(node Node, nodeWrapperMap map[Node]*wrapper) *wrapper {
++	w, ok := nodeWrapperMap[node]
+ 	if ok {
+ 		return w
+ 	}
+ 
+ 	w = &wrapper{node: node}
+-	s.nodeWrapperMap[node] = w
++	nodeWrapperMap[node] = w
+ 	return w
+ }
+ 
+diff --git a/algorithms/astar/grids/grid_generator.go b/algorithms/astar/grids/grid_generator.go
+index 8c763d4..418cd99 100644
+--- a/algorithms/astar/grids/grid_generator.go
++++ b/algorithms/astar/grids/grid_generator.go
+@@ -8,6 +8,7 @@ import (
+ 	"github.com/golang/freetype/truetype"
+ 	"github.com/shomali11/go-interview/algorithms/astar"
+ 	"github.com/shomali11/gridder"
++	"golang.org/x/image/font"
+ 	"golang.org/x/image/font/gofont/goregular"
+ )
+ 
+@@ -40,14 +41,7 @@ func createImage(rows int, columns int, start *GridNode, goal *GridNode, path []
+ 
+ 	for row := 0; row < rows; row++ {
+ 		for column := 0; column < columns; column++ {
+-			node := world.Get(row, column)
+-			if node.IsObstacle {
+-				grid.PaintCell(row, column, color.NRGBA{R: 0, G: 0, B: 0, A: 255 / 2})
+-				grid.DrawString(row, column, "Block", fontFace)
+-			} else {
+-				cost := strconv.FormatFloat(node.Cost, 'f', 0, 64)
+-				grid.DrawString(row, column, cost, fontFace)
+-			}
++			drawCell(world, row, column, grid, fontFace)
+ 		}
+ 	}
+ 
+@@ -65,3 +59,16 @@ func createImage(rows int, columns int, start *GridNode, goal *GridNode, path []
+ 
+ 	grid.SavePNG()
+ }
++
++// drawCell paints a single world cell, marking obstacles and writing free cell costs
++func drawCell(world *GridWorld, row int, column int, grid *gridder.Gridder, face font.Face) {
++	node := nodeAt(world, row, column)
++	if node.IsObstacle {
++		grid.PaintCell(row, column, color.NRGBA{R: 0, G: 0, B: 0, A: 255 / 2})
++		grid.DrawString(row, column, "Block", face)
++		return
++	}
++
++	cost := strconv.FormatFloat(node.Cost, 'f', 0, 64)
++	grid.DrawString(row, column, cost, face)
++}
+diff --git a/algorithms/astar/grids/grid_node.go b/algorithms/astar/grids/grid_node.go
+index 6a6653b..a1e663e 100644
+--- a/algorithms/astar/grids/grid_node.go
++++ b/algorithms/astar/grids/grid_node.go
+@@ -40,16 +40,16 @@ func (n *GridNode) GetNeighbors() []astar.Node {
+ 				continue
+ 			}
+ 
+-			if !n.world.IsValid(n.X+i, n.Y+j) {
+-				continue
+-			}
++			x := n.X + i
++			y := n.Y + j
+ 
+-			node := n.world.Get(n.X+i, n.Y+j)
+-			if node.IsObstacle {
++			if !isOpen(n.world, x, y) {
+ 				continue
+ 			}
+ 
+-			if n.isBehindObstacles(node) {
++			node := nodeAt(n.world, x, y)
++
++			if isBehindObstacles(n.world, n.X, n.Y, node) {
+ 				continue
+ 			}
+ 			nodes = append(nodes, node)
+@@ -58,44 +58,46 @@ func (n *GridNode) GetNeighbors() []astar.Node {
+ 	return nodes
+ }
+ 
+-func (n *GridNode) isBehindObstacles(node *GridNode) bool {
+-	dx := node.X - n.X
+-	dy := node.Y - n.Y
++// isBehindObstacles determines whether both cells forming a corner between the node at
++// (x, y) and its diagonal neighbor are obstacles
++func isBehindObstacles(world *GridWorld, x int, y int, node *GridNode) bool {
++	dx := node.X - x
++	dy := node.Y - y
+ 
+ 	i := node.X
+ 	j := node.Y
+ 
+ 	if dx == 1 && dy == 1 { // Lower Right
+-		if n.world.IsValid(i, j-1) && n.world.IsValid(i-1, j) {
+-			right := n.world.Get(i, j-1)
+-			bottom := n.world.Get(i-1, j)
++		if world.IsValid(i, j-1) && world.IsValid(i-1, j) {
++			right := nodeAt(world, i, j-1)
++			bottom := nodeAt(world, i-1, j)
+ 
+ 			if right.IsObstacle && bottom.IsObstacle {
+ 				return true
+ 			}
+ 		}
+ 	} else if dx == -1 && dy == -1 { // Upper Left
+-		if n.world.IsValid(i+1, j) && n.world.IsValid(i, j+1) {
+-			top := n.world.Get(i+1, j)
+-			left := n.world.Get(i, j+1)
++		if world.IsValid(i+1, j) && world.IsValid(i, j+1) {
++			top := nodeAt(world, i+1, j)
++			left := nodeAt(world, i, j+1)
+ 
+ 			if top.IsObstacle && left.IsObstacle {
+ 				return true
+ 			}
+ 		}
+ 	} else if dx == 1 && dy == -1 { // Upper Right
+-		if n.world.IsValid(i-1, j) && n.world.IsValid(i, j+1) {
+-			top := n.world.Get(i-1, j)
+-			right := n.world.Get(i, j+1)
++		if world.IsValid(i-1, j) && world.IsValid(i, j+1) {
++			top := nodeAt(world, i-1, j)
++			right := nodeAt(world, i, j+1)
+ 
+ 			if top.IsObstacle && right.IsObstacle {
+ 				return true
+ 			}
+ 		}
+ 	} else if dx == -1 && dy == 1 { // Lower Left
+-		if n.world.IsValid(i, j-1) && n.world.IsValid(i+1, j) {
+-			left := n.world.Get(i, j-1)
+-			bottom := n.world.Get(i+1, j)
++		if world.IsValid(i, j-1) && world.IsValid(i+1, j) {
++			left := nodeAt(world, i, j-1)
++			bottom := nodeAt(world, i+1, j)
+ 
+ 			if left.IsObstacle && bottom.IsObstacle {
+ 				return true
+diff --git a/algorithms/astar/grids/grid_world.go b/algorithms/astar/grids/grid_world.go
+index 978d0c6..2d4079d 100644
+--- a/algorithms/astar/grids/grid_world.go
++++ b/algorithms/astar/grids/grid_world.go
+@@ -39,6 +39,22 @@ func (n *GridWorld) IsValid(i int, j int) bool {
+ 	return i >= 0 && i < len(n.grid) && j >= 0 && j < len(n.grid[0])
+ }
+ 
++// isOpen determines whether the cell at a position can be entered
++func isOpen(world *GridWorld, i int, j int) bool {
++	if !world.IsValid(i, j) {
++		return false
++	}
++	return !world.Get(i, j).IsObstacle
++}
++
++// nodeAt fetches the node at a position, guarded by a bounds check
++func nodeAt(world *GridWorld, i int, j int) *GridNode {
++	if !world.IsValid(i, j) {
++		return nil
++	}
++	return world.Get(i, j)
++}
++
+ // PrintGrid prints a Grid
+ func (n *GridWorld) PrintGrid(nodes []astar.Node) {
+ 	rows := len(n.grid)
+diff --git a/streams/movingaverages/moving_averages.go b/streams/movingaverages/moving_averages.go
+index a71502c..2d0bc04 100644
+--- a/streams/movingaverages/moving_averages.go
++++ b/streams/movingaverages/moving_averages.go
+@@ -18,22 +18,37 @@ type MovingAverage struct {
+ 
+ // Add adds a number to the moving average calculations
+ func (ma *MovingAverage) Add(number int) {
+-	ma.sum += number
+-	ma.queue.Enqueue(number)
+-	if ma.queue.Size() <= ma.windowSize {
+-		return
+-	}
+-
+-	value, _ := ma.queue.Dequeue()
+-	ma.sum -= value
++	addToWindow(&ma.sum, ma.windowSize, ma.queue, number)
+ }
+ 
+ // GetAverage calculates the moving average
+ func (ma *MovingAverage) GetAverage() float64 {
+-	return float64(ma.sum) / float64(ma.queue.Size())
++	return windowAverage(&ma.sum, ma.windowSize, ma.queue)
+ }
+ 
+ // GetSum returns the sum within the sliding window
+ func (ma *MovingAverage) GetSum() int {
+ 	return ma.sum
+ }
++
++// addToWindow enqueues a number and evicts the values that fall outside the window
++func addToWindow(sum *int, windowSize int, queue *queues.Queue[int], number int) {
++	*sum += number
++	queue.Enqueue(number)
++	evict(sum, windowSize, queue)
++}
++
++// evict drops the oldest value once the queue has grown past the window
++func evict(sum *int, windowSize int, queue *queues.Queue[int]) {
++	if queue.Size() <= windowSize {
++		return
++	}
++
++	value, _ := queue.Dequeue()
++	*sum -= value
++}
++
++// windowAverage divides the tracked sum across the queue size
++func windowAverage(sum *int, windowSize int, queue *queues.Queue[int]) float64 {
++	return float64(*sum) / float64(queue.Size())
++}
+diff --git a/strings/wordbreakers/word_breaker.go b/strings/wordbreakers/word_breaker.go
+index 0b2229c..83672bd 100644
+--- a/strings/wordbreakers/word_breaker.go
++++ b/strings/wordbreakers/word_breaker.go
+@@ -22,13 +22,8 @@ func BreakWord(input string, values []string) string {
+ }
+ 
+ func breakWord(input string, dictionary *hashsets.HashSet[string], cache map[string]string) string {
+-	if dictionary.Contains(input) {
+-		return input
+-	}
+-
+-	cachedValue, exists := cache[input]
+-	if exists {
+-		return cachedValue
++	if word, found := firstKnownWord(input, dictionary, cache); found {
++		return word
+ 	}
+ 
+ 	inputRunes := []rune(input)
+@@ -47,6 +42,20 @@ func breakWord(input string, dictionary *hashsets.HashSet[string], cache map[str
+ 	return empty
+ }
+ 
++// firstKnownWord returns the input when it is a whole dictionary word, or an earlier
++// result for it recorded in the cache
++func firstKnownWord(input string, dictionary *hashsets.HashSet[string], cache map[string]string) (string, bool) {
++	if dictionary.Contains(input) {
++		return input, true
++	}
++
++	cachedValue, exists := cache[input]
++	if exists {
++		return cachedValue, true
++	}
++	return empty, false
++}
++
+ // ExtractWords extracts all possible words
+ func ExtractWords(input string, values []string) []string {
+ 	dictionary := hashsets.New[string]()

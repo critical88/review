@@ -1,0 +1,297 @@
+diff --git a/argh/src/lib.rs b/argh/src/lib.rs
+index 53b90ab..1a2ac77 100644
+--- a/argh/src/lib.rs
++++ b/argh/src/lib.rs
+@@ -699,32 +699,31 @@ impl<T: FromArgs> FromArgs for Box<T> {
+     }
+ }
+ 
+-/// A top-level `FromArgs` implementation that is not a subcommand.
+-pub trait TopLevelCommand: FromArgs {}
+-
+-/// A `FromArgs` implementation that can parse into one or more subcommands.
+-pub trait SubCommands: FromArgs {
++/// A `FromArgs` implementation with a fully specified command identity.
++///
++/// Every type that parses command line arguments, whether it is a top-level
++/// command, a single subcommand, or a group of subcommands, implements this
++/// interface. It carries both the info of the command itself and the info of
++/// the child commands it recognizes.
++pub trait CommandSpec: FromArgs {
+     /// Info for the commands.
+     const COMMANDS: &'static [&'static CommandInfo];
+ 
++    /// Information about the command.
++    const COMMAND: &'static CommandInfo;
++
+     /// Get a list of commands that are discovered at runtime.
+-    fn dynamic_commands() -> &'static [&'static CommandInfo] {
+-        &[]
+-    }
++    fn dynamic_commands() -> &'static [&'static CommandInfo];
+ }
+ 
+-impl<T: SubCommand> SubCommands for T {
+-    const COMMANDS: &'static [&'static CommandInfo] = &[T::COMMAND];
+-}
++impl<T: CommandSpec> CommandSpec for Box<T> {
++    const COMMANDS: &'static [&'static CommandInfo] = &[<T as CommandSpec>::COMMAND];
+ 
+-/// A `FromArgs` implementation that represents a single subcommand.
+-pub trait SubCommand: FromArgs {
+-    /// Information about the subcommand.
+-    const COMMAND: &'static CommandInfo;
+-}
++    const COMMAND: &'static CommandInfo = <T as CommandSpec>::COMMAND;
+ 
+-impl<T: SubCommand> SubCommand for Box<T> {
+-    const COMMAND: &'static CommandInfo = T::COMMAND;
++    fn dynamic_commands() -> &'static [&'static CommandInfo] {
++        <T as CommandSpec>::dynamic_commands()
++    }
+ }
+ 
+ /// Trait implemented by values returned from a dynamic subcommand handler.
+@@ -827,7 +826,7 @@ impl FromEnvError {
+ /// case is usually some form of early exit, which can be performed by calling
+ /// [`FromEnvError::handle`]. You can also call [`from_env`] to
+ /// automatically handle the error and exit.
+-pub fn try_from_env<T: TopLevelCommand>() -> Result<T, FromEnvError> {
++pub fn try_from_env<T: CommandSpec>() -> Result<T, FromEnvError> {
+     let strings: Vec<String> = std::env::args_os()
+         .map(|s| s.into_string())
+         .collect::<Result<Vec<_>, _>>()
+@@ -848,7 +847,7 @@ pub fn try_from_env<T: TopLevelCommand>() -> Result<T, FromEnvError> {
+ /// This function will exit early from the current process if argument parsing
+ /// was unsuccessful or if information like `--help` was requested. Error messages will be printed
+ /// to stderr, and `--help` output to stdout.
+-pub fn from_env<T: TopLevelCommand>() -> T {
++pub fn from_env<T: CommandSpec>() -> T {
+     try_from_env().unwrap_or_else(|e| e.handle())
+ }
+ 
+@@ -860,7 +859,7 @@ pub fn from_env<T: TopLevelCommand>() -> T {
+ /// This function will exit early from the current process if argument parsing
+ /// was unsuccessful or if information like `--help` was requested. Error messages will be printed
+ /// to stderr, and `--help` output to stdout.
+-pub fn cargo_from_env<T: TopLevelCommand>() -> T {
++pub fn cargo_from_env<T: CommandSpec>() -> T {
+     let strings: Vec<String> = std::env::args().collect();
+     let cmd = cmd(&strings[1], &strings[1]);
+     let strs: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
+diff --git a/argh_derive/src/help.rs b/argh_derive/src/help.rs
+index aef5d3c..21c6503 100644
+--- a/argh_derive/src/help.rs
++++ b/argh_derive/src/help.rs
+@@ -116,11 +116,11 @@ pub(crate) fn help(
+         subcommand_format_arg = quote! { subcommands = subcommands };
+         subcommand_calculation = quote! {
+             let subcommands = argh::print_subcommands(
+-                <#subcommand_ty as argh::SubCommands>::COMMANDS
++                <#subcommand_ty as argh::CommandSpec>::COMMANDS
+                     .iter()
+                     .copied()
+                     .chain(
+-                        <#subcommand_ty as argh::SubCommands>::dynamic_commands()
++                        <#subcommand_ty as argh::CommandSpec>::dynamic_commands()
+                             .iter()
+                             .copied())
+             );
+diff --git a/argh_derive/src/lib.rs b/argh_derive/src/lib.rs
+index ff439d0..35af787 100644
+--- a/argh_derive/src/lib.rs
++++ b/argh_derive/src/lib.rs
+@@ -278,7 +278,7 @@ fn test_kebabs() {
+     check("foo_bar__baz_", "foo-bar-baz");
+ }
+ 
+-/// Implements `FromArgs` and `TopLevelCommand` or `SubCommand` for a `#[derive(FromArgs)]` struct.
++/// Implements `FromArgs` and `CommandSpec` for a `#[derive(FromArgs)]` struct.
+ fn impl_from_args_struct(
+     errors: &Errors,
+     name: &syn::Ident,
+@@ -388,8 +388,8 @@ fn impl_from_args_struct_from_args<'a>(
+         let ty = subcommand.ty_without_wrapper;
+         quote_spanned! { impl_span =>
+             Some(argh::ParseStructSubCommand {
+-                subcommands: <#ty as argh::SubCommands>::COMMANDS,
+-                dynamic_subcommands: &<#ty as argh::SubCommands>::dynamic_commands(),
++                subcommands: <#ty as argh::CommandSpec>::COMMANDS,
++                dynamic_subcommands: &<#ty as argh::CommandSpec>::dynamic_commands(),
+                 parse_func: &mut |__command, __remaining_args| {
+                     #name = Some(<#ty as argh::FromArgs>::from_args(__command, __remaining_args)?);
+                     ::core::result::Result::Ok(())
+@@ -532,8 +532,8 @@ fn impl_from_args_struct_redact_arg_values<'a>(
+         let ty = subcommand.ty_without_wrapper;
+         quote_spanned! { impl_span =>
+             Some(argh::ParseStructSubCommand {
+-                subcommands: <#ty as argh::SubCommands>::COMMANDS,
+-                dynamic_subcommands: &<#ty as argh::SubCommands>::dynamic_commands(),
++                subcommands: <#ty as argh::CommandSpec>::COMMANDS,
++                dynamic_subcommands: &<#ty as argh::CommandSpec>::dynamic_commands(),
+                 parse_func: &mut |__command, __remaining_args| {
+                     #name = Some(<#ty as argh::FromArgs>::redact_arg_values(__command, __remaining_args)?);
+                     ::core::result::Result::Ok(())
+@@ -664,7 +664,7 @@ fn ensure_unique_names(errors: &Errors, fields: &[StructField<'_>]) {
+     }
+ }
+ 
+-/// Implement `argh::TopLevelCommand` or `argh::SubCommand` as appropriate.
++/// Implement `argh::CommandSpec` for a `#[derive(FromArgs)]` struct.
+ fn top_or_sub_cmd_impl(
+     errors: &Errors,
+     name: &syn::Ident,
+@@ -677,14 +677,28 @@ fn top_or_sub_cmd_impl(
+         String::new()
+     };
+     let (impl_generics, ty_generics, where_clause) = generic_args.split_for_impl();
++    let empty_str = syn::LitStr::new("", Span::call_site());
+     if type_attrs.is_subcommand.is_none() {
+-        // Not a subcommand
++        // Not a subcommand: the type still declares its own command identity and
++        // recognizes no child commands.
++        let placeholder_name = name.to_string();
+         quote! {
+             #[automatically_derived]
+-            impl #impl_generics argh::TopLevelCommand for #name #ty_generics #where_clause {}
++            impl #impl_generics argh::CommandSpec for #name #ty_generics #where_clause {
++                const COMMAND: &'static argh::CommandInfo = &argh::CommandInfo {
++                    name: #placeholder_name,
++                    short: &'\0',
++                    description: #description,
++                };
++
++                const COMMANDS: &'static [&'static argh::CommandInfo] = &[];
++
++                fn dynamic_commands() -> &'static [&'static argh::CommandInfo] {
++                    &[]
++                }
++            }
+         }
+     } else {
+-        let empty_str = syn::LitStr::new("", Span::call_site());
+         let subcommand_name = type_attrs.name.as_ref().unwrap_or_else(|| {
+             errors.err(name, "`#[argh(name = \"...\")]` attribute is required for subcommands");
+             &empty_str
+@@ -693,12 +707,18 @@ fn top_or_sub_cmd_impl(
+             type_attrs.short.as_ref().map(|c| quote! { &#c }).unwrap_or_else(|| quote! { &'\0' });
+         quote! {
+             #[automatically_derived]
+-            impl #impl_generics argh::SubCommand for #name #ty_generics #where_clause {
++            impl #impl_generics argh::CommandSpec for #name #ty_generics #where_clause {
+                 const COMMAND: &'static argh::CommandInfo = &argh::CommandInfo {
+                     name: #subcommand_name,
+                     short: #short_name,
+                     description: #description,
+                 };
++
++                const COMMANDS: &'static [&'static argh::CommandInfo] = &[Self::COMMAND];
++
++                fn dynamic_commands() -> &'static [&'static argh::CommandInfo] {
++                    &[]
++                }
+             }
+         }
+     }
+@@ -958,11 +978,11 @@ fn append_missing_requirements<'a>(
+                 quote! {
+                     if #field_name.is_none() {
+                         #mri.missing_subcommands(
+-                            <#ty as argh::SubCommands>::COMMANDS
++                            <#ty as argh::CommandSpec>::COMMANDS
+                                 .iter()
+                                 .cloned()
+                                 .chain(
+-                                    <#ty as argh::SubCommands>::dynamic_commands()
++                                    <#ty as argh::CommandSpec>::dynamic_commands()
+                                         .iter()
+                                         .copied()
+                                 ),
+@@ -1036,7 +1056,7 @@ fn ty_inner<'a>(wrapper_names: &[&str], ty: &'a syn::Type) -> Option<&'a syn::Ty
+     None
+ }
+ 
+-/// Implements `FromArgs` and `SubCommands` for a `#![derive(FromArgs)]` enum.
++/// Implements `FromArgs` and `CommandSpec` for a `#![derive(FromArgs)]` enum.
+ fn impl_from_args_enum(
+     errors: &Errors,
+     name: &syn::Ident,
+@@ -1099,6 +1119,31 @@ fn impl_from_args_enum(
+             }
+         }
+     });
++    let fallback_dynamic_commands = if dynamic_commands.is_some() {
++        quote! {}
++    } else {
++        quote! {
++            fn dynamic_commands() -> &'static [&'static argh::CommandInfo] {
++                &[]
++            }
++        }
++    };
++    let placeholder_name = name.to_string();
++    let command = variants.first().map(|variant| {
++        let variant_ty = variant.ty;
++        quote! {
++            const COMMAND: &'static argh::CommandInfo =
++                <#variant_ty as argh::CommandSpec>::COMMAND;
++        }
++    }).unwrap_or_else(|| {
++        quote! {
++            const COMMAND: &'static argh::CommandInfo = &argh::CommandInfo {
++                name: #placeholder_name,
++                short: &'\0',
++                description: "",
++            };
++        }
++    });
+ 
+     let (impl_generics, ty_generics, where_clause) = generic_args.split_for_impl();
+     quote! {
+@@ -1113,10 +1158,10 @@ fn impl_from_args_enum(
+                 };
+ 
+                 #(
+-                    if subcommand_name == <#variant_ty as argh::SubCommand>::COMMAND.name
+-                        || (*<#variant_ty as argh::SubCommand>::COMMAND.short != '\0'
++                    if subcommand_name == <#variant_ty as argh::CommandSpec>::COMMAND.name
++                        || (*<#variant_ty as argh::CommandSpec>::COMMAND.short != '\0'
+                             && subcommand_name.len() == 1
+-                            && subcommand_name.starts_with(*<#variant_ty as argh::SubCommand>::COMMAND.short))
++                            && subcommand_name.starts_with(*<#variant_ty as argh::CommandSpec>::COMMAND.short))
+                     {
+                         return ::core::result::Result::Ok(#name_repeating::#variant_names(
+                             <#variant_ty as argh::FromArgs>::from_args(command_name, args)?
+@@ -1137,10 +1182,10 @@ fn impl_from_args_enum(
+                 };
+ 
+                 #(
+-                    if subcommand_name == <#variant_ty as argh::SubCommand>::COMMAND.name
+-                        || (*<#variant_ty as argh::SubCommand>::COMMAND.short != '\0'
++                    if subcommand_name == <#variant_ty as argh::CommandSpec>::COMMAND.name
++                        || (*<#variant_ty as argh::CommandSpec>::COMMAND.short != '\0'
+                             && subcommand_name.len() == 1
+-                            && subcommand_name.starts_with(*<#variant_ty as argh::SubCommand>::COMMAND.short))
++                            && subcommand_name.starts_with(*<#variant_ty as argh::CommandSpec>::COMMAND.short))
+                     {
+                         return <#variant_ty as argh::FromArgs>::redact_arg_values(command_name, args);
+                     }
+@@ -1152,12 +1197,16 @@ fn impl_from_args_enum(
+             }
+         }
+ 
+-        impl #impl_generics argh::SubCommands for #name #ty_generics #where_clause {
++        impl #impl_generics argh::CommandSpec for #name #ty_generics #where_clause {
+             const COMMANDS: &'static [&'static argh::CommandInfo] = &[#(
+-                <#variant_ty as argh::SubCommand>::COMMAND,
++                <#variant_ty as argh::CommandSpec>::COMMAND,
+             )*];
+ 
++            #command
++
+             #dynamic_commands
++
++            #fallback_dynamic_commands
+         }
+     }
+ }

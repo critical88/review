@@ -1,0 +1,241 @@
+diff --git a/rmp-serde/src/decode.rs b/rmp-serde/src/decode.rs
+index 2c71e3b..fce3273 100644
+--- a/rmp-serde/src/decode.rs
++++ b/rmp-serde/src/decode.rs
+@@ -423,15 +423,17 @@ struct ExtDeserializer<'a, R, C> {
+     rd: &'a mut R,
+     _config: PhantomData<C>,
+     len: u32,
++    ty: i8,
+     state: ExtDeserializerState,
+ }
+ 
+ impl<'de, 'a, R: ReadSlice<'de> + 'a, C: SerializerConfig> ExtDeserializer<'a, R, C> {
+-    const fn new(d: &'a mut Deserializer<R, C>, len: u32) -> Self {
++    const fn new(d: &'a mut Deserializer<R, C>, len: u32, ty: i8) -> Self {
+         ExtDeserializer {
+             rd: &mut d.rd,
+             _config: d._config,
+             len,
++            ty,
+             state: ExtDeserializerState::New,
+         }
+     }
+@@ -478,9 +480,8 @@ impl<'de, 'a, R: ReadSlice<'de> + 'a, C: SerializerConfig> de::Deserializer<'de>
+     {
+         match self.state {
+             ExtDeserializerState::New => {
+-                let tag = self.rd.read_data_i8()?;
+                 self.state = ExtDeserializerState::ReadTag;
+-                visitor.visit_i8(tag)
++                visitor.visit_i8(self.ty)
+             },
+             ExtDeserializerState::ReadTag => {
+                 let data = self.rd.read_slice(self.len as usize).map_err(Error::InvalidDataRead)?;
+@@ -613,7 +614,10 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> Deserializer<R, C> {
+             Marker::Ext16 |
+             Marker::Ext32 => {
+                 let len = ext_len(&mut self.rd, marker)?;
+-                depth_count!(self.depth, visitor.visit_newtype_struct(ExtDeserializer::new(self, len)))
++                depth_count!(self.depth, {
++                    let ty = self.rd.read_data_i8()?;
++                    visitor.visit_newtype_struct(ExtDeserializer::new(self, len, ty))
++                })
+             },
+             Marker::Reserved => Err(Error::TypeMismatch(Marker::Reserved)),
+         }
+@@ -689,7 +693,8 @@ impl<'de, R: ReadSlice<'de>, C: SerializerConfig> serde::Deserializer<'de> for &
+             let marker = self.take_or_read_marker()?;
+ 
+             let len = ext_len(&mut self.rd, marker)?;
+-            let ext_de = ExtDeserializer::new(self, len);
++            let ty = self.rd.read_data_i8()?;
++            let ext_de = ExtDeserializer::new(self, len, ty);
+             return visitor.visit_newtype_struct(ext_de);
+         }
+ 
+diff --git a/rmp-serde/src/encode.rs b/rmp-serde/src/encode.rs
+index 7cb43df..2682b49 100644
+--- a/rmp-serde/src/encode.rs
++++ b/rmp-serde/src/encode.rs
+@@ -828,10 +828,7 @@ impl<'a, W: Write + 'a> serde::Serializer for &mut ExtFieldSerializer<'a, W> {
+     #[inline]
+     fn serialize_bytes(self, val: &[u8]) -> Result<Self::Ok, Self::Error> {
+         if let Some(tag) = self.tag.take() {
+-            encode::write_ext_meta(self.wr, val.len() as u32, tag)?;
+-            self.wr
+-                .write_all(val)
+-                .map_err(|err| Error::InvalidValueWrite(ValueWriteError::InvalidDataWrite(err)))?;
++            write_ext_field_bytes(self.wr, val.len() as u32, tag, val)?;
+ 
+             self.finish = true;
+ 
+@@ -1171,6 +1168,13 @@ impl<'a, W: Write + 'a> ExtSerializer<'a, W> {
+     }
+ }
+ 
++/// Writes an ext field value as the explicit `(`len`, `tag`, `data`)` triple: the ext metadata
++/// header built from the given payload size and type id, followed by the payload itself.
++fn write_ext_field_bytes<W: Write>(wr: &mut W, len: u32, tag: i8, data: &[u8]) -> Result<(), Error> {
++    encode::write_ext_meta(wr, len, tag)?;
++    wr.write_all(data).map_err(|err| Error::InvalidValueWrite(ValueWriteError::InvalidDataWrite(err)))
++}
++
+ impl<'a, W: Write + 'a> ExtFieldSerializer<'a, W> {
+     #[inline]
+     fn new<C>(ser: &'a mut Serializer<W, C>) -> Self {
+diff --git a/rmp/src/encode/ext.rs b/rmp/src/encode/ext.rs
+index 8b13789..36fb222 100644
+--- a/rmp/src/encode/ext.rs
++++ b/rmp/src/encode/ext.rs
+@@ -1 +1,43 @@
++use super::{write_marker, RmpWrite, ValueWriteError};
++use crate::Marker;
+ 
++/// Encodes and attempts to write the ext meta header: the marker, the payload size and the type id.
++///
++/// Both the payload size and the application type id are taken explicitly, mirroring the
++/// `write_ext_meta` primitive, with the payload itself remaining the caller's business.
++///
++/// # Errors
++///
++/// This function will return `ValueWriteError` on any I/O error occurred while writing either the
++/// marker or the data.
++pub(super) fn write_ext_header<W: RmpWrite>(wr: &mut W, len: u32, ty: i8) -> Result<(), ValueWriteError<W::Error>> {
++    let marker = ext_len_marker(len);
++
++    write_marker(wr, marker)?;
++    if marker == Marker::Ext8 {
++        wr.write_data_u8(len as u8)?;
++    } else if marker == Marker::Ext16 {
++        wr.write_data_u16(len as u16)?;
++    } else if marker == Marker::Ext32 {
++        wr.write_data_u32(len)?;
++    }
++
++    wr.write_data_i8(ty)?;
++
++    Ok(())
++}
++
++/// Encodes and attempts to write the most efficient ext length implementation for the given ext
++/// payload size, returning the marker used.
++pub(super) fn ext_len_marker(len: u32) -> Marker {
++    match len {
++        1 => Marker::FixExt1,
++        2 => Marker::FixExt2,
++        4 => Marker::FixExt4,
++        8 => Marker::FixExt8,
++        16 => Marker::FixExt16,
++        0..=255 => Marker::Ext8,
++        256..=65535 => Marker::Ext16,
++        _ => Marker::Ext32,
++    }
++}
+diff --git a/rmp/src/encode/mod.rs b/rmp/src/encode/mod.rs
+index ed60a37..4fe9af1 100644
+--- a/rmp/src/encode/mod.rs
++++ b/rmp/src/encode/mod.rs
+@@ -294,6 +294,10 @@ pub fn write_map_len<W: RmpWrite>(wr: &mut W, len: u32) -> Result<Marker, ValueW
+ /// Encodes and attempts to write the most efficient ext metadata implementation to the given
+ /// write, returning the marker used.
+ ///
++/// The payload size and the application type id are forwarded to the low-level ext header writer
++/// in `ext` as-is, so every ext writing path can share the same explicit `(`len`, `ty`)` header
++/// primitive.
++///
+ /// # Errors
+ ///
+ /// This function will return `ValueWriteError` on any I/O error occurred while writing either the
+@@ -304,27 +308,7 @@ pub fn write_map_len<W: RmpWrite>(wr: &mut W, len: u32) -> Result<Marker, ValueW
+ /// Panics if `ty` is negative, because it is reserved for future MessagePack extension including
+ /// 2-byte type information.
+ pub fn write_ext_meta<W: RmpWrite>(wr: &mut W, len: u32, ty: i8) -> Result<Marker, ValueWriteError<W::Error>> {
+-    let marker = match len {
+-        1 => Marker::FixExt1,
+-        2 => Marker::FixExt2,
+-        4 => Marker::FixExt4,
+-        8 => Marker::FixExt8,
+-        16 => Marker::FixExt16,
+-        0..=255 => Marker::Ext8,
+-        256..=65535 => Marker::Ext16,
+-        _ => Marker::Ext32,
+-    };
+-    write_marker(wr, marker)?;
+-
+-    if marker == Marker::Ext8 {
+-        wr.write_data_u8(len as u8)?;
+-    } else if marker == Marker::Ext16 {
+-        wr.write_data_u16(len as u16)?;
+-    } else if marker == Marker::Ext32 {
+-        wr.write_data_u32(len)?;
+-    }
+-
+-    wr.write_data_i8(ty)?;
+-
++    let marker = self::ext::ext_len_marker(len);
++    self::ext::write_ext_header(wr, len, ty)?;
+     Ok(marker)
+ }
+diff --git a/rmpv/src/encode/value.rs b/rmpv/src/encode/value.rs
+index 97df669..565e16a 100644
+--- a/rmpv/src/encode/value.rs
++++ b/rmpv/src/encode/value.rs
+@@ -59,10 +59,24 @@ pub fn write_value<W>(wr: &mut W, val: &Value) -> Result<(), Error>
+             }
+         },
+         Value::Ext(ty, ref data) => {
+-            write_ext_meta(wr, data.len() as u32, ty)?;
+-            wr.write_all(data).map_err(Error::InvalidDataWrite)?;
++            let len = data.len() as u32;
++            write_ext_value(wr, ty, len, data)?;
+         },
+     }
+ 
+     Ok(())
+ }
++
++/// Encodes and attempts to write the ext value as the explicit `(`ty`, `len`, `data`)` triple: the
++/// ext metadata built from the given length and type id, followed by the payload itself.
++///
++/// # Errors
++///
++/// This function returns Error with an underlying I/O error if unable to properly write the ext
++/// value. Interruption errors are handled internally by silent operation restarting.
++fn write_ext_value<W>(wr: &mut W, ty: i8, len: u32, data: &[u8]) -> Result<(), Error>
++    where W: Write
++{
++    write_ext_meta(wr, len, ty)?;
++    wr.write_all(data).map_err(Error::InvalidDataWrite)
++}
+diff --git a/rmpv/src/encode/value_ref.rs b/rmpv/src/encode/value_ref.rs
+index 431f87e..1a32f44 100644
+--- a/rmpv/src/encode/value_ref.rs
++++ b/rmpv/src/encode/value_ref.rs
+@@ -71,10 +71,24 @@ pub fn write_value_ref<W>(wr: &mut W, val: &ValueRef<'_>) -> Result<(), Error>
+             }
+         },
+         ValueRef::Ext(ty, data) => {
+-            write_ext_meta(wr, data.len() as u32, ty)?;
+-            wr.write_all(data).map_err(Error::InvalidDataWrite)?;
++            let len = data.len() as u32;
++            write_ext_value_ref(wr, len, ty, data)?;
+         },
+     }
+ 
+     Ok(())
+ }
++
++/// Encodes and attempts to write the ext value as the explicit `(`len`, `ty`, `data`)` triple: the
++/// ext metadata built from the given length and type id, followed by the payload itself.
++///
++/// # Errors
++///
++/// This function returns Error with an underlying I/O error if unable to properly write the ext
++/// value. Interruption errors are handled internally by silent operation restarting.
++fn write_ext_value_ref<W>(wr: &mut W, len: u32, ty: i8, data: &[u8]) -> Result<(), Error>
++    where W: Write
++{
++    write_ext_meta(wr, len, ty)?;
++    wr.write_all(data).map_err(Error::InvalidDataWrite)
++}

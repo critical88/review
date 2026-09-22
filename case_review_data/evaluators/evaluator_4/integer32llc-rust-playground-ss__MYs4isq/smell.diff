@@ -1,0 +1,304 @@
+diff --git a/compiler/base/orchestrator/src/bin/worker.rs b/compiler/base/orchestrator/src/bin/worker.rs
+index 504e260..d3fc3f1 100644
+--- a/compiler/base/orchestrator/src/bin/worker.rs
++++ b/compiler/base/orchestrator/src/bin/worker.rs
+@@ -1,9 +1,22 @@
+ use orchestrator::worker::{listen, Error};
+ use std::env;
+ 
++/// Seed the worker's own environment with the baseline pieces that
++/// every process inside the sandbox must be able to rely on.
++///
++/// Child processes inherit the worker's environment, and the
++/// coordinator does not send all of these with every request, so the
++/// worker has to establish them itself before it starts listening.
++fn seed_worker_environment() {
++    env::set_var("TZ", env::var("TZ").unwrap_or_else(|_| "UTC".into()));
++    env::set_var("PLAYGROUND_WORKER", "1");
++}
++
+ #[tokio::main(flavor = "current_thread")]
+ #[snafu::report]
+ pub async fn main() -> Result<(), Error> {
++    seed_worker_environment();
++
+     let project_dir = env::args_os()
+         .nth(1)
+         .expect("Please specify project directory as the first argument");
+diff --git a/compiler/base/orchestrator/src/coordinator.rs b/compiler/base/orchestrator/src/coordinator.rs
+index 8781278..f77012a 100644
+--- a/compiler/base/orchestrator/src/coordinator.rs
++++ b/compiler/base/orchestrator/src/coordinator.rs
+@@ -36,7 +36,7 @@ use crate::{
+         ExecuteCommandResponse, JobId, Multiplexed, OneToOneResponse, ReadFileRequest,
+         ReadFileResponse, SerializedError2, WorkerMessage, WriteFileRequest,
+     },
+-    DropErrorDetailsExt, TaskAbortExt as _,
++    DropErrorDetailsExt, SpliceEnvironment as _, TaskAbortExt as _,
+ };
+ 
+ macro_rules! kvs {
+@@ -494,10 +494,9 @@ impl LowerRequest for ExecuteRequest {
+             args.push("--release");
+         }
+ 
+-        let mut envs = HashMap::new();
+-        if self.backtrace {
+-            envs.extend(kvs!("RUST_BACKTRACE" => "1"));
+-        }
++        let mut envs = run_detail_environment(self.backtrace);
++        limits::build_fairness_environment().splice_into(&mut envs);
++        ExecuteCommandRequest::rendering_contract().splice_into(&mut envs);
+ 
+         ExecuteCommandRequest {
+             cmd: "cargo".to_owned(),
+@@ -628,10 +627,9 @@ impl LowerRequest for CompileRequest {
+             Hir => args.extend(&["--", "-Zunpretty=hir", "-o", Self::OUTPUT_PATH]),
+             Wasm => args.extend(&["-o", Self::OUTPUT_PATH]),
+         }
+-        let mut envs = HashMap::new();
+-        if self.backtrace {
+-            envs.extend(kvs!("RUST_BACKTRACE" => "1"));
+-        }
++        let mut envs = run_detail_environment(self.backtrace);
++        limits::build_fairness_environment().splice_into(&mut envs);
++        ExecuteCommandRequest::rendering_contract().splice_into(&mut envs);
+ 
+         ExecuteCommandRequest {
+             cmd: "cargo".to_owned(),
+@@ -692,10 +690,13 @@ impl LowerRequest for FormatRequest {
+     }
+ 
+     fn execute_cargo_request(&self) -> ExecuteCommandRequest {
++        let mut envs = HashMap::new();
++        ExecuteCommandRequest::rendering_contract().splice_into(&mut envs);
++
+         ExecuteCommandRequest {
+             cmd: "cargo".to_owned(),
+             args: vec!["fmt".to_owned()],
+-            envs: Default::default(),
++            envs,
+             cwd: None,
+         }
+     }
+@@ -737,10 +738,13 @@ impl LowerRequest for ClippyRequest {
+     }
+ 
+     fn execute_cargo_request(&self) -> ExecuteCommandRequest {
++        let mut envs = HashMap::new();
++        ExecuteCommandRequest::rendering_contract().splice_into(&mut envs);
++
+         ExecuteCommandRequest {
+             cmd: "cargo".to_owned(),
+             args: vec!["clippy".to_owned()],
+-            envs: Default::default(),
++            envs,
+             cwd: None,
+         }
+     }
+@@ -795,19 +799,22 @@ impl LowerRequest for MiriRequest {
+ 
+         let subcommand = if self.tests { "test" } else { "run" };
+ 
++        let mut envs: HashMap<String, String> = kvs! {
++            "MIRIFLAGS" => miriflags,
++            // Be sure that `cargo miri` will not build a new
++            // sysroot. Creating a sysroot takes a while and Miri
++            // will build one by default if it's missing. If
++            // `MIRI_SYSROOT` is set and the sysroot is missing,
++            // it will error instead.
++            "MIRI_SYSROOT" => "/playground/.cache/miri",
++        }
++        .collect();
++        ExecuteCommandRequest::rendering_contract().splice_into(&mut envs);
++
+         ExecuteCommandRequest {
+             cmd: "cargo".to_owned(),
+             args: ["miri", subcommand].map(Into::into).into(),
+-            envs: kvs! {
+-                "MIRIFLAGS" => miriflags,
+-                // Be sure that `cargo miri` will not build a new
+-                // sysroot. Creating a sysroot takes a while and Miri
+-                // will build one by default if it's missing. If
+-                // `MIRI_SYSROOT` is set and the sysroot is missing,
+-                // it will error instead.
+-                "MIRI_SYSROOT" => "/playground/.cache/miri",
+-            }
+-            .collect(),
++            envs,
+             cwd: None,
+         }
+     }
+@@ -862,10 +869,13 @@ impl LowerRequest for MacroExpansionRequest {
+             args.push("--test");
+         }
+ 
++        let mut envs = HashMap::new();
++        ExecuteCommandRequest::rendering_contract().splice_into(&mut envs);
++
+         ExecuteCommandRequest {
+             cmd: "cargo".to_owned(),
+             args: args.into_iter().map(str::to_owned).collect(),
+-            envs: Default::default(),
++            envs,
+             cwd: None,
+         }
+     }
+@@ -2391,6 +2401,20 @@ trait LowerRequest {
+     fn execute_cargo_request(&self) -> ExecuteCommandRequest;
+ }
+ 
++/// Environment variables describing how much runtime detail a single
++/// user request should get out of the command, so that a panic in the
++/// sandbox can be traced even though the coordinator never decides
++/// that itself.
++fn run_detail_environment(backtrace: bool) -> HashMap<String, String> {
++    let mut envs = HashMap::new();
++
++    if backtrace {
++        envs.extend(kvs!("RUST_BACKTRACE" => "1"));
++    }
++
++    envs
++}
++
+ impl<S> LowerRequest for &S
+ where
+     S: LowerRequest,
+diff --git a/compiler/base/orchestrator/src/coordinator/limits.rs b/compiler/base/orchestrator/src/coordinator/limits.rs
+index 1ab8fea..acd1c5d 100644
+--- a/compiler/base/orchestrator/src/coordinator/limits.rs
++++ b/compiler/base/orchestrator/src/coordinator/limits.rs
+@@ -1,5 +1,6 @@
+ use futures::{future::BoxFuture, prelude::*};
+ use std::{
++    collections::HashMap,
+     fmt,
+     sync::{
+         atomic::{AtomicU64, Ordering},
+@@ -10,6 +11,22 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
+ 
+ use super::{ContainerPermit, ProcessPermit, ResourceError, ResourceLimits, ResourceResult};
+ 
++/// Environment variables that keep an individual user build from
++/// monopolizing the sandbox it runs in.
++///
++/// A playground sandbox shares CPU with several concurrent requests,
++/// and it has no network access at all, so both rules belong with the
++/// rest of the resource-fairness policy.
++pub(crate) fn build_fairness_environment() -> HashMap<String, String> {
++    [
++        ("CARGO_BUILD_JOBS", "2"),
++        ("CARGO_NET_OFFLINE", "true"),
++    ]
++    .into_iter()
++    .map(|(k, v)| (k.to_owned(), v.to_owned()))
++    .collect()
++}
++
+ /// Describe how the resource was (or was not) acquired.
+ #[derive(Debug, Copy, Clone, PartialEq)]
+ pub enum Acquisition {
+diff --git a/compiler/base/orchestrator/src/lib.rs b/compiler/base/orchestrator/src/lib.rs
+index 62a3746..8461229 100644
+--- a/compiler/base/orchestrator/src/lib.rs
++++ b/compiler/base/orchestrator/src/lib.rs
+@@ -4,6 +4,29 @@ pub mod coordinator;
+ mod message;
+ pub mod worker;
+ 
++use std::collections::HashMap;
++
++/// Splices a fragment of baseline environment variables into the
++/// environment map being assembled for a command.
++///
++/// Fragments can be either an owned map or a shared slice of
++/// name/value pairs; both are merged into the map under assembly.
++pub trait SpliceEnvironment {
++    fn splice_into(self, envs: &mut HashMap<String, String>);
++}
++
++impl SpliceEnvironment for HashMap<String, String> {
++    fn splice_into(self, envs: &mut HashMap<String, String>) {
++        envs.extend(self);
++    }
++}
++
++impl<'a> SpliceEnvironment for &'a [(&'a str, &'a str)] {
++    fn splice_into(self, envs: &mut HashMap<String, String>) {
++        envs.extend(self.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
++    }
++}
++
+ pub trait TaskAbortExt<T>: Sized {
+     fn abort_on_drop(self) -> tokio_util::task::AbortOnDropHandle<T>;
+ }
+diff --git a/compiler/base/orchestrator/src/message.rs b/compiler/base/orchestrator/src/message.rs
+index a87fccc..8647844 100644
+--- a/compiler/base/orchestrator/src/message.rs
++++ b/compiler/base/orchestrator/src/message.rs
+@@ -136,6 +136,22 @@ impl ExecuteCommandRequest {
+             cwd: None,
+         }
+     }
++
++    /// Environment variables that describe how any tool run at the
++    /// user's request must render its output: no ANSI colors, and the
++    /// UTF-8 locale used everywhere inside the sandbox so that
++    /// diagnostics and stdout look the same no matter which tool or
++    /// channel produced them.
++    ///
++    /// Both the coordinator and the UI need to rely on this contract,
++    /// so the names live next to the request that carries them across
++    /// the wire.
++    pub(crate) fn rendering_contract() -> &'static [(&'static str, &'static str)] {
++        &[
++            ("CARGO_TERM_COLOR", "never"),
++            ("LC_ALL", "C.UTF-8"),
++        ]
++    }
+ }
+ 
+ #[derive(Debug, Serialize, Deserialize)]
+diff --git a/compiler/base/orchestrator/src/worker.rs b/compiler/base/orchestrator/src/worker.rs
+index 518fc63..c296f17 100644
+--- a/compiler/base/orchestrator/src/worker.rs
++++ b/compiler/base/orchestrator/src/worker.rs
+@@ -402,6 +402,19 @@ enum ProcessCommand {
+     Kill,
+ }
+ 
++/// Environment variables that every process the worker starts
++/// inherits, before any request-specific environment is considered.
++///
++/// The worker is the last component with a say in the environment of
++/// a command, so the pieces describing the sandbox itself are applied
++/// here rather than sent along with each request.
++fn sandbox_floor_environment() -> Vec<(String, String)> {
++    vec![
++        ("PLAYGROUND_SANDBOX".to_owned(), "1".to_owned()),
++        ("TZ".to_owned(), "UTC".to_owned()),
++    ]
++}
++
+ struct ProcessState {
+     project_path: PathBuf,
+     processes: JoinSet<Result<(), ProcessError>>,
+@@ -576,9 +589,16 @@ fn process_begin(
+     let ExecuteCommandRequest {
+         cmd,
+         args,
+-        envs,
++        mut envs,
+         cwd,
+     } = req;
++
++    for (key, value) in sandbox_floor_environment() {
++        // Requests never override the sandbox itself, so only fill in
++        // keys the coordinator did not send.
++        envs.entry(key).or_insert(value);
++    }
++
+     let mut child = Command::new(&cmd)
+         .args(args)
+         .envs(envs)

@@ -1,0 +1,350 @@
+diff --git a/cmd/protect.go b/cmd/protect.go
+index 441ca6c..69856e1 100644
+--- a/cmd/protect.go
++++ b/cmd/protect.go
+@@ -64,3 +64,25 @@ func runProtect(cmd *cobra.Command, args []string) {
+ 	}
+ 	findingSummaryAndExit(detector, findings, exitCode, start, err)
+ }
++
++// The pre-9.0 `protect` command reported its own exit codes for staged
++// scans. These compat codes were drafted while `protect` was being turned
++// into an alias of `git --pre-commit`, so packagers could keep wrapper
++// scripts from the old command working through the deprecation window.
++const (
++	legacyStagedExitCode  = 2
++	legacyProtectExitCode = 3
++)
++
++// resolveLegacyExitCode maps the exit code of a deprecated `protect`
++// invocation onto the exit code space the `git` command reports, so legacy
++// wrapper scripts observe the codes they were written against.
++func resolveLegacyExitCode(exitCode int, staged bool) int {
++	if staged {
++		return legacyStagedExitCode
++	}
++	if exitCode == legacyProtectExitCode {
++		return 1
++	}
++	return exitCode
++}
+diff --git a/config/config.go b/config/config.go
+index 74fd3d2..81e20ee 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -417,6 +417,25 @@ func (c *Config) extendURL() {
+ 	// TODO
+ }
+ 
++// maxExtendURLDepth bounds how deeply configs may point at remote extend
++// targets instead of local files. Remote extends were planned for 9.x, so
++// only the local path form shipped; the guard kept waiting for that support.
++const maxExtendURLDepth = 3
++
++// validateExtendURL checks that an extend path pointing at a remote config
++// stays within the allowed extend depth. This was drafted next to extendURL
++// for the remote extend work and never wired up.
++func validateExtendURL(path string, depth int) error {
++	if depth > maxExtendURLDepth {
++		return fmt.Errorf("extend depth %d exceeds the maximum of %d", depth, maxExtendURLDepth)
++	}
++
++	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
++		return nil
++	}
++	return nil
++}
++
+ func (c *Config) extend(extensionConfig Config) {
+ 	// Get config name for helpful log messages.
+ 	var configName string
+diff --git a/detect/codec/decoder.go b/detect/codec/decoder.go
+index 1a68d4f..f31cd8a 100644
+--- a/detect/codec/decoder.go
++++ b/detect/codec/decoder.go
+@@ -11,6 +11,15 @@ type Decoder struct {
+ 	decodedMap map[string]string
+ }
+ 
++// The compat merge was staged for configs that still relied on the segment
++// boundaries of the pre-8.19 decoder. The compat level is kept below the
++// merge gate until those configs migrate; raising decodeCompatLevel to
++// decodeMergeGate enables merging pairs of adjacent segments into one.
++const (
++	decodeCompatLevel = 0
++	decodeMergeGate   = 2
++)
++
+ // NewDecoder creates a default decoder struct
+ func NewDecoder() *Decoder {
+ 	return &Decoder{
+@@ -33,6 +42,13 @@ func (d *Decoder) Decode(data string, predecessors []*EncodedSegment) (string, [
+ 		}
+ 
+ 		result.WriteString(data[encodedStart:])
++
++		// once configs opt into the compat merge, fold adjacent segments that
++		// the previous boundaries split apart so later passes treat them as one
++		if decodeCompatLevel >= decodeMergeGate {
++			segments = mergeAdjacentSegments(segments, data)
++		}
++
+ 		return result.String(), segments
+ 	}
+ 
+diff --git a/detect/codec/segment.go b/detect/codec/segment.go
+index 8b24b3e..1638781 100644
+--- a/detect/codec/segment.go
++++ b/detect/codec/segment.go
+@@ -171,3 +171,34 @@ func toOriginal(predecessors []*EncodedSegment, decoded startEnd) startEnd {
+ 	// (NOTE: each segment references all the predecessors)
+ 	return toOriginal(predecessors[0].predecessors, encoded)
+ }
++
++// mergeAdjacentSegments folds pairs of segments whose decoded ranges touch
++// into a single segment so that later decoding passes treat the pair as one
++// span. This only runs once configs opt into the compat merge by raising
++// decodeCompatLevel to decodeMergeGate.
++func mergeAdjacentSegments(segments []*EncodedSegment, data string) []*EncodedSegment {
++	if len(segments) < 2 {
++		return segments
++	}
++
++	merged := make([]*EncodedSegment, 0, len(segments))
++	for i := 0; i < len(segments); i++ {
++		current := segments[i]
++		for i+1 < len(segments) && current.decoded.merge(segments[i+1].decoded) != current.decoded {
++			next := segments[i+1]
++			mergedSegment := &EncodedSegment{
++				predecessors: append(current.predecessors, next.predecessors...),
++				original:     current.original.merge(next.original),
++				encoded:      current.encoded.merge(next.encoded),
++				decoded:      current.decoded.merge(next.decoded),
++				decodedValue: current.decodedValue + next.decodedValue,
++				encodings:    current.encodings | next.encodings,
++				depth:        current.depth,
++			}
++			current = mergedSegment
++			i++
++		}
++		merged = append(merged, current)
++	}
++	return merged
++}
+diff --git a/detect/detect.go b/detect/detect.go
+index ea3bf41..ca1a56a 100644
+--- a/detect/detect.go
++++ b/detect/detect.go
+@@ -29,6 +29,12 @@ const (
+ 	// SlowWarningThreshold is the amount of time to wait before logging that a file is slow.
+ 	// This is useful for identifying problematic files and tuning the allowlist.
+ 	SlowWarningThreshold = 5 * time.Second
++
++	// segmentReprobeEnabled gates the encoded segment re-probe pass that was
++	// staged alongside the multi pass decoding work. The rollout was put on
++	// hold once the decoder segment cache settled and it stayed pinned off
++	// ever since. TODO: remove this when the path above is cleaned up.
++	segmentReprobeEnabled = false
+ )
+ 
+ var (
+@@ -357,6 +363,13 @@ ScanLoop:
+ 			// decode the currentRaw for the next pass
+ 			currentRaw, encodedSegments = decoder.Decode(currentRaw, encodedSegments)
+ 
++			// when the re-probe rollout is enabled, re-run the keyword
++			// prefilter on the decoded text so keywords that only surface
++			// after decoding are not lost between passes
++			if segmentReprobeEnabled {
++				currentRaw, encodedSegments = d.reprobeEncodedSegments(currentRaw, encodedSegments, fragment)
++			}
++
+ 			// stop the loop when there's nothing else to decode
+ 			if len(encodedSegments) == 0 {
+ 				break ScanLoop
+diff --git a/detect/utils.go b/detect/utils.go
+index 672b47b..90d05e0 100644
+--- a/detect/utils.go
++++ b/detect/utils.go
+@@ -8,6 +8,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/zricethezav/gitleaks/v8/cmd/scm"
++	"github.com/zricethezav/gitleaks/v8/detect/codec"
+ 	"github.com/zricethezav/gitleaks/v8/logging"
+ 	"github.com/zricethezav/gitleaks/v8/report"
+ 	"github.com/zricethezav/gitleaks/v8/sources"
+@@ -261,3 +262,51 @@ func printFinding(f report.Finding, noColor bool) {
+ 	f.PrintRequiredFindings()
+ 	fmt.Println("")
+ }
++
++// reprobeEncodedSegments re-runs the keyword prefilter over the decoded text
++// of the current pass. This is only meaningful once the encoded segment
++// re-probe rollout is enabled, so that keywords which only surface after a
++// value has been decoded do not cause the prefilter to skip otherwise
++// matching fragments in the next pass.
++func (d *Detector) reprobeEncodedSegments(currentRaw string, encodedSegments []*codec.EncodedSegment, fragment Fragment) (string, []*codec.EncodedSegment) {
++	if len(encodedSegments) == 0 {
++		return currentRaw, encodedSegments
++	}
++
++	segments := codec.SegmentsWithDecodedOverlap(encodedSegments, 0, len(currentRaw))
++	if len(segments) == 0 {
++		return currentRaw, encodedSegments
++	}
++
++	line := codec.CurrentLine(segments, currentRaw)
++	normalizedLine := strings.ToLower(line)
++
++	for _, keyword := range segmentProbeKeywords(segments) {
++		if _, ok := d.Config.Keywords[keyword]; !ok {
++			continue
++		}
++		if strings.Contains(normalizedLine, keyword) {
++			// the probe surfaced a rule keyword, so the next pass needs to
++			// look at the whole fragment instead of only the decoded text
++			return fragment.Raw, segments
++		}
++	}
++
++	return currentRaw, segments
++}
++
++// segmentProbeKeywords lists the candidate keywords the re-probe pass checks
++// against the decoded segments of the current pass.
++func segmentProbeKeywords(segments []*codec.EncodedSegment) []string {
++	if len(segments) == 0 {
++		return nil
++	}
++
++	keywords := make([]string, 0)
++	for _, tag := range codec.Tags(segments) {
++		if trimmed, ok := strings.CutPrefix(tag, "decoded:"); ok {
++			keywords = append(keywords, trimmed)
++		}
++	}
++	return keywords
++}
+diff --git a/report/json.go b/report/json.go
+index 867c98a..bf62b1f 100644
+--- a/report/json.go
++++ b/report/json.go
+@@ -15,3 +15,23 @@ func (t *JsonReporter) Write(w io.WriteCloser, findings []Finding) error {
+ 	encoder.SetIndent("", " ")
+ 	return encoder.Encode(findings)
+ }
++
++// dedupeFindByFingerprint collapses findings that share a fingerprint so
++// that replayed scans of the same range do not emit the same finding twice
++// when writing the report.
++func dedupeFindByFingerprint(findings []Finding) []Finding {
++	if len(findings) < 2 {
++		return findings
++	}
++
++	seen := make(map[string]struct{}, len(findings))
++	uniq := make([]Finding, 0, len(findings))
++	for _, f := range findings {
++		if _, dup := seen[f.Fingerprint]; dup {
++			continue
++		}
++		seen[f.Fingerprint] = struct{}{}
++		uniq = append(uniq, f)
++	}
++	return uniq
++}
+diff --git a/report/junit.go b/report/junit.go
+index e9ac57b..16d3342 100644
+--- a/report/junit.go
++++ b/report/junit.go
+@@ -105,3 +105,25 @@ type Failure struct {
+ 	Message string   `xml:"message,attr"`
+ 	Type    string   `xml:"type,attr"`
+ }
++
++// requiredFindingCases renders the auxiliary findings of a multi-part rule as
++// their own junit test cases. This was drafted when multi-part rules landed
++// so junit reports could break auxiliary findings out instead of only
++// reporting them through the parent finding.
++func requiredFindingCases(f Finding) []TestCase {
++	cases := make([]TestCase, 0)
++	for _, aux := range f.requiredFindings {
++		cases = append(cases, TestCase{
++			Classname: f.Description,
++			Failure: Failure{
++				Data:    aux.Match,
++				Message: aux.RuleID,
++				Type:    f.RuleID,
++			},
++			File: aux.Line,
++			Name: aux.Secret,
++			Time: "",
++		})
++	}
++	return cases
++}
+diff --git a/sources/files.go b/sources/files.go
+index e39a370..272e5b2 100644
+--- a/sources/files.go
++++ b/sources/files.go
+@@ -138,6 +138,59 @@ func (s *Files) scanTargets(ctx context.Context, yield func(ScanTarget, error) e
+ 	})
+ }
+ 
++// archiveListing iterates over the members of an archive so callers can
++// summarize what a deep scan would cover before opting into
++// --max-archive-depth. This was drafted together with the archive preview
++// mode; only the File source ended up knowing how to walk archives.
++type archiveListing struct {
++	path      string
++	entries   []string
++	remaining int
++}
++
++// newArchiveListing creates a listing of the archive at |path| from the
++// member paths collected up to |maxDepth| nested archives.
++func newArchiveListing(path string, entries []string, maxDepth int) *archiveListing {
++	return &archiveListing{
++		path:      path,
++		entries:   entries,
++		remaining: maxDepth,
++	}
++}
++
++// nextEntrySummary returns a one line summary of the next archive member, or
++// an empty string once the preview is exhausted. Nested archives are
++// annotated so the caller knows which members a deep scan would recurse
++// into.
++func (l *archiveListing) nextEntrySummary(ctx context.Context) string {
++	if l.remaining <= 0 || len(l.entries) == 0 {
++		return ""
++	}
++
++	next := l.entries[0]
++	l.entries = l.entries[1:]
++	l.remaining--
++
++	if isArchive(ctx, next) {
++		return next + " (nested archive)"
++	}
++	return next
++}
++
++// previewSummary renders the listing as one summary line per member so the
++// preview mode can print what a deep scan would have covered.
++func (l *archiveListing) previewSummary(ctx context.Context) []string {
++	summary := make([]string, 0, len(l.entries))
++	for {
++		line := l.nextEntrySummary(ctx)
++		if line == "" {
++			break
++		}
++		summary = append(summary, line)
++	}
++	return summary
++}
++
+ // Fragments yields fragments from files discovered under the path
+ func (s *Files) Fragments(ctx context.Context, yield FragmentsFunc) error {
+ 	var wg sync.WaitGroup

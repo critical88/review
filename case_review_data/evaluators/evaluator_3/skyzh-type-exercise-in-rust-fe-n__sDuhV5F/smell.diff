@@ -1,0 +1,261 @@
+diff --git a/type-exercise/core/src/expression/mod.rs b/type-exercise/core/src/expression/mod.rs
+index 6a4cfc7..e5b59f4 100644
+--- a/type-exercise/core/src/expression/mod.rs
++++ b/type-exercise/core/src/expression/mod.rs
+@@ -3,6 +3,7 @@
+ mod binary;
+ mod fallback;
+ mod primitive_i32;
++mod shape;
+ mod ternary;
+ mod unary;
+ mod writer;
+@@ -20,6 +21,7 @@ pub use primitive_i32::auto_vectorize_primitive_i32;
+ pub use ternary::{
+     auto_vectorize_ternary, evaluate_ternary, try_auto_vectorize_ternary, try_evaluate_ternary,
+ };
++pub use shape::{describe_plan_inputs, first_plan_input_line};
+ pub use unary::{auto_vectorize_unary, evaluate_nullable_unary, evaluate_unary};
+ pub use writer::evaluate_writer_binary;
+ 
+diff --git a/type-exercise/core/src/expression/shape.rs b/type-exercise/core/src/expression/shape.rs
+new file mode 100644
+index 0000000..55ebe6d
+--- /dev/null
++++ b/type-exercise/core/src/expression/shape.rs
+@@ -0,0 +1,45 @@
++//! Batch-shape descriptions for plan-level input diagnostics.
++//!
++//! The helpers here render one compact line per input column so expression
++//! logs can explain which batch shape an operator actually received.
++
++use crate::{ColumnViewImpl, ScalarRefImpl};
++
++/// Render one compact batch-shape line for each input column.
++///
++/// Every line reports the erased physical type, the verified row count, whether
++/// the column is empty, and the presence of a leading value.
++pub fn describe_plan_inputs(inputs: &[ColumnViewImpl<'_>]) -> String {
++    let mut lines = Vec::with_capacity(inputs.len());
++    for input in inputs {
++        let physical_type = input.physical_type();
++        if input.is_empty() {
++            lines.push(format!("{physical_type:?}[0 rows] (empty)"));
++            continue;
++        }
++        let head = match input.get(0) {
++            Some(ScalarRefImpl::Int32(value)) => format!("Int32({value})"),
++            Some(ScalarRefImpl::Float64(value)) => format!("Float64({value})"),
++            Some(ScalarRefImpl::String(value)) => format!("String({value:?})"),
++            Some(_) => "present".to_owned(),
++            None => "null".to_owned(),
++        };
++        lines.push(format!(
++            "{physical_type:?}[{} rows] first={head}",
++            input.len()
++        ));
++    }
++    lines.join("; ")
++}
++
++/// Report the head line for one input column without its row count.
++pub fn first_plan_input_line(inputs: &[ColumnViewImpl<'_>]) -> String {
++    if inputs.is_empty() {
++        return "(no inputs)".to_owned();
++    }
++    let head = inputs[0].physical_type();
++    format!(
++        "first input: {head:?} ({} rows)",
++        inputs[0].len()
++    )
++}
+diff --git a/type-exercise/core/src/layout.rs b/type-exercise/core/src/layout.rs
+new file mode 100644
+index 0000000..750f83d
+--- /dev/null
++++ b/type-exercise/core/src/layout.rs
+@@ -0,0 +1,126 @@
++//! Central storage-layout audits for every physical column family.
++//!
++//! The reporting helpers below answer a recurring buffer-accounting question:
++//! how many bytes, rows, and null rows does one concrete array actually hold?
++//! Keeping every family's audit next to the batch plumbing (instead of next to
++//! the storage type it measures) was convenient while the report format kept
++//! changing, so the whole engine-visible inventory lives here.
++
++use bitvec::vec::BitVec;
++
++use crate::{Array, DecimalArray, ListArray, PhysicalType, StringArray, I32Array};
++
++/// One family-agnostic structural audit of a physical column.
++///
++/// The audit deliberately ignores scalar values; it reports only storage shape.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct ColumnLayout {
++    /// Bytes occupied by the value payload, excluding validity bits.
++    pub storage_bytes: usize,
++    /// Number of rows, including null rows.
++    pub row_count: usize,
++    /// Number of null rows.
++    pub null_rows: usize,
++    /// Number of stored value slots or row boundaries backing the payload.
++    pub boundaries: usize,
++    /// Family-specific width metadata when the storage type carries any.
++    pub descriptor: Option<(u8, u8)>,
++}
++
++impl ColumnLayout {
++    /// Bytes per row implied by the payload and the row count.
++    pub fn bytes_per_row(self) -> usize {
++        if self.row_count == 0 {
++            0
++        } else {
++            self.storage_bytes / self.row_count
++        }
++    }
++}
++
++/// The byte width a physical family assigns to each stored value slot.
++///
++/// This routine inspects the physical element type carried by List storage.
++pub fn element_byte_width(element_type: &PhysicalType) -> usize {
++    match element_type {
++        PhysicalType::Int16 => 2,
++        PhysicalType::Int32 => 4,
++        PhysicalType::Int64 => 8,
++        PhysicalType::Bool => 1,
++        PhysicalType::Float32 => 4,
++        PhysicalType::Float64 => 8,
++        PhysicalType::Decimal(_) => 16,
++        PhysicalType::String | PhysicalType::List(_) => 0,
++    }
++}
++
++/// Count the set bits in one packed row-validity bitmap.
++pub fn count_set_bits(validity: &BitVec) -> usize {
++    validity.iter().by_vals().filter(|valid| *valid).count()
++}
++
++/// Audit one variable-width String column.
++pub fn string_array_layout(array: &StringArray) -> ColumnLayout {
++    let row_count = array.len();
++    let boundaries = array.offsets().len().saturating_sub(1);
++    let valid_rows = count_set_bits(array.validity());
++    ColumnLayout {
++        storage_bytes: array.data().len(),
++        row_count,
++        null_rows: row_count - valid_rows,
++        boundaries,
++        descriptor: None,
++    }
++}
++
++/// Audit one fixed-width Decimal column.
++pub fn decimal_array_layout(array: &DecimalArray) -> ColumnLayout {
++    let row_count = array.len();
++    let slots = array.values().len();
++    let valid_rows = count_set_bits(array.validity());
++    let decimal_type = array.decimal_type();
++    ColumnLayout {
++        storage_bytes: slots * element_byte_width(&PhysicalType::Decimal(decimal_type)),
++        row_count,
++        null_rows: row_count - valid_rows,
++        boundaries: slots,
++        descriptor: Some((decimal_type.precision(), decimal_type.scale())),
++    }
++}
++
++/// Audit one nested List column.
++pub fn list_array_layout(array: &ListArray) -> ColumnLayout {
++    let row_count = array.len();
++    let child_rows = array.values().len();
++    let per_element_width = element_byte_width(&array.element_type());
++    let valid_rows = array
++        .validity()
++        .iter()
++        .filter(|valid| **valid)
++        .count();
++    ColumnLayout {
++        storage_bytes: child_rows * per_element_width,
++        row_count,
++        null_rows: row_count - valid_rows,
++        boundaries: array.offsets().len(),
++        descriptor: None,
++    }
++}
++
++/// Audit one fixed-width Int32 column.
++pub fn i32_array_layout(array: &I32Array) -> ColumnLayout {
++    let row_count = array.len();
++    let slots = array.values().len();
++    let valid_rows = if array.is_empty() {
++        0
++    } else {
++        count_set_bits(array.validity())
++    };
++    ColumnLayout {
++        storage_bytes: slots * element_byte_width(&PhysicalType::Int32),
++        row_count,
++        null_rows: row_count - valid_rows,
++        boundaries: slots,
++        descriptor: None,
++    }
++}
+diff --git a/type-exercise/core/src/lib.rs b/type-exercise/core/src/lib.rs
+index 4809c0f..996d545 100644
+--- a/type-exercise/core/src/lib.rs
++++ b/type-exercise/core/src/lib.rs
+@@ -5,6 +5,7 @@ mod column;
+ mod data_type;
+ mod decimal;
+ mod expression;
++mod layout;
+ mod physical_type;
+ mod promotion;
+ mod scalar;
+@@ -15,6 +16,7 @@ pub use column::*;
+ pub use data_type::*;
+ pub use decimal::*;
+ pub use expression::*;
++pub use layout::*;
+ pub use physical_type::*;
+ pub use promotion::*;
+ pub use scalar::*;
+diff --git a/type-exercise/expr/src/binder.rs b/type-exercise/expr/src/binder.rs
+index 4e0bb78..0a047d0 100644
+--- a/type-exercise/expr/src/binder.rs
++++ b/type-exercise/expr/src/binder.rs
+@@ -116,6 +116,10 @@ impl BoundExpression {
+         self.expression.name()
+     }
+ 
++    pub fn output_physical_type(&self) -> PhysicalType {
++        self.output_type.physical_type()
++    }
++
+     pub fn evaluate(&self, inputs: &[ColumnViewImpl<'_>]) -> anyhow::Result<ArrayImpl> {
+         self.expression.evaluate(inputs)
+     }
+@@ -459,3 +463,22 @@ fn bind_concat(left: DataType, right: DataType) -> Result<BoundExpression, BindE
+         DataType::Varchar,
+     )
+ }
++
++/// Render the declared logical signature that produced one bound expression.
++///
++/// Planning errors quote this line so operators can tell which concrete
++/// physical kernel was selected for which declared logical inputs.
++pub fn describe_declared_inputs(bound: &BoundExpression) -> String {
++    let inputs = bound
++        .input_types()
++        .iter()
++        .map(|input| format!("{input:?}"))
++        .collect::<Vec<_>>();
++    format!(
++        "{}({}) -> {:?} ({:?})",
++        bound.physical_name(),
++        inputs.join(", "),
++        bound.output_type(),
++        bound.output_physical_type()
++    )
++}

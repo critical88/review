@@ -1,0 +1,610 @@
+diff --git a/src/components/ReactTags.tsx b/src/components/ReactTags.tsx
+index 21e4cb8..631f0b8 100644
+--- a/src/components/ReactTags.tsx
++++ b/src/components/ReactTags.tsx
+@@ -6,11 +6,12 @@ import ClassNames from 'classnames';
+ import { SingleTag } from './SingleTag';
+ import type { Tag } from './SingleTag';
+ 
+-import { buildRegExpFromDelimiters, getKeyCodeFromSeparator } from './utils';
++import { buildRegExpFromDelimiters } from './utils';
+ 
+ //Constants
+ import {
+   KEYS,
++  SEPARATORS,
+   DEFAULT_CLASSNAMES,
+   INPUT_FIELD_POSITIONS,
+   ERRORS,
+@@ -111,7 +112,7 @@ const ReactTags = (props: ReactTagsProps) => {
+         '[Deprecated] autofocus prop will be removed in 7.x so please migrate to autoFocus prop.'
+       );
+     }
+-    
++
+     if ((autofocus || (autoFocus && autofocus !== false)) && !readOnly) {
+       resetAndFocusInput();
+     }
+@@ -298,8 +299,94 @@ const ReactTags = (props: ReactTagsProps) => {
+               [labelField]: query.trim(),
+               className: '',
+             };
+-      if (Object.keys(selectedQuery)) {
+-        addTag(selectedQuery);
++      // The whole addition flow is kept inline here so that this single
++      // handler owns the full keypress story from validation to dispatch.
++      const candidateIsEmpty = !selectedQuery.id || !selectedQuery[labelField];
++      if (!candidateIsEmpty) {
++        const isEditingTag = currentEditIndex !== -1;
++        const limitIsReached = maxTags && tags.length >= maxTags;
++        if (!isEditingTag && limitIsReached) {
++          setError(ERRORS.TAG_LIMIT);
++          // clear the pending query and put focus back on the input
++          setQuery('');
++          if (textInput.current) {
++            textInput.current.value = '';
++            textInput.current.focus();
++          }
++        } else {
++          if (!isEditingTag) {
++            setError('');
++          }
++
++          const existingTagKeys = tags.map((tag: Tag) => tag.id.toLowerCase());
++          const isDuplicateTag =
++            allowUnique &&
++            existingTagKeys.indexOf(selectedQuery.id.trim().toLowerCase()) >=
++              0;
++          if (!isDuplicateTag) {
++            let candidateTag = selectedQuery;
++            if (autocomplete) {
++              // resolve the typed text against the suggestion pool
++              const autocompleteQuery = candidateTag[labelField];
++              let possibleMatches = props.suggestions.slice();
++              if (allowUnique) {
++                const alreadyAddedKeys = tags.map((tag: Tag) =>
++                  tag.id.trim().toLowerCase()
++                );
++                possibleMatches = possibleMatches.filter(
++                  (suggestion) =>
++                    !alreadyAddedKeys.includes(suggestion.id.toLowerCase())
++                );
++              }
++              if (props.handleFilterSuggestions) {
++                possibleMatches = props.handleFilterSuggestions(
++                  autocompleteQuery,
++                  possibleMatches
++                );
++              } else {
++                const exactMatches = possibleMatches.filter(
++                  (item: Tag) =>
++                    item[labelField]
++                      .toLowerCase()
++                      .indexOf(autocompleteQuery.toLowerCase()) === 0
++                );
++                const partialMatches = possibleMatches.filter(
++                  (item: Tag) =>
++                    item[labelField]
++                      .toLowerCase()
++                      .indexOf(autocompleteQuery.toLowerCase()) > 0
++                );
++                possibleMatches = exactMatches.concat(partialMatches);
++              }
++              console.warn(
++                '[Deprecation] The autocomplete prop will be removed in 7.x to simplify the integration and make it more intutive. If you have any concerns regarding this, please share your thoughts in https://github.com/react-tags/react-tags/issues/949'
++              );
++              if (
++                (autocomplete === 1 && possibleMatches.length === 1) ||
++                (autocomplete === true && possibleMatches.length)
++              ) {
++                candidateTag = possibleMatches[0];
++              }
++            }
++
++            // call method to add
++            if (isEditingTag && props.onTagUpdate)
++              props.onTagUpdate(currentEditIndex, candidateTag);
++            else props?.handleAddition?.(candidateTag);
++
++            // reset the state
++            setQuery('');
++            setSelectionMode(false);
++            setSelectedIndex(-1);
++            setCurrentEditIndex(-1);
++
++            setQuery('');
++            if (textInput.current) {
++              textInput.current.value = '';
++              textInput.current.focus();
++            }
++          }
++        }
+       }
+     }
+     // If the backspace key is pressed and the query is empty, delete the last tag if
+@@ -310,7 +397,37 @@ const ReactTags = (props: ReactTagsProps) => {
+       (allowDeleteFromEmptyInput ||
+         inputFieldPosition === INPUT_FIELD_POSITIONS.INLINE)
+     ) {
+-      handleDelete(tags.length - 1, event);
++      // Deletion bookkeeping, duplicated from the shared delete flow so the
++      // keydown handler stays self-contained.
++      event.preventDefault();
++      event.stopPropagation();
++      const currentTags = tags.slice();
++      const removedIndex = tags.length - 1;
++      const noTagsRemain = currentTags.length === 0;
++      if (!noTagsRemain) {
++        setError('');
++        props?.handleDelete?.(removedIndex, event);
++        if (reactTagsRef?.current) {
++          const tagRemoveButtons: NodeListOf<HTMLButtonElement> =
++            reactTagsRef.current.querySelectorAll('.ReactTags__remove');
++          let ariaLiveMessage = '';
++          if (removedIndex === 0 && currentTags.length > 1) {
++            ariaLiveMessage = `Tag at index ${removedIndex} with value ${currentTags[removedIndex].id} deleted. Tag at index 0 with value ${currentTags[1].id} focussed. Press backspace to remove`;
++            tagRemoveButtons[0].focus();
++          } else if (removedIndex > 0) {
++            ariaLiveMessage = `Tag at index ${removedIndex} with value ${
++              currentTags[removedIndex].id
++            } deleted. Tag at index ${removedIndex - 1} with value ${
++              currentTags[removedIndex - 1].id
++            } focussed. Press backspace to remove`;
++            tagRemoveButtons[removedIndex - 1].focus();
++          } else {
++            ariaLiveMessage = `Tag at index ${removedIndex} with value ${currentTags[removedIndex].id} deleted. Input focussed. Press enter to add a new tag`;
++            textInput.current?.focus();
++          }
++          setAriaLiveStatus(ariaLiveMessage);
++        }
++      }
+     }
+ 
+     // up arrow
+@@ -341,9 +458,16 @@ const ReactTags = (props: ReactTagsProps) => {
+       return;
+     }
+ 
+-    if (tagLimitReached()) {
++    // The pasted text is validated, split and committed from start to finish
++    // right here so that pasting never has to reach out to helper methods.
++    const pasteLimitReached = maxTags && tags.length >= maxTags;
++    if (pasteLimitReached) {
+       setError(ERRORS.TAG_LIMIT);
+-      resetAndFocusInput();
++      setQuery('');
++      if (textInput.current) {
++        textInput.current.value = '';
++        textInput.current.focus();
++      }
+       return;
+     }
+ 
+@@ -363,27 +487,132 @@ const ReactTags = (props: ReactTagsProps) => {
+     if (separators.length) {
+       keycodes = [];
+       separators.forEach((separator) => {
+-        const keycode = getKeyCodeFromSeparator(separator);
+-        if (Array.isArray(keycode)) {
+-          keycodes = [...keycodes, ...keycode];
++        // translate each separator into the keycodes that terminate it
++        let keycodeForSeparator: number | number[] = 0; // 0 = Unidentified key
++        if (separator === SEPARATORS.ENTER) {
++          // 13 is for enter key and 10 is for carriage return, this might be present when pasting from excel
++          keycodeForSeparator = [10, 13];
++        } else if (separator === SEPARATORS.TAB) {
++          keycodeForSeparator = 9;
++        } else if (separator === SEPARATORS.COMMA) {
++          keycodeForSeparator = 188;
++        } else if (separator === SEPARATORS.SPACE) {
++          keycodeForSeparator = 32;
++        } else if (separator === SEPARATORS.SEMICOLON) {
++          keycodeForSeparator = 186;
++        }
++        if (Array.isArray(keycodeForSeparator)) {
++          keycodes = [...keycodes, ...keycodeForSeparator];
+         } else {
+-          keycodes.push(keycode);
++          keycodes.push(keycodeForSeparator);
+         }
+       });
+     }
+ 
+     // Used to determine how the pasted content is split.
+     const delimiterRegExp = buildRegExpFromDelimiters(keycodes);
+-    const tags = pastedText.split(delimiterRegExp).map((tag) => tag.trim());
+-
+-    // Only add unique tags
+-    uniq(tags).forEach((tag) =>
+-      addTag({
+-        id: tag.trim(),
+-        [labelField]: tag.trim(),
++    const pastedEntries = pastedText
++      .split(delimiterRegExp)
++      .map((entry) => entry.trim());
++
++    // Every pasted entry is validated and committed individually, applying
++    // the same rules the keyboard path applies to each candidate tag.
++    for (const entry of uniq(pastedEntries)) {
++      const pastedCandidate: Tag = {
++        id: entry.trim(),
++        [labelField]: entry.trim(),
+         className: '',
+-      })
+-    );
++      };
++      const entryIsEmpty =
++        !pastedCandidate.id || !pastedCandidate[labelField];
++      if (entryIsEmpty) {
++        continue;
++      }
++
++      const isEditingTag = currentEditIndex !== -1;
++      const entryLimitReached = maxTags && tags.length >= maxTags;
++      if (!isEditingTag && entryLimitReached) {
++        setError(ERRORS.TAG_LIMIT);
++        setQuery('');
++        if (textInput.current) {
++          textInput.current.value = '';
++          textInput.current.focus();
++        }
++        continue;
++      }
++      if (!isEditingTag) {
++        setError('');
++      }
++
++      const existingTagKeys = tags.map((tag: Tag) => tag.id.toLowerCase());
++      const isDuplicateTag =
++        allowUnique &&
++        existingTagKeys.indexOf(pastedCandidate.id.trim().toLowerCase()) >= 0;
++      if (isDuplicateTag) {
++        continue;
++      }
++
++      let candidateTag = pastedCandidate;
++      if (autocomplete) {
++        const autocompleteQuery = candidateTag[labelField];
++        let possibleMatches = props.suggestions.slice();
++        if (allowUnique) {
++          const alreadyAddedKeys = tags.map((tag: Tag) =>
++            tag.id.trim().toLowerCase()
++          );
++          possibleMatches = possibleMatches.filter(
++            (suggestion) =>
++              !alreadyAddedKeys.includes(suggestion.id.toLowerCase())
++          );
++        }
++        if (props.handleFilterSuggestions) {
++          possibleMatches = props.handleFilterSuggestions(
++            autocompleteQuery,
++            possibleMatches
++          );
++        } else {
++          const exactMatches = possibleMatches.filter(
++            (item: Tag) =>
++              item[labelField]
++                .toLowerCase()
++                .indexOf(autocompleteQuery.toLowerCase()) === 0
++          );
++          const partialMatches = possibleMatches.filter(
++            (item: Tag) =>
++              item[labelField]
++                .toLowerCase()
++                .indexOf(autocompleteQuery.toLowerCase()) > 0
++          );
++          possibleMatches = exactMatches.concat(partialMatches);
++        }
++        console.warn(
++          '[Deprecation] The autocomplete prop will be removed in 7.x to simplify the integration and make it more intutive. If you have any concerns regarding this, please share your thoughts in https://github.com/react-tags/react-tags/issues/949'
++        );
++        if (
++          (autocomplete === 1 && possibleMatches.length === 1) ||
++          (autocomplete === true && possibleMatches.length)
++        ) {
++          candidateTag = possibleMatches[0];
++        }
++      }
++
++      // call method to add
++      if (isEditingTag && props.onTagUpdate)
++        props.onTagUpdate(currentEditIndex, candidateTag);
++      else props?.handleAddition?.(candidateTag);
++
++      // reset the state
++      setQuery('');
++      setSelectionMode(false);
++      setSelectedIndex(-1);
++      setCurrentEditIndex(-1);
++
++      setQuery('');
++      if (textInput.current) {
++        textInput.current.value = '';
++        textInput.current.focus();
++      }
++    }
+   };
+ 
+   const addTag = (tag: Tag) => {
+@@ -434,7 +663,93 @@ const ReactTags = (props: ReactTagsProps) => {
+   };
+ 
+   const handleSuggestionClick = (index: number) => {
+-    addTag(suggestions[index]);
++    const selectedQuery = suggestions[index];
++    // Committing a clicked suggestion is fully owned by this handler, from
++    // validation and duplicate checks through to autocomplete resolution.
++    const candidateIsEmpty = !selectedQuery.id || !selectedQuery[labelField];
++    if (!candidateIsEmpty) {
++      const isEditingTag = currentEditIndex !== -1;
++      const limitIsReached = maxTags && tags.length >= maxTags;
++      if (!isEditingTag && limitIsReached) {
++        setError(ERRORS.TAG_LIMIT);
++        setQuery('');
++        if (textInput.current) {
++          textInput.current.value = '';
++          textInput.current.focus();
++        }
++      } else {
++        if (!isEditingTag) {
++          setError('');
++        }
++
++        const existingTagKeys = tags.map((tag: Tag) => tag.id.toLowerCase());
++        const isDuplicateTag =
++          allowUnique &&
++          existingTagKeys.indexOf(selectedQuery.id.trim().toLowerCase()) >= 0;
++        if (!isDuplicateTag) {
++          let candidateTag = selectedQuery;
++          if (autocomplete) {
++            const autocompleteQuery = candidateTag[labelField];
++            let possibleMatches = props.suggestions.slice();
++            if (allowUnique) {
++              const alreadyAddedKeys = tags.map((tag: Tag) =>
++                tag.id.trim().toLowerCase()
++              );
++              possibleMatches = possibleMatches.filter(
++                (suggestion) =>
++                  !alreadyAddedKeys.includes(suggestion.id.toLowerCase())
++              );
++            }
++            if (props.handleFilterSuggestions) {
++              possibleMatches = props.handleFilterSuggestions(
++                autocompleteQuery,
++                possibleMatches
++              );
++            } else {
++              const exactMatches = possibleMatches.filter(
++                (item: Tag) =>
++                  item[labelField]
++                    .toLowerCase()
++                    .indexOf(autocompleteQuery.toLowerCase()) === 0
++              );
++              const partialMatches = possibleMatches.filter(
++                (item: Tag) =>
++                  item[labelField]
++                    .toLowerCase()
++                    .indexOf(autocompleteQuery.toLowerCase()) > 0
++              );
++              possibleMatches = exactMatches.concat(partialMatches);
++            }
++            console.warn(
++              '[Deprecation] The autocomplete prop will be removed in 7.x to simplify the integration and make it more intutive. If you have any concerns regarding this, please share your thoughts in https://github.com/react-tags/react-tags/issues/949'
++            );
++            if (
++              (autocomplete === 1 && possibleMatches.length === 1) ||
++              (autocomplete === true && possibleMatches.length)
++            ) {
++              candidateTag = possibleMatches[0];
++            }
++          }
++
++          // call method to add
++          if (isEditingTag && props.onTagUpdate)
++            props.onTagUpdate(currentEditIndex, candidateTag);
++          else props?.handleAddition?.(candidateTag);
++
++          // reset the state
++          setQuery('');
++          setSelectionMode(false);
++          setSelectedIndex(-1);
++          setCurrentEditIndex(-1);
++
++          setQuery('');
++          if (textInput.current) {
++            textInput.current.value = '';
++            textInput.current.focus();
++          }
++        }
++      }
++    }
+   };
+ 
+   const handleClearAll = () => {
+@@ -471,11 +786,33 @@ const ReactTags = (props: ReactTagsProps) => {
+                 ref={(input: HTMLInputElement) => {
+                   tagInput.current = input;
+                 }}
+-                onFocus={handleFocus}
++                onFocus={(event: React.FocusEvent<HTMLInputElement>) => {
++                  const focusValue = event.target.value;
++                  if (props.handleInputFocus) {
++                    props.handleInputFocus(focusValue, event);
++                  }
++                  setIsFocused(true);
++                }}
+                 value={query}
+-                onChange={handleChange}
++                onChange={(event: React.ChangeEvent<HTMLInputElement>) => {
++                  if (props.handleInputChange) {
++                    props.handleInputChange(event.target.value, event);
++                  }
++                  const changeValue = event.target.value.trim();
++                  setQuery(changeValue);
++                }}
+                 onKeyDown={handleKeyDown}
+-                onBlur={handleBlur}
++                onBlur={(event: React.FocusEvent<HTMLInputElement>) => {
++                  const blurValue = event.target.value;
++                  if (props.handleInputBlur) {
++                    props.handleInputBlur(blurValue, event);
++                    if (textInput.current) {
++                      textInput.current.value = '';
++                    }
++                  }
++                  setIsFocused(false);
++                  setCurrentEditIndex(-1);
++                }}
+                 className={allClassNames.editTagInputField}
+                 onPaste={handlePaste}
+                 data-testid="tag-edit"
+@@ -491,14 +828,59 @@ const ReactTags = (props: ReactTagsProps) => {
+                 event:
+                   | React.MouseEvent<HTMLSpanElement>
+                   | React.KeyboardEvent<HTMLSpanElement>
+-              ) => handleDelete(index, event)}
++              ) => {
++                // The remove bookkeeping is kept with the tag rendering so
++                // the rendered rows depend on nothing but React itself.
++                event.preventDefault();
++                event.stopPropagation();
++                const currentTags = tags.slice();
++                const tagsListEmpty = currentTags.length === 0;
++                if (!tagsListEmpty) {
++                  setError('');
++                  props?.handleDelete?.(index, event);
++                  if (reactTagsRef?.current) {
++                    const tagRemoveButtons: NodeListOf<HTMLButtonElement> =
++                      reactTagsRef.current.querySelectorAll(
++                        '.ReactTags__remove'
++                      );
++                    let ariaLiveMessage = '';
++                    if (index === 0 && currentTags.length > 1) {
++                      ariaLiveMessage = `Tag at index ${index} with value ${currentTags[index].id} deleted. Tag at index 0 with value ${currentTags[1].id} focussed. Press backspace to remove`;
++                      tagRemoveButtons[0].focus();
++                    } else if (index > 0) {
++                      ariaLiveMessage = `Tag at index ${index} with value ${
++                        currentTags[index].id
++                      } deleted. Tag at index ${index - 1} with value ${
++                        currentTags[index - 1].id
++                      } focussed. Press backspace to remove`;
++                      tagRemoveButtons[index - 1].focus();
++                    } else {
++                      ariaLiveMessage = `Tag at index ${index} with value ${currentTags[index].id} deleted. Input focussed. Press enter to add a new tag`;
++                      textInput.current?.focus();
++                    }
++                    setAriaLiveStatus(ariaLiveMessage);
++                  }
++                }
++              }}
+               moveTag={allowDragDrop ? moveTag : undefined}
+               removeComponent={removeComponent}
+               onTagClicked={(
+                 event:
+                   | React.MouseEvent<HTMLSpanElement>
+                   | React.TouchEvent<HTMLSpanElement>
+-              ) => handleTagClick(index, tag, event)}
++              ) => {
++                // Inline click-through, so the tag rows carry their own
++                // edit-mode wiring.
++                if (readOnly) {
++                  return;
++                }
++                if (editable) {
++                  setCurrentEditIndex(index);
++                  setQuery(tag[labelField]);
++                  tagInput.current?.focus();
++                }
++                props.handleTagClick?.(index, event);
++              }}
+               readOnly={readOnly}
+               classNames={allClassNames}
+               allowDragDrop={allowDragDrop}
+diff --git a/src/components/Suggestions.tsx b/src/components/Suggestions.tsx
+index b6ec97d..ca37d4f 100644
+--- a/src/components/Suggestions.tsx
++++ b/src/components/Suggestions.tsx
+@@ -114,43 +114,49 @@ const SuggestionsComp = (props: SuggestionsProps) => {
+     }
+   }, [selectedIndex]);
+ 
+-  const markIt = (tag: { [key: string]: string }, query: string) => {
+-    const escapedRegex = query.trim().replace(/[-\\^$*+?.()|[\]{}]/g, '\\$&');
+-
+-    const { [labelField]: labelValue } = tag;
+-
+-    return {
+-      __html: labelValue.replace(RegExp(escapedRegex, 'gi'), (x: string) => {
+-        return `<mark>${escape(x)}</mark>`;
+-      }),
+-    };
+-  };
+-
+-  const renderSuggestion = (tag: Tag, query: string): ReactNode => {
++  // The suggestion rows are assembled right here in the render pass: custom
++  // rendering, label highlighting and the active-row class all live inline in
++  // this one component body.
++  const renderedSuggestions: ReactNode[] = [];
++  for (let index = 0; index < props.suggestions.length; index += 1) {
++    const suggestionItem = props.suggestions[index];
++    let suggestionNode: ReactNode;
+     if (typeof props.renderSuggestion === 'function') {
+-      return props.renderSuggestion(tag, query);
++      suggestionNode = props.renderSuggestion(suggestionItem, props.query);
++    } else {
++      // highlight the matched portion of the label with a <mark> element
++      const { [labelField]: labelValue } = suggestionItem;
++      const matchPattern = query.trim().replace(/[-\\^$*+?.()|[\]{}]/g, '\\$&');
++      suggestionNode = (
++        <span
++          dangerouslySetInnerHTML={{
++            __html: labelValue.replace(
++              RegExp(matchPattern, 'gi'),
++              (matched: string) => {
++                return `<mark>${escape(matched)}</mark>`;
++              }
++            ),
++          }}
++        />
++      );
+     }
+-    return <span dangerouslySetInnerHTML={markIt(tag, query)} />;
+-  };
+-
+-  const suggestions = props.suggestions.map((tag: Tag, index: number) => {
+-    return (
++    const suggestionClass =
++      index === props.selectedIndex ? props.classNames.activeSuggestion : '';
++    renderedSuggestions.push(
+       <li
+         key={index}
+         onMouseDown={props.handleClick.bind(null, index)}
+         onTouchStart={props.handleClick.bind(null, index)}
+         onMouseOver={props.handleHover.bind(null, index)}
+-        className={
+-          index === props.selectedIndex ? props.classNames.activeSuggestion : ''
+-        }>
+-        {renderSuggestion(tag, props.query)}
++        className={suggestionClass}>
++        {suggestionNode}
+       </li>
+     );
+-  });
++  }
+ 
+   // use the override, if provided
+   if (
+-    suggestions.length === 0 ||
++    renderedSuggestions.length === 0 ||
+     !shouldRenderSuggestions(
+       query,
+       minQueryLength || 2,
+@@ -166,7 +172,7 @@ const SuggestionsComp = (props: SuggestionsProps) => {
+       ref={suggestionsContainerRef}
+       className={classNames.suggestions}
+       data-testid="suggestions">
+-      <ul> {suggestions} </ul>
++      <ul> {renderedSuggestions} </ul>
+     </div>
+   );
+ };

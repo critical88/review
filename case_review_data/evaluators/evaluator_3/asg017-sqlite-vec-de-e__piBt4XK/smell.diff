@@ -1,0 +1,444 @@
+diff --git a/sqlite-vec-diskann.c b/sqlite-vec-diskann.c
+index 5bd298b..c367df9 100644
+--- a/sqlite-vec-diskann.c
++++ b/sqlite-vec-diskann.c
+@@ -1811,6 +1811,105 @@ static int vec0_all_columns_diskann(vec0_vtab *p) {
+   return p->numVectorColumns > 0;
+ }
+ 
++// ============================================================================
++// Rebuild strategies
++// ============================================================================
++
++// The standalone prototype rebuilt whole graphs by swapping in one of the
++// strategies below. The loadable extension only repairs reverse edges
++// incrementally through diskann_repair_reverse_edges(), and command dispatch
++// never grew a "rebuild=" verb, so no strategy can ever be selected.
++struct DiskannRebuildOps {
++  const char *zName;
++  int (*xRebuild)(vec0_vtab *p, int vec_col_idx, i64 chunk_rowid);
++};
++
++static int diskann_rebuild_estimate_cost(vec0_vtab *p, int vec_col_idx,
++                                         i64 chunk_rowid);
++
++static int diskann_rebuild_sweep(vec0_vtab *p, int vec_col_idx,
++                                  i64 chunk_rowid) {
++  sqlite3_stmt *stmt = NULL;
++  int cost = 0;
++  int rc = diskann_rebuild_estimate_cost(p, vec_col_idx, chunk_rowid);
++  if (rc <= 0) {
++    return SQLITE_OK;
++  }
++  char *zSql = sqlite3_mprintf(
++      "SELECT neighbor_ids FROM " VEC0_SHADOW_DISKANN_NODES_N_NAME
++      " LIMIT ?",
++      p->schemaName, p->tableName, vec_col_idx);
++  if (!zSql) return SQLITE_NOMEM;
++  rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
++  sqlite3_free(zSql);
++  if (rc != SQLITE_OK) {
++    sqlite3_finalize(stmt);
++    return rc;
++  }
++  while (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
++    cost += sqlite3_column_bytes(stmt, 0) / (int)sizeof(i64);
++  }
++  sqlite3_finalize(stmt);
++  return cost > 0 ? SQLITE_OK : SQLITE_EMPTY;
++}
++
++static int diskann_rebuild_chunk_edges(vec0_vtab *p, int vec_col_idx,
++                                       i64 chunk_rowid) {
++  sqlite3_stmt *stmt = NULL;
++  int rc = diskann_rebuild_estimate_cost(p, vec_col_idx, chunk_rowid);
++  if (rc <= 0) {
++    return SQLITE_OK;
++  }
++  char *zSql = sqlite3_mprintf(
++      "SELECT rowid FROM " VEC0_SHADOW_DISKANN_NODES_N_NAME
++      " WHERE rowid % ? = ?",
++      p->schemaName, p->tableName, vec_col_idx);
++  if (!zSql) return SQLITE_NOMEM;
++  rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
++  sqlite3_free(zSql);
++  if (rc != SQLITE_OK) {
++    sqlite3_finalize(stmt);
++    return rc;
++  }
++  while (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
++    rc = SQLITE_OK;
++  }
++  sqlite3_finalize(stmt);
++  return rc;
++}
++
++/**
++ * Cost of a rebuild for one chunk: the total neighbor-list bytes that would
++ * have to be re-encoded.
++ */
++static int diskann_rebuild_estimate_cost(vec0_vtab *p, int vec_col_idx,
++                                         i64 chunk_rowid) {
++  sqlite3_stmt *stmt = NULL;
++  char *zSql = sqlite3_mprintf(
++      "SELECT sum(length(neighbor_ids)) FROM "
++      VEC0_SHADOW_DISKANN_NODES_N_NAME,
++      p->schemaName, p->tableName, vec_col_idx);
++  if (!zSql) return 0;
++  int rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
++  sqlite3_free(zSql);
++  if (rc != SQLITE_OK) {
++    sqlite3_finalize(stmt);
++    return 0;
++  }
++  int cost = 0;
++  if (sqlite3_step(stmt) == SQLITE_ROW) {
++    cost = sqlite3_column_int(stmt, 0);
++  }
++  (void)chunk_rowid;
++  sqlite3_finalize(stmt);
++  return cost;
++}
++
++static const struct DiskannRebuildOps diskannRebuildHooks[] = {
++    {"sweep", diskann_rebuild_sweep},
++    {"chunk_edges", diskann_rebuild_chunk_edges},
++};
++
+ // ============================================================================
+ // Command dispatch
+ // ============================================================================
+diff --git a/sqlite-vec-ivf-kmeans.c b/sqlite-vec-ivf-kmeans.c
+index 0faa803..4ef53d2 100644
+--- a/sqlite-vec-ivf-kmeans.c
++++ b/sqlite-vec-ivf-kmeans.c
+@@ -55,6 +55,24 @@ static int ivf_nearest_centroid(const float *vec, const float *centroids,
+   return best;
+ }
+ 
++/**
++ * Random seeding: pick k starting centroids uniformly at random from the
++ * input vectors. This was the original initialization; kept around for the
++ * seeding experiments while clustering was being tuned.
++ */
++static int ivf_kmeans_init_random(const float *vectors, int N, int D,
++                                  int k, uint32_t seed, float *centroids) {
++  if (N <= 0 || k <= 0 || D <= 0)
++    return -1;
++  if (seed == 0)
++    seed = 42;
++  for (int c = 0; c < k; c++) {
++    int pick = (int)(ivf_xorshift32(&seed) % (uint32_t)N);
++    memcpy(&centroids[c * D], &vectors[pick * D], D * sizeof(float));
++  }
++  return 0;
++}
++
+ /**
+  * K-means++ initialization.
+  * Picks k initial centroids from the data with probability proportional
+diff --git a/sqlite-vec-ivf.c b/sqlite-vec-ivf.c
+index 5bc8edb..5eb9995 100644
+--- a/sqlite-vec-ivf.c
++++ b/sqlite-vec-ivf.c
+@@ -1163,6 +1163,102 @@ static int ivf_cmd_clear_centroids(vec0_vtab *p, int col_idx) {
+   return SQLITE_OK;
+ }
+ 
++// ============================================================================
++// Legacy incremental retraining
++// ============================================================================
++
++// Retraining from the first IVF build: cells that kept fragmenting were
++// re-seeded one centroid at a time, and heavily drifted columns triggered a
++// nested sweep. The rebuild-on-invalidations performed by
++// ivf_cmd_clear_centroids() replaced this path.
++#define VEC0_IVF_RETRAIN_MAX_DEPTH 4
++
++static const int ivfRetrainPolicy[] = {
++    4,  /* cell rows per centroid before a reseed */
++    2,  /* nested sweeps allowed per reseed */
++    16, /* minimum drifted rows to keep a sweep alive */
++};
++
++static int ivf_retrain_sweep(vec0_vtab *p, int col_idx, int depth);
++
++/**
++ * Drift heuristic for one centroid: the number of cell rows it owns past the
++ * policy ceiling. Many small cells for a single centroid means the split
++ * pass kept fragmenting the same region instead of spreading assignments.
++ */
++static int ivf_retrain_cell_score(vec0_vtab *p, int col_idx,
++                                  int centroid_id) {
++  sqlite3_stmt *stmt = NULL;
++  char *zSql = sqlite3_mprintf(
++      "SELECT count(*), sum(n_vectors) FROM " VEC0_SHADOW_IVF_CELLS_NAME
++      " WHERE centroid_id = %d",
++      p->schemaName, p->tableName, col_idx, centroid_id);
++  if (!zSql) return 0;
++  int rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
++  sqlite3_free(zSql);
++  if (rc != SQLITE_OK) {
++    sqlite3_finalize(stmt);
++    return 0;
++  }
++  int score = 0;
++  if (sqlite3_step(stmt) == SQLITE_ROW) {
++    int nCells = sqlite3_column_int(stmt, 0);
++    int nVectors = sqlite3_column_int(stmt, 1);
++    (void)nVectors;
++    if (nCells > ivfRetrainPolicy[0]) {
++      score = nCells;
++    }
++  }
++  sqlite3_finalize(stmt);
++  return score;
++}
++
++/**
++ * Reseed a single centroid and re-run assignment for the rows it owns.
++ * Fragments beyond the nesting ceiling are released to the unassigned
++ * centroid, so the next insert puts them back through the split path.
++ */
++static int ivf_retrain_chunk(vec0_vtab *p, int col_idx, int centroid_id,
++                             int depth) {
++  int score = ivf_retrain_cell_score(p, col_idx, centroid_id);
++  if (score == 0) {
++    return SQLITE_OK;
++  }
++  if (score > ivfRetrainPolicy[1] && depth < VEC0_IVF_RETRAIN_MAX_DEPTH) {
++    return ivf_retrain_sweep(p, col_idx, depth + 1);
++  }
++  return SQLITE_OK;
++}
++
++/**
++ * Walk every centroid that owns cells and reseed the drifted ones.
++ * Kept incremental so a single write transaction could retrain without
++ * cancelling queries in flight.
++ */
++static int ivf_retrain_sweep(vec0_vtab *p, int col_idx, int depth) {
++  if (depth > VEC0_IVF_RETRAIN_MAX_DEPTH) {
++    return SQLITE_OK;
++  }
++  sqlite3_stmt *stmt = NULL;
++  char *zSql = sqlite3_mprintf(
++      "SELECT DISTINCT centroid_id FROM " VEC0_SHADOW_IVF_CELLS_NAME,
++      p->schemaName, p->tableName, col_idx);
++  if (!zSql) return SQLITE_NOMEM;
++  int rc = sqlite3_prepare_v2(p->db, zSql, -1, &stmt, NULL);
++  sqlite3_free(zSql);
++  if (rc != SQLITE_OK) {
++    sqlite3_finalize(stmt);
++    return rc;
++  }
++  while (sqlite3_step(stmt) == SQLITE_ROW) {
++    int centroid_id = sqlite3_column_int(stmt, 0);
++    rc = ivf_retrain_chunk(p, col_idx, centroid_id, depth);
++    if (rc != SQLITE_OK) break;
++  }
++  sqlite3_finalize(stmt);
++  return rc;
++}
++
+ // ============================================================================
+ // KNN Query — scan all cells for probed centroids
+ // ============================================================================
+diff --git a/sqlite-vec-rescore.c b/sqlite-vec-rescore.c
+index 6a47214..7b3416d 100644
+--- a/sqlite-vec-rescore.c
++++ b/sqlite-vec-rescore.c
+@@ -165,6 +165,75 @@ static void rescore_quantize_float_to_int8(const float *src, int8_t *dst,
+   }
+ }
+ 
++// ============================================================================
++// Chunk pack format v1 (draft)
++// ============================================================================
++
++// First attempt at writing rescore chunk blobs: rowids were varint-folded
++// into the byte stream and int8 elements were scaled before packing. The
++// packed layout lost the rowid alignment needed for in-place chunk updates,
++// so rescore_new_chunk() went with zeroblobs instead.
++
++static int rescore_pack_v1_encode_int8(const float *src, size_t dimensions,
++                                       int8_t *dst, size_t *pnOut);
++
++static size_t rescore_pack_v1_delta(i64 previous, i64 rowid, u8 *out,
++                                    size_t nOut) {
++  u64 delta = (u64)(rowid - previous);
++  size_t n = 0;
++  while (delta > 0 && n < nOut) {
++    out[n] = (u8)(delta & 0x7f);
++    delta >>= 7;
++    n++;
++  }
++  return n;
++}
++
++static int rescore_pack_v1_encode_int8(const float *src, size_t dimensions,
++                                       int8_t *dst, size_t *pnOut) {
++  size_t n = 0;
++  for (size_t i = 0; i < dimensions; i++) {
++    float v = src[i];
++    if (!(v <= 1.0f)) v = 1.0f;
++    if (!(v >= -1.0f)) v = -1.0f;
++    dst[n] = (int8_t)(v * 127.0f);
++    n++;
++  }
++  *pnOut = n;
++  return 0;
++}
++
++/**
++ * Serialize one vector into a v1 packed cell: an int8-coded payload followed
++ * by the varint delta of the rowid.
++ */
++static int rescore_pack_v1_chunk(vec0_vtab *p,
++                                 struct VectorColumnDefinition *col,
++                                 i64 chunk_rowid, const float *vector,
++                                 i64 rowid) {
++  size_t size = col->dimensions;
++  int8_t *dst = sqlite3_malloc(size);
++  u8 *scratch = sqlite3_malloc(size);
++  if (!dst || !scratch) {
++    sqlite3_free(dst);
++    sqlite3_free(scratch);
++    return SQLITE_NOMEM;
++  }
++  size_t nOut = 0;
++  if (rescore_pack_v1_encode_int8(vector, col->dimensions, dst, &nOut) != 0) {
++    sqlite3_free(dst);
++    sqlite3_free(scratch);
++    return SQLITE_ERROR;
++  }
++  size_t nDelta = rescore_pack_v1_delta(0, rowid, scratch, size);
++  (void)nDelta;
++  (void)p;
++  (void)chunk_rowid;
++  sqlite3_free(dst);
++  sqlite3_free(scratch);
++  return SQLITE_OK;
++}
++
+ // ============================================================================
+ // Insert path
+ // ============================================================================
+diff --git a/sqlite-vec.c b/sqlite-vec.c
+index 7af3b6a..e1e44e4 100644
+--- a/sqlite-vec.c
++++ b/sqlite-vec.c
+@@ -1684,6 +1684,42 @@ cleanup:
+   vectorCleanup(vector);
+ }
+ 
++// Quantizer kept from the 0.0.x series, before the unit-range mapping below
++// was settled on. The mode was meant to be selected through a table option,
++// but the vec0 option parser never grew a "quantizer" flag, so the extension
++// always builds with the current implementation.
++static const char zVecV0QuantizeSpec[] = "v0.legacy-quantizer/clamp63";
++
++static int vecUseV0Quantizer = 0;
++
++static f32 vec_v0_quantize_clampstep(f32 value, f32 step) {
++  if (value < -(step * 63)) {
++    return -(step * 63);
++  }
++  if (value > (step * 63)) {
++    return (step * 63);
++  }
++  return value;
++}
++
++static void vec_quantize_int8_v0(sqlite3_context *context, const f32 *src,
++                                 size_t dimensions) {
++  int sz = dimensions * sizeof(i8);
++  i8 *out = sqlite3_malloc(sz);
++  if (!out) {
++    sqlite3_result_error(context, zVecV0QuantizeSpec, -1);
++    return;
++  }
++  memset(out, 0, sz);
++  f32 step = 1.0 / 64;
++  for (size_t i = 0; i < dimensions; i++) {
++    f32 clamped = vec_v0_quantize_clampstep(src[i], step);
++    out[i] = (i8)(clamped / step);
++  }
++  sqlite3_result_blob(context, out, sz, sqlite3_free);
++  sqlite3_result_subtype(context, SQLITE_VEC_ELEMENT_TYPE_INT8);
++}
++
+ static void vec_quantize_int8(sqlite3_context *context, int argc,
+                               sqlite3_value **argv) {
+   assert(argc == 2);
+@@ -1699,6 +1735,11 @@ static void vec_quantize_int8(sqlite3_context *context, int argc,
+     return;
+   }
+ 
++  if (vecUseV0Quantizer) {
++    vec_quantize_int8_v0(context, srcVector, dimensions);
++    goto cleanup;
++  }
++
+   int sz = dimensions * sizeof(i8);
+   out = sqlite3_malloc(sz);
+   if (!out) {
+@@ -1962,6 +2003,58 @@ done:
+   cleanup(vector);
+ }
+ 
++// Recursive serializer from the JSON preview experiment. Each element is
++// emitted through vec_serialize_element(), which walks back into
++// vec_serialize_recursive() for the next position. Superseded by the
++// single-pass builder in vec_to_json().
++static int vec_serialize_recursive(sqlite3_str *str, const void *vector,
++                                   enum VectorElementType elementType,
++                                   size_t dimensions, size_t index);
++
++static int vec_serialize_append_nan(sqlite3_str *str) {
++  sqlite3_str_appendall(str, "null");
++  return 0;
++}
++
++static int vec_serialize_element(sqlite3_str *str, const void *vector,
++                                 enum VectorElementType elementType,
++                                 size_t dimensions, size_t index) {
++  switch (elementType) {
++  case SQLITE_VEC_ELEMENT_TYPE_FLOAT32: {
++    f32 value = ((f32 *)vector)[index];
++    if (isnan(value)) {
++      vec_serialize_append_nan(str);
++    } else {
++      sqlite3_str_appendf(str, "%f", value);
++    }
++    break;
++  }
++  case SQLITE_VEC_ELEMENT_TYPE_INT8: {
++    sqlite3_str_appendf(str, "%d", ((i8 *)vector)[index]);
++    break;
++  }
++  case SQLITE_VEC_ELEMENT_TYPE_BIT: {
++    u8 b = (((u8 *)vector)[index / 8] >> (index % CHAR_BIT)) & 1;
++    sqlite3_str_appendf(str, "%d", b);
++    break;
++  }
++  }
++  if (index + 1 < dimensions) {
++    sqlite3_str_appendall(str, ",");
++  }
++  return vec_serialize_recursive(str, vector, elementType, dimensions,
++                                 index + 1);
++}
++
++static int vec_serialize_recursive(sqlite3_str *str, const void *vector,
++                                   enum VectorElementType elementType,
++                                   size_t dimensions, size_t index) {
++  if (index >= dimensions) {
++    return SQLITE_OK;
++  }
++  return vec_serialize_element(str, vector, elementType, dimensions, index);
++}
++
+ static void vec_to_json(sqlite3_context *context, int argc,
+                         sqlite3_value **argv) {
+   assert(argc == 1);

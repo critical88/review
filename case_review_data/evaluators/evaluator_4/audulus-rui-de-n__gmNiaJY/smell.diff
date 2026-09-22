@@ -1,0 +1,231 @@
+diff --git a/src/context.rs b/src/context.rs
+index f32fda0..2655083 100644
+--- a/src/context.rs
++++ b/src/context.rs
+@@ -337,6 +337,16 @@ impl Context {
+         }
+     }
+ 
++    /// The layout rectangles of all views, for diagnostics overlays.
++    pub fn layout_rects(&self) -> Vec<LocalRect> {
++        self.layout.values().map(|b| b.rect).collect()
++    }
++
++    /// The number of dirty regions queued for the next render.
++    pub fn dirty_region_count(&self) -> usize {
++        self.dirty_region.rects().len()
++    }
++
+     /// Get menu commands.
+     pub fn commands(&mut self, view: &impl View, cmds: &mut Vec<CommandInfo>) {
+         let mut path = vec![0];
+diff --git a/src/modifiers.rs b/src/modifiers.rs
+index b71e0a5..4d00c13 100644
+--- a/src/modifiers.rs
++++ b/src/modifiers.rs
+@@ -29,6 +29,11 @@ pub trait Modifiers: View + Sized {
+         CommandGroup::new(self, cmds)
+     }
+ 
++    /// Draws a diagnostics overlay over the view, for debugging layouts.
++    fn debug_overlay(self, style: OverlayStyle) -> InspectorView<Self> {
++        inspector(style, self)
++    }
++
+     /// Calls a function in response to a drag.
+     fn drag<
+         F: Fn(&mut Context, LocalOffset, GestureState, Option<MouseButton>) + Clone + 'static,
+diff --git a/src/paint.rs b/src/paint.rs
+index 7a9f662..8536fd1 100644
+--- a/src/paint.rs
++++ b/src/paint.rs
+@@ -16,6 +16,11 @@ pub enum Paint {
+ }
+ 
+ impl Paint {
++    /// A solid color with the alpha channel replaced.
++    pub fn translucent(color: Color, alpha: f32) -> Paint {
++        Paint::Color(Color { a: alpha, ..color })
++    }
++
+     pub fn vger_paint(&self, vger: &mut Vger) -> PaintIndex {
+         match self {
+             Paint::Color(color) => vger.color_paint(*color),
+diff --git a/src/views/command.rs b/src/views/command.rs
+index 3d644b2..df85bbd 100644
+--- a/src/views/command.rs
++++ b/src/views/command.rs
+@@ -1,6 +1,9 @@
+ use crate::*;
+ use std::{any::Any, sync::Arc};
+ 
++/// Menu command name that toggles the inspector overlay.
++pub const INSPECT_COMMAND: &str = "toggle-inspector";
++
+ #[derive(Clone)]
+ pub struct Command<V, F> {
+     child: V,
+diff --git a/src/views/inspector.rs b/src/views/inspector.rs
+new file mode 100644
+index 0000000..d039ada
+--- /dev/null
++++ b/src/views/inspector.rs
+@@ -0,0 +1,145 @@
++use crate::*;
++use std::any::Any;
++
++/// How an inspector overlay visualizes the view tree.
++#[derive(Copy, Clone, Debug)]
++pub enum OverlayStyle {
++    /// Outline the layout rectangle of every view.
++    Bounds,
++    /// Mark the views that reported dirty regions for the current frame.
++    DirtyRegion,
++}
++
++impl OverlayStyle {
++    /// The paint used for the overlay's shapes.
++    pub fn overlay_paint(self) -> Paint {
++        Paint::translucent(self.overlay_color(), 0.35)
++    }
++
++    /// The stroke width used for the overlay's shapes.
++    pub fn overlay_stroke_width(self) -> f32 {
++        match self {
++            OverlayStyle::Bounds => 1.0,
++            OverlayStyle::DirtyRegion => 2.0,
++        }
++    }
++
++    fn overlay_color(self) -> Color {
++        match self {
++            OverlayStyle::Bounds => Color {
++                r: 0.0,
++                g: 0.827,
++                b: 1.0,
++                a: 1.0,
++            },
++            OverlayStyle::DirtyRegion => Color {
++                r: 1.0,
++                g: 0.815,
++                b: 0.0,
++                a: 1.0,
++            },
++        }
++    }
++}
++
++/// Wraps a view in an inspector that draws a diagnostics overlay on top of it.
++#[derive(Clone)]
++pub struct InspectorView<V> {
++    child: V,
++    style: OverlayStyle,
++}
++
++impl<V: View> InspectorView<V> {
++    pub fn overlay_child(child: V, style: OverlayStyle) -> Self {
++        Self { child, style }
++    }
++}
++
++/// Wrap a view in a view that draws an inspector overlay over it.
++pub fn inspector<V: View>(style: OverlayStyle, child: V) -> InspectorView<V> {
++    InspectorView::overlay_child(child, style)
++}
++
++impl<V: View> DynView for InspectorView<V> {
++    fn process(
++        &self,
++        event: &Event,
++        path: &mut IdPath,
++        cx: &mut Context,
++        actions: &mut Vec<Box<dyn Any>>,
++    ) {
++        if let Event::Command(name) = &event {
++            if **name == *INSPECT_COMMAND {
++                log::debug!("inspector: {} dirty region(s)", cx.dirty_region_count());
++            }
++        }
++
++        path.push(0);
++        self.child.process(event, path, cx, actions);
++        path.pop();
++    }
++
++    fn draw(&self, path: &mut IdPath, args: &mut DrawArgs) {
++        path.push(0);
++        self.child.draw(path, args);
++        path.pop();
++
++        let paint = self.style.overlay_paint().vger_paint(args.vger);
++        for rect in args.cx.layout_rects() {
++            args.vger
++                .stroke_rect(rect.min(), rect.max(), 0.0, self.style.overlay_stroke_width(), paint);
++        }
++    }
++
++    fn layout(&self, path: &mut IdPath, args: &mut LayoutArgs) -> LocalSize {
++        path.push(0);
++        let sz = self.child.layout(path, args);
++        path.pop();
++        sz
++    }
++
++    fn dirty(&self, path: &mut IdPath, xform: LocalToWorld, cx: &mut Context) {
++        path.push(0);
++        self.child.dirty(path, xform, cx);
++        path.pop();
++    }
++
++    fn hittest(&self, path: &mut IdPath, pt: LocalPoint, cx: &mut Context) -> Option<ViewId> {
++        path.push(0);
++        let id = self.child.hittest(path, pt, cx);
++        path.pop();
++        id
++    }
++
++    fn commands(&self, path: &mut IdPath, cx: &mut Context, cmds: &mut Vec<CommandInfo>) {
++        path.push(0);
++        self.child.commands(path, cx, cmds);
++        path.pop();
++
++        cmds.push(CommandInfo {
++            path: INSPECT_COMMAND.into(),
++            key: None,
++        })
++    }
++
++    fn gc(&self, path: &mut IdPath, cx: &mut Context, map: &mut Vec<ViewId>) {
++        map.push(cx.view_id(path));
++        path.push(0);
++        self.child.gc(path, cx, map);
++        path.pop();
++    }
++
++    fn access(
++        &self,
++        path: &mut IdPath,
++        cx: &mut Context,
++        nodes: &mut Vec<(accesskit::NodeId, accesskit::Node)>,
++    ) -> Option<accesskit::NodeId> {
++        path.push(0);
++        let node_id = self.child.access(path, cx, nodes);
++        path.pop();
++        node_id
++    }
++}
++
++impl<V: View> private::Sealed for InspectorView<V> {}
+diff --git a/src/views/mod.rs b/src/views/mod.rs
+index f48d10e..e5aef46 100644
+--- a/src/views/mod.rs
++++ b/src/views/mod.rs
+@@ -30,6 +30,8 @@ mod handle;
+ pub use handle::*;
+ mod hover;
+ pub use hover::*;
++mod inspector;
++pub use inspector::*;
+ mod key;
+ pub use key::*;
+ mod knob;

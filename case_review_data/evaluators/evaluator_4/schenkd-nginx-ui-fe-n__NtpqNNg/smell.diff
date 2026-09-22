@@ -1,0 +1,1201 @@
+diff --git a/app/api/editor.py b/app/api/editor.py
+new file mode 100644
+index 0000000..0b6bac3
+--- /dev/null
++++ b/app/api/editor.py
+@@ -0,0 +1,91 @@
++"""Writes changes to the managed site configuration files."""
++
++import io
++import os
++
++from app.api.registry import SiteRegistry
++from app.api.model import Site
++
++
++class SiteEditor(object):
++    """
++    Applies changes to the managed site configuration files.
++
++    :param registry: Registry reading the site configuration files
++    :type registry: SiteRegistry
++    """
++
++    def __init__(self, registry: SiteRegistry):
++        self.registry = registry
++
++    def create(self, name, content):
++        """
++        Creates the configuration file of the domain as a disabled site.
++
++        :param name: The domain name that corresponds to the file.
++        :type name: str
++        :param content: Rendered configuration of the new domain
++        :type content: str
++        """
++        filename = name + '.conf.disabled'
++
++        with io.open(os.path.join(self.registry.config_path, filename), 'w') as f:
++            f.write(content)
++
++    def apply_update(self, name, new_content):
++        """
++        Writes the new configuration to every file matching the name.
++
++        :param name: The domain name that corresponds to the file.
++        :type name: str
++        :param new_content: Updated configuration of the domain
++        :type new_content: str
++        """
++        for record in self.registry.scan():
++
++            if record.filename.startswith(name):
++
++                with io.open(os.path.join(record.config_path, record.filename), 'w') as f:
++                    f.write(new_content)
++
++    def remove(self, name):
++        """
++        Deletes the configuration file of the corresponding domain.
++
++        :param name: The domain name that corresponds to the file.
++        :type name: str
++
++        :return: Returns whether the configuration file was deleted.
++        :rtype: bool
++        """
++        removed = False
++
++        for record in self.registry.scan():
++
++            if record.filename.startswith(name):
++                os.remove(os.path.join(record.config_path, record.filename))
++                removed = not os.path.exists(os.path.join(record.config_path, record.filename))
++                break
++
++        return removed
++
++    def set_state(self, name, enable):
++        """
++        Activates or deactivates the configuration files matching the name.
++
++        :param name: The domain name that corresponds to the file.
++        :type name: str
++        :param enable: Whether the site is activated
++        :type enable: bool
++        """
++        for record in self.registry.scan():
++
++            if record.filename.startswith(name):
++
++                if enable:
++                    new_filename, _ = record.filename.rsplit('.', 1)
++                    os.rename(os.path.join(record.config_path, record.filename),
++                              os.path.join(record.config_path, new_filename))
++                else:
++                    os.rename(os.path.join(record.config_path, record.filename),
++                              os.path.join(record.config_path, record.filename + '.disabled'))
+diff --git a/app/api/endpoints.py b/app/api/endpoints.py
+index df8f9e1..443b0da 100644
+--- a/app/api/endpoints.py
++++ b/app/api/endpoints.py
+@@ -1,9 +1,21 @@
+-import datetime
+ import io
+ import os
+ import flask
+ 
+ from app.api import api
++from app.api.editor import SiteEditor
++from app.api.presenters import DomainOverview
++from app.api.registry import SiteRegistry
++
++
++def site_registry() -> SiteRegistry:
++    """
++    Reads the site registry of the current configuration.
++
++    :return: Registry for the configured site configuration files.
++    :rtype: SiteRegistry
++    """
++    return SiteRegistry(flask.current_app.config['CONFIG_PATH'])
+ 
+ 
+ @api.route('/config/<name>',  methods=['GET'])
+@@ -53,33 +65,9 @@ def get_domains():
+     :return: Rendered HTML document with the domains
+     :rtype: str
+     """
+-    config_path = flask.current_app.config['CONFIG_PATH']
+-    sites_available = []
+-    sites_enabled = []
+-
+-    for _ in os.listdir(config_path):
++    overview = DomainOverview(site_registry())
++    sites_available, sites_enabled = overview.cards()
+ 
+-        if os.path.isfile(os.path.join(config_path, _)):
+-            domain, state = _.rsplit('.', 1)
+-
+-            if state == 'conf':
+-                time = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(config_path, _)))
+-
+-                sites_available.append({
+-                    'name': domain,
+-                    'time': time
+-                })
+-                sites_enabled.append(domain)
+-            elif state == 'disabled':
+-                time = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(config_path, _)))
+-
+-                sites_available.append({
+-                    'name': domain.rsplit('.', 1)[0],
+-                    'time': time
+-                })
+-
+-    # sort sites by name
+-    sites_available = sorted(sites_available, key=lambda _: _['name'])
+     return flask.render_template('domains.html', sites_available=sites_available, sites_enabled=sites_enabled), 200
+ 
+ 
+@@ -95,23 +83,15 @@ def get_domain(name: str):
+     :return: Rendered HTML document with the domain
+     :rtype: str
+     """
+-    config_path = flask.current_app.config['CONFIG_PATH']
+-    _file = ''
+-    enabled = True
+-
+-    for _ in os.listdir(config_path):
+-
+-        if os.path.isfile(os.path.join(config_path, _)):
+-            if _.startswith(name):
+-                domain, state = _.rsplit('.', 1)
++    record = site_registry().find(name)
+ 
+-                if state == 'disabled':
+-                    enabled = False
+-
+-                with io.open(os.path.join(config_path, _), 'r') as f:
+-                    _file = f.read()
++    enabled = True
++    _file = ''
+ 
+-                break
++    if record is not None:
++        _, state = record.filename.rsplit('.', 1)
++        enabled = state != 'disabled'
++        _file = record.content
+ 
+     return flask.render_template('domain.html', name=name, file=_file, enabled=enabled), 200
+ 
+@@ -126,13 +106,11 @@ def post_domain(name: str):
+ 
+     :return: Returns a status about the success or failure of the action.
+     """
+-    config_path = flask.current_app.config['CONFIG_PATH']
++    editor = SiteEditor(site_registry())
+     new_domain = flask.render_template('new_domain.j2', name=name)
+-    name = name + '.conf.disabled'
+ 
+     try:
+-        with io.open(os.path.join(config_path, name), 'w') as f:
+-            f.write(new_domain)
++        editor.create(name, new_domain)
+ 
+         response = flask.jsonify({'success': True}), 201
+     except Exception as ex:
+@@ -151,18 +129,9 @@ def delete_domain(name: str):
+ 
+     :return: Returns a status about the success or failure of the action.
+     """
+-    config_path = flask.current_app.config['CONFIG_PATH']
+-    removed = False
+-
+-    for _ in os.listdir(config_path):
+-
+-        if os.path.isfile(os.path.join(config_path, _)):
+-            if _.startswith(name):
+-                os.remove(os.path.join(config_path, _))
+-                removed = not os.path.exists(os.path.join(config_path, _))
+-                break
++    editor = SiteEditor(site_registry())
+ 
+-    if removed:
++    if editor.remove(name):
+         return flask.jsonify({'success': True}), 200
+     else:
+         return flask.jsonify({'success': False}), 400
+@@ -179,14 +148,9 @@ def put_domain(name: str):
+     :return: Returns a status about the success or failure of the action.
+     """
+     content = flask.request.get_json()
+-    config_path = flask.current_app.config['CONFIG_PATH']
++    editor = SiteEditor(site_registry())
+ 
+-    for _ in os.listdir(config_path):
+-
+-        if os.path.isfile(os.path.join(config_path, _)):
+-            if _.startswith(name):
+-                with io.open(os.path.join(config_path, _), 'w') as f:
+-                    f.write(content['file'])
++    editor.apply_update(name, content['file'])
+ 
+     return flask.make_response({'success': True}), 200
+ 
+@@ -202,16 +166,8 @@ def enable_domain(name: str):
+     :return: Returns a status about the success or failure of the action.
+     """
+     content = flask.request.get_json()
+-    config_path = flask.current_app.config['CONFIG_PATH']
+-
+-    for _ in os.listdir(config_path):
++    editor = SiteEditor(site_registry())
+ 
+-        if os.path.isfile(os.path.join(config_path, _)):
+-            if _.startswith(name):
+-                if content['enable']:
+-                    new_filename, disable = _.rsplit('.', 1)
+-                    os.rename(os.path.join(config_path, _), os.path.join(config_path, new_filename))
+-                else:
+-                    os.rename(os.path.join(config_path, _), os.path.join(config_path, _ + '.disabled'))
++    editor.set_state(name, content['enable'])
+ 
+     return flask.make_response({'success': True}), 200
+diff --git a/app/api/model.py b/app/api/model.py
+new file mode 100644
+index 0000000..66129ba
+--- /dev/null
++++ b/app/api/model.py
+@@ -0,0 +1,25 @@
++"""Domain records for the sites managed by the nginx-ui API."""
++
++
++class Site(object):
++    """
++    A single managed site configuration file in the nginx conf.d directory.
++
++    The record carries the raw facts of the configuration file as they were
++    found on disk. Everything a record knows is stored in its attributes.
++
++    :param config_path: Directory holding the site configuration files
++    :type config_path: str
++    :param filename: Name of the configuration file of the site
++    :type filename: str
++    :param content: Content of the configuration file
++    :type content: str
++    :param modified: Modification time of the configuration file
++    :type modified: datetime.datetime
++    """
++
++    def __init__(self, config_path, filename, content='', modified=None):
++        self.config_path = config_path
++        self.filename = filename
++        self.content = content
++        self.modified = modified
+diff --git a/app/api/presenters.py b/app/api/presenters.py
+new file mode 100644
+index 0000000..0b0f1cf
+--- /dev/null
++++ b/app/api/presenters.py
+@@ -0,0 +1,45 @@
++"""Builds the view payload of the managed domains."""
++
++from app.api.model import Site
++from app.api.registry import SiteRegistry
++
++
++class DomainOverview(object):
++    """
++    Builds the cards and the state of the sites for the domains page.
++
++    :param registry: Registry reading the site configuration files
++    :type registry: SiteRegistry
++    """
++
++    def __init__(self, registry: SiteRegistry):
++        self.registry = registry
++
++    def cards(self):
++        """
++        Reads all site records and checks the state of the site configuration.
++
++        :return: Cards of the sites and the names of the enabled sites.
++        :rtype: tuple
++        """
++        sites_available = []
++        sites_enabled = []
++
++        for record in self.registry.scan():
++            domain, state = record.filename.rsplit('.', 1)
++
++            if state == 'conf':
++                sites_available.append({
++                    'name': domain,
++                    'time': record.modified
++                })
++                sites_enabled.append(domain)
++            elif state == 'disabled':
++                sites_available.append({
++                    'name': domain.rsplit('.', 1)[0],
++                    'time': record.modified
++                })
++
++        # sort sites by name
++        sites_available = sorted(sites_available, key=lambda _: _['name'])
++        return sites_available, sites_enabled
+diff --git a/app/api/registry.py b/app/api/registry.py
+new file mode 100644
+index 0000000..1508f27
+--- /dev/null
++++ b/app/api/registry.py
+@@ -0,0 +1,63 @@
++"""Read access to the directory of the managed site configuration files."""
++
++import datetime
++import io
++import os
++
++from app.api.model import Site
++
++
++class SiteRegistry(object):
++    """
++    Reads the managed site configuration files from the configuration directory.
++
++    :param config_path: Directory holding the site configuration files
++    :type config_path: str
++    """
++
++    def __init__(self, config_path):
++        self.config_path = config_path
++
++    def scan(self):
++        """
++        Reads all regular files of the configuration directory as site records.
++
++        :return: Site record for each regular file of the directory.
++        :rtype: list
++        """
++        records = []
++
++        for _ in os.listdir(self.config_path):
++
++            if os.path.isfile(os.path.join(self.config_path, _)):
++                records.append(Site(
++                    config_path=self.config_path,
++                    filename=_,
++                    content='',
++                    modified=datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(self.config_path, _)))
++                ))
++
++        return records
++
++    def find(self, name):
++        """
++        Reads the site record of the configuration file matching the name.
++
++        The content of the configuration file is loaded into the record.
++
++        :param name: The domain name that corresponds to the file.
++        :type name: str
++
++        :return: Site record of the configuration file or None.
++        :rtype: Site
++        """
++        for record in self.scan():
++
++            if record.filename.startswith(name):
++
++                with io.open(os.path.join(record.config_path, record.filename), 'r') as f:
++                    record.content = f.read()
++
++                return record
++
++        return None
+diff --git a/tests/conftest.py b/tests/conftest.py
+new file mode 100644
+index 0000000..5283c55
+--- /dev/null
++++ b/tests/conftest.py
+@@ -0,0 +1,95 @@
++"""Shared fixtures for the nginx-ui test suite.
++
++The tests drive the application exclusively through the Flask test client so
++that the HTTP contract (routes, status codes, payloads and rendered markup)
++stays the source of truth for behavior.
++"""
++import os
++import sys
++
++REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++if REPO_ROOT not in sys.path:
++    sys.path.insert(0, REPO_ROOT)
++
++import pytest
++
++from app import create_app
++
++SAMPLE_CONF = """server {
++    listen 80;
++    server_name example.com;
++}
++"""
++
++
++def make_site(app, domain, content=SAMPLE_CONF, disabled=False):
++    """Create a site configuration file inside CONFIG_PATH."""
++    suffix = '.conf.disabled' if disabled else '.conf'
++    path = os.path.join(app.config['CONFIG_PATH'], domain + suffix)
++    with open(path, 'w') as f:
++        f.write(content)
++    return path
++
++
++def read_site(app, domain, disabled=False):
++    suffix = '.conf.disabled' if disabled else '.conf'
++    path = os.path.join(app.config['CONFIG_PATH'], domain + suffix)
++    with open(path) as f:
++        return f.read()
++
++
++@pytest.fixture
++def app(tmp_path):
++    """Application instance pointed at a throwaway nginx directory."""
++    application = create_app('default')
++    nginx_root = tmp_path / 'nginx'
++    config_root = nginx_root / 'conf.d'
++    config_root.mkdir(parents=True)
++    application.config['NGINX_PATH'] = str(nginx_root)
++    application.config['CONFIG_PATH'] = str(config_root)
++    return application
++
++
++@pytest.fixture
++def client(app):
++    return app.test_client()
++
++
++@pytest.fixture
++def site_factory(app):
++    """Factory writing site files into the configured nginx tree."""
++
++    def _factory(domain, content=SAMPLE_CONF, disabled=False):
++        return make_site(app, domain, content=content, disabled=disabled)
++
++    return _factory
++
++
++@pytest.fixture
++def site_reader(app):
++    """Read helper for files inside the configured nginx tree."""
++
++    class _Reader(object):
++        def path(self, name, disabled=False):
++            suffix = '.conf.disabled' if disabled else '.conf'
++            return os.path.join(app.config['CONFIG_PATH'], name + suffix)
++
++        def nginx_path(self, name):
++            return os.path.join(app.config['NGINX_PATH'], name)
++
++        def read(self, path):
++            with open(path) as f:
++                return f.read()
++
++        def exists(self, path):
++            return os.path.exists(path)
++
++    return _Reader()
++
++
++@pytest.fixture
++def nginx_paths(app):
++    return {
++        'nginx': app.config['NGINX_PATH'],
++        'config': app.config['CONFIG_PATH'],
++    }
+diff --git a/tests/test_app_factory.py b/tests/test_app_factory.py
+new file mode 100644
+index 0000000..e539167
+--- /dev/null
++++ b/tests/test_app_factory.py
+@@ -0,0 +1,103 @@
++"""Tests for application creation and configuration selection."""
++import flask
++
++from app import create_app
++from config import Config, DevConfig, WorkingConfig, config as config_map
++
++
++class TestCreateApp(object):
++    def test_returns_flask_application(self):
++        application = create_app('default')
++        assert isinstance(application, flask.Flask)
++
++    def test_debug_disabled_for_default_config(self):
++        application = create_app('default')
++        assert application.debug is False
++
++    def test_debug_enabled_for_dev_config(self):
++        application = create_app('dev')
++        assert application.debug is True
++
++    def test_secret_key_generated(self):
++        application = create_app('default')
++        assert application.config['SECRET_KEY']
++
++    def test_secret_key_is_sixty_four_bytes_of_hex(self):
++        application = create_app('default')
++        secret = application.config['SECRET_KEY']
++        assert len(secret) == 128
++        int(secret, 16)
++
++    def test_secret_key_is_shared_within_process(self):
++        first = create_app('default')
++        second = create_app('default')
++        assert first.config['SECRET_KEY'] == second.config['SECRET_KEY']
++
++    def test_default_nginx_paths(self):
++        application = create_app('default')
++        assert application.config['NGINX_PATH'] == '/etc/nginx'
++        assert application.config['CONFIG_PATH'] == '/etc/nginx/conf.d'
++
++
++class TestBlueprints(object):
++    def test_ui_blueprint_mounted_at_root(self, app):
++        with app.test_request_context():
++            assert flask.url_for('ui.index') == '/'
++
++    def test_api_blueprint_mounted_under_api(self, app):
++        with app.test_request_context():
++            assert flask.url_for('api.get_domains') == '/api/domains'
++            assert flask.url_for('api.get_domain', name='example.com') == '/api/domain/example.com'
++
++    def test_ui_index_route_registered(self, app):
++        rules = [r.rule for r in app.url_map.iter_rules()]
++        assert '/' in rules
++
++    def test_api_routes_registered(self, app):
++        rules = [r.rule for r in app.url_map.iter_rules()]
++        assert '/api/domains' in rules
++        assert '/api/config/<name>' in rules
++        assert '/api/domain/<name>' in rules
++        assert '/api/domain/<name>/enable' in rules
++
++    def test_known_methods_registered(self, app):
++        by_rule = {}
++        for rule in app.url_map.iter_rules():
++            by_rule.setdefault(rule.rule, set()).update(rule.methods)
++        assert 'GET' in by_rule['/api/domains']
++        assert 'POST' in by_rule['/api/config/<name>']
++        assert 'DELETE' in by_rule['/api/domain/<name>']
++        assert 'PUT' in by_rule['/api/domain/<name>']
++        assert 'POST' in by_rule['/api/domain/<name>/enable']
++
++
++class TestConfigModule(object):
++    def test_config_map_contains_dev_and_default(self):
++        assert config_map['dev'] is DevConfig
++        assert config_map['default'] is WorkingConfig
++
++    def test_dev_config_inherits_working_config(self):
++        assert issubclass(DevConfig, Config)
++        assert issubclass(WorkingConfig, Config)
++
++    def test_working_config_disables_debug(self):
++        assert WorkingConfig.DEBUG is False
++
++    def test_config_defines_init_app(self):
++        assert callable(Config.init_app)
++        assert callable(DevConfig.init_app)
++
++    def test_init_app_is_a_no_op(self, app):
++        # init_app must not raise for any registered config.
++        for config_class in config_map.values():
++            config_class.init_app(app)
++
++
++class TestMomentExtension(object):
++    def test_moment_extension_initialized(self, app):
++        assert 'moment' in app.extensions
++
++    def test_index_renders_moment_assets(self, client):
++        response = client.get('/')
++        assert response.status_code == 200
++        assert b'moment' in response.data
+diff --git a/tests/test_config_api.py b/tests/test_config_api.py
+new file mode 100644
+index 0000000..0e81cb2
+--- /dev/null
++++ b/tests/test_config_api.py
+@@ -0,0 +1,81 @@
++"""Tests for the main configuration endpoints under /api/config."""
++import os
++
++
++class TestGetConfig(object):
++    def test_returns_rendered_configuration(self, client, site_reader):
++        with open(site_reader.nginx_path('nginx.conf'), 'w') as f:
++            f.write('worker_processes 1;')
++
++        response = client.get('/api/config/nginx.conf')
++        assert response.status_code == 200
++        assert b'worker_processes 1;' in response.data
++
++    def test_header_contains_file_name(self, client, site_reader):
++        with open(site_reader.nginx_path('nginx.conf'), 'w') as f:
++            f.write('events {}')
++
++        response = client.get('/api/config/nginx.conf')
++        assert b'<h1 class="ui header">nginx.conf</h1>' in response.data
++
++    def test_missing_file_fails(self, client):
++        response = client.get('/api/config/missing.conf')
++        assert response.status_code == 500
++
++    def test_directory_target_fails(self, client, site_reader):
++        os.mkdir(site_reader.nginx_path('modules-enabled'))
++        response = client.get('/api/config/modules-enabled')
++        assert response.status_code == 500
++
++    def test_nested_name_has_no_route(self, client):
++        response = client.get('/api/config/sub/nginx.conf')
++        assert response.status_code == 404
++
++    def test_multiline_content_preserved(self, client, site_reader):
++        content = 'line one\nline two\nline three\n'
++        with open(site_reader.nginx_path('long.conf'), 'w') as f:
++            f.write(content)
++
++        response = client.get('/api/config/long.conf')
++        assert response.status_code == 200
++        assert b'line two' in response.data
++
++
++class TestPostConfig(object):
++    def test_writes_content_and_reports_success(self, client, site_reader):
++        response = client.post('/api/config/nginx.conf', json={'file': 'worker_processes 2;'})
++        assert response.status_code == 200
++        assert response.get_json() == {'success': True}
++        assert site_reader.read(site_reader.nginx_path('nginx.conf')) == 'worker_processes 2;'
++
++    def test_overwrites_existing_configuration(self, client, site_reader):
++        with open(site_reader.nginx_path('nginx.conf'), 'w') as f:
++            f.write('worker_processes 1;')
++
++        client.post('/api/config/nginx.conf', json={'file': 'worker_processes 4;'})
++        assert site_reader.read(site_reader.nginx_path('nginx.conf')) == 'worker_processes 4;'
++
++    def test_requires_json_content_type(self, client):
++        response = client.post('/api/config/nginx.conf', data={'file': 'x'})
++        assert response.status_code == 415
++
++    def test_requires_file_key_in_payload(self, client):
++        response = client.post('/api/config/nginx.conf', json={'other': 'x'})
++        assert response.status_code == 500
++
++    def test_nested_name_has_no_route(self, client):
++        response = client.post('/api/config/sub/nginx.conf', json={'file': 'x'})
++        assert response.status_code == 404
++
++    def test_write_to_directory_target_fails(self, client, site_reader):
++        os.mkdir(site_reader.nginx_path('blocking'))
++        response = client.post('/api/config/blocking', json={'file': 'x'})
++        assert response.status_code == 500
++
++    def test_roundtrip_write_and_read(self, client, site_reader):
++        content = 'worker_processes auto;\n\n# managed by nginx-ui\n'
++        client.post('/api/config/round.conf', json={'file': content})
++
++        response = client.get('/api/config/round.conf')
++        assert response.status_code == 200
++        assert b'# managed by nginx-ui' in response.data
+diff --git a/tests/test_domain_api.py b/tests/test_domain_api.py
+new file mode 100644
+index 0000000..3c47464
+--- /dev/null
++++ b/tests/test_domain_api.py
+@@ -0,0 +1,273 @@
++"""Tests for the per-site lifecycle endpoints under /api/domain."""
++import os
++
++
++class TestGetDomain(object):
++    def test_enabled_site_returns_content(self, client, site_factory):
++        site_factory('example.com', content='server_name example.com;')
++        response = client.get('/api/domain/example.com')
++        assert response.status_code == 200
++        assert b'server_name example.com;' in response.data
++
++    def test_header_contains_domain_name(self, client, site_factory):
++        site_factory('example.com')
++        response = client.get('/api/domain/example.com')
++        assert b'<h1 class="ui header">example.com</h1>' in response.data
++
++    def test_disabled_site_marks_disabled(self, client, site_factory):
++        site_factory('example.com', disabled=True)
++        response = client.get('/api/domain/example.com')
++        assert response.status_code == 200
++        assert b'Enable' in response.data
++        assert b'Disable' not in response.data
++
++    def test_enabled_site_marks_enabled(self, client, site_factory):
++        site_factory('example.com')
++        response = client.get('/api/domain/example.com')
++        assert b'Disable' in response.data
++
++    def test_missing_site_renders_empty_document(self, client):
++        response = client.get('/api/domain/missing.com')
++        assert response.status_code == 200
++        assert b'<h1 class="ui header">missing.com</h1>' in response.data
++        assert b'id="file-content"' in response.data
++
++    def test_missing_site_defaults_to_enabled(self, client):
++        response = client.get('/api/domain/missing.com')
++        assert b'Disable' in response.data
++
++    def test_directory_with_site_name_is_ignored(self, client, nginx_paths):
++        os.mkdir(os.path.join(nginx_paths['config'], 'assets.conf'))
++        response = client.get('/api/domain/assets')
++        assert response.status_code == 200
++        assert b'id="file-content"' in response.data
++
++    def test_content_preserved_verbatim(self, client, site_factory):
++        content = 'location / {\n    proxy_pass http://127.0.0.1:8080;\n}\n'
++        site_factory('example.com', content=content)
++        response = client.get('/api/domain/example.com')
++        assert b'proxy_pass http://127.0.0.1:8080;' in response.data
++
++
++class TestPostDomain(object):
++    def test_creates_disabled_site_by_default(self, client, site_reader):
++        response = client.post('/api/domain/example.com')
++        assert response.status_code == 201
++        assert response.get_json() == {'success': True}
++        assert site_reader.exists(site_reader.path('example.com', disabled=True))
++        assert not site_reader.exists(site_reader.path('example.com'))
++
++    def test_rendered_configuration_references_domain(self, client, site_reader):
++        client.post('/api/domain/example.com')
++        content = site_reader.read(site_reader.path('example.com', disabled=True))
++        assert 'server_name     example.com,' in content
++        assert 'access_log      logs/example.com.access.log main;' in content
++        assert 'proxy_pass      http://127.0.0.1:8080;' in content
++
++    def test_created_site_starts_disabled_in_listing(self, client, site_factory):
++        client.post('/api/domain/example.com')
++        response = client.get('/api/domains')
++        assert 'green icon' not in response.data.decode('utf-8')
++
++    def test_multi_label_domain_created(self, client, site_reader):
++        response = client.post('/api/domain/shop.example.co.uk')
++        assert response.status_code == 201
++        assert site_reader.exists(site_reader.path('shop.example.co.uk', disabled=True))
++
++    def test_existing_enabled_site_is_left_alone(self, client, site_factory, site_reader):
++        site_factory('example.com', content='original rule;')
++        client.post('/api/domain/example.com')
++        assert site_reader.read(site_reader.path('example.com')) == 'original rule;'
++        assert site_reader.exists(site_reader.path('example.com', disabled=True))
++
++    def test_create_conflict_reports_failure(self, client, nginx_paths):
++        os.mkdir(os.path.join(nginx_paths['config'], 'blocked.com.conf.disabled'))
++        response = client.post('/api/domain/blocked.com')
++        assert response.status_code == 500
++        assert response.get_json() is None
++
++    def test_created_site_needs_enabling(self, client, site_reader):
++        client.post('/api/domain/example.com')
++        response = client.get('/api/domain/example.com')
++        # The disabled site is listed with its content and can be enabled.
++        assert response.status_code == 200
++        assert site_reader.exists(site_reader.path('example.com', disabled=True))
++
++
++class TestDeleteDomain(object):
++    def test_removes_enabled_site(self, client, site_factory, site_reader):
++        site_factory('example.com')
++        response = client.delete('/api/domain/example.com')
++        assert response.status_code == 200
++        assert response.get_json() == {'success': True}
++        assert not site_reader.exists(site_reader.path('example.com'))
++
++    def test_removes_disabled_site(self, client, site_factory, site_reader):
++        site_factory('example.com', disabled=True)
++        response = client.delete('/api/domain/example.com')
++        assert response.status_code == 200
++        assert not site_reader.exists(site_reader.path('example.com', disabled=True))
++
++    def test_missing_site_reports_failure(self, client):
++        response = client.delete('/api/domain/missing.com')
++        assert response.status_code == 400
++        assert response.get_json() == {'success': False}
++
++    def test_directory_with_site_name_is_not_removed(self, client, nginx_paths):
++        target = os.path.join(nginx_paths['config'], 'assets.conf')
++        os.mkdir(target)
++        response = client.delete('/api/domain/assets')
++        assert response.status_code == 400
++        assert os.path.isdir(target)
++
++    def test_delete_unknown_state_file(self, client, site_factory, site_reader):
++        path = site_factory('example.com')
++        response = client.delete('/api/domain/example.com')
++        assert response.status_code == 200
++        assert not site_reader.exists(path)
++
++    def test_other_sites_are_untouched(self, client, site_factory, site_reader):
++        site_factory('gone.com')
++        site_factory('stays.com')
++        client.delete('/api/domain/gone.com')
++        assert site_reader.exists(site_reader.path('stays.com'))
++
++
++class TestPutDomain(object):
++    def test_updates_enabled_site(self, client, site_factory, site_reader):
++        site_factory('example.com', content='old;')
++        response = client.put('/api/domain/example.com', json={'file': 'new;'})
++        assert response.status_code == 200
++        assert response.get_json() == {'success': True}
++        assert site_reader.read(site_reader.path('example.com')) == 'new;'
++
++    def test_updates_disabled_site(self, client, site_factory, site_reader):
++        site_factory('example.com', disabled=True, content='old;')
++        client.put('/api/domain/example.com', json={'file': 'new;'})
++        assert site_reader.read(site_reader.path('example.com', disabled=True)) == 'new;'
++        assert not site_reader.exists(site_reader.path('example.com'))
++
++    def test_missing_target_still_reports_success(self, client):
++        response = client.put('/api/domain/missing.com', json={'file': 'new;'})
++        assert response.status_code == 200
++        assert response.get_json() == {'success': True}
++
++    def test_requires_json_content_type(self, client, site_factory):
++        site_factory('example.com')
++        response = client.put('/api/domain/example.com', data={'file': 'new;'})
++        assert response.status_code == 415
++
++    def test_requires_file_key_in_payload(self, client, site_factory):
++        site_factory('example.com')
++        response = client.put('/api/domain/example.com', json={'content': 'new;'})
++        assert response.status_code == 500
++
++    def test_directories_are_never_updated(self, client, nginx_paths):
++        target = os.path.join(nginx_paths['config'], 'assets.conf')
++        os.mkdir(target)
++        response = client.put('/api/domain/assets', json={'file': 'new;'})
++        assert response.status_code == 200
++        assert os.path.isdir(target)
++
++    def test_update_visible_on_domain_page(self, client, site_factory):
++        site_factory('example.com')
++        client.put('/api/domain/example.com', json={'file': 'updated rule;'})
++        response = client.get('/api/domain/example.com')
++        assert b'updated rule;' in response.data
++
++
++class TestEnableDomain(object):
++    def test_enabling_disabled_site(self, client, site_factory, site_reader):
++        site_factory('example.com', disabled=True)
++        response = client.post('/api/domain/example.com/enable', json={'enable': True})
++        assert response.status_code == 200
++        assert response.get_json() == {'success': True}
++        assert site_reader.exists(site_reader.path('example.com'))
++        assert not site_reader.exists(site_reader.path('example.com', disabled=True))
++
++    def test_disabling_enabled_site(self, client, site_factory, site_reader):
++        site_factory('example.com')
++        response = client.post('/api/domain/example.com/enable', json={'enable': False})
++        assert response.status_code == 200
++        assert site_reader.exists(site_reader.path('example.com', disabled=True))
++        assert not site_reader.exists(site_reader.path('example.com'))
++
++    def test_enable_reflected_in_domain_page(self, client, site_factory):
++        site_factory('example.com', disabled=True)
++        client.post('/api/domain/example.com/enable', json={'enable': True})
++        response = client.get('/api/domain/example.com')
++        assert b'Disable' in response.data
++
++    def test_disable_adds_single_disabled_suffix(self, client, site_factory, site_reader):
++        site_factory('example.com')
++        client.post('/api/domain/example.com/enable', json={'enable': False})
++        assert site_reader.exists(site_reader.path('example.com', disabled=True))
++
++    def test_missing_site_reports_success_without_changes(self, client, site_reader):
++        response = client.post('/api/domain/missing.com/enable', json={'enable': True})
++        assert response.status_code == 200
++        assert response.get_json() == {'success': True}
++
++    def test_requires_json_content_type(self, client, site_factory):
++        site_factory('example.com', disabled=True)
++        response = client.post('/api/domain/example.com/enable', data={'enable': True})
++        assert response.status_code == 415
++
++    def test_requires_enable_key_in_payload(self, client, site_factory):
++        site_factory('example.com', disabled=True)
++        response = client.post('/api/domain/example.com/enable', json={'state': True})
++        assert response.status_code == 500
++
++    def test_enabling_missing_key_leaves_state_alone(self, client, site_factory, site_reader):
++        site_factory('example.com', disabled=True)
++        client.post('/api/domain/example.com/enable', json={'enable': True})
++        client.post('/api/domain/example.com/enable', json={'enable': False})
++        assert site_reader.exists(site_reader.path('example.com', disabled=True))
++
++    def test_directories_are_never_renamed(self, client, nginx_paths):
++        target = os.path.join(nginx_paths['config'], 'assets.conf')
++        os.mkdir(target)
++        response = client.post('/api/domain/assets/enable', json={'enable': True})
++        assert response.status_code == 200
++        assert os.path.isdir(target)
++
++
++class TestDomainLifecycle(object):
++    def test_full_lifecycle(self, client, site_reader):
++        # create
++        assert client.post('/api/domain/example.com').status_code == 201
++        # read while disabled
++        response = client.get('/api/domain/example.com')
++        assert b'Enable' in response.data
++        # enable
++        client.post('/api/domain/example.com/enable', json={'enable': True})
++        assert site_reader.read(site_reader.path('example.com')) != ''
++        # update
++        client.put('/api/domain/example.com', json={'file': 'updated;'})
++        assert site_reader.read(site_reader.path('example.com')) == 'updated;'
++        # read while enabled
++        response = client.get('/api/domain/example.com')
++        assert b'updated;' in response.data
++        assert b'Disable' in response.data
++        # disable
++        client.post('/api/domain/example.com/enable', json={'enable': False})
++        assert site_reader.exists(site_reader.path('example.com', disabled=True))
++        # remove
++        response = client.delete('/api/domain/example.com')
++        assert response.status_code == 200
++        assert not site_reader.exists(site_reader.path('example.com', disabled=True))
++
++    def test_two_sites_manipulated_independently(self, client, site_reader):
++        client.post('/api/domain/alpha.com')
++        client.post('/api/domain/beta.com')
++        client.post('/api/domain/alpha.com/enable', json={'enable': True})
++        assert site_reader.exists(site_reader.path('alpha.com'))
++        assert site_reader.exists(site_reader.path('beta.com', disabled=True))
++
++    def test_listing_state_follows_enable_toggle(self, client, site_reader):
++        client.post('/api/domain/example.com')
++        assert 'green icon' not in client.get('/api/domains').data.decode('utf-8')
++        client.post('/api/domain/example.com/enable', json={'enable': True})
++        assert 'green icon' in client.get('/api/domains').data.decode('utf-8')
++        client.post('/api/domain/example.com/enable', json={'enable': False})
++        assert 'green icon' not in client.get('/api/domains').data.decode('utf-8')
+diff --git a/tests/test_domains_api.py b/tests/test_domains_api.py
+new file mode 100644
+index 0000000..39aab03
+--- /dev/null
++++ b/tests/test_domains_api.py
+@@ -0,0 +1,113 @@
++"""Tests for the site listing endpoint GET /api/domains."""
++import os
++
++
++def site_cards(html):
++    """Return the list of domain names shown on the cards, in order."""
++    import re
++
++    names = re.findall(r"fetch_domain\('([^']+)'\)", html)
++    return [name for name in names if name]
++
++
++class TestGetDomains(object):
++    def test_empty_directory_renders_no_cards(self, client):
++        response = client.get('/api/domains')
++        assert response.status_code == 200
++        assert site_cards(response.data.decode('utf-8')) == []
++        assert b'id="domain_cards"' in response.data
++
++    def test_enabled_site_is_listed(self, client, site_factory):
++        site_factory('example.com')
++        response = client.get('/api/domains')
++        assert site_cards(response.data.decode('utf-8')) == ['example.com']
++
++    def test_disabled_site_is_listed(self, client, site_factory):
++        site_factory('example.com', disabled=True)
++        response = client.get('/api/domains')
++        assert site_cards(response.data.decode('utf-8')) == ['example.com']
++
++    def test_enabled_and_disabled_both_listed(self, client, site_factory):
++        site_factory('live.com')
++        site_factory('down.com', disabled=True)
++        response = client.get('/api/domains')
++        assert site_cards(response.data.decode('utf-8')) == ['down.com', 'live.com']
++
++    def test_sites_sorted_by_name(self, client, site_factory):
++        site_factory('zebra.com')
++        site_factory('aardvark.com')
++        site_factory('mule.com')
++        response = client.get('/api/domains')
++        assert site_cards(response.data.decode('utf-8')) == [
++            'aardvark.com', 'mule.com', 'zebra.com',
++        ]
++
++    def test_sorting_is_by_domain_not_by_extension(self, client, site_factory):
++        site_factory('zulu.com', disabled=True)
++        site_factory('alpha.com')
++        response = client.get('/api/domains')
++        assert site_cards(response.data.decode('utf-8')) == ['alpha.com', 'zulu.com']
++
++    def test_enabled_site_shows_active_icon(self, client, site_factory):
++        site_factory('example.com')
++        response = client.get('/api/domains')
++        html = response.data.decode('utf-8')
++        assert 'green icon' in html
++        assert 'outline grey icon' not in html
++
++    def test_disabled_site_shows_inactive_icon(self, client, site_factory):
++        site_factory('example.com', disabled=True)
++        response = client.get('/api/domains')
++        html = response.data.decode('utf-8')
++        assert 'outline grey icon' in html
++        assert 'green icon' not in html
++
++    def test_mixed_states_show_both_icons(self, client, site_factory):
++        site_factory('live.com')
++        site_factory('down.com', disabled=True)
++        response = client.get('/api/domains')
++        html = response.data.decode('utf-8')
++        assert 'green icon' in html
++        assert 'outline grey icon' in html
++
++    def test_multi_label_domain_names_listed(self, client, site_factory):
++        site_factory('shop.example.co.uk')
++        response = client.get('/api/domains')
++        assert site_cards(response.data.decode('utf-8')) == ['shop.example.co.uk']
++
++    def test_unrelated_extensions_are_ignored(self, client, site_factory, nginx_paths):
++        with open(os.path.join(nginx_paths['config'], 'README.txt'), 'w') as f:
++            f.write('notes')
++        with open(os.path.join(nginx_paths['config'], 'backup.bak'), 'w') as f:
++            f.write('backup')
++
++        response = client.get('/api/domains')
++        assert site_cards(response.data.decode('utf-8')) == []
++
++    def test_directories_are_ignored(self, client, nginx_paths):
++        os.mkdir(os.path.join(nginx_paths['config'], 'assets.conf'))
++
++        response = client.get('/api/domains')
++        assert site_cards(response.data.decode('utf-8')) == []
++
++    def test_updated_timestamp_rendered(self, client, site_factory):
++        site_factory('example.com')
++        response = client.get('/api/domains')
++        assert b'Updated' in response.data
++
++    def test_content_of_cards_fragment(self, client, site_factory):
++        site_factory('example.com')
++        response = client.get('/api/domains')
++        assert b'id="domain_cards"' in response.data
++        assert b'onclick="fetch_domain' in response.data
++
++    def test_listing_reflects_new_file_on_second_request(self, client, site_factory):
++        assert site_cards(client.get('/api/domains').data.decode('utf-8')) == []
++        site_factory('example.com')
++        assert site_cards(client.get('/api/domains').data.decode('utf-8')) == ['example.com']
++
++    def test_listing_reflects_removed_file_on_second_request(self, client, site_factory, nginx_paths):
++        path = site_factory('example.com')
++        assert site_cards(client.get('/api/domains').data.decode('utf-8')) == ['example.com']
++        os.remove(path)
++        assert site_cards(client.get('/api/domains').data.decode('utf-8')) == []
+diff --git a/tests/test_index.py b/tests/test_index.py
+new file mode 100644
+index 0000000..c016901
+--- /dev/null
++++ b/tests/test_index.py
+@@ -0,0 +1,58 @@
++"""Tests for the UI index page delivered by app.ui.views.index."""
++import os
++import re
++
++CONFIG_ITEM = re.compile(r'<div class="config item">([^<]+)</div>')
++
++
++class TestIndexPage(object):
++    def test_returns_home_page(self, client):
++        response = client.get('/')
++        assert response.status_code == 200
++        assert b'<title>Nginx UI</title>' in response.data
++
++    def test_lists_regular_files_only(self, client, nginx_paths):
++        with open(os.path.join(nginx_paths['nginx'], 'nginx.conf'), 'w') as f:
++            f.write('events {}')
++        os.mkdir(os.path.join(nginx_paths['nginx'], 'sites-available'))
++        os.mkdir(os.path.join(nginx_paths['nginx'], 'modules-enabled'))
++
++        response = client.get('/')
++        names = CONFIG_ITEM.findall(response.data.decode('utf-8'))
++        assert names == ['nginx.conf']
++
++    def test_lists_all_files_regardless_of_order(self, client, nginx_paths):
++        for name in ('nginx.conf', 'koi-encrypted.cert', 'mime.types'):
++            with open(os.path.join(nginx_paths['nginx'], name), 'w') as f:
++                f.write('data')
++
++        response = client.get('/')
++        assert sorted(CONFIG_ITEM.findall(response.data.decode('utf-8'))) == [
++            'koi-encrypted.cert', 'mime.types', 'nginx.conf',
++        ]
++
++    def test_empty_nginx_directory_renders_no_menu_entries(self, client):
++        response = client.get('/')
++        assert response.status_code == 200
++        assert CONFIG_ITEM.findall(response.data.decode('utf-8')) == []
++
++    def test_files_with_dots_are_preserved_verbatim(self, client, nginx_paths):
++        with open(os.path.join(nginx_paths['nginx'], 'main.v2.conf'), 'w') as f:
++            f.write('data')
++
++        response = client.get('/')
++        assert CONFIG_ITEM.findall(response.data.decode('utf-8')) == ['main.v2.conf']
++
++    def test_static_assets_referenced(self, client):
++        response = client.get('/')
++        assert b'semantic.min.css' in response.data
++        assert b'nginx.png' in response.data
++
++    def test_navigation_links_present(self, client):
++        response = client.get('/')
++        assert b'id="edit_config"' in response.data
++        assert b'id="domains"' in response.data
++
++    def test_index_content_type_is_html(self, client):
++        response = client.get('/')
++        assert response.content_type == 'text/html; charset=utf-8'
+diff --git a/tests/test_wsgi.py b/tests/test_wsgi.py
+new file mode 100644
+index 0000000..3a9eadb
+--- /dev/null
++++ b/tests/test_wsgi.py
+@@ -0,0 +1,21 @@
++"""Tests for the wsgi entry point used by the application server."""
++import flask
++
++
++class TestWsgiEntryPoint(object):
++    def test_module_exposes_application(self):
++        import wsgi
++
++        assert isinstance(wsgi.app, flask.Flask)
++
++    def test_application_uses_default_config(self):
++        import wsgi
++
++        assert wsgi.app.config['DEBUG'] is False
++        assert wsgi.app.config['NGINX_PATH'] == '/etc/nginx'
++        assert wsgi.app.config['CONFIG_PATH'] == '/etc/nginx/conf.d'
++
++    def test_application_has_secret_key(self):
++        import wsgi
++
++        assert wsgi.app.config['SECRET_KEY']

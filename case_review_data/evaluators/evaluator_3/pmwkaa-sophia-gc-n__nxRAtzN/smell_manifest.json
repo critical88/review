@@ -1,0 +1,146 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Clang-Tidy",
+  "smell_type": "god_classes",
+  "rule": {
+    "id": "scheduler-foreign-responsibility-cascade",
+    "description": "A method of the maintenance scheduler 'sc' class (struct sc and its sc_ method family, defined in sophia/scheduler/*.c) is flagged when it is oversized for dispatch purposes (clang-tidy readability-function-size, StatementThreshold=23) and its parameter interface is compiler-verified to bind a foreign engine record family (index si*/siplan*, version sv*, wal sw*, page format sd*, format sf*, object so*, environment se*, repository sy*, transaction sx*). Scheduler satellites (scdb, sctask, scworker, scworkerpool, scconf, scprofiler), runtime (sr*) and std (ss*) records do not count as foreign."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "sophia/scheduler/sc_plan.c",
+      "class_name": "sc",
+      "function_name": "sc_plan"
+    },
+    {
+      "id": "E2",
+      "file_path": "sophia/scheduler/sc_profile.c",
+      "class_name": "sc",
+      "function_name": "sc_profile"
+    },
+    {
+      "id": "E3",
+      "file_path": "sophia/scheduler/sc_log.c",
+      "class_name": "sc",
+      "function_name": "sc_logmaint"
+    },
+    {
+      "id": "E4",
+      "file_path": "sophia/scheduler/sc_plan.c",
+      "class_name": "sc",
+      "function_name": "sc_plantrace"
+    },
+    {
+      "id": "E5",
+      "file_path": "sophia/scheduler/sc_profiler.h",
+      "class_name": "scprofiler",
+      "function_name": null
+    }
+  ],
+  "injected_match_count": 3,
+  "checks": [
+    {
+      "id": "oversized-scheduler-method-binds-foreign-engine-record",
+      "description": "Detect scheduler methods that are large enough to be policy logic rather than dispatch and whose working state is a foreign engine's record. Parameter families are established from the compiler's own argument-type diagnostics on synthesized call sites against each detected method, so the foreign binding is structural, not name matching.",
+      "detected_relation": "oversized sc method (>= 24 statements) -> foreign engine record parameter (siplan*/si*, swmanager*)",
+      "why_this_is_the_smell": "The maintenance scheduler is supposed to coordinate engines through their public interfaces and own only task selection, ordering and worker admission. When a scheduler method carries entire foreign maintenance policies and is handed the foreign engine's own records as working state, the scheduling class absorbs responsibilities that change for different reasons: matching conditions over index node internals, statistics computed from index headers, and log file lifecycle rules. Size without the foreign binding is ordinary local composition; the combination marks the responsibility cascade.",
+      "matches": [
+        {
+          "file": "sophia/scheduler/sc_plan.c",
+          "symbol": "sc_plan",
+          "entry_ids": [
+            "E1"
+          ],
+          "evidence": "Scheduler method implements the index engine's complete maintenance-plan cascade inline: a six-way switch over index plan types peeking the index rank-queue, per-node matching conditions (LSN bounds, cache-per-node watermark, duplicated-key ratio, expire timestamps, backup bounds, delayed node-gc list), locked-node retry handling, node locking and the backup-end fallback. The index component's dispatch and peek procedures were removed at the same time; the trace renderer for plans was re-homed beside it (E4). It takes the per-database scheduling record as the carrier for the foreign index record (db->index dereferenced inside).",
+          "measurement": {
+            "statements": 124,
+            "statement_threshold": 23,
+            "decl_line": 51,
+            "foreign_parameters": [
+              "siplan * (index planning record)"
+            ],
+            "absorbed_owner": "index"
+          }
+        },
+        {
+          "file": "sophia/scheduler/sc_profile.c",
+          "symbol": "sc_profile",
+          "entry_ids": [
+            "E2",
+            "E5"
+          ],
+          "evidence": "Scheduler method computes a database statistics snapshot by walking the index rb-tree under the index lock, reading node header fields (stored and in-memory keys, duplicated keys, index size helpers, page counts) and index read counters, after copying scheduler state under the scheduler's own mutex. The statistics are accumulated into a scheduler-side record that was redefined to describe index internals (E5), replacing the index component's statistics module and record type, which were removed entirely.",
+          "measurement": {
+            "statements": 31,
+            "statement_threshold": 23,
+            "decl_line": 22,
+            "foreign_parameters": [
+              "si * (index engine record)"
+            ],
+            "absorbed_owner": "index"
+          }
+        },
+        {
+          "file": "sophia/scheduler/sc_log.c",
+          "symbol": "sc_logmaint",
+          "entry_ids": [
+            "E3"
+          ],
+          "evidence": "Scheduler method owns the write-ahead-log maintenance policy: for rotation it reads the active log file's garbage-collection state under the log manager's spinlock and decides against the rotation watermark whether a new file is opened; for garbage collection it sweeps the manager's file list under the same spinlock and unlinks completed files through wal's wreckage primitive. The manager's own rotation-readiness decision was removed from wal, while the rotate and gc commands it still serves for external callers remain there, leaving one maintenance rule split across two components.",
+          "measurement": {
+            "statements": 51,
+            "statement_threshold": 23,
+            "decl_line": 22,
+            "foreign_parameters": [
+              "swmanager * (wal manager record)"
+            ],
+            "absorbed_owner": "wal"
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "file": "sophia/scheduler/sc_step.c",
+      "symbol": "sc_do",
+      "reason": "70 statements, but its interface binds only scheduler records (sc*, sctask*): scheduler-local task selection and periodic scheduling, not an absorbed foreign responsibility."
+    },
+    {
+      "file": "sophia/scheduler/sc_step.c",
+      "symbol": "sc_step",
+      "reason": "37 statements, interface binds only scheduler records (sc*, scworker*): per-worker step composition."
+    },
+    {
+      "file": "sophia/scheduler/sc_backup.c",
+      "symbol": "sc_backupbegin",
+      "reason": "34 statements, interface binds only scheduler records (sc*, scdb*, sctask*, scworker*): backup procedure, already scheduling-local."
+    },
+    {
+      "file": "sophia/scheduler/sc_backup.c",
+      "symbol": "sc_backupend",
+      "reason": "29 statements, interface binds only scheduler and runtime records (sc*, scdb*, scworker*, sr*): backup completion procedure."
+    },
+    {
+      "file": "sophia/scheduler/sc_commit.c",
+      "symbol": "sc_commit",
+      "reason": "22 statements, below the size clause (threshold 23). Although it binds a transaction log record, the committing step is scheduling work; thin interface use at this size is coordination, not an absorbed policy."
+    },
+    {
+      "file": "sophia/scheduler/sc.c",
+      "symbol": "sc_init",
+      "reason": "19 statements, below the size clause; constructor wiring to the work manager and log manager is initialization coordination."
+    },
+    {
+      "file": "sophia/scheduler/sc_plan.c",
+      "symbol": "sc_plantrace",
+      "reason": "20 statements, below the size clause: single-purpose plan rendering re-homed beside the absorbed cascade (E4). Credited as part of entry E1's cluster, not as an independent policy match."
+    },
+    {
+      "file": "sophia/scheduler/sc_step.c",
+      "symbol": "sc_plan_queue",
+      "reason": "5 statements; admission wrapper keeping per-queue worker limits in the scheduler (genuinely scheduler-local responsibility), delegating the maintenance decision outward."
+    }
+  ]
+}

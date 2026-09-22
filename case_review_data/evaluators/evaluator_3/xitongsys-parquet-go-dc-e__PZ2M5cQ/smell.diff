@@ -1,0 +1,425 @@
+diff --git a/layout/chunk.go b/layout/chunk.go
+index d340895..c010cb4 100644
+--- a/layout/chunk.go
++++ b/layout/chunk.go
+@@ -15,14 +15,14 @@ type Chunk struct {
+ }
+ 
+ //Convert several pages to one chunk
+-func PagesToChunk(pages []*Page) *Chunk {
++func PagesToChunk(pages []*Page, maxVals []interface{}, minVals []interface{}, nullCounts []*int64) *Chunk {
+ 	ln := len(pages)
+ 	var numValues int64 = 0
+ 	var totalUncompressedSize int64 = 0
+ 	var totalCompressedSize int64 = 0
+ 
+-	var maxVal interface{} = pages[0].MaxVal
+-	var minVal interface{} = pages[0].MinVal
++	var maxVal interface{} = maxVals[0]
++	var minVal interface{} = minVals[0]
+ 	var nullCount int64 = 0
+ 	pT, cT, logT, omitStats := pages[0].Schema.Type, pages[0].Schema.ConvertedType, pages[0].Schema.LogicalType, pages[0].Info.OmitStats
+ 	funcTable := common.FindFuncTable(pT, cT, logT)
+@@ -36,9 +36,9 @@ func PagesToChunk(pages []*Page) *Chunk {
+ 		totalUncompressedSize += int64(pages[i].Header.UncompressedPageSize) + int64(len(pages[i].RawData)) - int64(pages[i].Header.CompressedPageSize)
+ 		totalCompressedSize += int64(len(pages[i].RawData))
+ 		if !omitStats {
+-			minVal = common.Min(funcTable, minVal, pages[i].MinVal)
+-			maxVal = common.Max(funcTable, maxVal, pages[i].MaxVal)
+-			nullCount += *pages[i].NullCount
++			minVal = common.Min(funcTable, minVal, minVals[i])
++			maxVal = common.Max(funcTable, maxVal, maxVals[i])
++			nullCount += *nullCounts[i]
+ 		}
+ 	}
+ 
+@@ -80,7 +80,7 @@ func PagesToChunk(pages []*Page) *Chunk {
+ }
+ 
+ //Convert several pages to one chunk with dict page first
+-func PagesToDictChunk(pages []*Page) *Chunk {
++func PagesToDictChunk(pages []*Page, maxVals []interface{}, minVals []interface{}, nullCounts []*int64) *Chunk {
+ 	if len(pages) < 2 {
+ 		return nil
+ 	}
+@@ -88,8 +88,8 @@ func PagesToDictChunk(pages []*Page) *Chunk {
+ 	var totalUncompressedSize int64 = 0
+ 	var totalCompressedSize int64 = 0
+ 
+-	var maxVal interface{} = pages[1].MaxVal
+-	var minVal interface{} = pages[1].MinVal
++	var maxVal interface{} = maxVals[1]
++	var minVal interface{} = minVals[1]
+ 	var nullCount int64 = 0
+ 	pT, cT, logT, omitStats := pages[1].Schema.Type, pages[1].Schema.ConvertedType, pages[1].Schema.LogicalType, pages[1].Info.OmitStats
+ 	funcTable := common.FindFuncTable(pT, cT, logT)
+@@ -103,9 +103,9 @@ func PagesToDictChunk(pages []*Page) *Chunk {
+ 		totalUncompressedSize += int64(pages[i].Header.UncompressedPageSize) + int64(len(pages[i].RawData)) - int64(pages[i].Header.CompressedPageSize)
+ 		totalCompressedSize += int64(len(pages[i].RawData))
+ 		if !omitStats && i > 0 {
+-			minVal = common.Min(funcTable, minVal, pages[i].MinVal)
+-			maxVal = common.Max(funcTable, maxVal, pages[i].MaxVal)
+-			nullCount += *pages[i].NullCount
++			minVal = common.Min(funcTable, minVal, minVals[i])
++			maxVal = common.Max(funcTable, maxVal, maxVals[i])
++			nullCount += *nullCounts[i]
+ 		}
+ 	}
+ 
+diff --git a/layout/dictpage.go b/layout/dictpage.go
+index 1f7941e..a12042f 100644
+--- a/layout/dictpage.go
++++ b/layout/dictpage.go
+@@ -71,10 +71,13 @@ func (page *Page) DictPageCompress(compressType parquet.CompressionCodec, pT par
+ }
+ 
+ //Convert a table to dict data pages
+-func TableToDictDataPages(dictRec *DictRecType, table *Table, pageSize int32, bitWidth int32, compressType parquet.CompressionCodec) ([]*Page, int64) {
++func TableToDictDataPages(dictRec *DictRecType, table *Table, pageSize int32, bitWidth int32, compressType parquet.CompressionCodec) ([]*Page, []interface{}, []interface{}, []*int64, int64) {
+ 	var totSize int64 = 0
+ 	totalLn := len(table.Values)
+ 	res := make([]*Page, 0)
++	maxVals := make([]interface{}, 0)
++	minVals := make([]interface{}, 0)
++	nullCounts := make([]*int64, 0)
+ 	i := 0
+ 
+ 	pT, cT, logT, omitStats := table.Schema.Type, table.Schema.ConvertedType, table.Schema.LogicalType, table.Info.OmitStats
+@@ -132,27 +135,33 @@ func TableToDictDataPages(dictRec *DictRecType, table *Table, pageSize int32, bi
+ 		//Values in DataTable of a DictPage is nil for optimization.
+ 		//page.DataTable.Values = values
+ 
++		var pageMaxVal interface{}
++		var pageMinVal interface{}
++		var pageNullCount *int64
+ 		if !omitStats {
+-			page.MaxVal = maxVal
+-			page.MinVal = minVal
+-			page.NullCount = &nullCount
++			pageMaxVal, pageMinVal = maxVal, minVal
++			pageNullCount = &nullCount
+ 		}
+ 		page.Schema = table.Schema
+ 		page.CompressType = compressType
+ 		page.Path = table.Path
+ 		page.Info = table.Info
+ 
+-		page.DictDataPageCompress(compressType, bitWidth, values)
++		maxVals = append(maxVals, pageMaxVal)
++		minVals = append(minVals, pageMinVal)
++		nullCounts = append(nullCounts, pageNullCount)
++
++		page.DictDataPageCompress(compressType, bitWidth, values, pageMaxVal, pageMinVal, pageNullCount)
+ 
+ 		totSize += int64(len(page.RawData))
+ 		res = append(res, page)
+ 		i = j
+ 	}
+-	return res, totSize
++	return res, maxVals, minVals, nullCounts, totSize
+ }
+ 
+ //Compress the data page to parquet file
+-func (page *Page) DictDataPageCompress(compressType parquet.CompressionCodec, bitWidth int32, values []int32) []byte {
++func (page *Page) DictDataPageCompress(compressType parquet.CompressionCodec, bitWidth int32, values []int32, maxVal interface{}, minVal interface{}, nullCount *int64) []byte {
+ 	//values////////////////////////////////////////////
+ 	valuesRawBuf := []byte{byte(bitWidth)}
+ 	valuesRawBuf = append(valuesRawBuf, encoding.WriteRLEInt32(values, bitWidth)...)
+@@ -193,16 +202,16 @@ func (page *Page) DictDataPageCompress(compressType parquet.CompressionCodec, bi
+ 	page.Header.DataPageHeader.Encoding = parquet.Encoding_PLAIN_DICTIONARY
+ 
+ 	page.Header.DataPageHeader.Statistics = parquet.NewStatistics()
+-	if page.MaxVal != nil {
+-		tmpBuf := encoding.WritePlain([]interface{}{page.MaxVal}, *page.Schema.Type)
++	if maxVal != nil {
++		tmpBuf := encoding.WritePlain([]interface{}{maxVal}, *page.Schema.Type)
+ 		if *page.Schema.Type == parquet.Type_BYTE_ARRAY {
+ 			tmpBuf = tmpBuf[4:]
+ 		}
+ 		page.Header.DataPageHeader.Statistics.Max = tmpBuf
+ 		page.Header.DataPageHeader.Statistics.MaxValue = tmpBuf
+ 	}
+-	if page.MinVal != nil {
+-		tmpBuf := encoding.WritePlain([]interface{}{page.MinVal}, *page.Schema.Type)
++	if minVal != nil {
++		tmpBuf := encoding.WritePlain([]interface{}{minVal}, *page.Schema.Type)
+ 		if *page.Schema.Type == parquet.Type_BYTE_ARRAY {
+ 			tmpBuf = tmpBuf[4:]
+ 		}
+@@ -210,7 +219,7 @@ func (page *Page) DictDataPageCompress(compressType parquet.CompressionCodec, bi
+ 		page.Header.DataPageHeader.Statistics.MinValue = tmpBuf
+ 	}
+ 
+-	page.Header.DataPageHeader.Statistics.NullCount = page.NullCount
++	page.Header.DataPageHeader.Statistics.NullCount = nullCount
+ 
+ 	ts := thrift.NewTSerializer()
+ 	ts.Protocol = thrift.NewTCompactProtocolFactory().GetProtocol(ts.Transport)
+diff --git a/layout/page.go b/layout/page.go
+index 05914a0..41677de 100644
+--- a/layout/page.go
++++ b/layout/page.go
+@@ -29,12 +29,6 @@ type Page struct {
+ 	Schema *parquet.SchemaElement
+ 	//Path in schema(include the root)
+ 	Path []string
+-	//Maximum of the values
+-	MaxVal interface{}
+-	//Minimum of the values
+-	MinVal interface{}
+-	//NullCount
+-	NullCount *int64
+ 	//Tag info
+ 	Info *common.Tag
+ 
+@@ -68,10 +62,13 @@ func NewDataPage() *Page {
+ }
+ 
+ //Convert a table to data pages
+-func TableToDataPages(table *Table, pageSize int32, compressType parquet.CompressionCodec) ([]*Page, int64) {
++func TableToDataPages(table *Table, pageSize int32, compressType parquet.CompressionCodec) ([]*Page, []interface{}, []interface{}, []*int64, int64) {
+ 	var totSize int64 = 0
+ 	totalLn := len(table.Values)
+ 	res := make([]*Page, 0)
++	maxVals := make([]interface{}, 0)
++	minVals := make([]interface{}, 0)
++	nullCounts := make([]*int64, 0)
+ 	i := 0
+ 	pT, cT, logT, omitStats := table.Schema.Type, table.Schema.ConvertedType, table.Schema.LogicalType, table.Info.OmitStats
+ 
+@@ -116,23 +113,30 @@ func TableToDataPages(table *Table, pageSize int32, compressType parquet.Compres
+ 		page.DataTable.Values = table.Values[i:j]
+ 		page.DataTable.DefinitionLevels = table.DefinitionLevels[i:j]
+ 		page.DataTable.RepetitionLevels = table.RepetitionLevels[i:j]
++
++		var pageMaxVal interface{}
++		var pageMinVal interface{}
++		var pageNullCount *int64
+ 		if !omitStats {
+-			page.MaxVal = maxVal
+-			page.MinVal = minVal
+-			page.NullCount = &nullCount
++			pageMaxVal, pageMinVal = maxVal, minVal
++			pageNullCount = &nullCount
+ 		}
+ 		page.Schema = table.Schema
+ 		page.CompressType = compressType
+ 		page.Path = table.Path
+ 		page.Info = table.Info
+ 
+-		page.DataPageCompress(compressType)
++		maxVals = append(maxVals, pageMaxVal)
++		minVals = append(minVals, pageMinVal)
++		nullCounts = append(nullCounts, pageNullCount)
++
++		page.DataPageCompress(compressType, pageMaxVal, pageMinVal, pageNullCount)
+ 
+ 		totSize += int64(len(page.RawData))
+ 		res = append(res, page)
+ 		i = j
+ 	}
+-	return res, totSize
++	return res, maxVals, minVals, nullCounts, totSize
+ }
+ 
+ //Decode dict page
+@@ -191,7 +195,7 @@ func (page *Page) EncodingValues(valuesBuf []interface{}) []byte {
+ }
+ 
+ //Compress the data page to parquet file
+-func (page *Page) DataPageCompress(compressType parquet.CompressionCodec) []byte {
++func (page *Page) DataPageCompress(compressType parquet.CompressionCodec, maxVal interface{}, minVal interface{}, nullCount *int64) []byte {
+ 	ln := len(page.DataTable.DefinitionLevels)
+ 
+ 	//values////////////////////////////////////////////
+@@ -251,16 +255,16 @@ func (page *Page) DataPageCompress(compressType parquet.CompressionCodec) []byte
+ 	page.Header.DataPageHeader.Encoding = page.Info.Encoding
+ 
+ 	page.Header.DataPageHeader.Statistics = parquet.NewStatistics()
+-	if page.MaxVal != nil {
+-		tmpBuf := encoding.WritePlain([]interface{}{page.MaxVal}, *page.Schema.Type)
++	if maxVal != nil {
++		tmpBuf := encoding.WritePlain([]interface{}{maxVal}, *page.Schema.Type)
+ 		if *page.Schema.Type == parquet.Type_BYTE_ARRAY {
+ 			tmpBuf = tmpBuf[4:]
+ 		}
+ 		page.Header.DataPageHeader.Statistics.Max = tmpBuf
+ 		page.Header.DataPageHeader.Statistics.MaxValue = tmpBuf
+ 	}
+-	if page.MinVal != nil {
+-		tmpBuf := encoding.WritePlain([]interface{}{page.MinVal}, *page.Schema.Type)
++	if minVal != nil {
++		tmpBuf := encoding.WritePlain([]interface{}{minVal}, *page.Schema.Type)
+ 		if *page.Schema.Type == parquet.Type_BYTE_ARRAY {
+ 			tmpBuf = tmpBuf[4:]
+ 		}
+@@ -268,7 +272,7 @@ func (page *Page) DataPageCompress(compressType parquet.CompressionCodec) []byte
+ 		page.Header.DataPageHeader.Statistics.MinValue = tmpBuf
+ 	}
+ 
+-	page.Header.DataPageHeader.Statistics.NullCount = page.NullCount
++	page.Header.DataPageHeader.Statistics.NullCount = nullCount
+ 
+ 	ts := thrift.NewTSerializer()
+ 	ts.Protocol = thrift.NewTCompactProtocolFactory().GetProtocol(ts.Transport)
+@@ -281,7 +285,7 @@ func (page *Page) DataPageCompress(compressType parquet.CompressionCodec) []byte
+ }
+ 
+ //Compress data page v2 to parquet file
+-func (page *Page) DataPageV2Compress(compressType parquet.CompressionCodec) []byte {
++func (page *Page) DataPageV2Compress(compressType parquet.CompressionCodec, maxVal interface{}, minVal interface{}, nullCount *int64) []byte {
+ 	ln := len(page.DataTable.DefinitionLevels)
+ 
+ 	//values////////////////////////////////////////////
+@@ -341,16 +345,16 @@ func (page *Page) DataPageV2Compress(compressType parquet.CompressionCodec) []by
+ 	page.Header.DataPageHeaderV2.IsCompressed = true
+ 
+ 	page.Header.DataPageHeaderV2.Statistics = parquet.NewStatistics()
+-	if page.MaxVal != nil {
+-		tmpBuf := encoding.WritePlain([]interface{}{page.MaxVal}, *page.Schema.Type)
++	if maxVal != nil {
++		tmpBuf := encoding.WritePlain([]interface{}{maxVal}, *page.Schema.Type)
+ 		if *page.Schema.Type == parquet.Type_BYTE_ARRAY {
+ 			tmpBuf = tmpBuf[4:]
+ 		}
+ 		page.Header.DataPageHeaderV2.Statistics.Max = tmpBuf
+ 		page.Header.DataPageHeaderV2.Statistics.MaxValue = tmpBuf
+ 	}
+-	if page.MinVal != nil {
+-		tmpBuf := encoding.WritePlain([]interface{}{page.MinVal}, *page.Schema.Type)
++	if minVal != nil {
++		tmpBuf := encoding.WritePlain([]interface{}{minVal}, *page.Schema.Type)
+ 		if *page.Schema.Type == parquet.Type_BYTE_ARRAY {
+ 			tmpBuf = tmpBuf[4:]
+ 		}
+@@ -358,7 +362,7 @@ func (page *Page) DataPageV2Compress(compressType parquet.CompressionCodec) []by
+ 		page.Header.DataPageHeaderV2.Statistics.MinValue = tmpBuf
+ 	}
+ 
+-	page.Header.DataPageHeaderV2.Statistics.NullCount = page.NullCount
++	page.Header.DataPageHeaderV2.Statistics.NullCount = nullCount
+ 
+ 	ts := thrift.NewTSerializer()
+ 	ts.Protocol = thrift.NewTCompactProtocolFactory().GetProtocol(ts.Transport)
+diff --git a/writer/arrow.go b/writer/arrow.go
+index 901de13..c1b76d5 100644
+--- a/writer/arrow.go
++++ b/writer/arrow.go
+@@ -44,6 +44,9 @@ func NewArrowWriter(arrowSchema *arrow.Schema, pfile source.ParquetFile,
+ 	// Compression type is by default: parquet.CompressionCodec_SNAPPY
+ 	res.CompressionType = parquet.CompressionCodec_GZIP
+ 	res.PagesMapBuf = make(map[string][]*layout.Page)
++	res.MaxValsBuf = make(map[string][]interface{})
++	res.MinValsBuf = make(map[string][]interface{})
++	res.NullCntsBuf = make(map[string][]*int64)
+ 	res.DictRecs = make(map[string]*layout.DictRecType)
+ 	res.NP = np
+ 	res.Footer = parquet.NewFileMetaData()
+diff --git a/writer/writer.go b/writer/writer.go
+index 5f6797f..0e84efc 100644
+--- a/writer/writer.go
++++ b/writer/writer.go
+@@ -36,6 +36,9 @@ type ParquetWriter struct {
+ 	CheckSizeCritical int64
+ 
+ 	PagesMapBuf map[string][]*layout.Page
++	MaxValsBuf  map[string][]interface{}
++	MinValsBuf  map[string][]interface{}
++	NullCntsBuf map[string][]*int64
+ 	Size        int64
+ 	NumRows     int64
+ 
+@@ -70,6 +73,9 @@ func NewParquetWriter(pFile source.ParquetFile, obj interface{}, np int64) (*Par
+ 	res.Offset = 4
+ 	res.PFile = pFile
+ 	res.PagesMapBuf = make(map[string][]*layout.Page)
++	res.MaxValsBuf = make(map[string][]interface{})
++	res.MinValsBuf = make(map[string][]interface{})
++	res.NullCntsBuf = make(map[string][]*int64)
+ 	res.DictRecs = make(map[string]*layout.DictRecType)
+ 	res.Footer = parquet.NewFileMetaData()
+ 	res.Footer.Version = 1
+@@ -265,8 +271,14 @@ func (pw *ParquetWriter) flushObjs() error {
+ 		return nil
+ 	}
+ 	pagesMapList := make([]map[string][]*layout.Page, pw.NP)
++	maxValsMapList := make([]map[string][]interface{}, pw.NP)
++	minValsMapList := make([]map[string][]interface{}, pw.NP)
++	nullCntsMapList := make([]map[string][]*int64, pw.NP)
+ 	for i := 0; i < int(pw.NP); i++ {
+ 		pagesMapList[i] = make(map[string][]*layout.Page)
++		maxValsMapList[i] = make(map[string][]interface{})
++		minValsMapList[i] = make(map[string][]interface{})
++		nullCntsMapList[i] = make(map[string][]*int64)
+ 	}
+ 
+ 	var c int64 = 0
+@@ -320,13 +332,21 @@ func (pw *ParquetWriter) flushObjs() error {
+ 							if _, ok := pw.DictRecs[name]; !ok {
+ 								pw.DictRecs[name] = layout.NewDictRec(*table.Schema.Type)
+ 							}
+-							pagesMapList[index][name], _ = layout.TableToDictDataPages(pw.DictRecs[name],
++							pages, maxVals, minVals, nullCnts, _ := layout.TableToDictDataPages(pw.DictRecs[name],
+ 								table, int32(pw.PageSize), 32, pw.CompressionType)
++							pagesMapList[index][name] = pages
++							maxValsMapList[index][name] = maxVals
++							minValsMapList[index][name] = minVals
++							nullCntsMapList[index][name] = nullCnts
+ 						}()
+ 
+ 					} else {
+-						pagesMapList[index][name], _ = layout.TableToDataPages(table, int32(pw.PageSize),
++						pages, maxVals, minVals, nullCnts, _ := layout.TableToDataPages(table, int32(pw.PageSize),
+ 							pw.CompressionType)
++						pagesMapList[index][name] = pages
++						maxValsMapList[index][name] = maxVals
++						minValsMapList[index][name] = minVals
++						nullCntsMapList[index][name] = nullCnts
+ 					}
+ 				}
+ 			} else {
+@@ -345,12 +365,18 @@ func (pw *ParquetWriter) flushObjs() error {
+ 		}
+ 	}
+ 
+-	for _, pagesMap := range pagesMapList {
++	for idx, pagesMap := range pagesMapList {
+ 		for name, pages := range pagesMap {
+ 			if _, ok := pw.PagesMapBuf[name]; !ok {
+ 				pw.PagesMapBuf[name] = pages
++				pw.MaxValsBuf[name] = maxValsMapList[idx][name]
++				pw.MinValsBuf[name] = minValsMapList[idx][name]
++				pw.NullCntsBuf[name] = nullCntsMapList[idx][name]
+ 			} else {
+ 				pw.PagesMapBuf[name] = append(pw.PagesMapBuf[name], pages...)
++				pw.MaxValsBuf[name] = append(pw.MaxValsBuf[name], maxValsMapList[idx][name]...)
++				pw.MinValsBuf[name] = append(pw.MinValsBuf[name], minValsMapList[idx][name]...)
++				pw.NullCntsBuf[name] = append(pw.NullCntsBuf[name], nullCntsMapList[idx][name]...)
+ 			}
+ 			for _, page := range pages {
+ 				pw.Size += int64(len(page.RawData))
+@@ -378,9 +404,12 @@ func (pw *ParquetWriter) Flush(flag bool) error {
+ 			if len(pages) > 0 && (pages[0].Info.Encoding == parquet.Encoding_PLAIN_DICTIONARY || pages[0].Info.Encoding == parquet.Encoding_RLE_DICTIONARY) {
+ 				dictPage, _ := layout.DictRecToDictPage(pw.DictRecs[name], int32(pw.PageSize), pw.CompressionType)
+ 				tmp := append([]*layout.Page{dictPage}, pages...)
+-				chunkMap[name] = layout.PagesToDictChunk(tmp)
++				tmpMaxVals := append([]interface{}{nil}, pw.MaxValsBuf[name]...)
++				tmpMinVals := append([]interface{}{nil}, pw.MinValsBuf[name]...)
++				tmpNullCnts := append([]*int64{nil}, pw.NullCntsBuf[name]...)
++				chunkMap[name] = layout.PagesToDictChunk(tmp, tmpMaxVals, tmpMinVals, tmpNullCnts)
+ 			} else {
+-				chunkMap[name] = layout.PagesToChunk(pages)
++				chunkMap[name] = layout.PagesToChunk(pages, pw.MaxValsBuf[name], pw.MinValsBuf[name], pw.NullCntsBuf[name])
+ 
+ 			}
+ 		}
+@@ -491,6 +520,9 @@ func (pw *ParquetWriter) Flush(flag bool) error {
+ 		pw.Footer.RowGroups = append(pw.Footer.RowGroups, rowGroup.RowGroupHeader)
+ 		pw.Size = 0
+ 		pw.PagesMapBuf = make(map[string][]*layout.Page)
++		pw.MaxValsBuf = make(map[string][]interface{})
++		pw.MinValsBuf = make(map[string][]interface{})
++		pw.NullCntsBuf = make(map[string][]*int64)
+ 	}
+ 	pw.Footer.NumRows += int64(len(pw.Objs))
+ 	pw.Objs = pw.Objs[:0]

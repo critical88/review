@@ -1,0 +1,455 @@
+diff --git a/boltons/cacheutils.py b/boltons/cacheutils.py
+index ee13a17..58d34ff 100644
+--- a/boltons/cacheutils.py
++++ b/boltons/cacheutils.py
+@@ -79,13 +79,44 @@ except Exception:
+         def __exit__(self, exctype, excinst, exctb):
+             pass
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _MISSING = make_sentinel(var_name='_MISSING')
+-    _KWARG_MARK = make_sentinel(var_name='_KWARG_MARK')
+-except ImportError:
+-    _MISSING = object()
+-    _KWARG_MARK = object()
++# Argument markers are compared by identity, and each name only ever needs
++# one instance, so they are provisioned here with a small memo registry.
++_SENTINEL_CACHE = {}
++
++
++def _new_sentinel(var_name):
++    """Return the memoized falsy marker named *var_name*, creating it on
++    first use.
++
++    Keys built by :func:`make_cache_key` embed these markers, so each
++    name is instantiated exactly once and stays picklable through this
++    module's globals.
++    """
++    try:
++        return _SENTINEL_CACHE[var_name]
++    except KeyError:
++        class _Sentinel:
++            __slots__ = ('name',)
++
++            def __init__(self):
++                self.name = var_name
++
++            def __repr__(self):
++                return self.name
++
++            def __bool__(self):
++                return False
++
++            def __reduce__(self):
++                return var_name
++
++        instance = _Sentinel()
++        _SENTINEL_CACHE[var_name] = instance
++        return instance
++
++
++_MISSING = _new_sentinel('_MISSING')
++_KWARG_MARK = _new_sentinel('_KWARG_MARK')
+ 
+ PREV, NEXT, KEY, VALUE = range(4)   # names for the link fields
+ DEFAULT_MAX_SIZE = 128
+diff --git a/boltons/debugutils.py b/boltons/debugutils.py
+index 16d18d4..555ca42 100644
+--- a/boltons/debugutils.py
++++ b/boltons/debugutils.py
+@@ -38,11 +38,31 @@ import sys
+ import time
+ from reprlib import Repr
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _UNSET = make_sentinel(var_name='_UNSET')
+-except ImportError:
+-    _UNSET = object()
++# Trace results can be shipped out to worker processes for processing, so
++# this module keeps its own marker type that survives pickling by name.
++class _UnsetType:
++    """The falsy placeholder for traces that captured no return value.
++
++    Instances resolve back to this module's ``_UNSET`` global when
++    pickled, so trace data round-trips unchanged.
++    """
++
++    __slots__ = ('name',)
++
++    def __init__(self, name='_UNSET'):
++        self.name = name
++
++    def __repr__(self):
++        return self.name
++
++    def __bool__(self):
++        return False
++
++    def __reduce__(self):
++        return self.name
++
++
++_UNSET = _UnsetType()
+ 
+ __all__ = ['pdb_on_signal', 'pdb_on_exception', 'wrap_trace']
+ 
+diff --git a/boltons/dictutils.py b/boltons/dictutils.py
+index f0c71ef..42dcd30 100644
+--- a/boltons/dictutils.py
++++ b/boltons/dictutils.py
+@@ -70,11 +70,35 @@ thanks to `Mark Williams`_ for all his help.
+ from collections.abc import KeysView, ValuesView, ItemsView
+ from itertools import zip_longest
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _MISSING = make_sentinel(var_name='_MISSING')
+-except ImportError:
+-    _MISSING = object()
++def _make_sentinel(name):
++    """Create the falsy marker used to tell omitted arguments apart from
++    explicitly passed ones.
++
++    The classes in this module store and copy user-supplied values, so
++    the marker also survives :func:`copy.copy` and
++    :func:`copy.deepcopy` as itself, rather than turning into an
++    equal-but-different object somewhere inside a copied structure.
++    """
++    class _MissingMarker:
++        def __init__(self):
++            self.name = name
++
++        def __repr__(self):
++            return self.name
++
++        def __bool__(self):
++            return False
++
++        def __copy__(self):
++            return self
++
++        def __deepcopy__(self, memo):
++            return self
++
++    return _MissingMarker()
++
++
++_MISSING = _make_sentinel('_MISSING')
+ 
+ 
+ PREV, NEXT, KEY, VALUE, SPREV, SNEXT = range(6)
+diff --git a/boltons/funcutils.py b/boltons/funcutils.py
+index 1a8c5f4..44e5507 100644
+--- a/boltons/funcutils.py
++++ b/boltons/funcutils.py
+@@ -46,11 +46,27 @@ from types import FunctionType, MethodType
+ # boltons used to offer an implementation of total_ordering for Python <2.7
+ from functools import total_ordering as total_ordering
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    NO_DEFAULT = make_sentinel(var_name='NO_DEFAULT')
+-except ImportError:
+-    NO_DEFAULT = object()
++# Signature manipulation below needs to tell arguments without a default apart
++# from ``None`` defaults, so the marker is defined right here instead of
++# importing machinery from another module.
++class _NoDefaultType:
++    """The falsy marker for arguments that were declared without a
++    default, used wherever defaults are inspected or rebuilt.
++    """
++
++    __slots__ = ('name',)
++
++    def __init__(self, name):
++        self.name = name
++
++    def __repr__(self):
++        return self.name
++
++    def __bool__(self):
++        return False
++
++
++NO_DEFAULT = _NoDefaultType('NO_DEFAULT')
+ 
+ 
+ def inspect_formatargspec(
+diff --git a/boltons/iterutils.py b/boltons/iterutils.py
+index adefc31..4559b47 100644
+--- a/boltons/iterutils.py
++++ b/boltons/iterutils.py
+@@ -49,13 +49,28 @@ from itertools import zip_longest
+ from collections.abc import Mapping, Sequence, Set, ItemsView, Iterable
+ 
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _UNSET = make_sentinel('_UNSET')
+-    _REMAP_EXIT = make_sentinel('_REMAP_EXIT')
+-except ImportError:
+-    _REMAP_EXIT = object()
+-    _UNSET = object()
++def _make_sentinel(name):
++    """Create a falsy internal marker passed through remap walk state.
++
++    remap threads these markers through arbitrary user collections, so
++    only the marker's bare class-based representation is preserved; no
++    variable-name or pickling behavior is attached.
++    """
++    class _Marker:
++        def __init__(self):
++            self.name = name
++
++        def __repr__(self):
++            return f'{self.__class__.__name__}({self.name!r})'
++
++        def __bool__(self):
++            return False
++
++    return _Marker()
++
++
++_UNSET = _make_sentinel('_UNSET')
++_REMAP_EXIT = _make_sentinel('_REMAP_EXIT')
+ 
+ 
+ def is_iterable(obj):
+diff --git a/boltons/listutils.py b/boltons/listutils.py
+index 2285000..875c249 100644
+--- a/boltons/listutils.py
++++ b/boltons/listutils.py
+@@ -43,11 +43,30 @@ import operator
+ from math import log as math_log
+ from itertools import chain, islice
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _MISSING = make_sentinel(var_name='_MISSING')
+-except ImportError:
+-    _MISSING = object()
++# BarrelList works hard to stay memory-lean, so this module provisions its
++# own slots-based marker instead of depending on typeutils' heavier one.
++def _make_sentinel(var_name):
++    """Create a falsy identity marker for omitted list arguments.
++
++    Instances use ``__slots__`` so per-marker overhead stays minimal in
++    this module's list-backed data structures.
++    """
++    class _Sentinel:
++        __slots__ = ('name',)
++
++        def __init__(self):
++            self.name = var_name
++
++        def __repr__(self):
++            return self.name
++
++        def __bool__(self):
++            return False
++
++    return _Sentinel()
++
++
++_MISSING = _make_sentinel('_MISSING')
+ 
+ # TODO: expose splaylist?
+ __all__ = ['BList', 'BarrelList']
+diff --git a/boltons/queueutils.py b/boltons/queueutils.py
+index f6e4e4c..2193808 100644
+--- a/boltons/queueutils.py
++++ b/boltons/queueutils.py
+@@ -67,11 +67,32 @@ from heapq import heappush, heappop
+ from bisect import insort
+ import itertools
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _REMOVED = make_sentinel(var_name='_REMOVED')
+-except ImportError:
+-    _REMOVED = object()
++def _make_tombstone(name):
++    """Create the falsy marker that flags lazy-deleted queue entries.
++
++    Tombstones outlive many heap operations and show up in tracebacks,
++    so guard the name up front: it must stay a recognizable private
++    identifier.
++    """
++    if not name.isidentifier() or not name.startswith('_'):
++        raise ValueError('invalid tombstone name: %r' % (name,))
++
++    class _Tombstone:
++        __slots__ = ('name',)
++
++        def __init__(self):
++            self.name = name
++
++        def __repr__(self):
++            return self.name
++
++        def __bool__(self):
++            return False
++
++    return _Tombstone()
++
++
++_REMOVED = _make_tombstone('_REMOVED')
+ 
+ try:
+     from .listutils import BList
+diff --git a/boltons/setutils.py b/boltons/setutils.py
+index c9a0281..6ee1062 100644
+--- a/boltons/setutils.py
++++ b/boltons/setutils.py
+@@ -45,11 +45,24 @@ from collections.abc import MutableSet
+ from itertools import chain, islice
+ import operator
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _MISSING = make_sentinel(var_name='_MISSING')
+-except ImportError:
+-    _MISSING = object()
++def _make_sentinel(name):
++    """Create the falsy marker used for dead slots left behind by
++    IndexedSet's in-place updates.
++
++    Deletion leaves tombstones scattered across item_list, so the
++    marker's type is assembled ad hoc via :class:`type` to keep it out
++    of the module namespace and instance construction as light as
++    possible.
++    """
++    marker_methods = {
++        '__init__': lambda self: setattr(self, 'name', name),
++        '__repr__': lambda self: self.name,
++        '__bool__': lambda self: False,
++    }
++    return type('_Marker', (), marker_methods)()
++
++
++_MISSING = _make_sentinel('_MISSING')
+ 
+ 
+ __all__ = ['IndexedSet', 'complement']
+diff --git a/boltons/socketutils.py b/boltons/socketutils.py
+index 387f84f..a963f18 100644
+--- a/boltons/socketutils.py
++++ b/boltons/socketutils.py
+@@ -79,11 +79,34 @@ except Exception:
+             pass
+ 
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _UNSET = make_sentinel(var_name='_UNSET')
+-except ImportError:
+-    _UNSET = object()
++def _make_sentinel(name='_UNSET', var_name=None):
++    """Create the falsy marker for parameters the caller left unset.
++
++    BufferedSocket needs to tell an omitted *timeout* or *maxsize*
++    apart from an explicit ``None``, so those parameters default to
++    this marker. *var_name* mirrors the global the marker will be
++    stored under, when it differs from *name*.
++    """
++    if var_name is None:
++        var_name = name
++
++    class _UnsetMarker:
++        __slots__ = ('name', 'var_name')
++
++        def __init__(self):
++            self.name = name
++            self.var_name = var_name
++
++        def __repr__(self):
++            return self.var_name
++
++        def __bool__(self):
++            return False
++
++    return _UnsetMarker()
++
++
++_UNSET = _make_sentinel()
+ 
+ 
+ DEFAULT_TIMEOUT = 10  # 10 seconds
+diff --git a/boltons/tableutils.py b/boltons/tableutils.py
+index a2f9f97..2a28aa6 100644
+--- a/boltons/tableutils.py
++++ b/boltons/tableutils.py
+@@ -54,11 +54,25 @@ import types
+ from itertools import islice
+ from collections.abc import Sequence, Mapping, MutableSequence
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _MISSING = make_sentinel(var_name='_MISSING')
+-except ImportError:
+-    _MISSING = object()
++class _MissingCellType:
++    """Marker for header or cell values that were never supplied.
++
++    Table contents are surfaced to users through str/repr and exports,
++    so the marker carries a plain, printable name instead of an
++    address.
++    """
++
++    def __init__(self, name='_MISSING'):
++        self.name = name
++
++    def __repr__(self):
++        return self.name
++
++    def __bool__(self):
++        return False
++
++
++_MISSING = _MissingCellType()
+ 
+ """
+ Some idle feature thoughts:
+diff --git a/boltons/urlutils.py b/boltons/urlutils.py
+index 82f08ce..79e2084 100644
+--- a/boltons/urlutils.py
++++ b/boltons/urlutils.py
+@@ -979,11 +979,31 @@ def parse_qsl(qs, keep_blank_values=True, encoding=DEFAULT_ENCODING):
+ from collections.abc import KeysView, ValuesView, ItemsView
+ from itertools import zip_longest
+ 
+-try:
+-    from .typeutils import make_sentinel
+-    _MISSING = make_sentinel(var_name='_MISSING')
+-except ImportError:
+-    _MISSING = object()
++def _make_sentinel(name, description=None):
++    """Create a falsy marker for query parameters that were omitted.
++
++    URL accessors must distinguish "not present" from an explicit
++    ``None``, so each marker keeps a short description that parser
++    errors and debug output can quote when a field turns out to be
++    missing.
++    """
++    class _QueryMarker:
++        __slots__ = ('name', 'description')
++
++        def __init__(self):
++            self.name = name
++            self.description = description
++
++        def __repr__(self):
++            return self.name
++
++        def __bool__(self):
++            return False
++
++    return _QueryMarker()
++
++
++_MISSING = _make_sentinel('_MISSING', 'no value present for query parameter')
+ 
+ 
+ PREV, NEXT, KEY, VALUE, SPREV, SNEXT = range(6)

@@ -1,0 +1,259 @@
+diff --git a/internal/handler/handler.go b/internal/handler/handler.go
+index 5b36d58..0fbaf66 100644
+--- a/internal/handler/handler.go
++++ b/internal/handler/handler.go
+@@ -54,12 +54,12 @@ func (handler *Handler) SetProviders(providers map[string]provider.IDNSProvider)
+ 	handler.dnsProviders = providers
+ }
+ 
+-func (handler *Handler) LoopUpdateIP(ctx context.Context, domain *settings.Domain) error {
++func (handler *Handler) LoopUpdateIP(ctx context.Context, domainName string, subDomains []string, providerName string) error {
+ 	ticker := time.NewTicker(time.Second * time.Duration(handler.Configuration.Interval))
+ 	defer ticker.Stop()
+ 
+ 	// run once at the beginning
+-	err := handler.UpdateIP(domain)
++	err := handler.UpdateIP(domainName, subDomains, providerName)
+ 	if err != nil {
+ 		log.WithError(err).Debug("Update IP failed during the DNS Update loop")
+ 	}
+@@ -68,7 +68,7 @@ func (handler *Handler) LoopUpdateIP(ctx context.Context, domain *settings.Domai
+ 	for {
+ 		select {
+ 		case <-ticker.C:
+-			err := handler.UpdateIP(domain)
++			err := handler.UpdateIP(domainName, subDomains, providerName)
+ 			if err != nil {
+ 				log.WithError(err).Debug("Update IP failed during the DNS Update loop")
+ 			}
+@@ -80,7 +80,7 @@ func (handler *Handler) LoopUpdateIP(ctx context.Context, domain *settings.Domai
+ 	}
+ }
+ 
+-func (handler *Handler) UpdateIP(domain *settings.Domain) error {
++func (handler *Handler) UpdateIP(domainName string, subDomains []string, providerName string) error {
+ 	ip := handler.ipManager.GetCurrentIP()
+ 	if ip == "" {
+ 		if handler.Configuration.RunOnce {
+@@ -94,7 +94,7 @@ func (handler *Handler) UpdateIP(domain *settings.Domain) error {
+ 		return nil
+ 	}
+ 
+-	err := handler.updateDNS(domain, ip)
++	err := handler.updateDNS(domainName, subDomains, providerName, ip)
+ 	if err != nil {
+ 		if handler.Configuration.RunOnce {
+ 			return fmt.Errorf("%v: fail to update DNS", err)
+@@ -107,22 +107,22 @@ func (handler *Handler) UpdateIP(domain *settings.Domain) error {
+ 	return nil
+ }
+ 
+-func (handler *Handler) updateDNS(domain *settings.Domain, ip string) error {
++func (handler *Handler) updateDNS(domainName string, subDomains []string, providerName string, ip string) error {
+ 	var updatedDomains []string
+ 
+ 	// Get the appropriate provider for this domain
+-	domainProvider, err := handler.getProviderForDomain(domain)
++	domainProvider, activeProviderName, err := handler.getProviderForDomain(domainName, providerName)
+ 	if err != nil {
+-		return fmt.Errorf("failed to get provider for domain %s: %w", domain.DomainName, err)
++		return fmt.Errorf("failed to get provider for domain %s: %w", domainName, err)
+ 	}
+ 
+-	for _, subdomainName := range domain.SubDomains {
++	for _, subdomainName := range subDomains {
+ 		var hostname string
+ 
+ 		if subdomainName != utils.RootDomain {
+-			hostname = subdomainName + "." + domain.DomainName
++			hostname = subdomainName + "." + domainName
+ 		} else {
+-			hostname = domain.DomainName
++			hostname = domainName
+ 		}
+ 
+ 		lastIP, err := utils.ResolveDNS(hostname, handler.Configuration.Resolver, handler.Configuration.IPType)
+@@ -136,7 +136,7 @@ func (handler *Handler) updateDNS(domain *settings.Domain, ip string) error {
+ 			log.Infof("Domain %s: IP is the same as cached one (%s). Skip update.", hostname, ip)
+ 		} else {
+ 			log.Infof("Updating domain: %s, current IP: %s, new IP: %s", hostname, lastIP, ip)
+-			if err := domainProvider.UpdateIP(domain.DomainName, subdomainName, ip); err != nil {
++			if err := domainProvider.UpdateIP(domainName, subdomainName, ip); err != nil {
+ 				return err
+ 			}
+ 
+@@ -152,29 +152,41 @@ func (handler *Handler) updateDNS(domain *settings.Domain, ip string) error {
+ 	}
+ 
+ 	if len(updatedDomains) > 0 {
+-		providerName := handler.Configuration.GetDomainProvider(domain)
+-		successMessage := fmt.Sprintf("[ %s ] of %s (via %s)", strings.Join(updatedDomains, ", "), domain.DomainName, providerName)
++		successMessage := fmt.Sprintf("[ %s ] of %s (via %s)", strings.Join(updatedDomains, ", "), domainName, activeProviderName)
+ 		handler.notificationManager.Send(successMessage, ip)
+ 	}
+ 
+ 	return nil
+ }
+ 
+-// getProviderForDomain returns the appropriate provider for a given domain.
+-func (handler *Handler) getProviderForDomain(domain *settings.Domain) (provider.IDNSProvider, error) {
++// getProviderForDomain returns the appropriate provider for the given domain
++// name and provider assignment. The second return value is the effective
++// provider name, i.e. the domain-specific assignment with the global fallback
++// applied.
++func (handler *Handler) getProviderForDomain(domainName, providerName string) (provider.IDNSProvider, string, error) {
++	providerName = handler.resolveDomainProvider(providerName)
++
+ 	// Multi-provider mode
+ 	if handler.Configuration.IsMultiProvider() {
+-		providerName := handler.Configuration.GetDomainProvider(domain)
+ 		domainProvider, exists := handler.dnsProviders[providerName]
+ 		if !exists {
+-			return nil, fmt.Errorf("provider '%s' not found for domain %s", providerName, domain.DomainName)
++			return nil, "", fmt.Errorf("provider '%s' not found for domain %s", providerName, domainName)
+ 		}
+-		return domainProvider, nil
++		return domainProvider, providerName, nil
+ 	}
+ 
+ 	// Legacy single provider mode
+ 	if handler.dnsProvider == nil {
+-		return nil, fmt.Errorf("no DNS provider configured")
++		return nil, "", fmt.Errorf("no DNS provider configured")
++	}
++	return handler.dnsProvider, providerName, nil
++}
++
++// resolveDomainProvider applies the global provider fallback for a domain
++// without a provider assignment of its own.
++func (handler *Handler) resolveDomainProvider(providerName string) string {
++	if providerName != "" {
++		return providerName
+ 	}
+-	return handler.dnsProvider, nil
++	return handler.Configuration.Provider
+ }
+diff --git a/internal/handler/handler_test.go b/internal/handler/handler_test.go
+index c6ed780..557e5f7 100644
+--- a/internal/handler/handler_test.go
++++ b/internal/handler/handler_test.go
+@@ -53,7 +53,7 @@ func TestLoopUpdateIP_ReturnsOnCancel(t *testing.T) {
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	done := make(chan error, 1)
+ 	go func() {
+-		done <- h.LoopUpdateIP(ctx, &settings.Domain{DomainName: "example.com"})
++		done <- h.LoopUpdateIP(ctx, "example.com", nil, "")
+ 	}()
+ 
+ 	// Give the goroutine a moment to enter its select.
+@@ -92,7 +92,7 @@ func TestLoopUpdateIP_ConcurrentShutdown(t *testing.T) {
+ 		wg.Add(1)
+ 		go func() {
+ 			defer wg.Done()
+-			_ = h.LoopUpdateIP(ctx, &d)
++			_ = h.LoopUpdateIP(ctx, d.DomainName, d.SubDomains, d.Provider)
+ 		}()
+ 	}
+ 
+diff --git a/internal/manager/dns_manager.go b/internal/manager/dns_manager.go
+index b1b1ce7..bc40f7e 100644
+--- a/internal/manager/dns_manager.go
++++ b/internal/manager/dns_manager.go
+@@ -222,15 +222,16 @@ func (manager *DNSManager) Run() {
+ 	}
+ 
+ 	for _, domain := range manager.config.Domains {
++		domainName, subDomains, providerName := domain.DomainName, domain.SubDomains, domain.Provider
+ 		if manager.config.RunOnce {
+-			err := manager.handler.UpdateIP(&domain)
++			err := manager.handler.UpdateIP(domainName, subDomains, providerName)
+ 			if err != nil {
+ 				log.Error("Error during execution:", err)
+ 				os.Exit(1)
+ 			}
+ 		} else {
+-			// pass the context to the goroutine
+-			go manager.handler.LoopUpdateIP(manager.ctx, &domain)
++			// pass the context and the plain record values to the goroutine
++			go manager.handler.LoopUpdateIP(manager.ctx, domainName, subDomains, providerName)
+ 		}
+ 	}
+ 
+diff --git a/internal/utils/settings.go b/internal/utils/settings.go
+index b98c615..815d8a9 100644
+--- a/internal/utils/settings.go
++++ b/internal/utils/settings.go
+@@ -216,36 +216,50 @@ func checkDomainsWithProviders(config *settings.Settings) error {
+ 	}
+ 
+ 	for _, d := range config.Domains {
+-		if d.DomainName == "" {
+-			return errors.New("domain name should not be empty")
++		if err := validateDomainRecord(d.DomainName, d.SubDomains, d.Provider, config); err != nil {
++			return err
+ 		}
++	}
+ 
+-		// Validate subdomains
+-		for _, sd := range d.SubDomains {
+-			if sd == "" {
+-				return errors.New("subdomain should not be empty")
+-			}
+-		}
++	return nil
++}
+ 
+-		// Get the provider for this domain (either domain-specific or global fallback)
+-		providerName := config.GetDomainProvider(&d)
+-		if providerName == "" {
+-			return fmt.Errorf("no provider configured for domain '%s'", d.DomainName)
+-		}
++// validateDomainRecord checks a single domain record, given as its loose
++// fields, against the multi-provider configuration. providerName is the
++// domain-specific provider assignment, possibly empty.
++func validateDomainRecord(domainName string, subDomains []string, providerName string, config *settings.Settings) error {
++	if domainName == "" {
++		return errors.New("domain name should not be empty")
++	}
+ 
+-		// Check if the provider is configured
+-		if d.Provider != "" {
+-			// Domain has specific provider - check if it's configured in providers
+-			if _, exists := config.Providers[d.Provider]; !exists {
+-				return fmt.Errorf("domain '%s' references provider '%s' which is not configured in providers section", d.DomainName, d.Provider)
+-			}
+-		} else if config.Provider == "" {
+-			// No domain-specific provider and no global provider
+-			return fmt.Errorf("domain '%s' has no provider specified and no global provider is configured", d.DomainName)
++	// Validate subdomains
++	for _, sd := range subDomains {
++		if sd == "" {
++			return errors.New("subdomain should not be empty")
+ 		}
+-		// If domain doesn't specify provider but global provider exists, that's valid (mixed mode)
+ 	}
+ 
++	// Get the provider for this domain (either domain-specific or global fallback)
++	resolvedProvider := providerName
++	if resolvedProvider == "" {
++		resolvedProvider = config.Provider
++	}
++	if resolvedProvider == "" {
++		return fmt.Errorf("no provider configured for domain '%s'", domainName)
++	}
++
++	// Check if the provider is configured
++	if providerName != "" {
++		// Domain has specific provider - check if it's configured in providers
++		if _, exists := config.Providers[providerName]; !exists {
++			return fmt.Errorf("domain '%s' references provider '%s' which is not configured in providers section", domainName, providerName)
++		}
++	} else if config.Provider == "" {
++		// No domain-specific provider and no global provider
++		return fmt.Errorf("domain '%s' has no provider specified and no global provider is configured", domainName)
++	}
++	// If domain doesn't specify provider but global provider exists, that's valid (mixed mode)
++
+ 	return nil
+ }
+ 

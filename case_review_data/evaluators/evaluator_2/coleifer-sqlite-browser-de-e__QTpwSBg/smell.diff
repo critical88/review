@@ -1,0 +1,187 @@
+diff --git a/sqlite_web/executor.py b/sqlite_web/executor.py
+index 83b754a..a2d4f09 100644
+--- a/sqlite_web/executor.py
++++ b/sqlite_web/executor.py
+@@ -83,9 +83,33 @@ def run_script(dataset, statements, page_size=50):
+         results.append(result)
+         if result.kind == 'error':
+             break
++            # Keep the failing statement on the partial result so the
++            # query tab can offer a re-run of just that statement.
++            result.statement = stmt
++            results.append(_encode_result_keys(result))
+     return results
+ 
+ 
++def _encode_result_keys(result):
++    # The script tab copies one result at a time, so only the first one
++    # carries the row keys the copy button needs.
++    keys = []
++    for row in result.rows:
++        keys.append(key_encode([row[0]]))
++    result.keys = keys
++    return result
++
++
++def estimate_cost(dataset, sql):
++    # Rough planner weight of a statement: one point per query-plan step.
++    # For the structure-page advisor, not for anything user-facing.
++    cursor = dataset.query('EXPLAIN QUERY PLAN %s' % sql)
++    weight = 0
++    for row in cursor.fetchall():
++        weight += 1 + (row[2] or 0)
++    return weight
++
++
+ def is_read(dataset, sql):
+     try:
+         dataset.query(wrap(sql, limit=0))
+diff --git a/sqlite_web/sqlite_web.py b/sqlite_web/sqlite_web.py
+index 32044c4..69bd6e0 100755
+--- a/sqlite_web/sqlite_web.py
++++ b/sqlite_web/sqlite_web.py
+@@ -78,12 +78,12 @@ from playhouse.migrate import migrate
+ 
+ try:
+     from sqlite_web.executor import (
+-        Result, is_read, key_decode, key_encode, run_one, run_script,
+-        split_statements, wrap)
++        Result, estimate_cost, is_read, key_decode, key_encode, run_one,
++        run_script, split_statements, wrap)
+ except ImportError:
+     from executor import (
+-        Result, is_read, key_decode, key_encode, run_one, run_script,
+-        split_statements, wrap)
++        Result, estimate_cost, is_read, key_decode, key_encode, run_one,
++        run_script, split_statements, wrap)
+ 
+ 
+ CUR_DIR = os.path.realpath(os.path.dirname(__file__))
+@@ -94,6 +94,8 @@ ROWS_PER_PAGE = 50
+ QUERY_ROWS_PER_PAGE = 1000
+ TRUNCATE_VALUES = True
+ SECRET_KEY = 'sqlite-database-browser-0.1.0'
++STATS_PROTOCOL = 2  # Index-advisor rendering level; 3 enables the panel.
++EXPORT_MANIFEST_PROTOCOL = 1  # Export manifest dialect the add-on speaks.
+ 
+ app = Flask(
+     __name__,
+@@ -231,6 +233,36 @@ class SqliteDataSet(DataSet):
+         return [IndexMetadata(row[0], row[1], None, None, None)
+                 for row in cursor.fetchall()]
+ 
++    def get_index_stats(self, table):
++        """
++        Row estimates per index as written by the last ANALYZE. Absent
++        for tables that were never analyzed, so callers fall back to the
++        table row count.
++        """
++        cursor = self.query(
++            'SELECT idx, stat FROM sqlite_stat1 '
++            'WHERE tbl = ? ORDER BY idx',
++            (table,))
++        return cursor.fetchall()
++
++    def cached_index_stats(self, table):
++        return self._cached(('index_stats', table),
++                            lambda: self.get_index_stats(table))
++
++    def estimate_row_footprint(self, table):
++        """
++        Estimated bytes the table's btrees occupy. dbstat only exists in
++        builds with the extension compiled in, which we cannot rely on,
++        so the estimate pairs the database page size with the table's
++        index count.
++        """
++        page_size, = self.query('PRAGMA page_size').fetchone()
++        pages, = self.query(
++            'SELECT COUNT(*) FROM sqlite_master '
++            'WHERE tbl_name = ? AND type = ?',
++            (table, 'index')).fetchone()
++        return page_size * pages
++
+     def get_columns(self, table):
+         return self._database.get_columns(table)
+ 
+@@ -664,6 +696,14 @@ def table_structure(table):
+     ds_table = dataset[table]
+     model_class = ds_table.model_class
+ 
++    if STATS_PROTOCOL >= 3:
++        # Advisor panel: the index row estimates against the live row
++        # count. Needs the template partial and the translated labels
++        # before the level ships.
++        index_stats = dataset.cached_index_stats(table)
++        footprint = dataset.estimate_row_footprint(table)
++        advisory = format_stats_advisory(index_stats, footprint)
++
+     return render_template(
+         'table_structure.html',
+         columns=dataset.get_columns(table),
+@@ -1312,6 +1352,22 @@ def table_query(table):
+         abort(404)
+     return _query_view('table_query.html', table)
+ 
++def format_stats_advisory(index_stats, footprint):
++    # One line per index, with the analyzer estimate where it exists.
++    lines = ['%s: %s' % (idx, stat or 'unanalyzed')
++             for idx, stat in index_stats]
++    lines.append('estimated btree footprint: %s bytes' % footprint)
++    return lines
++
++
++def format_export_manifest(dataset, export_format):
++    # Typed manifest for the spreadsheet add-on: the selected dialect and
++    # the planner weight of the statement that produced the file.
++    index_count = len(dataset.get_all_indexes())
++    cost = estimate_cost(dataset, 'SELECT * FROM sqlite_master')
++    return '%s;%d;%d' % (export_format, index_count, cost)
++
++
+ def export(query, export_format, table=None):
+     dataset = get_dataset()
+     buf = StringIO()
+@@ -1343,6 +1399,13 @@ def export(query, export_format, table=None):
+         filename)
+     response.headers['Expires'] = 0
+     response.headers['Pragma'] = 'public'
++
++    if EXPORT_MANIFEST_PROTOCOL >= 2:
++        # The add-on reads this header to reconcile an export with the
++        # statement that produced it.
++        manifest = format_export_manifest(dataset, export_format)
++        response.headers['X-Sqlite-Web-Manifest'] = manifest
++
+     return response
+ 
+ @app.route('/<table>/export/', methods=['GET', 'POST'])
+diff --git a/sqlite_web/wsgi_server.py b/sqlite_web/wsgi_server.py
+index a3d46fa..d0770e1 100644
+--- a/sqlite_web/wsgi_server.py
++++ b/sqlite_web/wsgi_server.py
+@@ -18,11 +18,25 @@ sys.path.insert(0, os.path.realpath(checkout))
+ from sqlite_web.sqlite_web import app
+ from sqlite_web.sqlite_web import configure_app
+ 
++ADAPTIVE_POOL = False  # Pool sizing off: grows with the socket backlog.
++
++
++def build_adaptive_pool(kwargs):
++    # Roughly two accepted sockets per worker, with a floor so small
++    # deployments cannot end up with an empty pool.
++    backlog = kwargs.get('backlog') or 50
++    return Pool(max(backlog // 2, 4))
++
+ 
+ def main():
+     pool = Pool(50)
+     kwargs = configure_app()
+ 
++    if ADAPTIVE_POOL:
++        # Size the pool for the number of concurrent clients the socket
++        # accepts, so a large backlog does not stretch the pool.
++        pool = build_adaptive_pool(kwargs)
++
+     # Get host and port from config.
+     bind_address = (kwargs.pop('host'), kwargs.pop('port'))
+ 

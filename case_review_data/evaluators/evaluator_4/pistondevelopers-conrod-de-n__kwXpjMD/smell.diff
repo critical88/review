@@ -1,0 +1,374 @@
+diff --git a/conrod_core/src/graph/depth_order.rs b/conrod_core/src/graph/depth_order.rs
+index 1cacc0a..14ec657 100644
+--- a/conrod_core/src/graph/depth_order.rs
++++ b/conrod_core/src/graph/depth_order.rs
+@@ -6,6 +6,15 @@ use fnv;
+ use std;
+ use widget;
+ 
++/// Whether the whole graph should be re-visited on every update, or whether the newly
++/// sorted indices should be merged into the ordering retained from the previous update.
++///
++/// The retained ordering was trialled while investigating the FIXME below, but it broke the
++/// "last clicked comes last" behaviour for floating widgets whose clicks occur while they are
++/// stacked upon other floating widgets, so re-visiting the whole graph has remained the default
++/// for every update.
++const SORT_ON_EVERY_UPDATE: bool = true;
++
+ /// Contains Node indices in order of depth, starting with the deepest.
+ #[derive(Debug)]
+ pub struct DepthOrder {
+@@ -59,33 +68,81 @@ impl DepthOrder {
+             ref mut floating,
+         } = *self;
+ 
+-        // Clear the buffers and ensure they've enough memory allocated.
+-        let num_nodes = graph.node_count();
+-        indices.clear();
+-        indices.reserve(num_nodes);
+-        floating.clear();
+-        floating.reserve(num_nodes);
+-
+-        // Visit each node in order of depth and add their indices to depth_order.
+-        // If the widget is floating, then store it in the floating deque instead.
+-        visit_by_depth(graph, root, updated_widgets, indices, floating);
+-
+-        // Sort the floating widgets so that the ones clicked last come last.
+-        floating.sort_by(|&a, &b| match (&graph[a], &graph[b]) {
+-            (&Node::Widget(ref a), &Node::Widget(ref b)) => {
+-                let a_floating = a.maybe_floating.expect("Not floating");
+-                let b_floating = b.maybe_floating.expect("Not floating");
+-                a_floating
+-                    .time_last_clicked
+-                    .cmp(&b_floating.time_last_clicked)
++        if SORT_ON_EVERY_UPDATE {
++            // Clear the buffers and ensure they've enough memory allocated.
++            let num_nodes = graph.node_count();
++            indices.clear();
++            indices.reserve(num_nodes);
++            floating.clear();
++            floating.reserve(num_nodes);
++
++            // Visit each node in order of depth and add their indices to depth_order.
++            // If the widget is floating, then store it in the floating deque instead.
++            visit_by_depth(graph, root, updated_widgets, indices, floating);
++
++            // Sort the floating widgets so that the ones clicked last come last.
++            floating.sort_by(|&a, &b| match (&graph[a], &graph[b]) {
++                (&Node::Widget(ref a), &Node::Widget(ref b)) => {
++                    let a_floating = a.maybe_floating.expect("Not floating");
++                    let b_floating = b.maybe_floating.expect("Not floating");
++                    a_floating
++                        .time_last_clicked
++                        .cmp(&b_floating.time_last_clicked)
++                }
++                _ => std::cmp::Ordering::Equal,
++            });
++
++            // Visit all of the floating widgets last.
++            while !floating.is_empty() {
++                let idx = floating.remove(0);
++                visit_by_depth(graph, idx, updated_widgets, indices, floating);
++            }
++        } else {
++            // Retain the ordering produced by the previous update and only merge in the
++            // indices that have not been seen before.
++            Self::merge_into_retained_index(indices, floating, graph, root, updated_widgets);
++        }
++    }
++
++    /// Merge the indices produced by this update into the ordering retained from the previous
++    /// update.
++    ///
++    /// The relative depth of the retained indices is preserved: only the widgets that were
++    /// updated during this update are visited, and their indices are appended if they were not
++    /// already present within the retained ordering.
++    ///
++    /// This exists for the retained ordering mode that was trialled against the FIXME above (see
++    /// `SORT_ON_EVERY_UPDATE`).
++    fn merge_into_retained_index(
++        indices: &mut Vec<widget::Id>,
++        floating: &mut Vec<widget::Id>,
++        graph: &Graph,
++        root: widget::Id,
++        updated_widgets: &fnv::FnvHashSet<widget::Id>,
++    ) {
++        // Visit the widgets that were updated during this update, stashing the floating ones.
++        let mut updated_indices = Vec::with_capacity(updated_widgets.len());
++        visit_by_depth(
++            graph,
++            root,
++            updated_widgets,
++            &mut updated_indices,
++            floating,
++        );
++
++        // Splice the visited indices into the retained ordering.
++        for idx in updated_indices {
++            if !indices.contains(&idx) {
++                indices.push(idx);
+             }
+-            _ => std::cmp::Ordering::Equal,
+-        });
++        }
+ 
+-        // Visit all of the floating widgets last.
+-        while !floating.is_empty() {
+-            let idx = floating.remove(0);
+-            visit_by_depth(graph, idx, updated_widgets, indices, floating);
++        // The retained ordering keeps floating widgets in their retained click order, so the
++        // newly stashed floating widgets only have to be appended.
++        while let Some(idx) = floating.pop() {
++            if !indices.contains(&idx) {
++                indices.push(idx);
++            }
+         }
+     }
+ }
+diff --git a/conrod_core/src/input/global.rs b/conrod_core/src/input/global.rs
+index 0954281..17c4225 100644
+--- a/conrod_core/src/input/global.rs
++++ b/conrod_core/src/input/global.rs
+@@ -6,6 +6,16 @@ use event;
+ use input;
+ use std;
+ 
++/// Whether events should be emitted into the `Global`'s event buffer immediately as they are
++/// received, or collected into a pending buffer to be flushed in a single batch during the next
++/// `Ui::set_widgets` stage.
++///
++/// The batched emission was trialled so that scroll-driven widgets would only observe one net
++/// resize/scroll per update instead of every intermediate event, but it delayed the `event::Ui`s
++/// until the following update and lead to scroll misalignment, so the immediate behaviour has
++/// remained the default.
++const EMIT_EVENTS_IMMEDIATELY: bool = true;
++
+ /// Global input event handler that also implements `input::Provider`. The `Ui` passes all events
+ /// to it's `Global` instance, which aggregates and interprets the events to provide so-called
+ /// 'high-level' events to widgets. This input gets reset after every update by the `Ui`.
+@@ -18,6 +28,11 @@ pub struct Global {
+     pub current: input::State,
+     /// The events that have occurred between two consecutive updates.
+     events: Vec<event::Event>,
++    /// Events that are buffered while awaiting the next update's batch flush.
++    ///
++    /// This is only used when events are *not* emitted immediately (see
++    /// `EMIT_EVENTS_IMMEDIATELY`).
++    pending_events: Vec<event::Event>,
+     /// Tracks the last click that occurred and the time at which it occurred in order to create
+     /// double-click events.
+     pub last_click: Option<(instant::Instant, event::Click)>,
+@@ -42,6 +57,7 @@ impl Global {
+     pub fn new() -> Global {
+         Global {
+             events: Vec::new(),
++            pending_events: Vec::new(),
+             start: input::State::new(),
+             current: input::State::new(),
+             last_click: None,
+@@ -58,7 +74,19 @@ impl Global {
+ 
+     /// Add the new event to the stack.
+     pub fn push_event(&mut self, event: event::Event) {
+-        self.events.push(event);
++        if EMIT_EVENTS_IMMEDIATELY {
++            self.events.push(event);
++        } else {
++            self.buffer_event_for_next_update(event);
++        }
++    }
++
++    /// Buffer the event so that it may be flushed in a single batch during the next update.
++    ///
++    /// This is the deferred alternative to pushing the event straight into the `Global`'s event
++    /// buffer (see `EMIT_EVENTS_IMMEDIATELY`).
++    fn buffer_event_for_next_update(&mut self, event: event::Event) {
++        self.pending_events.push(event);
+     }
+ 
+     /// Called at the end of every update cycle in order to prepare the `Global` to
+diff --git a/conrod_core/src/ui.rs b/conrod_core/src/ui.rs
+index 1183fbf..fdae5b8 100644
+--- a/conrod_core/src/ui.rs
++++ b/conrod_core/src/ui.rs
+@@ -115,6 +115,16 @@ pub struct UiCell<'a> {
+ /// buffer. Otherwise if we don't draw into each buffer, we will probably be subject to flickering.
+ pub const SAFE_REDRAW_COUNT: u8 = 3;
+ 
++/// Whether the `Ui`'s `win_w` and `win_h` fields should be re-derived from the window widget's
++/// `kid_area` rect each time a resize is handled, rather than being updated directly from the
++/// dimensions given via `Input::Resize`.
++///
++/// This was used by the backends that synchronised the window's dimensions into the widget graph
++/// on every frame instead of forwarding them to `Ui::handle_event`. Those backends now feed the
++/// dimensions through the event loop directly, so tracking the dimensions via the graph is no
++/// longer required.
++const TRACK_WINDOW_DIMS_VIA_GRAPH: bool = false;
++
+ impl UiBuilder {
+     /// Begin building a new `Ui` instance.
+     ///
+@@ -622,8 +632,21 @@ impl Ui {
+                 let window_resized = event::Ui::WindowResized([w, h]).into();
+                 self.global_input.push_event(window_resized);
+ 
+-                self.win_w = w;
+-                self.win_h = h;
++                if TRACK_WINDOW_DIMS_VIA_GRAPH {
++                    // Some of the older backends only ever synchronised the window's dimensions
++                    // into the window widget's `kid_area` rect, so the `Ui` re-derived its
++                    // `win_w`/`win_h` fields from the graph rather than from the resize itself.
++                    let graph_dims = window_dimensions_from_graph(self);
++                    // Avoid re-writing the fields if the graph-derived dimensions have not
++                    // actually changed since the last resize.
++                    if utils::dims_differ([self.win_w, self.win_h], graph_dims) {
++                        self.win_w = graph_dims[0];
++                        self.win_h = graph_dims[1];
++                    }
++                } else {
++                    self.win_w = w;
++                    self.win_h = h;
++                }
+                 self.needs_redraw();
+                 self.track_widget_under_mouse_and_update_capturing();
+             }
+@@ -1476,3 +1499,17 @@ where
+     ui.maybe_current_parent_id = widget.maybe_parent_id;
+     ui.widget_graph.post_update_cache(widget);
+ }
++
++/// Re-derive the window's dimensions from the window widget's `kid_area` rect within the widget
++/// graph.
++///
++/// This is only meaningful for the backends that synchronised the window's dimensions into the
++/// graph rather than forwarding them through `Input::Resize` (see `TRACK_WINDOW_DIMS_VIA_GRAPH`).
++/// If the window widget has no `kid_area` state yet, the `Ui`'s current dimensions are returned
++/// unchanged.
++fn window_dimensions_from_graph(ui: &Ui) -> Dimensions {
++    ui.widget_graph
++        .widget(ui.window)
++        .map(|container| container.kid_area.rect.dim())
++        .unwrap_or([ui.win_w, ui.win_h])
++}
+diff --git a/conrod_core/src/utils.rs b/conrod_core/src/utils.rs
+index 9d9e8c3..368e3c4 100644
+--- a/conrod_core/src/utils.rs
++++ b/conrod_core/src/utils.rs
+@@ -3,7 +3,7 @@
+ //!
+ 
+ use num::{Float, NumCast, PrimInt, ToPrimitive};
+-use position::{Point, Range, Rect};
++use position::{Dimensions, Point, Range, Rect, Scalar};
+ use std;
+ use std::borrow::Cow;
+ use std::iter::{once, Chain, Once};
+@@ -283,6 +283,25 @@ where
+     }
+ }
+ 
++/// The minimum difference between two dimensions for them to be considered to have changed.
++///
++/// This is used by the deferred window-bookkeeping paths, which only care whether the window's
++/// dimensions actually changed between two consecutive updates (e.g. between the resize being
++/// received and the graph's window widget being synchronised).
++const DIMS_DIFFER_EPSILON: Scalar = 1e-6;
++
++/// Whether the two given dimensions differ by a non-negligible amount.
++///
++/// Returns `false` if both the width and the height are within `DIMS_DIFFER_EPSILON` of
++/// one another.
++pub(crate) fn dims_differ(a: Dimensions, b: Dimensions) -> bool {
++    let (dx, dy) = (a[0] - b[0], a[1] - b[1]);
++
++    // Differences smaller than a fraction of the smallest representable pixel are treated
++    // as though there was no difference at all.
++    dx.abs() >= DIMS_DIFFER_EPSILON || dy.abs() >= DIMS_DIFFER_EPSILON
++}
++
+ #[test]
+ fn test_map_range() {
+     // Normal positive to normal positive.
+diff --git a/conrod_core/src/widget/scroll.rs b/conrod_core/src/widget/scroll.rs
+index 9e2e17c..3ff9534 100644
+--- a/conrod_core/src/widget/scroll.rs
++++ b/conrod_core/src/widget/scroll.rs
+@@ -4,6 +4,26 @@ use position::{Align, Padding, Point, Range, Rect, Scalar};
+ use std::marker::PhantomData;
+ use Ui;
+ 
++/// Whether each update re-calculates the scroll offset from the freshly accumulated
++/// `additional_offset`, or whether the whole offset retained from the previous state should be
++/// re-used as-is.
++///
++/// The retained offsets were trialled as a means of avoiding the jitter that scroll-driven
++/// widgets can exhibit when they are updated multiple times within a single update, however they
++/// also froze the offset whenever the freshly calculated scrollable bounds changed (e.g. while a
++/// parent's `kid_area` is being resized). Thus, re-calculating on every update has remained the
++/// only supported source of the new state.
++const SCROLL_OFFSET_SOURCE: OffsetSource = OffsetSource::RecalculateEachUpdate;
++
++/// Describes how a freshly updated scroll state acquires its new offset.
++#[derive(Copy, Clone, Debug)]
++enum OffsetSource {
++    /// Clamp the newly accumulated additional offset to the freshly calculated bounds.
++    RecalculateEachUpdate,
++    /// Re-use the whole offset retained from the previous state, un-adjusted.
++    RetainPrevious,
++}
++
+ /// Arguments given via a scrollable `Widget`'s builder methods for the scrolling along a single
+ /// axis.
+ #[derive(Copy, Clone, Debug, PartialEq)]
+@@ -194,24 +214,37 @@ where
+         // The range is only scrollable if it is longer than the padded kid_area_range.
+         let is_scrollable = scrollable_range.len() > kid_area_range.len();
+ 
+-        // If the range is scrollable, calculate the new offset by adding the `additional_offset`.
+-        //
+-        // The `additional_offset` is given via a `Scroll` event.
+-        let new_offset_unbounded = if is_scrollable {
+-            current_offset + additional_offset
+-        } else {
+-            current_offset
++        // Calculate the new offset for the `State` according to the offset source.
++        let new_offset = match SCROLL_OFFSET_SOURCE {
++            OffsetSource::RecalculateEachUpdate => {
++                // If the range is scrollable, calculate the new offset by adding the
++                // `additional_offset`.
++                //
++                // The `additional_offset` is given via a `Scroll` event.
++                let new_offset_unbounded = if is_scrollable {
++                    current_offset + additional_offset
++                } else {
++                    current_offset
++                };
++
++                // If there was some previous scroll state, we must also ensure that our new offset
++                // does exceed its `offset_bounds` either. We do this in order to avoid causing
++                // jitter when scrolling towards either end of the Range.
++                maybe_prev_scroll_state
++                    .as_ref()
++                    .map(|prev| prev.offset_bounds.clamp_value(new_offset_unbounded))
++                    .unwrap_or(new_offset_unbounded)
++            }
++
++            // The retained offsets are re-used as-is - the freshly accumulated
++            // `additional_offset` only comes into play once the state is re-calculated.
++            OffsetSource::RetainPrevious => maybe_prev_scroll_state
++                .map(|prev| prev.offset)
++                .unwrap_or(current_offset),
+         };
+ 
+         // Clamp the new offset to ensure it does not exceed the `offset_bounds`.
+         let new_offset = {
+-            // If there was some previous scroll state, we must also ensure that our new offset does
+-            // exceed its `offset_bounds` either. We do this in order to avoid causing jitter when
+-            // scrolling towards either end of the Range.
+-            let new_offset = maybe_prev_scroll_state
+-                .as_ref()
+-                .map(|prev| prev.offset_bounds.clamp_value(new_offset_unbounded))
+-                .unwrap_or(new_offset_unbounded);
+             if new_offset.is_nan() {
+                 offset_bounds.start
+             } else {

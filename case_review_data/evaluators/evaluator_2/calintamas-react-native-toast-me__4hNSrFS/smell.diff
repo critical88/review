@@ -1,0 +1,1721 @@
+diff --git a/src/Toast.tsx b/src/Toast.tsx
+index 2cc85c7..72480cc 100644
+--- a/src/Toast.tsx
++++ b/src/Toast.tsx
+@@ -1,13 +1,9 @@
+ import React from 'react';
+ 
+ import { LoggerProvider, GestureProvider } from './contexts';
++import { ToastManager } from './ToastManager';
+ import { ToastUI } from './ToastUI';
+-import {
+-  ToastHideParams,
+-  ToastProps,
+-  ToastRef,
+-  ToastShowParams
+-} from './types';
++import { ToastProps, ToastRef, ToastShowParams, ToastHideParams } from './types';
+ import { useToast } from './useToast';
+ 
+ const ToastRoot = React.forwardRef((props: ToastProps, ref) => {
+@@ -40,32 +36,6 @@ const ToastRoot = React.forwardRef((props: ToastProps, ref) => {
+   );
+ });
+ 
+-type ToastRefObj = {
+-  current: ToastRef | null;
+-};
+-
+-let refs: ToastRefObj[] = [];
+-
+-/**
+- * Adds a ref to the end of the array, which will be used to show the toasts until its ref becomes null.
+- *
+- * @param newRef the new ref, which must be stable for the life of the Toast instance.
+- */
+-function addNewRef(newRef: ToastRef) {
+-  refs.push({
+-    current: newRef
+-  });
+-}
+-
+-/**
+- * Removes the passed in ref from the file-level refs array using a strict equality check.
+- *
+- * @param oldRef the exact ref object to remove from the refs array.
+- */
+-function removeOldRef(oldRef: ToastRef | null) {
+-  refs = refs.filter((r) => r.current !== oldRef);
+-}
+-
+ export function Toast(props: ToastProps): React.ReactElement {
+   const toastRef = React.useRef<ToastRef | null>(null);
+ 
+@@ -75,14 +45,14 @@ export function Toast(props: ToastProps): React.ReactElement {
+     rather than being the Toast that was *mounted* last.
+   */
+   const setRef = React.useCallback((ref: ToastRef | null) => {
+-    // Since we know there's a ref, we'll update `refs` to use it.
++    // Since we know there's a ref, we'll update the registry to use it.
+     if (ref) {
+-      // store the ref in this toast instance to be able to remove it from the array later when the ref becomes null.
++      // store the ref in this toast instance to be able to remove it from the registry later when the ref becomes null.
+       toastRef.current = ref;
+-      addNewRef(ref);
++      ToastManager.registerToastRef(ref);
+     } else {
+-      // remove the this toast's ref, wherever it is in the array.
+-      removeOldRef(toastRef.current);
++      // remove the this toast's ref, wherever it is in the registry.
++      ToastManager.unregisterToastRef(toastRef.current);
+     }
+   }, []);
+ 
+@@ -95,36 +65,27 @@ export function Toast(props: ToastProps): React.ReactElement {
+   );
+ }
+ 
+-/**
+- * Get the active Toast instance `ref`, by priority.
+- * The "highest" Toast in the `View` hierarchy has the highest priority.
+- *
+- * For example, a Toast inside a `Modal`, would have had its ref set later than a Toast inside App's Root.
+- * Therefore, the library knows that it is currently visible on top of the App's Root
+- * and will thus use the `Modal`'s Toast when showing/hiding.
+- *
+- * ```js
+- * <>
+- *  <Toast />
+- *  <Modal>
+- *    <Toast />
+- *  </Modal>
+- * </>
+- * ```
+- */
+-function getRef() {
+-  const reversePriority = [...refs].reverse();
+-  const activeRef = reversePriority.find((ref) => ref?.current !== null);
+-  if (!activeRef) {
+-    return null;
+-  }
+-  return activeRef.current;
+-}
++/*
++Toast.show / Toast.hide route to the active Toast instance `ref`, by priority.
++The `ToastManager` registry implements the priority rules on behalf of the component.
++
++For example, a Toast inside a `Modal`, would have had its ref set later than a Toast inside App's Root.
++Therefore, the library knows that it is currently visible on top of the App's Root
++and will thus use the `Modal`'s Toast when showing/hiding.
+ 
++```js
++<>
++  <Toast />
++  <Modal>
++    <Toast />
++  </Modal>
++</>
++```
++*/
+ Toast.show = (params: ToastShowParams) => {
+-  getRef()?.show(params);
++  ToastManager.showToast(params);
+ };
+ 
+ Toast.hide = (params?: ToastHideParams) => {
+-  getRef()?.hide(params);
++  ToastManager.hideToast(params);
+ };
+diff --git a/src/ToastManager.tsx b/src/ToastManager.tsx
+new file mode 100644
+index 0000000..7cb0e66
+--- /dev/null
++++ b/src/ToastManager.tsx
+@@ -0,0 +1,753 @@
++import React from 'react';
++import {
++  Animated,
++  Dimensions,
++  GestureResponderEvent,
++  Keyboard,
++  KeyboardEvent,
++  LayoutChangeEvent,
++  PanResponder,
++  PanResponderGestureState,
++  Platform
++} from 'react-native';
++
++import { ErrorToast } from './components/ErrorToast';
++import { InfoToast } from './components/InfoToast';
++import { SuccessToast } from './components/SuccessToast';
++import {
++  ReactChildren,
++  ToastAnimationConfig,
++  ToastConfig,
++  ToastData,
++  ToastHideParams,
++  ToastOptions,
++  ToastPosition,
++  ToastRef,
++  ToastShowParams,
++  ToastSingleAnimationConfig,
++  ToastSpringAnimationConfig
++} from './types';
++import { noop } from './utils/func';
++import { bound } from './utils/number';
++import { isIOS } from './utils/platform';
++
++type ToastRefObj = {
++  current: ToastRef | null;
++};
++
++type Log = (...args: unknown[]) => void;
++
++type PanningRef = React.MutableRefObject<boolean>;
++
++export type ToastSession = {
++  log: Log;
++  panning: PanningRef;
++  options: Required<ToastOptions>;
++  initialOptions: Required<ToastOptions>;
++  applyData: (data: ToastData) => void;
++  applyOptions: (options: Required<ToastOptions>) => void;
++  applyVisibility: (visible: boolean) => void;
++  cancelAutoHideTimer: () => void;
++};
++
++export type TimerSession = {
++  log: Log;
++  onTimeout: () => void;
++  delayMs: number;
++};
++
++export type SwipeSession = {
++  log: Log;
++  panning: PanningRef;
++  position: ToastPosition;
++  animate: (toValue: number) => void;
++  onHide: () => void;
++  onRestorePosition: () => void;
++};
++
++export type GestureSession = {
++  animatedValue: React.RefObject<Animated.Value>;
++  computeNewAnimatedValueForGesture: (gesture: PanResponderGestureState) => number;
++  onDismiss: () => void;
++  onRestore: () => void;
++  onStart: () => void;
++  onEnd: () => void;
++  disable?: boolean;
++};
++
++/**
++ * Central coordinator for the whole toast pipeline.
++ *
++ * Every part of the library funnels through here: instance registration and
++ * the imperative `Toast.show()` / `Toast.hide()` gateway, the presentation
++ * options and defaults, the auto-hide timer, the keyboard tracking, the
++ * layout measurement, the slide animation, the swipe gestures and the toast
++ * render config resolution. Keeping it all in one place makes sure every
++ * consumer observes the same lifecycle rules.
++ */
++export class ToastManager {
++  // ---------------------------------------------------------------------------
++  // Toast instance registry & imperative gateway
++  // ---------------------------------------------------------------------------
++
++  private static toastRefs: ToastRefObj[] = [];
++
++  /**
++   * Adds a ref to the end of the registry, which will be used to show the
++   * toasts until its ref becomes null.
++   */
++  static registerToastRef(newRef: ToastRef) {
++    ToastManager.toastRefs.push({
++      current: newRef
++    });
++  }
++
++  /**
++   * Removes the passed in ref from the registry using a strict equality check.
++   */
++  static unregisterToastRef(oldRef: ToastRef | null) {
++    ToastManager.toastRefs = ToastManager.toastRefs.filter(
++      (r) => r.current !== oldRef
++    );
++  }
++
++  /**
++   * Get the active Toast instance ref, by priority.
++   * The "highest" Toast in the `View` hierarchy has the highest priority.
++   */
++  static activeToast(): ToastRef | null {
++    const reversePriority = [...ToastManager.toastRefs].reverse();
++    const activeRef = reversePriority.find((ref) => ref?.current !== null);
++    if (!activeRef) {
++      return null;
++    }
++    return activeRef.current;
++  }
++
++  static showToast(params: ToastShowParams) {
++    ToastManager.activeToast()?.show(params);
++  }
++
++  static hideToast(params?: ToastHideParams) {
++    ToastManager.activeToast()?.hide(params);
++  }
++
++  // ---------------------------------------------------------------------------
++  // Presentation defaults & options resolution
++  // ---------------------------------------------------------------------------
++
++  static readonly defaultData: ToastData = {
++    text1: undefined,
++    text2: undefined
++  };
++
++  static readonly defaultAnimationConfig: ToastSpringAnimationConfig = {
++    type: 'spring',
++    friction: 8
++  };
++
++  static readonly defaultOptions: Required<ToastOptions> = {
++    type: 'success',
++    text1Style: null,
++    text2Style: null,
++    position: 'top',
++    autoHide: true,
++    swipeable: true,
++    visibilityTime: 4000,
++    topOffset: 40,
++    bottomOffset: 40,
++    keyboardOffset: 10,
++    avoidKeyboard: true,
++    onShow: noop,
++    onHide: noop,
++    onPress: noop,
++    props: {},
++    animationConfig: ToastManager.defaultAnimationConfig
++  };
++
++  static mergeOptions(
++    baseOptions: Record<string, unknown>,
++    overrides: Record<string, unknown>
++  ) {
++    const mergedOptions = {
++      ...baseOptions
++    };
++    Object.entries(overrides).forEach(([key, value]) => {
++      if (value !== null && value !== undefined) {
++        mergedOptions[key] = value;
++      }
++    });
++    return mergedOptions;
++  }
++
++  static resolveShowParams(
++    params: ToastShowParams,
++    initialOptions: Required<ToastOptions>
++  ) {
++    const {
++      text1 = ToastManager.defaultData.text1,
++      text2 = ToastManager.defaultData.text2,
++      type = initialOptions.type,
++      text1Style = initialOptions.text1Style,
++      text2Style = initialOptions.text2Style,
++      position = initialOptions.position,
++      autoHide = initialOptions.autoHide,
++      visibilityTime = initialOptions.visibilityTime,
++      topOffset = initialOptions.topOffset,
++      bottomOffset = initialOptions.bottomOffset,
++      keyboardOffset = initialOptions.keyboardOffset,
++      avoidKeyboard = initialOptions.avoidKeyboard,
++      onShow = initialOptions.onShow,
++      onHide = initialOptions.onHide,
++      onPress = initialOptions.onPress,
++      swipeable = initialOptions.swipeable,
++      props = initialOptions.props,
++      animationConfig = initialOptions.animationConfig
++    } = params;
++
++    const data = {
++      text1,
++      text2
++    };
++    const options = ToastManager.mergeOptions(initialOptions, {
++      type,
++      text1Style,
++      text2Style,
++      position,
++      autoHide,
++      visibilityTime,
++      topOffset,
++      bottomOffset,
++      keyboardOffset,
++      avoidKeyboard,
++      onShow,
++      onHide,
++      onPress,
++      swipeable,
++      props,
++      animationConfig
++    }) as Required<ToastOptions>;
++
++    return {
++      data,
++      options
++    };
++  }
++
++  // ---------------------------------------------------------------------------
++  // Presentation lifecycle state machine
++  // ---------------------------------------------------------------------------
++
++  private toastSession?: ToastSession;
++
++  bindToast(session: ToastSession) {
++    this.toastSession = session;
++  }
++
++  presentToast(params: ToastShowParams) {
++    const session = ToastManager.requireToastSession(this);
++    session.log(`Showing with params: ${JSON.stringify(params)}`);
++    // TODO: validate input
++    // TODO: use a queue when Toast is already visible
++    const { data, options } = ToastManager.resolveShowParams(
++      params,
++      session.initialOptions
++    );
++    session.applyData(data);
++    session.applyOptions(options);
++    session.applyVisibility(true);
++    options.onShow(params);
++  }
++
++  dismissToast() {
++    const session = ToastManager.requireToastSession(this);
++    session.log('Hiding');
++    session.applyVisibility(false);
++    session.cancelAutoHideTimer();
++    session.options.onHide();
++  }
++
++  runAutoHide() {
++    const session = ToastManager.requireToastSession(this);
++    if (session.panning.current) {
++      session.log('Auto hiding was blocked due to panning');
++    } else {
++      session.log('Auto hiding');
++      session.applyVisibility(false);
++      session.options.onHide();
++    }
++  }
++
++  // ---------------------------------------------------------------------------
++  // Auto-hide timer scheduling
++  // ---------------------------------------------------------------------------
++
++  private timerSession?: TimerSession;
++  private timerId?: NodeJS.Timeout;
++
++  bindTimer(session: TimerSession) {
++    this.timerSession = session;
++  }
++
++  startTimer() {
++    const { log, onTimeout, delayMs } = ToastManager.requireTimerSession(this);
++    this.clearTimer();
++    this.timerId = setTimeout(() => {
++      onTimeout();
++      log('Running timer', this.timerId);
++      this.timerId = undefined;
++    }, delayMs);
++    log('Starting timer', this.timerId);
++  }
++
++  clearTimer() {
++    const { log } = ToastManager.requireTimerSession(this);
++    if (this.timerId) {
++      log('Clearing timer', this.timerId);
++      clearTimeout(this.timerId);
++      this.timerId = undefined;
++    }
++  }
++
++  timerActive() {
++    return this.timerId !== undefined;
++  }
++
++  // ---------------------------------------------------------------------------
++  // Keyboard position tracking
++  // ---------------------------------------------------------------------------
++
++  private didShowListener?: ReturnType<typeof Keyboard.addListener>;
++  private didHideListener?: ReturnType<typeof Keyboard.addListener>;
++
++  attachKeyboard(
++    onShow: (event: KeyboardEvent) => void,
++    onHide: () => void
++  ) {
++    if (!isIOS()) {
++      return;
++    }
++    this.didShowListener = Keyboard.addListener('keyboardDidShow', onShow);
++    this.didHideListener = Keyboard.addListener('keyboardDidHide', onHide);
++  }
++
++  detachKeyboard() {
++    this.didShowListener?.remove();
++    this.didHideListener?.remove();
++    this.didShowListener = undefined;
++    this.didHideListener = undefined;
++  }
++
++  // ---------------------------------------------------------------------------
++  // View layout measurement
++  // ---------------------------------------------------------------------------
++
++  static layoutValue(event: LayoutChangeEvent, key: 'height' | 'width') {
++    return event?.nativeEvent?.layout?.[key] ?? 0;
++  }
++
++  static viewDimensions(
++    event: LayoutChangeEvent,
++    {
++      heightOffset = 0,
++      widthOffset = 0
++    }: { heightOffset?: number; widthOffset?: number } = {}
++  ) {
++    const height =
++      ToastManager.layoutValue(event, 'height') + heightOffset;
++    const width = ToastManager.layoutValue(event, 'width') + widthOffset;
++    return {
++      height,
++      width
++    };
++  }
++
++  // ---------------------------------------------------------------------------
++  // Slide animation & rendering math
++  // ---------------------------------------------------------------------------
++
++  static readonly nativeDriverActive: boolean = Platform.select({
++    ios: true,
++    default: false
++  });
++
++  static additiveInverse(values: number[]) {
++    return values.map((i) => -i);
++  }
++
++  static animationFor(
++    config: ToastAnimationConfig | undefined,
++    phase: 'enter' | 'exit'
++  ): ToastSingleAnimationConfig {
++    if (!config) {
++      return ToastManager.defaultAnimationConfig;
++    }
++    if ('type' in config) {
++      return config;
++    }
++    return config[phase] ?? ToastManager.defaultAnimationConfig;
++  }
++
++  static translateYRangeFor({
++    position,
++    height,
++    topOffset,
++    bottomOffset,
++    keyboardHeight,
++    keyboardOffset,
++    avoidKeyboard
++  }: {
++    position: ToastPosition;
++    height: number;
++    topOffset: number;
++    bottomOffset: number;
++    keyboardHeight: number;
++    keyboardOffset: number;
++    avoidKeyboard: boolean;
++  }) {
++    const offset = position === 'bottom' ? bottomOffset : topOffset;
++    const keyboardAwareOffset =
++      position === 'bottom' && avoidKeyboard
++        ? keyboardHeight + keyboardOffset
++        : 0;
++
++    const range = [-(height * 2), Math.max(offset, keyboardAwareOffset)];
++    const outputRange =
++      position === 'bottom' ? ToastManager.additiveInverse(range) : range;
++
++    return outputRange;
++  }
++
++  static slideAnimationStyles(
++    animatedValue: Animated.Value,
++    params: {
++      position: ToastPosition;
++      height: number;
++      topOffset: number;
++      bottomOffset: number;
++      keyboardHeight: number;
++      keyboardOffset: number;
++      avoidKeyboard: boolean;
++    }
++  ) {
++    const translateY = animatedValue.interpolate({
++      inputRange: [0, 1],
++      outputRange: ToastManager.translateYRangeFor(params)
++    });
++    const opacity = animatedValue.interpolate({
++      inputRange: [0, 0.7, 1],
++      outputRange: [0, 1, 1]
++    });
++    return {
++      opacity,
++      transform: [
++        {
++          translateY
++        }
++      ]
++    };
++  }
++
++  static slideAnimationTo(
++    animatedValue: Animated.Value,
++    animationConfig: ToastAnimationConfig | undefined,
++    toValue: number
++  ) {
++    const animation = ToastManager.animationFor(
++      animationConfig,
++      toValue === 1 ? 'enter' : 'exit'
++    );
++
++    if (animation.type === 'timing') {
++      const { type: _type, ...timingConfig } = animation;
++      Animated.timing(animatedValue, {
++        ...timingConfig,
++        toValue,
++        useNativeDriver: ToastManager.nativeDriverActive
++      }).start();
++    } else {
++      const { type: _type, ...springConfig } = animation;
++      Animated.spring(animatedValue, {
++        ...springConfig,
++        toValue,
++        useNativeDriver: ToastManager.nativeDriverActive
++      }).start();
++    }
++  }
++
++  // ---------------------------------------------------------------------------
++  // Swipe gesture physics & responder
++  // ---------------------------------------------------------------------------
++
++  /**
++   * Produces a positive damping value.
++   *
++   * To note: `moveY` becomes negative when going off-screen. By making sure the value
++   * produced is always positive, we avoid issues like: https://github.com/calintamas/react-native-toast-message/issues/280
++   */
++  static dampingFor(
++    gesture: PanResponderGestureState,
++    position: ToastPosition
++  ) {
++    const { moveY } = gesture;
++
++    switch (position) {
++      case 'bottom': {
++        const { height: screenHeight } = Dimensions.get('screen');
++        return Math.abs(screenHeight - moveY);
++      }
++      case 'top':
++        return Math.abs(moveY);
++      default:
++        throw new Error(`Toast position: ${position} not implemented`);
++    }
++  }
++
++  static animatedValueFor(
++    gesture: PanResponderGestureState,
++    position: ToastPosition,
++    damping: number
++  ) {
++    const boundValue = (val: number) => bound(val, 0, 2);
++    const { dy } = gesture;
++
++    switch (position) {
++      case 'bottom':
++        return boundValue(1 - dy / damping);
++      case 'top':
++        return boundValue(1 + dy / damping);
++      default:
++        throw new Error(`Toast position: ${position} not implemented`);
++    }
++  }
++
++  static swipeDismisses(
++    newAnimatedValue: number,
++    gesture: PanResponderGestureState
++  ) {
++    const dismissThreshold = 0.65;
++    const { vy, dy } = gesture;
++    return (
++      newAnimatedValue <= dismissThreshold ||
++      (Math.abs(vy) >= dismissThreshold && dy < 0)
++    );
++  }
++
++  static shouldStartPanOnStart() {
++    return true;
++  }
++
++  static shouldStartPanOnMove(
++    _event: GestureResponderEvent,
++    gesture: PanResponderGestureState
++  ) {
++    // Fixes onPress handler
++    // https://github.com/calintamas/react-native-toast-message/issues/113
++    const offset = 2;
++    return Math.abs(gesture.dx) > offset || Math.abs(gesture.dy) > offset;
++  }
++
++  private gestureSession?: GestureSession;
++
++  bindGesture(session: GestureSession) {
++    this.gestureSession = session;
++  }
++
++  createResponder() {
++    const manager = this;
++    return PanResponder.create({
++      onStartShouldSetPanResponder: ToastManager.shouldStartPanOnStart,
++      onPanResponderGrant: () => manager.onGestureGrant(),
++      onMoveShouldSetPanResponder: ToastManager.shouldStartPanOnMove,
++      onMoveShouldSetPanResponderCapture: ToastManager.shouldStartPanOnMove,
++      onPanResponderMove: (event: GestureResponderEvent, gesture: PanResponderGestureState) =>
++        manager.onGestureMove(event, gesture),
++      onPanResponderRelease: (event: GestureResponderEvent, gesture: PanResponderGestureState) =>
++        manager.onGestureRelease(event, gesture),
++      onPanResponderTerminate: () => manager.onGestureTerminate()
++    });
++  }
++
++  onGestureGrant() {
++    const session = ToastManager.requireGestureSession(this);
++    if (session.disable) return;
++    session.onStart();
++  }
++
++  onGestureMove(_event: GestureResponderEvent, gesture: PanResponderGestureState) {
++    const session = ToastManager.requireGestureSession(this);
++    if (session.disable) return;
++
++    const newAnimatedValue = session.computeNewAnimatedValueForGesture(gesture);
++
++    session.animatedValue.current?.setValue(newAnimatedValue);
++  }
++
++  onGestureRelease(
++    _event: GestureResponderEvent,
++    gesture: PanResponderGestureState
++  ) {
++    const session = ToastManager.requireGestureSession(this);
++    session.onEnd();
++
++    if (session.disable) return;
++
++    const newAnimatedValue = session.computeNewAnimatedValueForGesture(gesture);
++    if (ToastManager.swipeDismisses(newAnimatedValue, gesture)) {
++      session.onDismiss();
++    } else {
++      session.onRestore();
++    }
++  }
++
++  onGestureTerminate() {
++    const session = ToastManager.requireGestureSession(this);
++    session.onEnd();
++    if (session.disable) return;
++    session.onRestore();
++  }
++
++  // ---------------------------------------------------------------------------
++  // Swipe visual session (panning flags, restore / dismiss animation)
++  // ---------------------------------------------------------------------------
++
++  private swipeSession?: SwipeSession;
++
++  bindSwipe(session: SwipeSession) {
++    this.swipeSession = session;
++  }
++
++  onSwipeStart() {
++    const session = ToastManager.requireSwipeSession(this);
++    session.log('Swipe, pan start');
++    session.panning.current = true;
++  }
++
++  onSwipeEnd() {
++    const session = ToastManager.requireSwipeSession(this);
++    session.log('Swipe, pan end');
++    session.panning.current = false;
++  }
++
++  onSwipeDismiss() {
++    const session = ToastManager.requireSwipeSession(this);
++    session.log('Swipe, dismissing');
++    session.animate(0);
++    session.onHide();
++  }
++
++  onSwipeRestore() {
++    const session = ToastManager.requireSwipeSession(this);
++    session.log('Swipe, restoring to original position');
++    session.animate(1);
++    session.onRestorePosition();
++  }
++
++  swipeAnimatedValueFor(gesture: PanResponderGestureState) {
++    const session = ToastManager.requireSwipeSession(this);
++    const damping = ToastManager.dampingFor(gesture, session.position);
++    return ToastManager.animatedValueFor(gesture, session.position, damping);
++  }
++
++  // ---------------------------------------------------------------------------
++  // Toast render config resolution
++  // ---------------------------------------------------------------------------
++
++  static readonly defaultRenderers: ToastConfig = {
++    success: (props) => <SuccessToast {...props} />,
++    error: (props) => <ErrorToast {...props} />,
++    info: (props) => <InfoToast {...props} />
++  };
++
++  static rendererFor(type: ToastOptions['type'], config?: ToastConfig) {
++    const toastRenderers = {
++      ...ToastManager.defaultRenderers,
++      ...config
++    };
++    const ToastRenderer = type == null ? undefined : toastRenderers[type];
++
++    if (!ToastRenderer) {
++      throw new Error(
++        `Toast type: '${type}' does not exist. You can add it via the 'config' prop on the Toast instance. Learn more: https://github.com/calintamas/react-native-toast-message/blob/master/README.md`
++      );
++    }
++
++    return ToastRenderer;
++  }
++
++  static renderToast({
++    data,
++    options,
++    config,
++    isVisible,
++    show,
++    hide
++  }: {
++    data: ToastData;
++    options: Required<ToastOptions>;
++    config?: ToastConfig;
++    isVisible: boolean;
++    show: (params: ToastShowParams) => void;
++    hide: (params?: ToastHideParams) => void;
++  }) {
++    const { text1, text2 } = data;
++    const {
++      type,
++      onPress,
++      text1Style,
++      text2Style,
++      position,
++      visibilityTime,
++      props
++    } = options;
++
++    const ToastRenderer = ToastManager.rendererFor(type, config);
++
++    return ToastRenderer({
++      position,
++      type,
++      isVisible,
++      visibilityTime,
++      text1,
++      text2,
++      text1Style,
++      text2Style,
++      show,
++      hide,
++      onPress,
++      props
++    });
++  }
++
++  // ---------------------------------------------------------------------------
++  // Session accessors
++  // ---------------------------------------------------------------------------
++
++  private static requireToastSession(manager: ToastManager) {
++    if (!manager.toastSession) {
++      throw new Error('ToastManager: toast session is not configured');
++    }
++    return manager.toastSession;
++  }
++
++  private static requireTimerSession(manager: ToastManager) {
++    if (!manager.timerSession) {
++      throw new Error('ToastManager: timer session is not configured');
++    }
++    return manager.timerSession;
++  }
++
++  private static requireGestureSession(manager: ToastManager) {
++    if (!manager.gestureSession) {
++      throw new Error('ToastManager: gesture session is not configured');
++    }
++    return manager.gestureSession;
++  }
++
++  private static requireSwipeSession(manager: ToastManager) {
++    if (!manager.swipeSession) {
++      throw new Error('ToastManager: swipe session is not configured');
++    }
++    return manager.swipeSession;
++  }
++}
+diff --git a/src/ToastUI.tsx b/src/ToastUI.tsx
+index 04c6ebe..c9184b8 100644
+--- a/src/ToastUI.tsx
++++ b/src/ToastUI.tsx
+@@ -1,9 +1,7 @@
+ import React from 'react';
+ 
+ import { AnimatedContainer } from './components/AnimatedContainer';
+-import { ErrorToast } from './components/ErrorToast';
+-import { InfoToast } from './components/InfoToast';
+-import { SuccessToast } from './components/SuccessToast';
++import { ToastManager } from './ToastManager';
+ import {
+   ToastConfig,
+   ToastData,
+@@ -21,59 +19,6 @@ export type ToastUIProps = {
+   config?: ToastConfig;
+ };
+ 
+-const defaultToastConfig: ToastConfig = {
+-  success: (props) => <SuccessToast {...props} />,
+-  error: (props) => <ErrorToast {...props} />,
+-  info: (props) => <InfoToast {...props} />
+-};
+-
+-function renderComponent({
+-  data,
+-  options,
+-  config,
+-  isVisible,
+-  show,
+-  hide
+-}: ToastUIProps) {
+-  const { text1, text2 } = data;
+-  const {
+-    type,
+-    onPress,
+-    text1Style,
+-    text2Style,
+-    position,
+-    visibilityTime,
+-    props
+-  } = options;
+-
+-  const toastConfig = {
+-    ...defaultToastConfig,
+-    ...config
+-  };
+-  const ToastComponent = toastConfig[type];
+-
+-  if (!ToastComponent) {
+-    throw new Error(
+-      `Toast type: '${type}' does not exist. You can add it via the 'config' prop on the Toast instance. Learn more: https://github.com/calintamas/react-native-toast-message/blob/master/README.md`
+-    );
+-  }
+-
+-  return ToastComponent({
+-    position,
+-    type,
+-    isVisible,
+-    visibilityTime,
+-    text1,
+-    text2,
+-    text1Style,
+-    text2Style,
+-    show,
+-    hide,
+-    onPress,
+-    props
+-  });
+-}
+-
+ export function ToastUI(props: ToastUIProps) {
+   const { isVisible, options, hide } = props;
+   const {
+@@ -97,7 +42,7 @@ export function ToastUI(props: ToastUIProps) {
+       swipeable={swipeable}
+       animationConfig={animationConfig}
+       onHide={hide}>
+-      {renderComponent(props)}
++      {ToastManager.renderToast(props)}
+     </AnimatedContainer>
+   );
+ }
+diff --git a/src/components/AnimatedContainer.tsx b/src/components/AnimatedContainer.tsx
+index 16962e6..95909e5 100644
+--- a/src/components/AnimatedContainer.tsx
++++ b/src/components/AnimatedContainer.tsx
+@@ -1,5 +1,5 @@
+ import React from 'react';
+-import { Animated, Dimensions, PanResponderGestureState } from 'react-native';
++import { Animated, PanResponderGestureState } from 'react-native';
+ 
+ import { useLogger, useGesture } from '../contexts';
+ import {
+@@ -8,9 +8,9 @@ import {
+   useSlideAnimation,
+   useViewDimensions
+ } from '../hooks';
++import { ToastManager } from '../ToastManager';
+ import { ReactChildren, ToastAnimationConfig, ToastPosition } from '../types';
+ import { noop } from '../utils/func';
+-import { bound } from '../utils/number';
+ import { getTestId } from '../utils/test-id';
+ import { styles } from './AnimatedContainer.styles';
+ 
+@@ -38,18 +38,7 @@ export function dampingFor(
+   gesture: PanResponderGestureState,
+   position: ToastPosition
+ ) {
+-  const { moveY } = gesture;
+-
+-  switch (position) {
+-    case 'bottom': {
+-      const { height: screenHeight } = Dimensions.get('screen');
+-      return Math.abs(screenHeight - moveY);
+-    }
+-    case 'top':
+-      return Math.abs(moveY);
+-    default:
+-      throw new Error(`Toast position: ${position} not implemented`);
+-  }
++  return ToastManager.dampingFor(gesture, position);
+ }
+ 
+ export function animatedValueFor(
+@@ -57,17 +46,7 @@ export function animatedValueFor(
+   position: ToastPosition,
+   damping: number
+ ) {
+-  const boundValue = (val: number) => bound(val, 0, 2);
+-  const { dy } = gesture;
+-
+-  switch (position) {
+-    case 'bottom':
+-      return boundValue(1 - dy / damping);
+-    case 'top':
+-      return boundValue(1 + dy / damping);
+-    default:
+-      throw new Error(`Toast position: ${position} not implemented`);
+-  }
++  return ToastManager.animatedValueFor(gesture, position, damping);
+ }
+ 
+ export function AnimatedContainer({
+@@ -101,35 +80,39 @@ export function AnimatedContainer({
+ 
+   const disable = !swipeable || !isVisible;
+ 
++  // Swipe visuals (panning flags, restore / dismiss animation) are coordinated
++  // through the shared manager
++  const manager = React.useMemo(() => new ToastManager(), []);
++  manager.bindSwipe({
++    log,
++    panning,
++    position,
++    animate,
++    onHide,
++    onRestorePosition
++  });
++
+   const onStart = React.useCallback(() => {
+-    log('Swipe, pan start');
+-    panning.current = true;
+-  }, [log, panning]);
++    manager.onSwipeStart();
++  }, [manager]);
+ 
+   const onEnd = React.useCallback(() => {
+-    log('Swipe, pan end');
+-    panning.current = false;
+-  }, [log, panning]);
++    manager.onSwipeEnd();
++  }, [manager]);
+ 
+   const onDismiss = React.useCallback(() => {
+-    log('Swipe, dismissing');
+-    animate(0);
+-    onHide();
+-  }, [animate, log, onHide]);
++    manager.onSwipeDismiss();
++  }, [manager]);
+ 
+   const onRestore = React.useCallback(() => {
+-    log('Swipe, restoring to original position');
+-    animate(1);
+-    onRestorePosition();
+-  }, [animate, log, onRestorePosition]);
++    manager.onSwipeRestore();
++  }, [manager]);
+ 
+   const computeNewAnimatedValueForGesture = React.useCallback(
+     (gesture: PanResponderGestureState) => {
+-      const damping = dampingFor(gesture, position);
+-      const newAnimatedValue = animatedValueFor(gesture, position, damping);
+-      return newAnimatedValue;
++      return manager.swipeAnimatedValueFor(gesture);
+     },
+-    [position]
++    [manager]
+   );
+   const { panResponder } = usePanResponder({
+     animatedValue,
+@@ -138,7 +121,7 @@ export function AnimatedContainer({
+     onRestore,
+     onStart,
+     onEnd,
+-    disable,
++    disable
+   });
+ 
+   useIsomorphicLayoutEffect(() => {
+diff --git a/src/hooks/useKeyboard.ts b/src/hooks/useKeyboard.ts
+index 0a9e945..827d466 100644
+--- a/src/hooks/useKeyboard.ts
++++ b/src/hooks/useKeyboard.ts
+@@ -1,7 +1,7 @@
+ import React from 'react';
+ import { Keyboard, KeyboardEvent } from 'react-native';
+ 
+-import { isIOS } from '../utils/platform';
++import { ToastManager } from '../ToastManager';
+ 
+ export function useKeyboard() {
+   const [keyboardHeight, setKeyboardHeight] = React.useState(0);
+@@ -18,18 +18,16 @@ export function useKeyboard() {
+     setIsKeyboardVisible(false);
+   }, []);
+ 
++  // Keyboard tracking is owned by the toast pipeline manager
++  const manager = React.useMemo(() => new ToastManager(), []);
++
+   React.useEffect(() => {
+-    if (!isIOS()) {
+-      return () => {};
+-    }
+-    const didShowListener = Keyboard.addListener('keyboardDidShow', onShow);
+-    const didHideListener = Keyboard.addListener('keyboardDidHide', onHide);
++    manager.attachKeyboard(onShow, onHide);
+ 
+     return () => {
+-      didShowListener.remove();
+-      didHideListener.remove();
++      manager.detachKeyboard();
+     };
+-  }, [onHide, onShow]);
++  }, [onHide, onShow, manager]);
+ 
+   return {
+     keyboardHeight,
+diff --git a/src/hooks/usePanResponder.ts b/src/hooks/usePanResponder.ts
+index acb9b27..e514f68 100644
+--- a/src/hooks/usePanResponder.ts
++++ b/src/hooks/usePanResponder.ts
+@@ -2,35 +2,27 @@ import React, { RefObject } from 'react';
+ import {
+   Animated,
+   GestureResponderEvent,
+-  PanResponder,
+   PanResponderGestureState
+ } from 'react-native';
+ 
++import { ToastManager } from '../ToastManager';
++
+ export function startShouldSetPanResponder() {
+-  return true;
++  return ToastManager.shouldStartPanOnStart();
+ }
+ 
+ export function moveShouldSetPanResponder(
+-  _event: GestureResponderEvent,
++  event: GestureResponderEvent,
+   gesture: PanResponderGestureState
+ ) {
+-  const { dx, dy } = gesture;
+-  // Fixes onPress handler
+-  // https://github.com/calintamas/react-native-toast-message/issues/113
+-  const offset = 2;
+-  return Math.abs(dx) > offset || Math.abs(dy) > offset;
++  return ToastManager.shouldStartPanOnMove(event, gesture);
+ }
+ 
+ export function shouldDismissView(
+   newAnimatedValue: number,
+   gesture: PanResponderGestureState
+ ) {
+-  const dismissThreshold = 0.65;
+-  const { vy, dy } = gesture;
+-  return (
+-    newAnimatedValue <= dismissThreshold ||
+-    (Math.abs(vy) >= dismissThreshold && dy < 0)
+-  );
++  return ToastManager.swipeDismisses(newAnimatedValue, gesture);
+ }
+ 
+ export type UsePanResponderParams = {
+@@ -54,58 +46,43 @@ export function usePanResponder({
+   onEnd,
+   disable
+ }: UsePanResponderParams) {
++  // Gesture dispatch is owned by the toast pipeline manager
++  const manager = React.useMemo(() => new ToastManager(), []);
++  manager.bindGesture({
++    animatedValue,
++    computeNewAnimatedValueForGesture,
++    onDismiss,
++    onRestore,
++    onStart,
++    onEnd,
++    disable
++  });
++
+   const onGrant = React.useCallback(() => {
+-      if (disable) return;
+-      onStart();
+-    },
+-    [onStart, disable]
+-  );
++    manager.onGestureGrant();
++  }, [manager]);
+ 
+   const onMove = React.useCallback(
+-    (_event: GestureResponderEvent, gesture: PanResponderGestureState) => {
+-      if (disable) return;
+-
+-      const newAnimatedValue = computeNewAnimatedValueForGesture(gesture);
+-
+-      animatedValue.current?.setValue(newAnimatedValue);
++    (event: GestureResponderEvent, gesture: PanResponderGestureState) => {
++      manager.onGestureMove(event, gesture);
+     },
+-    [animatedValue, computeNewAnimatedValueForGesture, disable]
++    [manager]
+   );
+ 
+   const onRelease = React.useCallback(
+-    (_event: GestureResponderEvent, gesture: PanResponderGestureState) => {
+-      onEnd();
+-
+-      if (disable) return;
+-
+-      const newAnimatedValue = computeNewAnimatedValueForGesture(gesture);
+-      if (shouldDismissView(newAnimatedValue, gesture)) {
+-        onDismiss();
+-      } else {
+-        onRestore();
+-      }
++    (event: GestureResponderEvent, gesture: PanResponderGestureState) => {
++      manager.onGestureRelease(event, gesture);
+     },
+-    [computeNewAnimatedValueForGesture, onEnd, onDismiss, onRestore, disable]
++    [manager]
+   );
+ 
+   const onTerminate = React.useCallback(() => {
+-    onEnd();
+-    if (disable) return;
+-    onRestore();
+-  }, [onEnd, onRestore, disable]);
++    manager.onGestureTerminate();
++  }, [manager]);
+ 
+   const panResponder = React.useMemo(
+-    () =>
+-      PanResponder.create({
+-        onStartShouldSetPanResponder: startShouldSetPanResponder,
+-        onPanResponderGrant: onGrant,
+-        onMoveShouldSetPanResponder: moveShouldSetPanResponder,
+-        onMoveShouldSetPanResponderCapture: moveShouldSetPanResponder,
+-        onPanResponderMove: onMove,
+-        onPanResponderRelease: onRelease,
+-        onPanResponderTerminate: onTerminate
+-      }),
+-    [onMove, onRelease, onTerminate, onGrant]
++    () => manager.createResponder(),
++    [manager]
+   );
+ 
+   return {
+diff --git a/src/hooks/useSlideAnimation.ts b/src/hooks/useSlideAnimation.ts
+index 2438488..94da84f 100644
+--- a/src/hooks/useSlideAnimation.ts
++++ b/src/hooks/useSlideAnimation.ts
+@@ -1,9 +1,8 @@
+ import React from 'react';
+-import { Animated, Platform } from 'react-native';
++import { Animated } from 'react-native';
+ 
++import { ToastManager } from '../ToastManager';
+ import { ToastAnimationConfig, ToastPosition } from '../types';
+-import { additiveInverseArray } from '../utils/array';
+-import { resolveAnimationConfig } from '../utils/animationConfig';
+ import { useKeyboard } from './useKeyboard';
+ 
+ type UseSlideAnimationParams = {
+@@ -27,22 +26,17 @@ export function translateYOutputRangeFor({
+ }: UseSlideAnimationParams & {
+   keyboardHeight: number;
+ }) {
+-  const offset = position === 'bottom' ? bottomOffset : topOffset;
+-  const keyboardAwareOffset =
+-    position === 'bottom' && avoidKeyboard ? keyboardHeight + keyboardOffset : 0;
+-
+-  const range = [-(height * 2), Math.max(offset, keyboardAwareOffset)];
+-  const outputRange =
+-    position === 'bottom' ? additiveInverseArray(range) : range;
+-
+-  return outputRange;
++  return ToastManager.translateYRangeFor({
++    position,
++    height,
++    topOffset,
++    bottomOffset,
++    keyboardHeight,
++    keyboardOffset,
++    avoidKeyboard
++  });
+ }
+ 
+-const useNativeDriver = Platform.select({
+-  ios: true,
+-  default: false
+-});
+-
+ export function useSlideAnimation({
+   position,
+   height,
+@@ -55,32 +49,29 @@ export function useSlideAnimation({
+   const animatedValue = React.useRef(new Animated.Value(0));
+   const { keyboardHeight } = useKeyboard();
+ 
+-  const animate = React.useCallback((toValue: number) => {
+-    const resolved = resolveAnimationConfig(
+-      animationConfig,
+-      toValue === 1 ? 'enter' : 'exit'
+-    );
+-
+-    if (resolved.type === 'timing') {
+-      const { type: _type, ...timingConfig } = resolved;
+-      Animated.timing(animatedValue.current, {
+-        ...timingConfig,
+-        toValue,
+-        useNativeDriver
+-      }).start();
+-    } else {
+-      const { type: _type, ...springConfig } = resolved;
+-      Animated.spring(animatedValue.current, {
+-        ...springConfig,
+-        toValue,
+-        useNativeDriver
+-      }).start();
+-    }
+-  }, [animationConfig]);
++  const animate = React.useCallback(
++    (toValue: number) => {
++      ToastManager.slideAnimationTo(
++        animatedValue.current,
++        animationConfig,
++        toValue
++      );
++    },
++    [animationConfig]
++  );
+ 
+-  const translateY = React.useMemo(() => animatedValue.current.interpolate({
+-    inputRange: [0, 1],
+-    outputRange: translateYOutputRangeFor({
++  const animationStyles = React.useMemo(
++    () =>
++      ToastManager.slideAnimationStyles(animatedValue.current, {
++        position,
++        height,
++        topOffset,
++        bottomOffset,
++        keyboardHeight,
++        keyboardOffset,
++        avoidKeyboard
++      }),
++    [
+       position,
+       height,
+       topOffset,
+@@ -88,25 +79,13 @@ export function useSlideAnimation({
+       keyboardHeight,
+       keyboardOffset,
+       avoidKeyboard
+-    })
+-  }), [position, height, topOffset, bottomOffset, keyboardHeight, keyboardOffset, avoidKeyboard]);
+-
+-  const opacity = animatedValue.current.interpolate({
+-    inputRange: [0, 0.7, 1],
+-    outputRange: [0, 1, 1]
+-  });
++    ]
++  );
+ 
+   return {
+     animatedValue,
+     animate,
+     keyboardHeight,
+-    animationStyles: {
+-      opacity,
+-      transform: [
+-        {
+-          translateY
+-        }
+-      ]
+-    }
++    animationStyles
+   };
+ }
+diff --git a/src/hooks/useTimeout.ts b/src/hooks/useTimeout.ts
+index 03787d0..622a55b 100644
+--- a/src/hooks/useTimeout.ts
++++ b/src/hooks/useTimeout.ts
+@@ -1,36 +1,33 @@
+ import React from 'react';
+ 
+ import { useLogger } from '../contexts';
++import { ToastManager } from '../ToastManager';
+ 
+ function useTimeout<CbParams>(cb: (params?: CbParams) => void, delayMs = 0) {
+   const { log } = useLogger();
+ 
+-  const ref = React.useRef<NodeJS.Timeout>();
++  // Timer scheduling is owned by the toast pipeline manager
++  const manager = React.useMemo(() => new ToastManager(), []);
++  manager.bindTimer({
++    log,
++    onTimeout: (params?: CbParams) => cb(params),
++    delayMs
++  });
+ 
+   const clearTimer = React.useCallback(() => {
+-    if (ref.current) {
+-      log('Clearing timer', ref.current);
+-      clearTimeout(ref.current);
+-      ref.current = undefined;
+-    }
+-  }, [log]);
++    manager.clearTimer();
++  }, [manager]);
+ 
+   const startTimer = React.useCallback(() => {
+-    clearTimer();
+-    ref.current = setTimeout(() => {
+-      cb();
+-      log('Running timer', ref.current);
+-      ref.current = undefined;
+-    }, delayMs);
+-    log('Starting timer', ref.current);
+-  }, [clearTimer, delayMs, log, cb]);
++    manager.startTimer();
++  }, [manager]);
+ 
+   React.useEffect(() => () => clearTimer(), [clearTimer]);
+ 
+   return {
+     startTimer,
+     clearTimer,
+-    isActive: ref.current !== undefined
++    isActive: manager.timerActive()
+   };
+ }
+ 
+diff --git a/src/hooks/useViewDimensions.ts b/src/hooks/useViewDimensions.ts
+index e58870e..491fd45 100644
+--- a/src/hooks/useViewDimensions.ts
++++ b/src/hooks/useViewDimensions.ts
+@@ -1,15 +1,13 @@
+ import React from 'react';
+ import { LayoutChangeEvent } from 'react-native';
+ 
++import { ToastManager } from '../ToastManager';
++
+ export type UseViewDimensionsParams = {
+   heightOffset?: number;
+   widthOffset?: number;
+ };
+ 
+-const getLayoutValue =
+-  (key: 'height' | 'width') => (event: LayoutChangeEvent) =>
+-    event?.nativeEvent?.layout?.[key] ?? 0;
+-
+ /**
+  * Retrieves View dimensions (height, width) from a LayoutChangeEvent and sets them on state
+  */
+@@ -22,10 +20,12 @@ export function useViewDimensions({
+ 
+   const computeViewDimensions = React.useCallback(
+     (event: LayoutChangeEvent) => {
+-      const h = getLayoutValue('height')(event);
+-      const w = getLayoutValue('width')(event);
+-      setHeight(h + heightOffset);
+-      setWidth(w + widthOffset);
++      const dimensions = ToastManager.viewDimensions(event, {
++        heightOffset,
++        widthOffset
++      });
++      setHeight(dimensions.height);
++      setWidth(dimensions.width);
+     },
+     [heightOffset, widthOffset]
+   );
+diff --git a/src/useToast.ts b/src/useToast.ts
+index c421c36..fa4a404 100644
+--- a/src/useToast.ts
++++ b/src/useToast.ts
+@@ -2,34 +2,18 @@ import React from 'react';
+ 
+ import { useLogger, useGesture } from './contexts';
+ import { useTimeout } from './hooks';
+-import { ToastData, ToastOptions, ToastProps, ToastShowParams } from './types';
+-import { DEFAULT_ANIMATION_CONFIG } from './utils/animationConfig';
+-import { noop } from './utils/func';
+-import { mergeIfDefined } from './utils/obj';
++import { ToastManager } from './ToastManager';
++import {
++  ToastData,
++  ToastOptions,
++  ToastProps,
++  ToastShowParams
++} from './types';
+ 
+-export const DEFAULT_DATA: ToastData = {
+-  text1: undefined,
+-  text2: undefined
+-};
++export const DEFAULT_DATA: ToastData = ToastManager.defaultData;
+ 
+-export const DEFAULT_OPTIONS: Required<ToastOptions> = {
+-  type: 'success',
+-  text1Style: null,
+-  text2Style: null,
+-  position: 'top',
+-  autoHide: true,
+-  swipeable: true,
+-  visibilityTime: 4000,
+-  topOffset: 40,
+-  bottomOffset: 40,
+-  keyboardOffset: 10,
+-  avoidKeyboard: true,
+-  onShow: noop,
+-  onHide: noop,
+-  onPress: noop,
+-  props: {},
+-  animationConfig: DEFAULT_ANIMATION_CONFIG
+-};
++export const DEFAULT_OPTIONS: Required<ToastOptions> =
++  ToastManager.defaultOptions;
+ 
+ export type UseToastParams = {
+   defaultOptions: Omit<ToastProps, 'config'>;
+@@ -42,88 +26,43 @@ export function useToast({ defaultOptions }: UseToastParams) {
+   const [isVisible, setIsVisible] = React.useState(false);
+   const [data, setData] = React.useState<ToastData>(DEFAULT_DATA);
+ 
+-  const initialOptions = mergeIfDefined(
++  const initialOptions = ToastManager.mergeOptions(
+     DEFAULT_OPTIONS,
+     defaultOptions
+   ) as Required<ToastOptions>;
+   const [options, setOptions] =
+     React.useState<Required<ToastOptions>>(initialOptions);
+ 
++  // The manager owns the presentation lifecycle, so the hook only keeps the
++  // React state that needs to be rendered and hands the rest over
++  const manager = React.useMemo(() => new ToastManager(), []);
++
+   const onAutoHide = React.useCallback(() => {
+-    if (panning.current) {
+-      log('Auto hiding was blocked due to panning');
+-    } else {
+-      log('Auto hiding');
+-      setIsVisible(false);
+-      options.onHide();
+-    }
+-  }, [log, options, panning]);
++    manager.runAutoHide();
++  }, [manager]);
+   const { startTimer, clearTimer } = useTimeout(
+     onAutoHide,
+     options.visibilityTime
+   );
+ 
++  manager.bindToast({
++    log,
++    panning,
++    options,
++    initialOptions,
++    applyData: setData,
++    applyOptions: setOptions,
++    applyVisibility: setIsVisible,
++    cancelAutoHideTimer: clearTimer
++  });
++
+   const hide = React.useCallback(() => {
+-    log('Hiding');
+-    setIsVisible(false);
+-    clearTimer();
+-    options.onHide();
+-  }, [clearTimer, log, options]);
++    manager.dismissToast();
++  }, [manager]);
+ 
+-  const show = React.useCallback(
+-    (params: ToastShowParams) => {
+-      log(`Showing with params: ${JSON.stringify(params)}`);
+-      const {
+-        text1 = DEFAULT_DATA.text1,
+-        text2 = DEFAULT_DATA.text2,
+-        type = initialOptions.type,
+-        text1Style = initialOptions.text1Style,
+-        text2Style = initialOptions.text2Style,
+-        position = initialOptions.position,
+-        autoHide = initialOptions.autoHide,
+-        visibilityTime = initialOptions.visibilityTime,
+-        topOffset = initialOptions.topOffset,
+-        bottomOffset = initialOptions.bottomOffset,
+-        keyboardOffset = initialOptions.keyboardOffset,
+-        avoidKeyboard = initialOptions.avoidKeyboard,
+-        onShow = initialOptions.onShow,
+-        onHide = initialOptions.onHide,
+-        onPress = initialOptions.onPress,
+-        swipeable = initialOptions.swipeable,
+-        props = initialOptions.props,
+-        animationConfig = initialOptions.animationConfig
+-      } = params;
+-      setData({
+-        text1,
+-        text2
+-      });
+-      setOptions(
+-        mergeIfDefined(initialOptions, {
+-          type,
+-          text1Style,
+-          text2Style,
+-          position,
+-          autoHide,
+-          visibilityTime,
+-          topOffset,
+-          bottomOffset,
+-          keyboardOffset,
+-          avoidKeyboard,
+-          onShow,
+-          onHide,
+-          onPress,
+-          swipeable,
+-          props,
+-          animationConfig
+-        }) as Required<ToastOptions>
+-      );
+-      // TODO: validate input
+-      // TODO: use a queue when Toast is already visible
+-      setIsVisible(true);
+-      onShow(params);
+-    },
+-    [initialOptions, log]
+-  );
++  const show = React.useCallback((params: ToastShowParams) => {
++    manager.presentToast(params);
++  }, [manager]);
+ 
+   React.useEffect(() => {
+     const { autoHide } = options;
+diff --git a/src/utils/animationConfig.ts b/src/utils/animationConfig.ts
+index 3e0a0cb..3f1c77d 100644
+--- a/src/utils/animationConfig.ts
++++ b/src/utils/animationConfig.ts
+@@ -1,13 +1,10 @@
+ import {
+   ToastAnimationConfig,
+-  ToastSingleAnimationConfig,
+-  ToastSpringAnimationConfig
++  ToastSingleAnimationConfig
+ } from '../types';
++import { ToastManager } from '../ToastManager';
+ 
+-export const DEFAULT_ANIMATION_CONFIG: ToastSpringAnimationConfig = {
+-  type: 'spring',
+-  friction: 8
+-};
++export const DEFAULT_ANIMATION_CONFIG = ToastManager.defaultAnimationConfig;
+ 
+ export type AnimationPhase = 'enter' | 'exit';
+ 
+@@ -15,11 +12,5 @@ export function resolveAnimationConfig(
+   config: ToastAnimationConfig | undefined,
+   phase: AnimationPhase
+ ): ToastSingleAnimationConfig {
+-  if (!config) {
+-    return DEFAULT_ANIMATION_CONFIG;
+-  }
+-  if ('type' in config) {
+-    return config;
+-  }
+-  return config[phase] ?? DEFAULT_ANIMATION_CONFIG;
++  return ToastManager.animationFor(config, phase);
+ }
+diff --git a/src/utils/array.ts b/src/utils/array.ts
+index 07281b8..126963c 100644
+--- a/src/utils/array.ts
++++ b/src/utils/array.ts
+@@ -1,5 +1,7 @@
++import { ToastManager } from '../ToastManager';
++
+ function additiveInverseArray(arr: number[]) {
+-  return arr.map((i) => -i);
++  return ToastManager.additiveInverse(arr);
+ }
+ 
+ export { additiveInverseArray };
+diff --git a/src/utils/obj.ts b/src/utils/obj.ts
+index 7e9a72f..c6cc684 100644
+--- a/src/utils/obj.ts
++++ b/src/utils/obj.ts
+@@ -1,14 +1,8 @@
++import { ToastManager } from '../ToastManager';
++
+ export function mergeIfDefined(
+   obj1: Record<string, unknown>,
+   obj2: Record<string, unknown>
+ ) {
+-  const newObj = {
+-    ...obj1
+-  };
+-  Object.entries(obj2).forEach(([key, value]) => {
+-    if (value !== null && value !== undefined) {
+-      newObj[key] = value;
+-    }
+-  });
+-  return newObj;
++  return ToastManager.mergeOptions(obj1, obj2);
+ }
