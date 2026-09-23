@@ -158,6 +158,8 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
   <div class="sbox">
     <input id="si" type="text" placeholder="Enter case-id ..." spellcheck="false">
     <button class="btn btn-p" onclick="load()">Load</button>
+    <button class="btn btn-f" onclick="pickResultsFile()" title="导入 JSON，并覆盖当前 evaluator 的评分">&#128194; Import</button>
+    <input id="results-import" type="file" accept="application/json,.json" style="display:none" onchange="importResultsFile(event)">
     <button class="btn btn-f" onclick="collectResults()" title="导出当前 evaluator 的全部标注结果 (JSON)">&#128190; Collect</button>
   </div>
   <div class="evs" id="es"></div>
@@ -323,16 +325,24 @@ let doneTasks=new Set();
 async function loadDoneTasks(){try{const db=await idbOpen();return new Promise((ok,no)=>{const tx=db.transaction(IDB_STORE,'readonly');const r=tx.objectStore(IDB_STORE).get(DONE_KEY);r.onsuccess=()=>{if(r.result)doneTasks=new Set(r.result);ok();};r.onerror=e=>no(e.target.error);});}catch(e){}}
 async function saveDoneTasks(){try{const db=await idbOpen();return new Promise((ok,no)=>{const tx=db.transaction(IDB_STORE,'readwrite');tx.objectStore(IDB_STORE).put(Array.from(doneTasks),DONE_KEY);tx.oncomplete=ok;tx.onerror=e=>no(e.target.error);});}catch(e){}}
 function toggleDone(key,e){e.stopPropagation();/* checkbox is auto-driven by scoring completeness; ignore manual toggle */}
-function updateDoneUI(){document.querySelectorAll('.ti[data-trial]').forEach(el=>{const key=el.getAttribute('data-trial');const cb=el.querySelector('.tc');if(cb)cb.checked=doneTasks.has(key);el.classList.toggle('done',doneTasks.has(key));});}
+function doneKey(ev,name){return scoreKey(ev,name);}
+function scoreComplete(s){if(!s||!rubricZh.quality||!rubricZh.difficulty)return false;return Object.keys(rubricZh.quality.dimensions).every(k=>s.quality&&s.quality[k]!=null)&&Object.keys(rubricZh.difficulty.dimensions).every(k=>s.difficulty&&s.difficulty[k]!=null);}
+function rebuildDoneFromScores(){doneTasks=new Set(Object.keys(evalScores).filter(k=>scoreComplete(evalScores[k])));saveDoneTasks();}
+function updateDoneUI(){let migrated=false;document.querySelectorAll('.ti[data-trial]').forEach(el=>{const name=el.getAttribute('data-trial');migrated=ensureScoreFor(curEv,name)||migrated;const key=doneKey(curEv,name),completed=scoreComplete(evalScores[key]);if(completed)doneTasks.add(key);else doneTasks.delete(key);const cb=el.querySelector('.tc');if(cb)cb.checked=completed;el.classList.toggle('done',completed);});if(migrated)saveEvalScores();}
 
 // ---- evaluator scores persistence ----
 async function loadEvalScores(){try{const db=await idbOpen();return new Promise((ok,no)=>{const tx=db.transaction(IDB_STORE,'readonly');const r=tx.objectStore(IDB_STORE).get(SCORES_KEY);r.onsuccess=()=>{if(r.result)evalScores=r.result;ok();};r.onerror=e=>no(e.target.error);});}catch(e){}}
 async function saveEvalScores(){try{const db=await idbOpen();return new Promise((ok,no)=>{const tx=db.transaction(IDB_STORE,'readwrite');tx.objectStore(IDB_STORE).put(evalScores,SCORES_KEY);tx.oncomplete=ok;tx.onerror=e=>no(e.target.error);});}catch(e){}}
 function scoreKey(ev,name){return ev+'::'+name;}
+function scoreHasAny(s){return !!(s&&((s.quality&&Object.keys(s.quality).length)||(s.difficulty&&Object.keys(s.difficulty).length)));}
+function fallbackScore(name,excludeKey){
+  const old=evalScores[name];return name!==excludeKey&&scoreHasAny(old)?old:null;
+}
+function ensureScoreFor(ev,name){const k=scoreKey(ev,name);if(scoreHasAny(evalScores[k]))return false;const old=fallbackScore(name,k);if(!old)return false;evalScores[k]=JSON.parse(JSON.stringify(old));return true;}
 function getScore(gk,dk){const s=evalScores[scoreKey(curEv,curTrialName)];return s&&s[gk]&&s[gk][dk]!=null?s[gk][dk]:null;}
-function setScore(gk,dk,v){const k=scoreKey(curEv,curTrialName);if(!evalScores[k])evalScores[k]={quality:{},difficulty:{}};if(v==null){delete evalScores[k][gk][dk];}else{evalScores[k][gk][dk]=v;}saveEvalScores();}
+function setScore(gk,dk,v){const current=scoreKey(curEv,curTrialName);ensureScoreFor(curEv,curTrialName);const keys=new Set([current]);if(scoreHasAny(evalScores[curTrialName]))keys.add(curTrialName);const now=Date.now();for(const k of keys){if(!evalScores[k])evalScores[k]={quality:{},difficulty:{}};if(!evalScores[k][gk])evalScores[k][gk]={};if(v==null)delete evalScores[k][gk][dk];else evalScores[k][gk][dk]=v;evalScores[k]._updated_at=now;}saveEvalScores();}
 function allDimsScored(){const s=evalScores[scoreKey(curEv,curTrialName)];if(!s)return false;const q=s.quality||{},d=s.difficulty||{};if(!rubricZh.quality||!rubricZh.difficulty)return false;const all=(group)=>Object.keys(rubricZh[group].dimensions).every(k=>group==='quality'?q[k]!=null:d[k]!=null);return all('quality')&&all('difficulty');}
-function syncDoneFromScores(){if(!curTrialName)return;const wasDone=doneTasks.has(curTrialName);const nowDone=allDimsScored();if(nowDone)doneTasks.add(curTrialName);else doneTasks.delete(curTrialName);saveDoneTasks();updateDoneUI();updateFab();}
+function syncDoneFromScores(){if(!curTrialName)return;const key=doneKey(curEv,curTrialName);const nowDone=allDimsScored();if(nowDone)doneTasks.add(key);else doneTasks.delete(key);saveDoneTasks();updateDoneUI();updateFab();}
 function evaluatorScore100(group){const s=evalScores[scoreKey(curEv,curTrialName)];if(!s||!s[group]||!rubricZh[group])return null;let tot=0,all=true;for(const [dk,dm] of Object.entries(rubricZh[group].dimensions)){const v=s[group][dk];if(v==null){all=false;continue;}tot+=dm.weight*v/5;}return all?Math.round(tot):null;}
 
 function toggleSide(){
@@ -360,7 +370,7 @@ async function openFolder(presetHandle){
   if(!evIds.length){alert('No evaluator folders found.');return;}
   const es=document.getElementById('es');es.innerHTML='';
   evIds.forEach(id=>{const b=document.createElement('button');b.textContent='E'+id;if(+id===1)b.classList.add('on');b.onclick=()=>selEv(+id);es.appendChild(b);});
-  await loadDoneTasks();await loadEvalScores();await loadRubricZh();await loadIndex(1);
+  await loadDoneTasks();await loadEvalScores();await loadRubricZh();rebuildDoneFromScores();await loadIndex(1);
   document.getElementById('wc').style.display='none';document.getElementById('tc').style.display='block';
   document.getElementById('si').addEventListener('keydown',e=>{if(e.key==='Enter')load();});
   try{await idbSave(root);}catch(e){console.warn('IDB save failed:',e);}
@@ -396,11 +406,14 @@ function buildList(evId){
   document.getElementById('sh').textContent='Cases ('+trialList.length+')';
   const list=document.getElementById('tl');list.innerHTML='';
   trialList.sort((a,b)=>a.task_id.localeCompare(b.task_id)||((b.final_reward||0)-(a.final_reward||0)));
+  let migrated=false;
   trialList.forEach(t=>{
     const dc=t.difficulty==='easy'?'e':t.difficulty==='medium'?'m':t.difficulty==='hard'?'h':'';
-    const d=document.createElement('div');d.className='ti'+(t.trial_name===curTrialName?' on':'')+(doneTasks.has(t.trial_name)?' done':'');
+    migrated=ensureScoreFor(evId,t.trial_name)||migrated;
+    const key=doneKey(evId,t.trial_name),completed=scoreComplete(evalScores[key]);if(completed)doneTasks.add(key);else doneTasks.delete(key);
+    const d=document.createElement('div');d.className='ti'+(t.trial_name===curTrialName?' on':'')+(completed?' done':'');
     d.setAttribute('data-trial',t.trial_name);
-    d.innerHTML='<input type="checkbox" class="tc"'+(doneTasks.has(t.trial_name)?' checked':'')+'>'+
+    d.innerHTML='<input type="checkbox" class="tc"'+(completed?' checked':'')+'>'+
       '<div class="tbody"><div class="tid" title="'+esc(t.trial_name)+'">'+esc(t.trial_name)+'</div>'+
       '<div class="tinf">'+
         (t.language?'<span class="tag" style="background:#eafaea;color:#0a7">'+esc(t.language)+'</span>':'')+
@@ -409,17 +422,22 @@ function buildList(evId){
         (t.prompt_mode?'<span class="tag" style="background:#eaeefe;color:var(--ac)">'+esc(t.prompt_mode)+'</span>':'')+
         (t.final_reward!=null?'<span class="tag" style="background:#eaeefe;color:var(--ac)">Q '+t.final_reward.toFixed(0)+'</span>':'')+
       '</div></div>';
-    d.onclick=(e)=>{if(e.target.classList.contains('tc'))return;document.getElementById('si').value=t.trial_name;load();};
+    d.onclick=(e)=>{if(e.target.classList.contains('tc'))return;document.getElementById('si').value=t.trial_name;load(evId);};
     list.appendChild(d);
   });
+  if(migrated){saveEvalScores();saveDoneTasks();}
 }
 
-function selEv(id){curEv=id;document.querySelectorAll('.evs button').forEach((b,i)=>b.classList.toggle('on',evIds[i]==id));loadIndex(id);}
+function selEv(id){curEv=id;curTrialName=null;curTaskId=null;closeScoringModal();const fab=document.getElementById('score-fab');if(fab)fab.style.display='none';document.querySelectorAll('.evs button').forEach((b,i)=>b.classList.toggle('on',evIds[i]==id));loadIndex(id);}
 
-async function load(){
+async function load(preferredEv=curEv){
   const input=document.getElementById('si').value.trim();if(!input||!root)return;
   let foundEv=null,matchedTrial=null;
-  for(const eid of evIds){
+  // A trial can intentionally appear under multiple evaluators. Search the
+  // evaluator whose list was clicked first, otherwise duplicate trial names
+  // are silently routed to the lowest-numbered evaluator and scored there.
+  const searchEvIds=[String(preferredEv),...evIds.filter(eid=>String(eid)!==String(preferredEv))];
+  for(const eid of searchEvIds){
     const trials=indexCache[eid]?.trials||[];
     matchedTrial=trials.find(t=>t.trial_name===input);
     if(matchedTrial){foundEv=eid;break;}
@@ -427,13 +445,15 @@ async function load(){
     if(byTask.length){matchedTrial=byTask[0];foundEv=eid;break;}
   }
   if(!foundEv){
-    for(const eid of evIds){
+    for(const eid of searchEvIds){
       const tasks=indexCache[eid]?.tasks||[];
       if(tasks.some(t=>t.task_id===input)){foundEv=eid;matchedTrial={trial_name:input,task_id:input};break;}
     }
   }
   if(!foundEv||!matchedTrial){alert('Not found: '+input);return;}
   curTrialName=matchedTrial.trial_name;curTaskId=matchedTrial.task_id;curEv=+foundEv;
+  if(ensureScoreFor(curEv,curTrialName))saveEvalScores();
+  document.querySelectorAll('.evs button').forEach((b,i)=>b.classList.toggle('on',String(evIds[i])===String(foundEv)));
   document.querySelectorAll('.ti[data-trial]').forEach(el=>el.classList.toggle('on',el.getAttribute('data-trial')===curTrialName));
   let meta={},ag='';
   try{meta=JSON.parse(await rf(evPath(foundEv,curTrialName,'meta.json')));}catch{}
@@ -942,13 +962,38 @@ function updateScoringSummary(){
     '<div class="sum-row sum-model"><span class="sum-l">模型评分(参照)</span> 质量 '+chip(j.quality&&j.quality.score_100)+'/100 · 难度 '+chip(j.difficulty&&j.difficulty.score_100)+'/100'+(j.difficulty&&j.difficulty.band?' ('+esc(j.difficulty.band)+')':'')+'</div>';
 }
 
+function pickResultsFile(){
+  if(!root||!curEv){alert('请先选择目录和 evaluator');return;}
+  const input=document.getElementById('results-import');input.value='';input.click();
+}
+async function importResultsFile(event){
+  const file=event.target.files&&event.target.files[0];if(!file)return;
+  let data;try{data=JSON.parse(await file.text());}catch(e){alert('导入失败：不是有效的 JSON 文件');return;}
+  const rows=Array.isArray(data)?data:data.cases;if(!Array.isArray(rows)){alert('导入失败：JSON 中缺少 cases 数组');return;}
+  const idx=indexCache[curEv]||{},trials=(idx.trials&&idx.trials.length?idx.trials:idx.tasks)||[];
+  const allowed=new Set(trials.map(t=>t.trial_name||t.task_id));let imported=0,skipped=0;
+  const cleanGroup=(src,group)=>{const out={};if(!src||typeof src!=='object'||!rubricZh[group])return out;for(const dk of Object.keys(rubricZh[group].dimensions)){const v=src[dk];if(Number.isInteger(v)&&v>=0&&v<=5)out[dk]=v;}return out;};
+  for(const row of rows){
+    const name=row&&(row.trial||row.trial_name||row.task_id);if(!name||!allowed.has(name)){skipped++;continue;}
+    // Write only the selected evaluator's scoped key. Never touch the legacy
+    // unscoped key or another evaluator's same-named case.
+    evalScores[scoreKey(curEv,name)]={quality:cleanGroup(row.quality,'quality'),difficulty:cleanGroup(row.difficulty_dims||row.difficulty_scores,'difficulty'),_updated_at:Date.now()};
+    imported++;
+  }
+  await saveEvalScores();rebuildDoneFromScores();buildList(curEv);
+  if(curTrialName&&document.getElementById('scoring-modal').classList.contains('open'))renderScoringForm(document.getElementById('scoring-modal-body'));
+  updateFab();alert('导入完成：覆盖当前 E'+curEv+' 的 '+imported+' 个 case'+(skipped?'，跳过 '+skipped+' 个不属于当前 evaluator 的条目':'')+'。');
+}
+
 // Collect the current evaluator's annotation results (evalScores) into a JSON file and download it.
-function collectResults(){
+async function collectResults(){
   if(!curEv){alert('请先选择目录并加载数据');return;}
-  const idx=indexCache[curEv]||{};const trials=idx.trials||idx.tasks||[];
+  await saveEvalScores();
+  const idx=indexCache[curEv]||{};const trials=(idx.trials&&idx.trials.length?idx.trials:idx.tasks)||[];
   const prefix=curEv+'::';
   const cases=[];
   for(const t of trials){
+    ensureScoreFor(curEv,t.trial_name);
     const s=evalScores[prefix+t.trial_name];
     const rec={trial:t.trial_name,task_id:t.task_id,repo:t.repo,language:t.language,smell_type:t.smell_type,
       difficulty:t.difficulty,quality:(s&&s.quality)||{},difficulty_dims:(s&&s.difficulty)||{},
@@ -963,7 +1008,9 @@ function collectResults(){
     rec.quality_score_100=q100;rec.difficulty_score_100=d100;
     cases.push(rec);
   }
-  const out={evaluator_id:curEv,schema_version:rubricZh.schema_version||null,protocol_version:rubricZh.protocol_version||null,collected_cases:cases.length,cases:cases};
+  await saveEvalScores();
+  const scoredCases=cases.filter(c=>c.all_scored).length;
+  const out={evaluator_id:curEv,schema_version:rubricZh.schema_version||null,protocol_version:rubricZh.protocol_version||null,collected_cases:cases.length,scored_cases:scoredCases,incomplete_cases:cases.length-scoredCases,cases:cases};
   const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');a.href=url;a.download='evaluator_'+curEv+'_results.json';
