@@ -329,11 +329,23 @@ body{font-family:'Inter',-apple-system,sans-serif;background:var(--bg);color:var
 .ag-yb:hover{border-color:var(--ac);color:var(--ac)}
 .ag-yb.on.yes{border-color:var(--gn);background:rgba(26,127,55,.14);color:var(--gn)}
 .ag-yb.on.no{border-color:var(--rd);background:rgba(207,34,46,.14);color:var(--rd)}
+.ag-yn .ag-res{margin-left:auto;display:flex;align-items:center;gap:6px;flex-shrink:0}
+.ag-rtag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;border:1px solid var(--bd);white-space:nowrap}
+.ag-rtag.pass{color:var(--gn);border-color:var(--gn);background:rgba(26,127,55,.10)}
+.ag-rtag.fail{color:var(--rd);border-color:var(--rd);background:rgba(207,34,46,.10)}
+.ag-rq{position:relative;display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:50%;border:1px solid var(--bd);color:var(--tx2);cursor:help;font-size:11px;font-weight:700;flex-shrink:0;outline:none}
+.ag-rq:hover,.ag-rq:focus{border-color:var(--ac);color:var(--ac)}
+.ag-rq-tip{position:absolute;bottom:130%;right:0;z-index:60;width:360px;max-width:60vw;padding:10px 12px;border-radius:8px;background:var(--bg2);border:1px solid var(--bd);box-shadow:0 8px 24px rgba(0,0,0,.18);color:var(--tx);font-size:12px;font-weight:400;line-height:1.6;text-align:left;white-space:normal;word-break:break-word;display:none}
+.ag-rq:hover .ag-rq-tip,.ag-rq:focus .ag-rq-tip{display:block}
 `;document.head.appendChild(s);})();
 
 let root=null,evIds=[],curEv=1,curTrialName=null,curTaskId=null,indexCache={},directEvMode=false,sideOpen=true,curMeta={};
-let judgeFull={},promptMd='',diffDescMd='',solveRubric={},smellMeta={entries:[],ruleId:'',ruleDesc:''},curEntryIdx=0,hasJudgeScore=false;
+let judgeFull={},promptMd='',diffDescMd='',solveRubric={},rubricResults=null,smellMeta={entries:[],ruleId:'',ruleDesc:''},curEntryIdx=0,hasJudgeScore=false;
 let rubricZh={};
+// Per-case "has task scoring" cache: scoreKey(ev,trial) -> bool.
+// True when judge_score.json has quality.dimensions (evaluator can score smell).
+// False (no task 打分) means the case is solved once agent answered everything.
+let judgeCases={};
 // evaluator scoring state: evalScores["evId::trial"] = { quality:{dim:n}, difficulty:{dim:n} }
 let evalScores={};
 const SCORES_KEY='caseReviewScores';
@@ -376,7 +388,11 @@ function evaluatorScore100(group){const s=evalScores[scoreKey(curEv,curTrialName
 // ---- agent solving-rubric (是/否) state, rides in evalScores[key].solve ----
 function agentRubricIds(){return (solveRubric&&Array.isArray(solveRubric.rubrics))?solveRubric.rubrics.map(r=>r.id).filter(Boolean):[];}
 function agentAnsweredKey(key){const s=evalScores[key];if(!s||!s.solve)return false;const v=Object.values(s.solve);return v.length>0&&v.every(x=>x==='yes'||x==='no');}
-function caseSolvedKey(key){return scoreComplete(evalScores[key])&&agentAnsweredKey(key);}
+function caseSolvedKey(key){
+  if(!agentAnsweredKey(key))return false;
+  if(judgeCases[key]===false)return true;       // no task 打分 → agent 全打即 solved
+  return scoreComplete(evalScores[key]);       // 有/未知 task 打分 → 需 smell 维度全打
+}
 function caseSolved(ev,name){return caseSolvedKey(scoreKey(ev||curEv,name||curTrialName));}
 function currentAgentAnswered(){return agentAnsweredKey(scoreKey(curEv,curTrialName));}
 function getSolve(rid){const s=evalScores[scoreKey(curEv,curTrialName)];return s&&s.solve?s.solve[rid]:null;}
@@ -457,7 +473,20 @@ async function loadRubricZh(){if(rubricZh.quality)return;try{rubricZh=JSON.parse
 
 async function loadIndex(evId){
   if(!indexCache[evId]){try{indexCache[evId]=JSON.parse(await rf(evPath(evId,'index.json')));}catch{indexCache[evId]={evaluator_id:evId,num_tasks:0,num_trials:0,trials:[],tasks:[]};}}
+  await loadJudgeCases(evId);
   buildList(evId);
+}
+// Pre-populate judgeCases for every trial in this evaluator so the left list can
+// mark no-task-scoring cases done the moment the agent answered everything.
+async function loadJudgeCases(evId){
+  const idx=indexCache[evId]||{};const trials=idx.trials||[];
+  const list=trials.length?trials:(idx.tasks||[]).map(t=>({trial_name:t.task_id}));
+  const need=list.map(t=>t.trial_name).filter(n=>n&&judgeCases[scoreKey(evId,n)]===undefined);
+  await Promise.all(need.map(async n=>{
+    const key=scoreKey(evId,n);
+    try{const d=JSON.parse(await rf(evPath(evId,n,'judge_score.json')));judgeCases[key]=!!(d&&d.quality&&d.quality.dimensions);}
+    catch{judgeCases[key]=false;}
+  }));
 }
 
 function buildList(evId){
@@ -540,6 +569,9 @@ async function load(preferredEv=curEv){
   // Solve-rubrics drawer content (Agent Diff tab Rubric): per-case solver rubrics
   solveRubric={};
   try{solveRubric=JSON.parse(await rf(evPath(foundEv,curTrialName,'solve_rubrics.json')));}catch(e){console.warn('No solve_rubrics.json:',e);}
+  // Per-case rubric_results.json (agent 自动评判结果): result 1=通过 / 0=不通过 + evidence,展示在 Agent 判断行右侧
+  rubricResults=null;
+  try{rubricResults=JSON.parse(await rf(evPath(foundEv,curTrialName,'rubric_results.json')));}catch(e){console.warn('No rubric_results.json:',e);}
 
   // diff_desc.md drawer content (Injection design record — describes the modeled smell change)
   diffDescMd='';
@@ -550,6 +582,7 @@ async function load(preferredEv=curEv){
   const hasJudge=!!(judgeFull.quality&&judgeFull.quality.dimensions);
   if(jb){if(hasJudge){jb.style.display='inline-block';jb.classList.add('has-data');}else{jb.style.display='none';jb.classList.remove('has-data');}}
   hasJudgeScore=hasJudge;
+  judgeCases[scoreKey(curEv,curTrialName)]=hasJudge;   // keep per-case cache fresh for the opened case
   // Smell Type button is always available (every case has a smell_type)
   const stb=document.getElementById('smelltype-btn-sds');
   if(stb){stb.style.display='inline-block';}
@@ -1037,7 +1070,8 @@ async function importResultsFile(event){
   for(const row of rows){
     const name=row&&(row.trial||row.trial_name||row.task_id);if(!name||!allowed.has(name)){skipped++;continue;}
     const quality=cleanGroup(row.quality,'quality'),difficulty=cleanGroup(row.difficulty_dims||row.difficulty_scores,'difficulty');
-    const solveIn={};const sr=row.solve||row.solve_rubrics;if(sr&&typeof sr==='object'){for(const[rid,v]of Object.entries(sr)){if(v==='yes'||v==='no')solveIn[rid]=v;}}
+    // 导出口径是 1(通过)/0(不通过),内部存 yes/no;导入两种都接受并映射回 yes/no
+    const solveIn={};const sr=row.solve||row.solve_rubrics;if(sr&&typeof sr==='object'){for(const[rid,v]of Object.entries(sr)){let m=null;if(v==='yes'||v===1||v==='1')m='yes';else if(v==='no'||v===0||v==='0')m='no';if(m)solveIn[rid]=m;}}
     if(!Object.keys(quality).length&&!Object.keys(difficulty).length&&!Object.keys(solveIn).length){emptySkipped++;continue;}
     // Only non-empty imported dimensions overwrite the selected evaluator.
     // Empty groups/dimensions preserve the existing score; other evaluator
@@ -1079,18 +1113,24 @@ async function collectResults(){
     try{const sr=JSON.parse(await rf(evPath(curEv,t.trial_name,'solve_rubrics.json')));if(sr&&Array.isArray(sr.rubrics))solvedIds=sr.rubrics.map(r=>r.id).filter(Boolean);}catch{}
     const aAns=(solvedIds&&solvedIds.length)?solvedIds.every(id=>solve[id]==='yes'||solve[id]==='no'):agentAnsweredKey(prefix+t.trial_name);
     const yesIds=solvedIds?solvedIds.filter(id=>solve[id]==='yes'):(Object.keys(solve).filter(id=>solve[id]==='yes'));
-    rec.solve_rubrics=solve;
+    // 是否有 task 打分（judge_score.json 含 quality.dimensions）；无则 agent 全打即 solved。
+    let hasTask=judgeCases[prefix+t.trial_name];
+    if(hasTask===undefined){try{const d=JSON.parse(await rf(evPath(curEv,t.trial_name,'judge_score.json')));hasTask=!!(d&&d.quality&&d.quality.dimensions);}catch{hasTask=false;}judgeCases[prefix+t.trial_name]=hasTask;}
+    // 导出口径:是→1(通过),否→0(不通过),与 rubric_results.json 的 result 一致(内部仍存 yes/no)
+    const rubOut={};for(const id of Object.keys(solve)){const v=solve[id];rubOut[id]=(v==='yes')?1:(v==='no')?0:(v==null?null:v);}
+    rec.solve_rubrics=rubOut;
     rec.solve_rubrics_ids=solvedIds;
     rec.agent_scored=!!aAns;
-    rec.solve_yes_count=yesIds.length;
-    rec.solved=!!(rec.all_scored&&aAns);
+    rec.has_task_scoring=hasTask;
+    rec.solve_pass_count=yesIds.length;   // 通过的条数(=1 的数量)
+    rec.solved=!!(aAns&&(rec.all_scored||!hasTask));
     cases.push(rec);
   }
   await saveEvalScores();
   const scoredCases=cases.filter(c=>c.all_scored).length;
   const agentScoredCases=cases.filter(c=>c.agent_scored).length;
   const solvedCases=cases.filter(c=>c.solved).length;
-  const out={evaluator_id:curEv,schema_version:rubricZh.schema_version||null,protocol_version:rubricZh.protocol_version||null,collected_cases:cases.length,scored_cases:scoredCases,agent_scored_cases:agentScoredCases,solved_cases:solvedCases,incomplete_cases:cases.length-scoredCases,cases:cases};
+  const out={evaluator_id:curEv,schema_version:rubricZh.schema_version||null,protocol_version:rubricZh.protocol_version||null,collected_cases:cases.length,scored_cases:scoredCases,agent_scored_cases:agentScoredCases,solved_cases:solvedCases,incomplete_cases:cases.length-solvedCases,cases:cases};
   const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});
   const url=URL.createObjectURL(blob);
   const a=document.createElement('a');a.href=url;a.download='evaluator_'+curEv+'_results.json';
@@ -1191,15 +1231,25 @@ function renderAgentForm(box){
   const polarityClr=p=>p==='negative'?'#b00':p==='positive'?'#080':'#888';
   const impClr=i=>i==='must_have'?'#fff8c5':i==='nice_to_have'?'#eaeefe':'var(--bg3)';
   let h='<div class="ag-wrap"><div class="ag-head">逐条判断 agent 的求解是否符合该 rubric:<b>是</b>=满足预期,<b>否</b>=不满足。全部判完(连同左侧 9 维"案例打分")才算"是否解决"。</div><div id="ag-summary" class="ag-sum"></div><div class="ag-list">';
-  s.rubrics.forEach(r=>{
+  // rubric_results.json (agent 自动评判): result 1=通过 / 0=不通过 + evidence。按 criterion 匹配到本轮每个 rubric(顺序一致)。
+  const rrList=(rubricResults&&Array.isArray(rubricResults.rubrics))?rubricResults.rubrics:[];
+  const rrByCrit=new Map();rrList.forEach(x=>{if(x&&x.criterion!=null)rrByCrit.set(x.criterion,x);});
+  s.rubrics.forEach((r,idx)=>{
     const cur=getSolve(r.id);
+    const rr=(r.criterion!=null&&rrByCrit.get(r.criterion))||rrList[idx]||null;
+    let resH='';
+    if(rr){
+      const pass=rr.result===1,resEv=rr.evidence?esc(rr.evidence):'';
+      resH='<span class="ag-res"><span class="ag-rtag '+(pass?'pass':'fail')+'">'+(pass?'通过':'不通过')+'</span>'+
+        (resEv?'<span class="ag-rq" tabindex="0">?<span class="ag-rq-tip"><b>证据 (rubric_results.json)</b><br/>'+resEv+'</span></span>':'')+'</span>';
+    }
     h+='<div class="ag-ri"><div class="ag-ri-top"><span class="ag-id">'+esc(r.id||'')+'<span class="ag-cat">'+esc(r.category||'')+'</span></span>'+
       '<span class="ag-chips"><span class="ag-chip pol" style="background:'+polarityClr(r.polarity)+'">'+esc(r.polarity||'')+'</span>'+
       '<span class="ag-chip imp" style="background:'+impClr(r.importance)+'">'+esc(r.importance||'')+'</span></span></div>';
     if(r.criterion)h+='<div class="ag-crit"><span class="ag-lab">criterion</span><div>'+esc(r.criterion)+'</div></div>';
     if(r.rationale)h+='<div class="ag-text"><span class="ag-lab">rationale</span><div>'+esc(r.rationale)+'</div></div>';
     if(r.note)h+='<div class="ag-text sm"><span class="ag-lab">note</span><div>'+esc(r.note)+'</div></div>';
-    h+='<div class="ag-yn"><span class="ag-yn-l">判断</span>'+agYBtn(r.id,'yes',cur)+agYBtn(r.id,'no',cur)+'</div></div>';
+    h+='<div class="ag-yn"><span class="ag-yn-l">判断</span>'+agYBtn(r.id,'yes',cur)+agYBtn(r.id,'no',cur)+resH+'</div></div>';
   });
   h+='</div></div>';
   box.innerHTML=h;
@@ -1218,13 +1268,16 @@ function onAgentInput(e){
 }
 function updateAgentSummary(){
   const el=document.getElementById('ag-summary');if(!el)return;
-  const ids=agentRubricIds();const sl=(evalScores[scoreKey(curEv,curTrialName)]&&evalScores[scoreKey(curEv,curTrialName)].solve)||{};
+  const key=scoreKey(curEv,curTrialName);
+  const ids=agentRubricIds();const sl=(evalScores[key]&&evalScores[key].solve)||{};
   const answered=ids.filter(id=>sl[id]==='yes'||sl[id]==='no').length;
   const yesN=ids.filter(id=>sl[id]==='yes').length;
   const aDone=ids.length&&answered===ids.length;
-  const smDone=allDimsScored();
+  const noTask=judgeCases[key]===false;
+  const smDone=noTask||allDimsScored();
+  const smLbl=noTask?'smell —':(allDimsScored()?'smell ✓':'smell ✗');
   el.innerHTML='<div class="sum-row"><span class="sum-l">Agent 评判</span> 已判 '+answered+'/'+ids.length+(answered?(yesN!==answered?' (是 '+yesN+' / 否 '+(answered-yesN)+')':' (全 是)'):'')+'</div>'+
-    '<div class="sum-row sum-model"><span class="sum-l">是否解决</span> '+((aDone&&smDone)?'<span style="color:var(--gn)">✓ 已解决(smell ✓ · agent ✓)</span>':'<span class="sum-null">未完成( '+(smDone?'smell ✓':'smell ✗')+' · '+(aDone?'agent ✓':'agent '+answered+'/'+ids.length)+' )</span>')+'</div>';
+    '<div class="sum-row sum-model"><span class="sum-l">是否解决</span> '+((aDone&&smDone)?'<span style="color:var(--gn)">✓ 已解决('+smLbl+' · agent ✓)</span>':'<span class="sum-null">未完成( '+smLbl+' · '+(aDone?'agent ✓':'agent '+answered+'/'+ids.length)+' )</span>')+'</div>';
 }
 </script>
 
