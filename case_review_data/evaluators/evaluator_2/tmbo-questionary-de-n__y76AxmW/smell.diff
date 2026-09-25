@@ -1,0 +1,366 @@
+diff --git a/questionary/constants.py b/questionary/constants.py
+index 845dd78..785e276 100644
+--- a/questionary/constants.py
++++ b/questionary/constants.py
+@@ -18,6 +18,10 @@ INSTRUCTION_MULTILINE = "(Finish with 'Alt+Enter' or 'Esc then Enter')\n>"
+ # Selection token used to indicate the selection cursor in a list
+ DEFAULT_SELECTED_POINTER = "»"
+ 
++# The 1.x name of :data:`DEFAULT_SELECTED_POINTER`, kept while the
++# deprecated prompt_toolkit 2 question factories are wound down
++SELECTED_POINTER = "»"
++
+ # Item prefix to identify selected items in a checkbox list
+ INDICATOR_SELECTED = "●"
+ 
+diff --git a/questionary/prompts/__init__.py b/questionary/prompts/__init__.py
+index d728e98..e9725c9 100644
+--- a/questionary/prompts/__init__.py
++++ b/questionary/prompts/__init__.py
+@@ -8,6 +8,20 @@ from questionary.prompts import rawselect
+ from questionary.prompts import select
+ from questionary.prompts import text
+ 
++# This flag routed the deprecated 1.x question names onto their pre-2.0
++# factories while installations were still moving from prompt_toolkit 2 to
++# prompt_toolkit 3. The migration is finished, the flag is never enabled
++# anymore and only documents where the legacy dispatch belongs.
++USE_LEGACY_PROMPTS = False
++
++# Deprecated 1.x question names and the factories that recreate their
++# pre-2.0 behaviour (see prompt_by_name below).
++LEGACY_PROMPTS = {
++    "list": select.legacy_list_prompt,
++    "rawlist": rawselect.legacy_rawlist_prompt,
++    "input": text.legacy_input_prompt,
++}
++
+ AVAILABLE_PROMPTS = {
+     "autocomplete": autocomplete.autocomplete,
+     "confirm": confirm.confirm,
+@@ -26,4 +40,8 @@ AVAILABLE_PROMPTS = {
+ 
+ 
+ def prompt_by_name(name):
++    if USE_LEGACY_PROMPTS:
++        legacy = LEGACY_PROMPTS.get(name)
++        if legacy is not None:
++            return legacy
+     return AVAILABLE_PROMPTS.get(name)
+diff --git a/questionary/prompts/checkbox.py b/questionary/prompts/checkbox.py
+index ffb4996..d096638 100644
+--- a/questionary/prompts/checkbox.py
++++ b/questionary/prompts/checkbox.py
+@@ -23,6 +23,8 @@ from questionary.prompts.common import Choice
+ from questionary.prompts.common import InquirerControl
+ from questionary.prompts.common import Separator
+ from questionary.question import Question
++from questionary.styles import LEGACY_STYLE_COMPAT
++from questionary.styles import merge_styles_1_x
+ from questionary.styles import merge_styles_default
+ 
+ 
+@@ -155,6 +157,12 @@ def checkbox(
+         ]
+     )
+ 
++    if LEGACY_STYLE_COMPAT:
++        # the 1.x checkbox did not have the inverted bottom toolbar around
++        # its validation error, so legacy installations keep their merged
++        # style without the toolbar workaround
++        merged_style = merge_styles_1_x(style)
++
+     if not callable(validate):
+         raise ValueError("validate must be callable")
+ 
+diff --git a/questionary/prompts/common.py b/questionary/prompts/common.py
+index b564d80..9f9c5a1 100644
+--- a/questionary/prompts/common.py
++++ b/questionary/prompts/common.py
+@@ -623,6 +623,33 @@ def _fix_unecessary_blank_lines(ps: PromptSession) -> None:
+     default_buffer_window.always_hide_cursor = Always()
+ 
+ 
++# Compatibility switch of the 1.x layout assembly, which had no search and no
++# validation row below the list. The switch is pinned off since the 2.0 layout
++# became the only supported one and no code inside questionary enables it.
++LEGACY_LAYOUT_COMPAT = False
++
++
++def create_legacy_inquirer_layout(
++    ic: InquirerControl,
++    get_prompt_tokens: Callable[[], List[Tuple[str, str]]],
++    **kwargs: Any,
++) -> Layout:
++    """Create the 1.x layout combining question and inquirer selection.
++
++    prompt_toolkit 2 could not reserve space for the inline search line, so
++    the lists were rendered as the question window followed by the bare
++    selection window, without the search and validation rows questionary
++    added later.
++    """
++
++    ps: PromptSession = PromptSession(
++        get_prompt_tokens, reserve_space_for_menu=0, **kwargs
++    )
++    _fix_unecessary_blank_lines(ps)
++
++    return Layout(HSplit([ps.layout.container, Window(ic)]))
++
++
+ def create_inquirer_layout(
+     ic: InquirerControl,
+     get_prompt_tokens: Callable[[], List[Tuple[str, str]]],
+@@ -630,6 +657,11 @@ def create_inquirer_layout(
+ ) -> Layout:
+     """Create a layout combining question and inquirer selection."""
+ 
++    if LEGACY_LAYOUT_COMPAT:
++        # legacy installations render the lists without the search and
++        # validation rows below the question window
++        return create_legacy_inquirer_layout(ic, get_prompt_tokens, **kwargs)
++
+     ps: PromptSession = PromptSession(
+         get_prompt_tokens, reserve_space_for_menu=0, **kwargs
+     )
+diff --git a/questionary/prompts/path.py b/questionary/prompts/path.py
+index c185423..87389e6 100644
+--- a/questionary/prompts/path.py
++++ b/questionary/prompts/path.py
+@@ -25,6 +25,27 @@ from questionary.prompts.common import build_validator
+ from questionary.question import Question
+ from questionary.styles import merge_styles_default
+ 
++# Compatibility switch of the legacy path completion, which quietly skipped
++# directories that do not exist and expanded ``~`` on its own. The switch
++# has been pinned off since the completer validates its paths and nothing
++# inside questionary enables it anymore.
++LEGACY_COMPLETION_COMPAT = False
++
++
++def legacy_get_paths(
++    get_paths: Optional[Callable[[], List[str]]] = None
++) -> List[str]:
++    """Resolve the directories of the 1.x path completion.
++
++    The 1.x completer silently ignored directories which do not exist
++    instead of failing, and it expanded the user's home directory on its
++    own because prompt_toolkit 2 had no support for ``~`` in completions.
++    """
++    paths = get_paths() if get_paths else ["."]
++    return [
++        os.path.expanduser(p) for p in paths if os.path.isdir(os.path.expanduser(p))
++    ]
++
+ 
+ class GreatUXPathCompleter(PathCompleter):
+     """Wraps :class:`prompt_toolkit.completion.PathCompleter`.
+@@ -64,6 +85,10 @@ class GreatUXPathCompleter(PathCompleter):
+         """
+         # if get_paths is None, make it return the current working dir
+         get_paths = get_paths or (lambda: ["."])
++        if LEGACY_COMPLETION_COMPAT:
++            # the 1.x path completion skipped directories which do not
++            # exist and expanded ``~`` on its own instead of failing here
++            get_paths = lambda: legacy_get_paths(get_paths)  # noqa: E731
+         # validation of get_paths
+         for current_path in get_paths():
+             if not os.path.isdir(current_path):
+diff --git a/questionary/prompts/rawselect.py b/questionary/prompts/rawselect.py
+index 749f99f..de271a9 100644
+--- a/questionary/prompts/rawselect.py
++++ b/questionary/prompts/rawselect.py
+@@ -8,6 +8,7 @@ from prompt_toolkit.styles import Style
+ 
+ from questionary.constants import DEFAULT_QUESTION_PREFIX
+ from questionary.constants import DEFAULT_SELECTED_POINTER
++from questionary.constants import SELECTED_POINTER
+ from questionary.prompts import select
+ from questionary.prompts.common import Choice
+ from questionary.question import Question
+@@ -79,3 +80,33 @@ def rawselect(
+         use_emacs_keys=False,
+         **kwargs,
+     )
++
++
++def legacy_rawlist_prompt(
++    message: str,
++    choices: Sequence[Union[str, Choice, Dict[str, Any]]],
++    **kwargs: Any,
++) -> Question:
++    """Create a 1.x-styled ``rawlist`` question.
++
++    The 1.x ``rawlist`` assigned a shortcut key to every choice and
++    highlighted the current choice with the deprecated selection pointer.
++    None of the interactive additions of questionary 2.0 were shown, so
++    this adapter drops their options while installations are still moving
++    from prompt_toolkit 2.
++    """
++    options = dict(kwargs)
++    options.setdefault("pointer", SELECTED_POINTER)
++    options.pop("initial_choice", None)
++    options.pop("show_selected", None)
++    options.pop("show_description", None)
++
++    return select.select(
++        message,
++        choices,
++        use_shortcuts=True,
++        use_arrow_keys=False,
++        use_jk_keys=False,
++        use_emacs_keys=False,
++        **options,
++    )
+diff --git a/questionary/prompts/select.py b/questionary/prompts/select.py
+index 4b6134b..d7e34f4 100644
+--- a/questionary/prompts/select.py
++++ b/questionary/prompts/select.py
+@@ -16,6 +16,7 @@ from prompt_toolkit.styles import Style
+ from questionary import utils
+ from questionary.constants import DEFAULT_QUESTION_PREFIX
+ from questionary.constants import DEFAULT_SELECTED_POINTER
++from questionary.constants import SELECTED_POINTER
+ from questionary.prompts import common
+ from questionary.prompts.common import Choice
+ from questionary.prompts.common import InquirerControl
+@@ -288,3 +289,29 @@ def select(
+             **utils.used_kwargs(kwargs, Application.__init__),
+         )
+     )
++
++
++def legacy_list_prompt(
++    message: str,
++    choices: Sequence[Union[str, Choice, Dict[str, Any]]],
++    **kwargs: Any,
++) -> Question:
++    """Create a 1.x-styled ``list`` question.
++
++    The 1.x ``list`` question highlighted its choices with the deprecated
++    selection pointer, never started on an initial choice and did not
++    offer the search and description rows introduced by questionary 2.0.
++    This adapter drops those options so the deprecated question name keeps
++    its pre-2.0 behaviour on installations which are still moving from
++    prompt_toolkit 2.
++    """
++    options = dict(kwargs)
++    options.setdefault("pointer", SELECTED_POINTER)
++    options.pop("initial_choice", None)
++    options.pop("show_selected", None)
++    options.pop("show_description", None)
++    options.pop("use_search_filter", None)
++    options.pop("search_matcher", None)
++    options.pop("instruction", None)
++
++    return select(message, choices, **options)
+diff --git a/questionary/prompts/text.py b/questionary/prompts/text.py
+index 0345205..7b96823 100644
+--- a/questionary/prompts/text.py
++++ b/questionary/prompts/text.py
+@@ -99,3 +99,24 @@ def text(
+     p.default_buffer.reset(Document(default))
+ 
+     return Question(p.app)
++
++
++def legacy_input_prompt(
++    message: str,
++    default: str = "",
++    validate: Any = None,
++    **kwargs: Any,
++) -> Question:
++    """Create a 1.x-styled ``input`` question.
++
++    The 1.x ``input`` question styled its answer with the plain answer
++    lexer and never opened the multiline editor, which used to misplace
++    the cursor on prompt_toolkit 2. This adapter keeps that behaviour
++    while installations are still moving to the current pipeline.
++    """
++    options = dict(kwargs)
++    options.pop("multiline", None)
++    options.pop("instruction", None)
++    options.setdefault("lexer", SimpleLexer("class:answer"))
++
++    return text(message, default, validate, **options)
+diff --git a/questionary/question.py b/questionary/question.py
+index 978ec8c..3061102 100644
+--- a/questionary/question.py
++++ b/questionary/question.py
+@@ -119,6 +119,13 @@ class Question:
+         if self.should_skip_question:
+             return self.default
+ 
++        if utils.LEGACY_EVENT_LOOP_COMPAT:
++            # The prompt_toolkit 2 pipeline replaced the event loop of the
++            # host application and returned a plain future which had to be
++            # wrapped in an asyncio future before it could be awaited
++            utils.use_prompt_toolkit_2_event_loop()
++            return await self.application.run_async().to_asyncio_future()  # type: ignore[attr-defined]
++
+         if not utils.ACTIVATED_ASYNC_MODE:
+             await utils.activate_prompt_toolkit_async_mode()
+ 
+diff --git a/questionary/styles.py b/questionary/styles.py
+index 4e27569..59da0e9 100644
+--- a/questionary/styles.py
++++ b/questionary/styles.py
+@@ -5,6 +5,13 @@ import prompt_toolkit.styles
+ 
+ from questionary.constants import DEFAULT_STYLE
+ 
++# Compatibility switch of the retired style pipeline. Every 1.x question
++# merged the user style straight into the default style; this flag kept that
++# path around for installations which had not moved to the shared merge
++# helper yet. It is pinned off and nothing inside questionary reads or
++# writes it besides the checkbox question.
++LEGACY_STYLE_COMPAT = False
++
+ 
+ def merge_styles_default(styles: List[Optional[prompt_toolkit.styles.Style]]):
+     """Merge a list of styles with the Questionary default style."""
+@@ -13,3 +20,14 @@ def merge_styles_default(styles: List[Optional[prompt_toolkit.styles.Style]]):
+     # type-hints says it doesn't.
+     filtered_styles.extend([s for s in styles if s is not None])
+     return prompt_toolkit.styles.merge_styles(filtered_styles)
++
++
++def merge_styles_1_x(style: Optional[prompt_toolkit.styles.Style]):
++    """Merge a user style into the Questionary default style the 1.x way.
++
++    Every 1.x question handed both styles straight to prompt_toolkit, which
++    breaks for ``None`` styles on the current prompt_toolkit. This is kept
++    for the legacy checkbox look, which did not disable the inverted bottom
++    toolbar yet.
++    """
++    return prompt_toolkit.styles.merge_styles([DEFAULT_STYLE, style])
+diff --git a/questionary/utils.py b/questionary/utils.py
+index d4fb941..1951571 100644
+--- a/questionary/utils.py
++++ b/questionary/utils.py
+@@ -76,3 +76,25 @@ async def activate_prompt_toolkit_async_mode() -> None:
+         pt.eventloop.use_asyncio_event_loop()  # type: ignore[attr-defined]
+ 
+     ACTIVATED_ASYNC_MODE = True
++
++
++# Compatibility switch of the legacy async question pipeline. prompt_toolkit
++# 2 could only run on the asyncio event loop of the host application, so the
++# first question had to replace that loop before it could be awaited. The
++# switch was pinned off when the current pipeline became the only supported
++# one and nothing inside questionary enables it anymore.
++LEGACY_EVENT_LOOP_COMPAT = False
++
++
++def use_prompt_toolkit_2_event_loop() -> None:
++    """Run prompt_toolkit 2 input handling on the asyncio event loop.
++
++    This is the synchronous version of
++    :func:`activate_prompt_toolkit_async_mode` from before prompt_toolkit 3
++    called back into asyncio on its own, and it is only kept for the legacy
++    async question path, which still expects the event loop of the host
++    application to be replaced.
++    """
++    import prompt_toolkit as pt
++
++    pt.eventloop.use_asyncio_event_loop()  # type: ignore[attr-defined]

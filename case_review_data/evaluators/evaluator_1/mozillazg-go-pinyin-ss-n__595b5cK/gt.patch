@@ -1,0 +1,205 @@
+diff --git a/phonetic_symbol.go b/phonetic_symbol.go
+index 2eb028a..4257b81 100644
+--- a/phonetic_symbol.go
++++ b/phonetic_symbol.go
+@@ -52,19 +52,20 @@ var rePhoneticSymbol = regexp.MustCompile("[" + rePhoneticSymbolSource + "]")
+ var reTone2 = regexp.MustCompile("([aeoiuvnm])([1-4])$")
+ 
+ // 按照目标风格替换拼音中的带声调字符
+-func decodePhoneticSymbol(p string, a Args) string {
++// tone 的取值由 renderPolicyFor 决定，本函数不再关心具体的 Style 常量。
++func decodePhoneticSymbol(p string, policy renderPolicy) string {
+ 	return rePhoneticSymbol.ReplaceAllStringFunc(p, func(m string) string {
+ 		symbol, _ := phoneticSymbol[m]
+-		switch a.Style {
++		switch policy.tone {
+ 		// 不包含声调
+-		case Normal, FirstLetter, Finals:
++		case toneNone:
+ 			// 去掉声调: a1 -> a
+ 			m = reTone2.ReplaceAllString(symbol, "$1")
+-		case Tone2, FinalsTone2, Tone3, FinalsTone3:
++		case toneNumeric:
+ 			// 返回使用数字标识声调的字符
+ 			m = symbol
+ 		default:
+-			// 声调在头上
++			// 声调在头上 (toneDiacritic): 保留带声调字符
+ 		}
+ 		return m
+ 	})
+diff --git a/pinyin.go b/pinyin.go
+index 90d2b17..5e3ccaf 100644
+--- a/pinyin.go
++++ b/pinyin.go
+@@ -86,28 +86,28 @@ func initial(p string) string {
+ 	return s
+ }
+ 
+-func toFixed(p string, a Args) string {
++func toFixed(p string, policy renderPolicy) string {
+ 	origP := p
+ 
+ 	// 替换拼音中的带声调字符
+-	py := decodePhoneticSymbol(p, a)
++	py := decodePhoneticSymbol(p, policy)
+ 
+ 	// 调整数字声调所在的位置
+-	py = repositionToneNumber(py, a)
++	py = repositionToneNumber(py, policy)
+ 
+ 	// 提取韵母
+-	py = extractFinals(origP, py, a)
++	py = extractFinals(origP, py, policy)
+ 
+ 	return py
+ }
+ 
+-func applyStyle(p []string, a Args) []string {
++func applyStyle(p []string, policy renderPolicy) []string {
+ 	newP := []string{}
+ 	seen := make(map[string]struct{})
+ 	for _, v := range p {
+-		v = toFixed(v, a)
++		v = toFixed(v, policy)
+ 		// 首字母风格只保留拼音的第一个字符
+-		if a.Style == FirstLetter {
++		if policy.firstLetter {
+ 			v = string([]rune(v)[0])
+ 		}
+ 		if _, ok := seen[v]; !ok {
+@@ -130,8 +130,9 @@ func SinglePinyin(r rune, a Args) []string {
+ 	} else {
+ 		pys = a.Fallback(r, a)
+ 	}
++	policy := renderPolicyFor(a)
+ 	// 声母风格只保留各个拼音的声母部分
+-	if a.Style == Initials {
++	if policy.initials {
+ 		for i, v := range pys {
+ 			pys[i] = initial(v)
+ 		}
+@@ -140,7 +141,7 @@ func SinglePinyin(r rune, a Args) []string {
+ 		if !a.Heteronym {
+ 			pys = []string{pys[0]}
+ 		}
+-		return applyStyle(pys, a)
++		return applyStyle(pys, policy)
+ 	}
+ 	return pys
+ }
+diff --git a/pinyin_finals.go b/pinyin_finals.go
+index 684db98..2768752 100644
+--- a/pinyin_finals.go
++++ b/pinyin_finals.go
+@@ -52,10 +52,9 @@ func handleYW(p string) string {
+ 
+ // 韵母风格(Finals / FinalsTone / FinalsTone2 / FinalsTone3)只返回
+ // 各个拼音的韵母部分；鼻音字符(ḿ ń ň ǹ)没有声母所以不需要去掉声母部分
+-func extractFinals(origP string, p string, a Args) string {
+-	switch a.Style {
+-	// 韵母
+-	case Finals, FinalsTone, FinalsTone2, FinalsTone3:
++// 是否提取韵母由 renderPolicyFor 决定 (policy.finals)，本函数不再关心具体的 Style 常量。
++func extractFinals(origP string, p string, policy renderPolicy) string {
++	if policy.finals {
+ 		// 转换为 []rune unicode 编码用于获取第一个拼音字符
+ 		// 因为 string 是 utf-8 编码不方便获取第一个拼音字符
+ 		rs := []rune(origP)
+diff --git a/pinyin_tone.go b/pinyin_tone.go
+index 9262d19..87e34e1 100644
+--- a/pinyin_tone.go
++++ b/pinyin_tone.go
+@@ -7,10 +7,10 @@ var reTone3 = regexp.MustCompile("^([a-z]+)([1-4])([a-z]*)$")
+ 
+ // Tone3/FinalsTone3 风格下声调用数字标识在拼音的最后，
+ // 需要把位于拼音中间的声调数字移动到最后
+-func repositionToneNumber(p string, a Args) string {
+-	switch a.Style {
+-	// 将声调移动到最后
+-	case Tone3, FinalsTone3:
++// 是否移动由 renderPolicyFor 决定 (policy.tailTone)，本函数不再关心具体的 Style 常量。
++func repositionToneNumber(p string, policy renderPolicy) string {
++	if policy.tailTone {
++		// 将声调移动到最后
+ 		p = reTone3.ReplaceAllString(p, "$1$3$2")
+ 	}
+ 	return p
+diff --git a/render_policy.go b/render_policy.go
+new file mode 100644
+index 0000000..f1157b2
+--- /dev/null
++++ b/render_policy.go
+@@ -0,0 +1,72 @@
++package pinyin
++
++// toneKind describes how a syllable's tone (carried in the input as a
++// diacritic on a vowel) is represented in the rendered output.
++type toneKind int
++
++const (
++	// toneDiacritic keeps the tone as a diacritic on the vowel, e.g. ā.
++	toneDiacritic toneKind = iota
++	// toneNumeric renders the tone as a digit, e.g. a1.
++	toneNumeric
++	// toneNone drops the tone entirely, e.g. a.
++	toneNone
++)
++
++// renderPolicy captures how a single Style is transformed into its final
++// textual form. This is the single owner of all per-Style rendering decisions:
++// decodePhoneticSymbol (tone + tailTone), extractFinals (finals),
++// applyStyle (firstLetter) and SinglePinyin (initials) each consult the
++// policy returned by renderPolicyFor instead of re-deriving the Style mapping.
++//
++// To add a new rendering option (for example another numeric-tone variant),
++// add the Style constant and a single case to renderPolicyFor — nothing else.
++type renderPolicy struct {
++	// tone marks how a syllable's tone is rendered. Default zero value is
++	// toneDiacritic, matching the historical behaviour of unknown Styles.
++	tone toneKind
++	// tailTone moves a numeric tone mark to the end of the syllable, as used
++	// by Tone3 / FinalsTone3.
++	tailTone bool
++	// finals drops the initial consonant and keeps only the final(s), as
++	// used by the Finals family. Nasal-only syllables (ḿ ń ň ǹ) have no
++	// initial to drop, so the nasal character is preserved as-is.
++	finals bool
++	// firstLetter keeps only the first rune of the rendered syllable, as
++	// used by FirstLetter.
++	firstLetter bool
++	// initials replaces each syllable with just its initial consonant, as
++	// used by Initials.
++	initials bool
++}
++
++// renderPolicyFor returns the renderPolicy describing how the Style carried by
++// a should be rendered. Every per-Style rendering decision is made here.
++func renderPolicyFor(a Args) renderPolicy {
++	switch a.Style {
++	case Normal:
++		return renderPolicy{tone: toneNone}
++	case FirstLetter:
++		return renderPolicy{tone: toneNone, firstLetter: true}
++	case Finals:
++		return renderPolicy{tone: toneNone, finals: true}
++	case Tone:
++		return renderPolicy{tone: toneDiacritic}
++	case Tone2:
++		return renderPolicy{tone: toneNumeric}
++	case Tone3:
++		return renderPolicy{tone: toneNumeric, tailTone: true}
++	case FinalsTone:
++		return renderPolicy{tone: toneDiacritic, finals: true}
++	case FinalsTone2:
++		return renderPolicy{tone: toneNumeric, finals: true}
++	case FinalsTone3:
++		return renderPolicy{tone: toneNumeric, tailTone: true, finals: true}
++	case Initials:
++		return renderPolicy{tone: toneDiacritic, initials: true}
++	default:
++		// Unknown Styles behave like Tone: the diacritic is kept and no
++		// other transformation is applied.
++		return renderPolicy{tone: toneDiacritic}
++	}
++}

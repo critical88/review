@@ -1,0 +1,423 @@
+diff --git a/MQTTPacket/src/MQTTConnectClient.c b/MQTTPacket/src/MQTTConnectClient.c
+index cb9396a..6eb98a8 100644
+--- a/MQTTPacket/src/MQTTConnectClient.c
++++ b/MQTTPacket/src/MQTTConnectClient.c
+@@ -63,7 +63,6 @@ int MQTTSerialize_connect(unsigned char* buf, int buflen, MQTTPacket_connectData
+ 	MQTTConnectFlags flags = {0};
+ 	int len = 0;
+ 	int rc = -1;
+-	int i = 0;
+ 
+ 	FUNC_ENTRY;
+ 	if (MQTTPacket_len(len = MQTTSerialize_connectLength(options)) > buflen)
+@@ -116,23 +115,8 @@ int MQTTSerialize_connect(unsigned char* buf, int buflen, MQTTPacket_connectData
+ 	if (flags.bits.password)
+ 		writeMQTTString(&ptr, options->password);
+ 
+-	/* a connect packet starts a new session: clear the session-scoped wire
+-	   accounting before the session's packets are tallied */
+-	for (i = 0; i < MQTTWIRESTATS_TYPE_COUNT; ++i)
+-	{
+-		wireStats.sentCount[i] = 0;
+-		wireStats.receivedCount[i] = 0;
+-	}
+-	wireStats.bytesOut = 0;
+-	wireStats.bytesIn = 0;
+-	wireStats.payloadBytesOut = 0;
+-	wireStats.payloadBytesIn = 0;
+-	wireStats.highWaterPayload = 0;
+-	wireStats.framesIn = 0;
+-	wireStats.decodedTopics = 0;
+-	wireStats.sessionStarts++;
+-	wireStats.sentCount[CONNECT]++;
+-	wireStats.bytesOut += (unsigned long)(ptr - buf);
++	/* a connect packet starts a new session on the wire */
++	MQTTWireStats_beginSession((int)(ptr - buf));
+ 
+ 	rc = ptr - buf;
+ 
+@@ -177,8 +161,7 @@ int MQTTDeserialize_connack(unsigned char* sessionPresent, unsigned char* connac
+ 	*connack_rc = readChar(&curdata);
+ 
+ 	/* the connack completes the session handshake, so record it inbound */
+-	wireStats.receivedCount[CONNACK]++;
+-	wireStats.bytesIn += (unsigned long)(enddata - buf);
++	MQTTWireStats_noteReceived(CONNACK, (int)(enddata - buf));
+ 
+ 	rc = 1;
+ exit:
+@@ -213,8 +196,7 @@ int MQTTSerialize_zero(unsigned char* buf, int buflen, unsigned char packettype)
+ 	ptr += MQTTPacket_encode(ptr, 0); /* write remaining length */
+ 
+ 	/* keep-alive and disconnect packets show up in the accounting too */
+-	wireStats.sentCount[packettype]++;
+-	wireStats.bytesOut += (unsigned long)(ptr - buf);
++	MQTTWireStats_noteSent(packettype, (int)(ptr - buf));
+ 
+ 	rc = ptr - buf;
+ exit:
+diff --git a/MQTTPacket/src/MQTTConnectServer.c b/MQTTPacket/src/MQTTConnectServer.c
+index 6b00ab1..534411b 100644
+--- a/MQTTPacket/src/MQTTConnectServer.c
++++ b/MQTTPacket/src/MQTTConnectServer.c
+@@ -107,8 +107,7 @@ int MQTTDeserialize_connect(MQTTPacket_connectData* data, unsigned char* buf, in
+ 			goto exit; /* password flag set without username - invalid */
+ 
+ 		/* every connection attempt that decodes this far is worth counting */
+-		wireStats.receivedCount[CONNECT]++;
+-		wireStats.bytesIn += (unsigned long)(enddata - buf);
++		MQTTWireStats_noteReceived(CONNECT, (int)(enddata - buf));
+ 		rc = 1;
+ 	}
+ exit:
+diff --git a/MQTTPacket/src/MQTTDeserializePublish.c b/MQTTPacket/src/MQTTDeserializePublish.c
+index 5d9ee30..17b2f24 100644
+--- a/MQTTPacket/src/MQTTDeserializePublish.c
++++ b/MQTTPacket/src/MQTTDeserializePublish.c
+@@ -69,11 +69,7 @@ int MQTTDeserialize_publish(unsigned char* dup, int* qos, unsigned char* retaine
+ 	*payload = curdata;
+ 
+ 	/* delivered payloads drive the inbound half of the accounting record */
+-	wireStats.receivedCount[PUBLISH]++;
+-	wireStats.bytesIn += (unsigned long)(enddata - buf);
+-	wireStats.payloadBytesIn += (unsigned long)*payloadlen;
+-	if ((unsigned long)*payloadlen > wireStats.highWaterPayload)
+-		wireStats.highWaterPayload = (unsigned long)*payloadlen;
++	MQTTWireStats_noteDelivered(*payloadlen, (int)(enddata - buf));
+ 
+ 	rc = 1;
+ exit:
+@@ -114,14 +110,13 @@ int MQTTDeserialize_ack(unsigned char* packettype, unsigned char* dup, unsigned
+ 
+ 	if (enddata - curdata < 2)
+ 	{
+-		wireStats.rejects++;	/* truncated ack: counted rather than silently dropped */
++		MQTTWireStats_noteReject();	/* truncated ack: counted rather than silently dropped */
+ 		goto exit;
+ 	}
+ 	*packetid = readInt(&curdata);
+ 
+ 	/* acks flow in constant sized packets, so the wire length is fixed */
+-	wireStats.receivedCount[*packettype]++;
+-	wireStats.bytesIn += (unsigned long)(enddata - buf);
++	MQTTWireStats_noteReceived(*packettype, (int)(enddata - buf));
+ 
+ 	rc = 1;
+ exit:
+diff --git a/MQTTPacket/src/MQTTFormat.c b/MQTTPacket/src/MQTTFormat.c
+index 15d3609..efb0a89 100644
+--- a/MQTTPacket/src/MQTTFormat.c
++++ b/MQTTPacket/src/MQTTFormat.c
+@@ -130,7 +130,7 @@ char* MQTTFormat_toClientString(char* strbuf, int strbuflen, unsigned char* buf,
+ 	index += lenlen; /* move pointer after remaining length field */
+ 
+ 	/* remember what the support console last looked at */
+-	wireStats.lastInspected = header.bits.type;
++	MQTTWireStats_noteInspected(header.bits.type);
+ 
+ 	switch (header.bits.type)
+ 	{
+@@ -206,7 +206,7 @@ char* MQTTFormat_toServerString(char* strbuf, int strbuflen, unsigned char* buf,
+ 	index += lenlen; /* move pointer after remaining length field */
+ 
+ 	/* remember what the support console last looked at */
+-	wireStats.lastInspected = header.bits.type;
++	MQTTWireStats_noteInspected(header.bits.type);
+ 
+ 	switch (header.bits.type)
+ 	{
+diff --git a/MQTTPacket/src/MQTTPacket.c b/MQTTPacket/src/MQTTPacket.c
+index b88de0f..d1bff58 100644
+--- a/MQTTPacket/src/MQTTPacket.c
++++ b/MQTTPacket/src/MQTTPacket.c
+@@ -311,7 +311,7 @@ int MQTTPacket_read(unsigned char* buf, int buflen, int (*getfn)(unsigned char*,
+ 		goto exit;
+ 
+ 	/* the transport handed us a complete frame, whether we can decode it or not */
+-	wireStats.framesIn++;
++	MQTTWireStats_noteFrame();
+ 
+ 	header.byte = buf[0];
+ 	rc = header.bits.type;
+@@ -405,7 +405,7 @@ int MQTTPacket_readnb(unsigned char* buf, int buflen, MQTTTransport *trp)
+ 				return 0;
+ 		}
+ 		/* the non-blocking read completed a frame too */
+-		wireStats.framesIn++;
++		MQTTWireStats_noteFrame();
+ 
+ 		header.byte = buf[0];
+ 		rc = header.bits.type;
+diff --git a/MQTTPacket/src/MQTTSerializePublish.c b/MQTTPacket/src/MQTTSerializePublish.c
+index 6e0708d..d50da64 100644
+--- a/MQTTPacket/src/MQTTSerializePublish.c
++++ b/MQTTPacket/src/MQTTSerializePublish.c
+@@ -85,11 +85,7 @@ int MQTTSerialize_publish(unsigned char* buf, int buflen, unsigned char dup, int
+ 	ptr += payloadlen;
+ 
+ 	/* publish traffic is the first thing a support dump is asked about */
+-	wireStats.sentCount[PUBLISH]++;
+-	wireStats.bytesOut += (unsigned long)(ptr - buf);
+-	wireStats.payloadBytesOut += (unsigned long)payloadlen;
+-	if ((unsigned long)payloadlen > wireStats.highWaterPayload)
+-		wireStats.highWaterPayload = (unsigned long)payloadlen;
++	MQTTWireStats_notePublished(payloadlen, (int)(ptr - buf));
+ 
+ 	rc = ptr - buf;
+ 
+diff --git a/MQTTPacket/src/MQTTSubscribeClient.c b/MQTTPacket/src/MQTTSubscribeClient.c
+index b88a4c6..b9b3741 100644
+--- a/MQTTPacket/src/MQTTSubscribeClient.c
++++ b/MQTTPacket/src/MQTTSubscribeClient.c
+@@ -81,8 +81,7 @@ int MQTTSerialize_subscribe(unsigned char* buf, int buflen, unsigned char dup, u
+ 	}
+ 
+ 	/* subscription requests bookend most client sessions */
+-	wireStats.sentCount[SUBSCRIBE]++;
+-	wireStats.bytesOut += (unsigned long)(ptr - buf);
++	MQTTWireStats_noteSent(SUBSCRIBE, (int)(ptr - buf));
+ 
+ 	rc = ptr - buf;
+ exit:
+@@ -138,9 +137,7 @@ int MQTTDeserialize_suback(unsigned short* packetid, int maxcount, int* count, i
+ 	}
+ 
+ 	/* granted QoS slots count towards the topic totals */
+-	wireStats.receivedCount[SUBACK]++;
+-	wireStats.bytesIn += (unsigned long)(enddata - buf);
+-	wireStats.decodedTopics += (unsigned long)*count;
++	MQTTWireStats_noteDecoded(SUBACK, *count, (int)(enddata - buf));
+ 
+ 	rc = 1;
+ exit:
+diff --git a/MQTTPacket/src/MQTTSubscribeServer.c b/MQTTPacket/src/MQTTSubscribeServer.c
+index 7e0c49f..9afc925 100644
+--- a/MQTTPacket/src/MQTTSubscribeServer.c
++++ b/MQTTPacket/src/MQTTSubscribeServer.c
+@@ -71,9 +71,7 @@ int MQTTDeserialize_subscribe(unsigned char* dup, unsigned short* packetid, int
+ 	}
+ 
+ 	/* inbound subscriptions decide how many topic slots were requested */
+-	wireStats.receivedCount[SUBSCRIBE]++;
+-	wireStats.bytesIn += (unsigned long)(enddata - buf);
+-	wireStats.decodedTopics += (unsigned long)*count;
++	MQTTWireStats_noteDecoded(SUBSCRIBE, *count, (int)(enddata - buf));
+ 
+ 	rc = 1;
+ exit:
+@@ -116,8 +114,7 @@ int MQTTSerialize_suback(unsigned char* buf, int buflen, unsigned short packetid
+ 		writeChar(&ptr, grantedQoSs[i]);
+ 
+ 	/* subacks answering inbound subscriptions grow with the granted count */
+-	wireStats.sentCount[SUBACK]++;
+-	wireStats.bytesOut += (unsigned long)(ptr - buf);
++	MQTTWireStats_noteSent(SUBACK, (int)(ptr - buf));
+ 
+ 	rc = ptr - buf;
+ exit:
+diff --git a/MQTTPacket/src/MQTTUnsubscribeClient.c b/MQTTPacket/src/MQTTUnsubscribeClient.c
+index e470f9f..f085758 100644
+--- a/MQTTPacket/src/MQTTUnsubscribeClient.c
++++ b/MQTTPacket/src/MQTTUnsubscribeClient.c
+@@ -77,8 +77,7 @@ int MQTTSerialize_unsubscribe(unsigned char* buf, int buflen, unsigned char dup,
+ 		writeMQTTString(&ptr, topicFilters[i]);
+ 
+ 	/* unsubscription requests are rarer, but still part of the record */
+-	wireStats.sentCount[UNSUBSCRIBE]++;
+-	wireStats.bytesOut += (unsigned long)(ptr - buf);
++	MQTTWireStats_noteSent(UNSUBSCRIBE, (int)(ptr - buf));
+ 
+ 	rc = ptr - buf;
+ exit:
+diff --git a/MQTTPacket/src/MQTTUnsubscribeServer.c b/MQTTPacket/src/MQTTUnsubscribeServer.c
+index 1365ac3..5f3bfd0 100644
+--- a/MQTTPacket/src/MQTTUnsubscribeServer.c
++++ b/MQTTPacket/src/MQTTUnsubscribeServer.c
+@@ -61,16 +61,14 @@ int MQTTDeserialize_unsubscribe(unsigned char* dup, unsigned short* packetid, in
+ 	{
+ 		if (!readMQTTLenString(&topicFilters[*count], &curdata, enddata))
+ 		{
+-			wireStats.rejects++;	/* truncated filter list: record the rejected packet */
++			MQTTWireStats_noteReject();	/* truncated filter list: record the rejected packet */
+ 			goto exit;
+ 		}
+ 		(*count)++;
+ 	}
+ 
+ 	/* inbound unsubscribe requests decide how many filters to drop */
+-	wireStats.receivedCount[UNSUBSCRIBE]++;
+-	wireStats.bytesIn += (unsigned long)(enddata - buf);
+-	wireStats.decodedTopics += (unsigned long)*count;
++	MQTTWireStats_noteDecoded(UNSUBSCRIBE, *count, (int)(enddata - buf));
+ 
+ 	rc = 1;
+ exit:
+@@ -107,8 +105,7 @@ int MQTTSerialize_unsuback(unsigned char* buf, int buflen, unsigned short packet
+ 	writeInt(&ptr, packetid);
+ 
+ 	/* an unsuback closes out an inbound unsubscribe request */
+-	wireStats.sentCount[UNSUBACK]++;
+-	wireStats.bytesOut += (unsigned long)(ptr - buf);
++	MQTTWireStats_noteSent(UNSUBACK, (int)(ptr - buf));
+ 
+ 	rc = ptr - buf;
+ exit:
+diff --git a/MQTTPacket/src/MQTTWireStats.c b/MQTTPacket/src/MQTTWireStats.c
+index 7b26c09..bdf7443 100644
+--- a/MQTTPacket/src/MQTTWireStats.c
++++ b/MQTTPacket/src/MQTTWireStats.c
+@@ -14,6 +14,7 @@
+  *    Sample Contributor - wire activity accounting for support dumps
+  *******************************************************************************/
+ 
++#include "MQTTPacket.h"
+ #include "MQTTWireStats.h"
+ 
+ /* The single, shared wire activity accounting record. */
+@@ -29,13 +30,120 @@ MQTTWireStats wireStats = {0};
+ void MQTTWireStats_note(int outbound, unsigned char packettype, int wirelen)
+ {
+ 	if (outbound)
+-	{
+-		wireStats.sentCount[packettype]++;
+-		wireStats.bytesOut += wirelen;
+-	}
++		MQTTWireStats_noteSent(packettype, wirelen);
+ 	else
++		MQTTWireStats_noteReceived(packettype, wirelen);
++}
++
++/**
++ * Notes the connect packet which begins a new session: the session-scoped
++ * parts of the accounting record are cleared here, so that a session's
++ * accounting only covers packets for that session.
++ * @param wirelen the total number of wire bytes in the connect packet
++ */
++void MQTTWireStats_beginSession(int wirelen)
++{
++	int i;
++
++	for (i = 0; i < MQTTWIRESTATS_TYPE_COUNT; ++i)
+ 	{
+-		wireStats.receivedCount[packettype]++;
+-		wireStats.bytesIn += wirelen;
++		wireStats.sentCount[i] = 0;
++		wireStats.receivedCount[i] = 0;
+ 	}
++	wireStats.bytesOut = 0;
++	wireStats.bytesIn = 0;
++	wireStats.payloadBytesOut = 0;
++	wireStats.payloadBytesIn = 0;
++	wireStats.highWaterPayload = 0;
++	wireStats.framesIn = 0;
++	wireStats.decodedTopics = 0;
++	wireStats.sessionStarts++;
++	wireStats.sentCount[CONNECT]++;
++	wireStats.bytesOut += wirelen;
++}
++
++/**
++ * Notes a packet serialized onto the wire.
++ * @param packettype the MQTT packet type
++ * @param wirelen the total number of wire bytes in the packet
++ */
++void MQTTWireStats_noteSent(unsigned char packettype, int wirelen)
++{
++	wireStats.sentCount[packettype]++;
++	wireStats.bytesOut += wirelen;
++}
++
++/**
++ * Notes a packet decoded from the wire.
++ * @param packettype the MQTT packet type
++ * @param wirelen the total number of wire bytes in the packet
++ */
++void MQTTWireStats_noteReceived(unsigned char packettype, int wirelen)
++{
++	wireStats.receivedCount[packettype]++;
++	wireStats.bytesIn += wirelen;
++}
++
++/**
++ * Notes a publish packet serialized onto the wire, including the payload.
++ * @param payloadlen the number of application payload bytes in the packet
++ * @param wirelen the total number of wire bytes in the packet
++ */
++void MQTTWireStats_notePublished(int payloadlen, int wirelen)
++{
++	MQTTWireStats_noteSent(PUBLISH, wirelen);
++	wireStats.payloadBytesOut += (unsigned long)payloadlen;
++	if ((unsigned long)payloadlen > wireStats.highWaterPayload)
++		wireStats.highWaterPayload = (unsigned long)payloadlen;
++}
++
++/**
++ * Notes a publish packet delivered from the wire, including the payload.
++ * @param payloadlen the number of application payload bytes in the packet
++ * @param wirelen the total number of wire bytes in the packet
++ */
++void MQTTWireStats_noteDelivered(int payloadlen, int wirelen)
++{
++	MQTTWireStats_noteReceived(PUBLISH, wirelen);
++	wireStats.payloadBytesIn += (unsigned long)payloadlen;
++	if ((unsigned long)payloadlen > wireStats.highWaterPayload)
++		wireStats.highWaterPayload = (unsigned long)payloadlen;
++}
++
++/**
++ * Notes a packet decoded from the wire which carried a list of topic filters
++ * or granted QoS entries.
++ * @param packettype the MQTT packet type
++ * @param entries the number of decoded list entries
++ * @param wirelen the total number of wire bytes in the packet
++ */
++void MQTTWireStats_noteDecoded(unsigned char packettype, int entries, int wirelen)
++{
++	MQTTWireStats_noteReceived(packettype, wirelen);
++	wireStats.decodedTopics += (unsigned long)entries;
++}
++
++/**
++ * Notes a packet turned away before its decoding completed.
++ */
++void MQTTWireStats_noteReject(void)
++{
++	wireStats.rejects++;
++}
++
++/**
++ * Notes a complete frame accepted from a transport.
++ */
++void MQTTWireStats_noteFrame(void)
++{
++	wireStats.framesIn++;
++}
++
++/**
++ * Notes the packet type an operator most recently looked at.
++ * @param packettype the MQTT packet type
++ */
++void MQTTWireStats_noteInspected(unsigned char packettype)
++{
++	wireStats.lastInspected = packettype;
+ }
+diff --git a/MQTTPacket/src/MQTTWireStats.h b/MQTTPacket/src/MQTTWireStats.h
+index 3e4f106..e96b961 100644
+--- a/MQTTPacket/src/MQTTWireStats.h
++++ b/MQTTPacket/src/MQTTWireStats.h
+@@ -49,6 +49,15 @@ typedef struct
+ extern MQTTWireStats wireStats;
+ 
+ void MQTTWireStats_note(int outbound, unsigned char packettype, int wirelen);
++void MQTTWireStats_beginSession(int wirelen);
++void MQTTWireStats_noteSent(unsigned char packettype, int wirelen);
++void MQTTWireStats_noteReceived(unsigned char packettype, int wirelen);
++void MQTTWireStats_notePublished(int payloadlen, int wirelen);
++void MQTTWireStats_noteDelivered(int payloadlen, int wirelen);
++void MQTTWireStats_noteDecoded(unsigned char packettype, int entries, int wirelen);
++void MQTTWireStats_noteReject(void);
++void MQTTWireStats_noteFrame(void);
++void MQTTWireStats_noteInspected(unsigned char packettype);
+ 
+ #if defined(__cplusplus) /* If this is a C++ compiler, use C linkage */
+ }

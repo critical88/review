@@ -1,0 +1,295 @@
+diff --git a/custom_components/xiaomi_gateway3/core/gate/base.py b/custom_components/xiaomi_gateway3/core/gate/base.py
+index fce3629..a4b6ab5 100644
+--- a/custom_components/xiaomi_gateway3/core/gate/base.py
++++ b/custom_components/xiaomi_gateway3/core/gate/base.py
+@@ -95,8 +95,32 @@ class XGateway:
+     def remove_all_event_listners(self):
+         self.listeners.clear()
+ 
+-    def init_device(self, model: str | int | None, **kwargs) -> XDevice:
+-        device = XDevice(model, **kwargs)
++    def init_device(
++        self,
++        model: str | int | None,
++        did: str,
++        dtype: str,
++        mac: str = None,
++        ieee: str = None,
++        nwk: str = None,
++        **kwargs,
++    ) -> XDevice:
++        """Create and register device with the raw identity fields.
++
++        MAC/IEEE from the gateway databases and from the reports can have
++        different formats, so they are normalized to lower case fields.
++        """
++        if mac:
++            mac = mac.lower()
++        extra: XDeviceExtra = {"did": did, "type": dtype}
++        if mac is not None:
++            extra["mac"] = mac
++        if ieee is not None:
++            extra["ieee"] = ieee
++        if nwk is not None:
++            extra["nwk"] = nwk
++        extra.update(kwargs)
++        device = XDevice(model, **extra)
+         self.debug("init_device", device=device, data=device.extra)
+         self.devices[device.did] = device
+         return device
+@@ -122,18 +146,15 @@ class XGateway:
+         for device in self.devices.values():
+             self.remove_device(device)
+ 
+-    async def base_read_device(self, info: dict[str]):
+-        self.device = self.devices.get(info["did"])
++    async def base_read_device(
++        self, did: str, model: str, mac: str, fw_ver: str, mac2: str = None
++    ):
++        self.device = self.devices.get(did)
+         if not self.device:
+-            extra: XDeviceExtra = {
+-                "did": info["did"],
+-                "type": GATEWAY,
+-                "mac": info["mac"].lower(),  # aa:bb:cc:dd:ee:ff
+-                "fw_ver": info["version"],
+-            }
+-            if "lan_mac" in info:
+-                extra["mac2"] = info["lan_mac"]
+-            self.device = self.init_device(info["model"], **extra)
++            kwargs: XDeviceExtra = {"fw_ver": fw_ver}
++            if mac2 is not None:
++                kwargs["mac2"] = mac2
++            self.device = self.init_device(model, did, GATEWAY, mac, **kwargs)
+         self.add_device(self.device)
+ 
+     async def handle_mqtt_messages(self):
+diff --git a/custom_components/xiaomi_gateway3/core/gate/ble.py b/custom_components/xiaomi_gateway3/core/gate/ble.py
+index a2d5046..520f844 100644
+--- a/custom_components/xiaomi_gateway3/core/gate/ble.py
++++ b/custom_components/xiaomi_gateway3/core/gate/ble.py
+@@ -6,6 +6,15 @@ from ..mini_mqtt import MQTTMessage
+ from ..shell.shell_mgw import ShellMGW
+ 
+ 
++def ble_identity(did: str, model: str | int, mac: str) -> tuple:
++    """Normalize identity of the BLE device.
++
++    Can be used for devices from the gateway DB and for devices
++    created on the fly from the report.
++    """
++    return did, model, mac.lower()
++
++
+ # noinspection PyMethodMayBeStatic,PyUnusedLocal
+ class BLEGateway(XGateway):
+     async def ble_read_devices(self, sh: ShellMGW):
+@@ -15,9 +24,8 @@ class BLEGateway(XGateway):
+             did = row[4]
+             device = self.devices.get(did)
+             if not device:
+-                mac = reverse_mac(row[1])  # aa:bb:cc:dd:ee:ff
+-                model = row[2]
+-                device = self.init_device(model, did=did, type=BLE, mac=mac)
++                did, model, mac = ble_identity(did, row[2], reverse_mac(row[1]))
++                device = self.init_device(model, did, BLE, mac)
+             self.add_device(device)
+ 
+     def ble_on_mqtt_publish(self, msg: MQTTMessage):
+@@ -44,9 +52,10 @@ class BLEGateway(XGateway):
+                 self.debug("Unknown device without mac", data=data)
+                 return
+             # create device "on the fly"
+-            model = data["dev"]["pdid"]
+-            mac = data["dev"]["mac"].lower()
+-            device = self.init_device(model, type=BLE, mac=mac, did=did)
++            did, model, mac = ble_identity(
++                did, data["dev"]["pdid"], data["dev"]["mac"]
++            )
++            device = self.init_device(model, did, BLE, mac)
+             device.available = True
+             self.add_device(device)
+ 
+diff --git a/custom_components/xiaomi_gateway3/core/gate/lumi.py b/custom_components/xiaomi_gateway3/core/gate/lumi.py
+index 379045f..7f04b96 100644
+--- a/custom_components/xiaomi_gateway3/core/gate/lumi.py
++++ b/custom_components/xiaomi_gateway3/core/gate/lumi.py
+@@ -9,6 +9,22 @@ from ..shell.shell_mgw import ShellMGW
+ from ..shell.shell_mgw2 import ShellMGW2
+ 
+ 
++def zigbee_identity(
++    did: str,
++    model: str | int,
++    mac: str,
++    nwk: str,
++    app_ver: int,
++    hard_ver: int,
++    xiaomi_did: str = None,
++) -> tuple:
++    """Normalize identity of the zigbee device from device.info row.
++
++    The raw "mac" from device.info is the hex EUI64 without colons.
++    """
++    return did, model, hex_to_ieee(mac), nwk, app_ver, hard_ver, xiaomi_did
++
++
+ class LumiGateway(XGateway):
+     async def lumi_read_devices(self, sh: ShellMGW | ShellMGW2):
+         raw = await sh.read_file("/data/zigbee/device.info")
+@@ -20,17 +36,21 @@ class LumiGateway(XGateway):
+             did = item["did"]
+             device = self.devices.get(did)
+             if not device:
+-                extra: XDeviceExtra = {
+-                    "did": did,
+-                    "type": ZIGBEE,
+-                    "ieee": hex_to_ieee(item["mac"]),
+-                    "nwk": item["shortId"],
+-                    "fw_ver": item["appVer"],
+-                    "hw_ver": item["hardVer"],
+-                }
+-                if did in xiaomi_did:
+-                    extra["cloud_did"] = xiaomi_did[did]
+-                device = self.init_device(item["model"], **extra)
++                did, model, ieee, nwk, fw_ver, hw_ver, cloud_did = zigbee_identity(
++                    did,
++                    item["model"],
++                    item["mac"],
++                    item["shortId"],
++                    item["appVer"],
++                    item["hardVer"],
++                    xiaomi_did.get(did),
++                )
++                extra: XDeviceExtra = {"fw_ver": fw_ver, "hw_ver": hw_ver}
++                if cloud_did:
++                    extra["cloud_did"] = cloud_did
++                device = self.init_device(
++                    model, did, ZIGBEE, ieee=ieee, nwk=nwk, **extra
++                )
+ 
+             self.add_device(device)
+ 
+diff --git a/custom_components/xiaomi_gateway3/core/gate/matter.py b/custom_components/xiaomi_gateway3/core/gate/matter.py
+index d43a0e8..354a3d7 100644
+--- a/custom_components/xiaomi_gateway3/core/gate/matter.py
++++ b/custom_components/xiaomi_gateway3/core/gate/matter.py
+@@ -17,9 +17,8 @@ class MatterGateway(XGateway):
+             did = item["did"]
+             device = self.devices.get(did)
+             if not device:
+-                device = self.init_device(
+-                    item["model"], did=did, type=MATTER, fw_ver=item["fw_ver"]
+-                )
++                model, fw_ver = item["model"], item["fw_ver"]
++                device = self.init_device(model, did, MATTER, fw_ver=fw_ver)
+             self.add_device(device)
+ 
+     def matter_on_mqtt_publish(self, msg: MQTTMessage):
+diff --git a/custom_components/xiaomi_gateway3/core/gate/mesh.py b/custom_components/xiaomi_gateway3/core/gate/mesh.py
+index 8a7f2e7..fdfdde0 100644
+--- a/custom_components/xiaomi_gateway3/core/gate/mesh.py
++++ b/custom_components/xiaomi_gateway3/core/gate/mesh.py
+@@ -6,6 +6,11 @@ from ..mini_mqtt import MQTTMessage
+ from ..shell.shell_mgw import ShellMGW
+ 
+ 
++def mesh_identity(did: str, model: str | int, mac: str) -> tuple:
++    """Normalize identity of the mesh bulb from the gateway DB."""
++    return did, model, mac.lower()
++
++
+ # noinspection PyMethodMayBeStatic,PyUnusedLocal
+ class MeshGateway(XGateway):
+     async def mesh_read_devices(self, sh: ShellMGW):
+@@ -21,9 +26,8 @@ class MeshGateway(XGateway):
+                 did = row[0]
+                 device = self.devices.get(did)
+                 if not device:
+-                    mac = row[1].lower()  # aa:bb:cc:dd:ee:ff
+-                    model = row[2]
+-                    device = self.init_device(model, did=did, mac=mac, type=MESH)
++                    did, model, mac = mesh_identity(did, row[2], row[1])
++                    device = self.init_device(model, did, MESH, mac)
+                 self.add_device(device)
+ 
+                 # add bulb to group address
+@@ -36,7 +40,7 @@ class MeshGateway(XGateway):
+                 device = self.devices.get(did)
+                 if not device:
+                     model = row[2]
+-                    device = self.init_device(model, did=did, type=GROUP)
++                    device = self.init_device(model, did, GROUP)
+                 # update childs of device
+                 device.extra["childs"] = childs.get(row[1])
+                 self.add_device(device)
+diff --git a/custom_components/xiaomi_gateway3/core/gate/silabs.py b/custom_components/xiaomi_gateway3/core/gate/silabs.py
+index a4d22b3..9675061 100644
+--- a/custom_components/xiaomi_gateway3/core/gate/silabs.py
++++ b/custom_components/xiaomi_gateway3/core/gate/silabs.py
+@@ -100,8 +100,11 @@ class SilabsGateway(XGateway):
+                 if not device:
+                     if uid not in self.unknown:
+                         self.debug("silabs_add_unknown", uid=uid)
++                        ieee = hex_to_ieee(uid)
+                         self.unknown[uid] = {"did": did, "nwk": nwk}
+-                        asyncio.create_task(self.silabs_process_unknown(uid))
++                        asyncio.create_task(
++                            self.silabs_process_unknown(uid, did, ieee, nwk)
++                        )
+                     return
+ 
+             device.extra["lqi"] = data["linkQuality"]
+@@ -146,16 +149,14 @@ class SilabsGateway(XGateway):
+         self.device.dispatch({"left_uid": uid})
+         self.unknown.pop(uid, None)  # remove uid from unknown
+ 
+-    async def silabs_process_unknown(self, uid: str):
++    async def silabs_process_unknown(self, uid: str, did: str, ieee: str, nwk: str):
+         await asyncio.sleep(10)  # 10 sec delay before adding unknown device
+ 
+         unk = self.unknown.pop(uid, {})
+-        if not unk or unk["did"] in self.devices:
++        if not unk or did in self.devices:
+             return
+ 
+-        device = self.init_device(
+-            None, did=unk["did"], type=ZIGBEE, ieee=hex_to_ieee(uid), nwk=unk["nwk"]
+-        )
++        device = self.init_device(None, did, ZIGBEE, ieee=ieee, nwk=nwk)
+         self.add_device(device)
+ 
+     async def silabs_process_join(self, data: dict):
+diff --git a/custom_components/xiaomi_gateway3/core/gateway.py b/custom_components/xiaomi_gateway3/core/gateway.py
+index eec6447..362b40c 100644
+--- a/custom_components/xiaomi_gateway3/core/gateway.py
++++ b/custom_components/xiaomi_gateway3/core/gateway.py
+@@ -79,9 +79,10 @@ class MultiGateway(
+                     return False
+ 
+                 info = await sh.get_miio_info()
+-                model, fw = info["model"], info["version"]
++                did, model, mac = info["did"], info["model"], info["mac"]
++                fw_ver = info["version"]
+ 
+-                if model == "lumi.gateway.mgl03" and fw < "1.4.7_0160":
++                if model == "lumi.gateway.mgl03" and fw_ver < "1.4.7_0160":
+                     self.warning(f"Unsupported firmware: {info}")
+ 
+                 support_ble_mesh = model in (
+@@ -89,9 +90,13 @@ class MultiGateway(
+                     "lumi.gateway.mcn001",
+                     "lumi.gateway.mgl001",
+                 )
+-                support_matter = model == "lumi.gateway.mgl001" and fw >= "1.0.7_0019"
++                support_matter = (
++                    model == "lumi.gateway.mgl001" and fw_ver >= "1.0.7_0019"
++                )
+ 
+-                await self.base_read_device(info)
++                await self.base_read_device(
++                    did, model, mac, fw_ver, info.get("lan_mac")
++                )
+                 await self.lumi_read_devices(sh)
+                 await self.silabs_read_device(sh)
+                 await self.openmiio_prepare_gateway(sh)

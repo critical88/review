@@ -1,0 +1,50 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "go/analysis",
+  "smell_type": "shotgun_surgery",
+  "rule": {
+    "id": "scattered-shortname-resolution",
+    "description": "A single conceptual responsibility -- how an incoming short link name is canonicalized for identity and reconciled with tolerant lookup -- is re-derived locally by multiple functions across files instead of being owned in one place. The smell is detectable as every function (outside the consolidated owner) that inlines two or more distinct short-name identity/resolution primitives (case folding, percent escaping, dash stripping, trailing punctuation trimming)."
+  },
+  "smell_entries": [
+    { "id": "E1", "file_path": "db.go", "class_name": null, "function_name": "Load" },
+    { "id": "E2", "file_path": "db.go", "class_name": null, "function_name": "Save" },
+    { "id": "E3", "file_path": "db.go", "class_name": null, "function_name": "Delete" },
+    { "id": "E4", "file_path": "db.go", "class_name": null, "function_name": "SaveStats" },
+    { "id": "E5", "file_path": "db.go", "class_name": null, "function_name": "DeleteStats" },
+    { "id": "E6", "file_path": "db.go", "class_name": null, "function_name": "LoadStats" },
+    { "id": "E7", "file_path": "golink.go", "class_name": null, "function_name": "serveGo" },
+    { "id": "E8", "file_path": "golink.go", "class_name": null, "function_name": "serveDetail" },
+    { "id": "E9", "file_path": "golink.go", "class_name": null, "function_name": "serveDelete" },
+    { "id": "E10", "file_path": "golink.go", "class_name": null, "function_name": "serveSave" },
+    { "id": "E11", "file_path": "resolve.go", "class_name": null, "function_name": "resolveLink" }
+  ],
+  "injected_match_count": 11,
+  "checks": [
+    {
+      "id": "fragment-inlined-name-normalization",
+      "description": "Detect functions that inline two or more distinct short-name identity/resolution primitives (case folding, percent escaping, rune/dash stripping, trailing punctuation trimming) instead of delegating canonicalization to a single owner.",
+      "detected_relation": "function -> partial inline re-implementation of the short-name identity/resolution rule",
+      "why_this_is_the_smell": "Every matched function re-derives a slice of the same conceptual rule, so a change to how short names canonicalize or tolerate messy input requires editing all of them rather than one consolidated location.",
+      "matches": [
+        { "file": "db.go", "symbol": "Load", "entry_ids": ["E1"], "evidence": "Load inlines case folding (strings.ToLower), percent escaping (url.PathEscape), and dash stripping (strings.ReplaceAll) directly into its SQL QueryRow call instead of calling a single canonical ID helper.", "measurement": { "distinct_primitives": 3 } },
+        { "file": "db.go", "symbol": "Save", "entry_ids": ["E2"], "evidence": "Save recomputes the storage ID with strings.ToLower, url.PathEscape, and strings.ReplaceAll in a local variable before the INSERT OR REPLACE, duplicating the identity rule owned elsewhere.", "measurement": { "distinct_primitives": 3 } },
+        { "file": "db.go", "symbol": "Delete", "entry_ids": ["E3"], "evidence": "Delete recomputes the same canonical ID inline with its own local variable (strings.ToLower, url.PathEscape, strings.ReplaceAll) for the DELETE statement.", "measurement": { "distinct_primitives": 3 } },
+        { "file": "db.go", "symbol": "SaveStats", "entry_ids": ["E4"], "evidence": "SaveStats strips dashes with strings.NewReplacer and re-applies case folding and percent escaping inline for the Stats row key, using a different idiom from the other DB methods.", "measurement": { "distinct_primitives": 3 } },
+        { "file": "db.go", "symbol": "DeleteStats", "entry_ids": ["E5"], "evidence": "DeleteStats re-inlines strings.ToLower, url.PathEscape, and strings.ReplaceAll into the DELETE statement, re-deriving the canonical ID a fourth time.", "measurement": { "distinct_primitives": 3 } },
+        { "file": "db.go", "symbol": "LoadStats", "entry_ids": ["E6"], "evidence": "LoadStats builds the ID-to-short map with strings.ToLower and strings.ReplaceAll inline (omitting percent escaping), a drifted variant of the same rule that requires its own coordinated change.", "measurement": { "distinct_primitives": 2 } },
+        { "file": "golink.go", "symbol": "serveGo", "entry_ids": ["E7"], "evidence": "serveGo performs lookup-time tolerance with strings.TrimRight plus its own strings.ToLower fallback, re-implementing request-side name normalization in the redirect handler.", "measurement": { "distinct_primitives": 2 } },
+        { "file": "golink.go", "symbol": "serveDetail", "entry_ids": ["E8"], "evidence": "serveDetail folds case and trims trailing punctuation inline (strings.ToLower + strings.TrimRight) before db.Load, re-deriving the same request-side normalization the lookup already performs internally.", "measurement": { "distinct_primitives": 2 } },
+        { "file": "golink.go", "symbol": "serveDelete", "entry_ids": ["E9"], "evidence": "serveDelete sanitizes the incoming name inline (strings.TrimSpace + strings.ToLower + strings.TrimRight) before lookup, re-implementing request-side normalization a third time.", "measurement": { "distinct_primitives": 2 } },
+        { "file": "golink.go", "symbol": "serveSave", "entry_ids": ["E10"], "evidence": "serveSave computes a conflict-detection key inline (strings.ToLower + strings.ReplaceAll) before its existence check, re-deriving the canonical identity rule at the save boundary.", "measurement": { "distinct_primitives": 3 } },
+        { "file": "resolve.go", "symbol": "resolveLink", "entry_ids": ["E11"], "evidence": "resolveLink, split into its own file, folds case and trims trailing punctuation inline (strings.ToLower + strings.TrimRight) before db.Load, re-deriving request-side normalization for the CLI/resolver path.", "measurement": { "distinct_primitives": 2 } }
+      ]
+    }
+  ],
+  "excluded": [
+    { "file": "golink.go", "symbol": "parseAdvertiseTags", "reason": "Trims and splits comma-separated ACL tag strings; a different domain (tag-list parsing), not short-link name identity. It applies only strings.TrimSpace, below the two-distinct-primitive threshold, and is not part of link resolution." },
+    { "file": "db.go", "symbol": "GetLinksByOwner", "reason": "Performs case-insensitive owner matching via the SQL LOWER(...) predicate rather than any Go-side normalization primitive; owner matching is a separate concern from short-name identity." },
+    { "file": "golink.go", "symbol": "serveSave (url.PathEscape in the detail redirect redirect)", "reason": "The url.PathEscape call builds a detail-page redirect URL and is incidental URL construction, not identity normalization; cite url.PathEscape as a routing concern." },
+    { "file": "golink.go", "symbol": "expandFuncMap", "reason": "Exposes Trim/ToLower/ToUpper as text/template helper functions; these are registry references in a package-level map literal, not call sites that normalize a link name at runtime." }
+  ]
+}

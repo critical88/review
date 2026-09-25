@@ -1,0 +1,845 @@
+diff --git a/device/noise-protocol.go b/device/noise-protocol.go
+index 5cf1702..191dc9c 100644
+--- a/device/noise-protocol.go
++++ b/device/noise-protocol.go
+@@ -337,6 +337,69 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
+ 	return &msg, nil
+ }
+ 
++// mixInitiationTranscript mixes the sender's static public key and the
++// message's ephemeral public key into the transcript, deriving the initial
++// chain key.
++func (device *Device) mixInitiationTranscript(msg *MessageInitiation, hash *[blake2s.Size]byte, chainKey *[blake2s.Size]byte) {
++	mixHash(hash, &InitialHash, device.staticIdentity.publicKey[:])
++	mixHash(hash, hash, msg.Ephemeral[:])
++	mixKey(chainKey, &InitialChainKey, msg.Ephemeral[:])
++}
++
++// decryptInitiationStatic decrypts the peer's static public key from the
++// initiation message, advancing the transcript. It reports whether the
++// static field authenticated correctly.
++func (device *Device) decryptInitiationStatic(msg *MessageInitiation, hash *[blake2s.Size]byte, chainKey *[blake2s.Size]byte) (peerPK NoisePublicKey, ok bool) {
++	// decrypt static key
++
++	var key [chacha20poly1305.KeySize]byte
++	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
++	if err != nil {
++		return peerPK, false
++	}
++	KDF2(chainKey, &key, chainKey[:], ss[:])
++	aead, _ := chacha20poly1305.New(key[:])
++	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
++	if err != nil {
++		return peerPK, false
++	}
++	mixHash(hash, hash, msg.Static[:])
++	return peerPK, true
++}
++
++// verifyInitiationTimestamp decrypts and authenticates the initiation
++// timestamp using the peer's precomputed static-static secret, advancing the
++// transcript, and evaluates the replay and flood conditions for the message.
++func (device *Device) verifyInitiationTimestamp(handshake *Handshake, msg *MessageInitiation, hash *[blake2s.Size]byte, chainKey *[blake2s.Size]byte) (timestamp tai64n.Timestamp, replay bool, flood bool, ok bool) {
++	handshake.mutex.RLock()
++	defer handshake.mutex.RUnlock()
++
++	// verify identity
++
++	if isZero(handshake.precomputedStaticStatic[:]) {
++		return timestamp, false, false, false
++	}
++	var key [chacha20poly1305.KeySize]byte
++	KDF2(
++		chainKey,
++		&key,
++		chainKey[:],
++		handshake.precomputedStaticStatic[:],
++	)
++	aead, _ := chacha20poly1305.New(key[:])
++	_, err := aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
++	if err != nil {
++		return timestamp, false, false, false
++	}
++	mixHash(hash, hash, msg.Timestamp[:])
++
++	// protect against replay & flood
++
++	replay = !timestamp.After(handshake.lastTimestamp)
++	flood = time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
++	return timestamp, replay, flood, true
++}
++
+ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+ 	var (
+ 		hash     [blake2s.Size]byte
+@@ -350,26 +413,14 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+ 	device.staticIdentity.RLock()
+ 	defer device.staticIdentity.RUnlock()
+ 
+-	mixHash(&hash, &InitialHash, device.staticIdentity.publicKey[:])
+-	mixHash(&hash, &hash, msg.Ephemeral[:])
+-	mixKey(&chainKey, &InitialChainKey, msg.Ephemeral[:])
++	device.mixInitiationTranscript(msg, &hash, &chainKey)
+ 
+-	// decrypt static key
+-	var peerPK NoisePublicKey
+-	var key [chacha20poly1305.KeySize]byte
+-	ss, err := device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+-	if err != nil {
+-		return nil
+-	}
+-	KDF2(&chainKey, &key, chainKey[:], ss[:])
+-	aead, _ := chacha20poly1305.New(key[:])
+-	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
+-	if err != nil {
++	// decrypt static key & lookup peer
++
++	peerPK, ok := device.decryptInitiationStatic(msg, &hash, &chainKey)
++	if !ok {
+ 		return nil
+ 	}
+-	mixHash(&hash, &hash, msg.Static[:])
+-
+-	// lookup peer
+ 
+ 	peer := device.LookupPeer(peerPK)
+ 	if peer == nil || !peer.isRunning.Load() {
+@@ -378,37 +429,14 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+ 
+ 	handshake := &peer.handshake
+ 
+-	// verify identity
+-
+-	var timestamp tai64n.Timestamp
++	// verify identity & protect against replay & flood
+ 
+-	handshake.mutex.RLock()
+-
+-	if isZero(handshake.precomputedStaticStatic[:]) {
+-		handshake.mutex.RUnlock()
++	timestamp, replay, flood, ok2 := device.verifyInitiationTimestamp(handshake, msg, &hash, &chainKey)
++	if !ok2 {
+ 		return nil
+ 	}
+-	KDF2(
+-		&chainKey,
+-		&key,
+-		chainKey[:],
+-		handshake.precomputedStaticStatic[:],
+-	)
+-	aead, _ = chacha20poly1305.New(key[:])
+-	_, err = aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
+-	if err != nil {
+-		handshake.mutex.RUnlock()
+-		return nil
+-	}
+-	mixHash(&hash, &hash, msg.Timestamp[:])
+-
+-	// protect against replay & flood
+-
+-	replay := !timestamp.After(handshake.lastTimestamp)
+-	flood := time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate
+-	handshake.mutex.RUnlock()
+ 	if replay {
+-		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay @ %v", peer, timestamp)
++		device.log.Verbosef("%v - ConsumeMessageInitiation: handshake replay", peer)
+ 		return nil
+ 	}
+ 	if flood {
+@@ -509,6 +537,65 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
+ 	return &msg, nil
+ }
+ 
++// consumeResponseTranscript verifies the 3-way DH of a handshake response
++// and the preshared key, mixing each exchanged value into the transcript. It
++// reports whether the response authenticated correctly.
++func (device *Device) consumeResponseTranscript(handshake *Handshake, msg *MessageResponse, hash *[blake2s.Size]byte, chainKey *[blake2s.Size]byte) bool {
++	// lock handshake state and the private key for reading
++
++	handshake.mutex.RLock()
++	defer handshake.mutex.RUnlock()
++
++	device.staticIdentity.RLock()
++	defer device.staticIdentity.RUnlock()
++
++	if handshake.state != handshakeInitiationCreated {
++		return false
++	}
++
++	// finish 3-way DH
++
++	mixHash(hash, &handshake.hash, msg.Ephemeral[:])
++	mixKey(chainKey, &handshake.chainKey, msg.Ephemeral[:])
++
++	ss, err := handshake.localEphemeral.sharedSecret(msg.Ephemeral)
++	if err != nil {
++		return false
++	}
++	mixKey(chainKey, chainKey, ss[:])
++	setZero(ss[:])
++
++	ss, err = device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
++	if err != nil {
++		return false
++	}
++	mixKey(chainKey, chainKey, ss[:])
++	setZero(ss[:])
++
++	// add preshared key (psk)
++
++	var tau [blake2s.Size]byte
++	var key [chacha20poly1305.KeySize]byte
++	KDF3(
++		chainKey,
++		&tau,
++		&key,
++		chainKey[:],
++		handshake.presharedKey[:],
++	)
++	mixHash(hash, hash, tau[:])
++
++	// authenticate transcript
++
++	aead, _ := chacha20poly1305.New(key[:])
++	_, err = aead.Open(nil, ZeroNonce[:], msg.Empty[:], hash[:])
++	if err != nil {
++		return false
++	}
++	mixHash(hash, hash, msg.Empty[:])
++	return true
++}
++
+ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
+ 	if msg.Type != MessageResponseType {
+ 		return nil
+@@ -527,65 +614,7 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
+ 		chainKey [blake2s.Size]byte
+ 	)
+ 
+-	ok := func() bool {
+-		// lock handshake state
+-
+-		handshake.mutex.RLock()
+-		defer handshake.mutex.RUnlock()
+-
+-		if handshake.state != handshakeInitiationCreated {
+-			return false
+-		}
+-
+-		// lock private key for reading
+-
+-		device.staticIdentity.RLock()
+-		defer device.staticIdentity.RUnlock()
+-
+-		// finish 3-way DH
+-
+-		mixHash(&hash, &handshake.hash, msg.Ephemeral[:])
+-		mixKey(&chainKey, &handshake.chainKey, msg.Ephemeral[:])
+-
+-		ss, err := handshake.localEphemeral.sharedSecret(msg.Ephemeral)
+-		if err != nil {
+-			return false
+-		}
+-		mixKey(&chainKey, &chainKey, ss[:])
+-		setZero(ss[:])
+-
+-		ss, err = device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+-		if err != nil {
+-			return false
+-		}
+-		mixKey(&chainKey, &chainKey, ss[:])
+-		setZero(ss[:])
+-
+-		// add preshared key (psk)
+-
+-		var tau [blake2s.Size]byte
+-		var key [chacha20poly1305.KeySize]byte
+-		KDF3(
+-			&chainKey,
+-			&tau,
+-			&key,
+-			chainKey[:],
+-			handshake.presharedKey[:],
+-		)
+-		mixHash(&hash, &hash, tau[:])
+-
+-		// authenticate transcript
+-
+-		aead, _ := chacha20poly1305.New(key[:])
+-		_, err = aead.Open(nil, ZeroNonce[:], msg.Empty[:], hash[:])
+-		if err != nil {
+-			return false
+-		}
+-		mixHash(&hash, &hash, msg.Empty[:])
+-		return true
+-	}()
+-
+-	if !ok {
++	if !device.consumeResponseTranscript(handshake, msg, &hash, &chainKey) {
+ 		return nil
+ 	}
+ 
+diff --git a/device/receive.go b/device/receive.go
+index 1392957..e1df70e 100644
+--- a/device/receive.go
++++ b/device/receive.go
+@@ -276,154 +276,170 @@ func (device *Device) RoutineHandshake(id int) {
+ 	device.log.Verbosef("Routine: handshake worker %d - started", id)
+ 
+ 	for elem := range device.queue.handshake.c {
++		device.handleHandshakeMsg(elem.msgType, elem.packet, elem.endpoint)
++		device.PutMessageBuffer(elem.buffer)
++	}
++}
+ 
+-		// handle cookie fields and ratelimiting
+-
+-		switch elem.msgType {
+-
+-		case MessageCookieReplyType:
+-
+-			// unmarshal packet
+-
+-			var reply MessageCookieReply
+-			err := reply.unmarshal(elem.packet)
+-			if err != nil {
+-				device.log.Verbosef("Failed to decode cookie reply")
+-				goto skip
+-			}
+-
+-			// lookup peer from index
++// handleHandshakeMsg dispatches a queued handshake message by its type.
++func (device *Device) handleHandshakeMsg(msgType uint32, packet []byte, endpoint conn.Endpoint) {
++	switch msgType {
++	case MessageCookieReplyType:
++		device.processCookieReply(packet, endpoint)
+ 
+-			entry := device.indexTable.Lookup(reply.Receiver)
++	case MessageInitiationType, MessageResponseType:
++		if !device.authenticateHandshake(packet, endpoint) {
++			return
++		}
++		switch msgType {
++		case MessageInitiationType:
++			device.processHandshakeInitiation(packet, endpoint)
++		case MessageResponseType:
++			device.processHandshakeResponse(packet, endpoint)
++		}
+ 
+-			if entry.peer == nil {
+-				goto skip
+-			}
++	default:
++		device.log.Errorf("Invalid packet ended up in the handshake queue")
++	}
++}
+ 
+-			// consume reply
++// processCookieReply consumes a cookie reply received from a peer.
++func (device *Device) processCookieReply(packet []byte, endpoint conn.Endpoint) {
++	// unmarshal packet
+ 
+-			if peer := entry.peer; peer.isRunning.Load() {
+-				device.log.Verbosef("Receiving cookie response from %s", elem.endpoint.DstToString())
+-				if !peer.cookieGenerator.ConsumeReply(&reply) {
+-					device.log.Verbosef("Could not decrypt invalid cookie response")
+-				}
+-			}
++	var reply MessageCookieReply
++	err := reply.unmarshal(packet)
++	if err != nil {
++		device.log.Verbosef("Failed to decode cookie reply")
++		return
++	}
+ 
+-			goto skip
++	// lookup peer from index
+ 
+-		case MessageInitiationType, MessageResponseType:
++	entry := device.indexTable.Lookup(reply.Receiver)
+ 
+-			// check mac fields and maybe ratelimit
++	if entry.peer == nil {
++		return
++	}
+ 
+-			if !device.cookieChecker.CheckMAC1(elem.packet) {
+-				device.log.Verbosef("Received packet with invalid mac1")
+-				goto skip
+-			}
++	// consume reply
+ 
+-			// endpoints destination address is the source of the datagram
++	if peer := entry.peer; peer.isRunning.Load() {
++		device.log.Verbosef("Receiving cookie response from %s", endpoint.DstToString())
++		if !peer.cookieGenerator.ConsumeReply(&reply) {
++			device.log.Verbosef("Could not decrypt invalid cookie response")
++		}
++	}
++}
+ 
+-			if device.IsUnderLoad() {
++// authenticateHandshake checks the mac fields and ratelimits an incoming
++// handshake message; when under load it may reply with a cookie.
++func (device *Device) authenticateHandshake(packet []byte, endpoint conn.Endpoint) bool {
++	// check mac fields and maybe ratelimit
+ 
+-				// verify MAC2 field
++	if !device.cookieChecker.CheckMAC1(packet) {
++		device.log.Verbosef("Received packet with invalid mac1")
++		return false
++	}
+ 
+-				if !device.cookieChecker.CheckMAC2(elem.packet, elem.endpoint.DstToBytes()) {
+-					device.SendHandshakeCookie(&elem)
+-					goto skip
+-				}
++	// endpoints destination address is the source of the datagram
+ 
+-				// check ratelimiter
++	if device.IsUnderLoad() {
+ 
+-				if !device.rate.limiter.Allow(elem.endpoint.DstIP()) {
+-					goto skip
+-				}
+-			}
++		// verify MAC2 field
+ 
+-		default:
+-			device.log.Errorf("Invalid packet ended up in the handshake queue")
+-			goto skip
++		if !device.cookieChecker.CheckMAC2(packet, endpoint.DstToBytes()) {
++			device.SendHandshakeCookie(packet, endpoint)
++			return false
+ 		}
+ 
+-		// handle handshake initiation/response content
++		// check ratelimiter
+ 
+-		switch elem.msgType {
+-		case MessageInitiationType:
++		if !device.rate.limiter.Allow(endpoint.DstIP()) {
++			return false
++		}
++	}
++	return true
++}
+ 
+-			// unmarshal
++// processHandshakeInitiation consumes a handshake initiation message.
++func (device *Device) processHandshakeInitiation(packet []byte, endpoint conn.Endpoint) {
++	// unmarshal
+ 
+-			var msg MessageInitiation
+-			err := msg.unmarshal(elem.packet)
+-			if err != nil {
+-				device.log.Errorf("Failed to decode initiation message")
+-				goto skip
+-			}
++	var msg MessageInitiation
++	err := msg.unmarshal(packet)
++	if err != nil {
++		device.log.Errorf("Failed to decode initiation message")
++		return
++	}
+ 
+-			// consume initiation
++	// consume initiation
+ 
+-			peer := device.ConsumeMessageInitiation(&msg)
+-			if peer == nil {
+-				device.log.Verbosef("Received invalid initiation message from %s", elem.endpoint.DstToString())
+-				goto skip
+-			}
++	peer := device.ConsumeMessageInitiation(&msg)
++	if peer == nil {
++		device.log.Verbosef("Received invalid initiation message from %s", endpoint.DstToString())
++		return
++	}
+ 
+-			// update timers
++	// update timers
+ 
+-			peer.timersAnyAuthenticatedPacketTraversal()
+-			peer.timersAnyAuthenticatedPacketReceived()
++	peer.timersAnyAuthenticatedPacketTraversal()
++	peer.timersAnyAuthenticatedPacketReceived()
+ 
+-			// update endpoint
+-			peer.SetEndpointFromPacket(elem.endpoint)
++	// update endpoint
+ 
+-			device.log.Verbosef("%v - Received handshake initiation", peer)
+-			peer.rxBytes.Add(uint64(len(elem.packet)))
++	peer.SetEndpointFromPacket(endpoint)
+ 
+-			peer.SendHandshakeResponse()
++	device.log.Verbosef("%v - Received handshake initiation", peer)
++	peer.rxBytes.Add(uint64(len(packet)))
+ 
+-		case MessageResponseType:
++	peer.SendHandshakeResponse()
++}
+ 
+-			// unmarshal
++// processHandshakeResponse consumes a handshake response message and derives
++// the first transport keys from it.
++func (device *Device) processHandshakeResponse(packet []byte, endpoint conn.Endpoint) {
++	// unmarshal
+ 
+-			var msg MessageResponse
+-			err := msg.unmarshal(elem.packet)
+-			if err != nil {
+-				device.log.Errorf("Failed to decode response message")
+-				goto skip
+-			}
++	var msg MessageResponse
++	err := msg.unmarshal(packet)
++	if err != nil {
++		device.log.Errorf("Failed to decode response message")
++		return
++	}
+ 
+-			// consume response
++	// consume response
+ 
+-			peer := device.ConsumeMessageResponse(&msg)
+-			if peer == nil {
+-				device.log.Verbosef("Received invalid response message from %s", elem.endpoint.DstToString())
+-				goto skip
+-			}
++	peer := device.ConsumeMessageResponse(&msg)
++	if peer == nil {
++		device.log.Verbosef("Received invalid response message from %s", endpoint.DstToString())
++		return
++	}
+ 
+-			// update endpoint
+-			peer.SetEndpointFromPacket(elem.endpoint)
++	// update endpoint
+ 
+-			device.log.Verbosef("%v - Received handshake response", peer)
+-			peer.rxBytes.Add(uint64(len(elem.packet)))
++	peer.SetEndpointFromPacket(endpoint)
+ 
+-			// update timers
++	device.log.Verbosef("%v - Received handshake response", peer)
++	peer.rxBytes.Add(uint64(len(packet)))
+ 
+-			peer.timersAnyAuthenticatedPacketTraversal()
+-			peer.timersAnyAuthenticatedPacketReceived()
++	// update timers
+ 
+-			// derive keypair
++	peer.timersAnyAuthenticatedPacketTraversal()
++	peer.timersAnyAuthenticatedPacketReceived()
+ 
+-			err = peer.BeginSymmetricSession()
++	// derive keypair
+ 
+-			if err != nil {
+-				device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
+-				goto skip
+-			}
++	err = peer.BeginSymmetricSession()
+ 
+-			peer.timersSessionDerived()
+-			peer.timersHandshakeComplete()
+-			peer.SendKeepalive()
+-		}
+-	skip:
+-		device.PutMessageBuffer(elem.buffer)
++	if err != nil {
++		device.log.Errorf("%v - Failed to derive keypair: %v", peer, err)
++		return
+ 	}
++
++	peer.timersSessionDerived()
++	peer.timersHandshakeComplete()
++	peer.SendKeepalive()
+ }
+ 
+ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
+diff --git a/device/send.go b/device/send.go
+index ff8f7da..1927513 100644
+--- a/device/send.go
++++ b/device/send.go
+@@ -174,20 +174,20 @@ func (peer *Peer) SendHandshakeResponse() error {
+ 	return err
+ }
+ 
+-func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement) error {
+-	device.log.Verbosef("Sending cookie response for denied handshake message for %v", initiatingElem.endpoint.DstToString())
++func (device *Device) SendHandshakeCookie(packet []byte, endpoint conn.Endpoint) error {
++	device.log.Verbosef("Sending cookie response for denied handshake message for %v", endpoint.DstToString())
+ 
+-	sender := binary.LittleEndian.Uint32(initiatingElem.packet[4:8])
+-	reply, err := device.cookieChecker.CreateReply(initiatingElem.packet, sender, initiatingElem.endpoint.DstToBytes())
++	sender := binary.LittleEndian.Uint32(packet[4:8])
++	reply, err := device.cookieChecker.CreateReply(packet, sender, endpoint.DstToBytes())
+ 	if err != nil {
+ 		device.log.Errorf("Failed to create cookie reply: %v", err)
+ 		return err
+ 	}
+ 
+-	packet := make([]byte, MessageCookieReplySize)
+-	_ = reply.marshal(packet)
++	replyPacket := make([]byte, MessageCookieReplySize)
++	_ = reply.marshal(replyPacket)
+ 	// TODO: allocation could be avoided
+-	device.net.bind.Send([][]byte{packet}, initiatingElem.endpoint)
++	device.net.bind.Send([][]byte{replyPacket}, endpoint)
+ 
+ 	return nil
+ }
+diff --git a/device/uapi.go b/device/uapi.go
+index cc69488..3683f7d 100644
+--- a/device/uapi.go
++++ b/device/uapi.go
+@@ -147,7 +147,11 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 		}
+ 	}()
+ 
+-	peer := new(ipcSetPeer)
++	var peer *Peer
++	dummy := false
++	created := false
++	pkaOn := false
++
+ 	deviceConfig := true
+ 
+ 	scanner := bufio.NewScanner(r)
+@@ -155,7 +159,7 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 		line := scanner.Text()
+ 		if line == "" {
+ 			// Blank line means terminate operation.
+-			peer.handlePostConfig()
++			device.handlePostConfig(&peer, &dummy, &created, &pkaOn)
+ 			return nil
+ 		}
+ 		key, value, ok := strings.Cut(line, "=")
+@@ -167,9 +171,9 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 			if deviceConfig {
+ 				deviceConfig = false
+ 			}
+-			peer.handlePostConfig()
++			device.handlePostConfig(&peer, &dummy, &created, &pkaOn)
+ 			// Load/create the peer we are now configuring.
+-			err := device.handlePublicKeyLine(peer, value)
++			err := device.handlePublicKeyLine(&peer, &dummy, &created, value)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -180,13 +184,13 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 		if deviceConfig {
+ 			err = device.handleDeviceLine(key, value)
+ 		} else {
+-			err = device.handlePeerLine(peer, key, value)
++			err = device.handlePeerLine(&peer, &dummy, &created, &pkaOn, key, value)
+ 		}
+ 		if err != nil {
+ 			return err
+ 		}
+ 	}
+-	peer.handlePostConfig()
++	device.handlePostConfig(&peer, &dummy, &created, &pkaOn)
+ 
+ 	if err := scanner.Err(); err != nil {
+ 		return ipcErrorf(ipc.IpcErrorIO, "failed to read input: %w", err)
+@@ -247,31 +251,28 @@ func (device *Device) handleDeviceLine(key, value string) error {
+ 	return nil
+ }
+ 
+-// An ipcSetPeer is the current state of an IPC set operation on a peer.
+-type ipcSetPeer struct {
+-	*Peer        // Peer is the current peer being operated on
+-	dummy   bool // dummy reports whether this peer is a temporary, placeholder peer
+-	created bool // new reports whether this is a newly created peer
+-	pkaOn   bool // pkaOn reports whether the peer had the persistent keepalive turn on
+-}
+-
+-func (peer *ipcSetPeer) handlePostConfig() {
+-	if peer.Peer == nil || peer.dummy {
++// handlePostConfig applies the deferred start actions for the peer most
++// recently configured by an IPC set operation. peer is the peer being
++// operated on; dummy reports whether it is a temporary, placeholder peer;
++// created reports whether it is a newly created peer; and pkaOn reports
++// whether the peer had the persistent keepalive turned on.
++func (device *Device) handlePostConfig(peer **Peer, dummy *bool, created *bool, pkaOn *bool) {
++	if *peer == nil || *dummy {
+ 		return
+ 	}
+-	if peer.created {
+-		peer.endpoint.disableRoaming = peer.device.net.brokenRoaming && peer.endpoint.val != nil
++	if *created {
++		(*peer).endpoint.disableRoaming = (*peer).device.net.brokenRoaming && (*peer).endpoint.val != nil
+ 	}
+-	if peer.device.isUp() {
+-		peer.Start()
+-		if peer.pkaOn {
+-			peer.SendKeepalive()
++	if (*peer).device.isUp() {
++		(*peer).Start()
++		if *pkaOn {
++			(*peer).SendKeepalive()
+ 		}
+-		peer.SendStagedPackets()
++		(*peer).SendStagedPackets()
+ 	}
+ }
+ 
+-func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error {
++func (device *Device) handlePublicKeyLine(peer **Peer, dummy *bool, created *bool, value string) error {
+ 	// Load/create the peer we are configuring.
+ 	var publicKey NoisePublicKey
+ 	err := publicKey.FromHex(value)
+@@ -281,37 +282,37 @@ func (device *Device) handlePublicKeyLine(peer *ipcSetPeer, value string) error
+ 
+ 	// Ignore peer with the same public key as this device.
+ 	device.staticIdentity.RLock()
+-	peer.dummy = device.staticIdentity.publicKey.Equals(publicKey)
++	*dummy = device.staticIdentity.publicKey.Equals(publicKey)
+ 	device.staticIdentity.RUnlock()
+ 
+-	if peer.dummy {
+-		peer.Peer = &Peer{}
++	if *dummy {
++		*peer = &Peer{}
+ 	} else {
+-		peer.Peer = device.LookupPeer(publicKey)
++		*peer = device.LookupPeer(publicKey)
+ 	}
+ 
+-	peer.created = peer.Peer == nil
+-	if peer.created {
+-		peer.Peer, err = device.NewPeer(publicKey)
++	*created = *peer == nil
++	if *created {
++		*peer, err = device.NewPeer(publicKey)
+ 		if err != nil {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to create new peer: %w", err)
+ 		}
+-		device.log.Verbosef("%v - UAPI: Created", peer.Peer)
++		device.log.Verbosef("%v - UAPI: Created", *peer)
+ 	}
+ 	return nil
+ }
+ 
+-func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error {
++func (device *Device) handlePeerLine(peer **Peer, dummy *bool, created *bool, pkaOn *bool, key, value string) error {
+ 	switch key {
+ 	case "update_only":
+ 		// allow disabling of creation
+ 		if value != "true" {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set update only, invalid value: %v", value)
+ 		}
+-		if peer.created && !peer.dummy {
+-			device.RemovePeer(peer.handshake.remoteStatic)
+-			peer.Peer = &Peer{}
+-			peer.dummy = true
++		if *created && !*dummy {
++			device.RemovePeer((*peer).handshake.remoteStatic)
++			*peer = &Peer{}
++			*dummy = true
+ 		}
+ 
+ 	case "remove":
+@@ -319,56 +320,56 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error
+ 		if value != "true" {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set remove, invalid value: %v", value)
+ 		}
+-		if !peer.dummy {
+-			device.log.Verbosef("%v - UAPI: Removing", peer.Peer)
+-			device.RemovePeer(peer.handshake.remoteStatic)
++		if !*dummy {
++			device.log.Verbosef("%v - UAPI: Removing", *peer)
++			device.RemovePeer((*peer).handshake.remoteStatic)
+ 		}
+-		peer.Peer = &Peer{}
+-		peer.dummy = true
++		*peer = &Peer{}
++		*dummy = true
+ 
+ 	case "preshared_key":
+-		device.log.Verbosef("%v - UAPI: Updating preshared key", peer.Peer)
++		device.log.Verbosef("%v - UAPI: Updating preshared key", *peer)
+ 
+-		peer.handshake.mutex.Lock()
+-		err := peer.handshake.presharedKey.FromHex(value)
+-		peer.handshake.mutex.Unlock()
++		(*peer).handshake.mutex.Lock()
++		err := (*peer).handshake.presharedKey.FromHex(value)
++		(*peer).handshake.mutex.Unlock()
+ 
+ 		if err != nil {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set preshared key: %w", err)
+ 		}
+ 
+ 	case "endpoint":
+-		device.log.Verbosef("%v - UAPI: Updating endpoint", peer.Peer)
++		device.log.Verbosef("%v - UAPI: Updating endpoint", *peer)
+ 		endpoint, err := device.net.bind.ParseEndpoint(value)
+ 		if err != nil {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set endpoint %v: %w", value, err)
+ 		}
+-		peer.endpoint.Lock()
+-		defer peer.endpoint.Unlock()
+-		peer.endpoint.val = endpoint
++		(*peer).endpoint.Lock()
++		defer (*peer).endpoint.Unlock()
++		(*peer).endpoint.val = endpoint
+ 
+ 	case "persistent_keepalive_interval":
+-		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
++		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", *peer)
+ 
+ 		secs, err := strconv.ParseUint(value, 10, 16)
+ 		if err != nil {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set persistent keepalive interval: %w", err)
+ 		}
+ 
+-		old := peer.persistentKeepaliveInterval.Swap(uint32(secs))
++		old := (*peer).persistentKeepaliveInterval.Swap(uint32(secs))
+ 
+ 		// Send immediate keepalive if we're turning it on and before it wasn't on.
+-		peer.pkaOn = old == 0 && secs != 0
++		*pkaOn = old == 0 && secs != 0
+ 
+ 	case "replace_allowed_ips":
+-		device.log.Verbosef("%v - UAPI: Removing all allowedips", peer.Peer)
++		device.log.Verbosef("%v - UAPI: Removing all allowedips", *peer)
+ 		if value != "true" {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to replace allowedips, invalid value: %v", value)
+ 		}
+-		if peer.dummy {
++		if *dummy {
+ 			return nil
+ 		}
+-		device.allowedips.RemoveByPeer(peer.Peer)
++		device.allowedips.RemoveByPeer(*peer)
+ 
+ 	case "allowed_ip":
+ 		add := true
+@@ -378,18 +379,18 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error
+ 			verb = "Removing"
+ 			value = value[1:]
+ 		}
+-		device.log.Verbosef("%v - UAPI: %s allowedip", peer.Peer, verb)
++		device.log.Verbosef("%v - UAPI: %s allowedip", *peer, verb)
+ 		prefix, err := netip.ParsePrefix(value)
+ 		if err != nil {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set allowed ip: %w", err)
+ 		}
+-		if peer.dummy {
++		if *dummy {
+ 			return nil
+ 		}
+ 		if add {
+-			device.allowedips.Insert(prefix, peer.Peer)
++			device.allowedips.Insert(prefix, *peer)
+ 		} else {
+-			device.allowedips.Remove(prefix, peer.Peer)
++			device.allowedips.Remove(prefix, *peer)
+ 		}
+ 
+ 	case "protocol_version":

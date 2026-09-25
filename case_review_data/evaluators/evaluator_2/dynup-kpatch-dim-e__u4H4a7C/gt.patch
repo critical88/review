@@ -1,0 +1,655 @@
+diff --git a/kpatch-build/create-diff-object.c b/kpatch-build/create-diff-object.c
+index 4be0dce..e5b8c90 100644
+--- a/kpatch-build/create-diff-object.c
++++ b/kpatch-build/create-diff-object.c
+@@ -1065,6 +1065,42 @@ static struct rela *kpatch_find_static_twin_ref(struct section *relasec,
+ 	return NULL;
+ }
+ 
++/*
++ * Look for the patched object's static-local variable corresponding to
++ * sym, also checking the parent function's section for a .part. sibling
++ * that may have kept the reference when gcc numbers the mangled suffixes
++ * arbitrarily.
++ */
++static struct symbol *kpatch_find_static_twin(struct section *relasec,
++					       struct symbol *sym)
++{
++	struct section *relasec2 = relasec;
++	struct symbol *res = NULL;
++
++	if (!relasec2->twin && relasec2->base->sym) {
++		/*
++		 * The static twin might have been in a .part. symbol in the
++		 * original object that got removed in the patched object.
++		 */
++		struct symbol *parent = NULL;
++
++		parent = kpatch_get_correlated_parent(relasec2->base->sym);
++		if (parent)
++			relasec2 = parent->sec->rela;
++
++	}
++
++	if (relasec2->twin) {
++		res = kpatch_find_uncorrelated_rela(relasec2->twin, sym);
++		if (!res && relasec2->twin->base->sym)
++			/* reference may have moved to child functions' sections */
++			res = kpatch_find_static_twin_in_children(relasec2->twin->base->sym,
++								   sym);
++	}
++
++	return res;
++}
++
+ 
+ /*
+  * Correlate the elements of the original and patched objects.
+@@ -1118,28 +1154,8 @@ static void kpatch_correlate_elfs(struct kpatch_elf *kelf_orig,
+ 					continue;
+ 			}
+ 
+-			/*
+-			 * Unrolled kpatch_correlate_section(): correlate the
+-			 * section pair (and its base/rela/secsym/sym) in place.
+-			 */
+-			{
+-				struct section *cs_orig = sec_orig, *cs_patched = sec_patched;
+-
+-				__kpatch_correlate_section(cs_orig, cs_patched);
+-
+-				if (is_rela_section(cs_orig)) {
+-					__kpatch_correlate_section(cs_orig->base, cs_patched->base);
+-					cs_orig = cs_orig->base;
+-					cs_patched = cs_patched->base;
+-				} else if (cs_orig->rela && cs_patched->rela) {
+-					__kpatch_correlate_section(cs_orig->rela, cs_patched->rela);
+-				}
+-
+-				if (cs_orig->secsym)
+-					kpatch_correlate_symbol(cs_orig->secsym, cs_patched->secsym);
+-				if (cs_orig->sym)
+-					kpatch_correlate_symbol(cs_orig->sym, cs_patched->sym);
+-			}
++			/* correlate the section pair (and its base/rela/secsym/sym) */
++			kpatch_correlate_section(sec_orig, sec_patched);
+ 			break;
+ 		}
+ 	}
+@@ -1247,38 +1263,12 @@ static void kpatch_correlate_elfs(struct kpatch_elf *kelf_orig,
+ 			}
+ 
+ 			/*
+-			 * Unrolled kpatch_find_static_twin(): look for the
+-			 * patched object's corresponding variable, also
+-			 * checking the parent function's section for a
+-			 * .part. sibling that may have kept the reference.
++			 * Look for the patched object's corresponding static
++			 * local variable, also checking the parent function's
++			 * section for a .part. sibling that may have kept the
++			 * reference.
+ 			 */
+-			{
+-				struct section *relasec2 = relasec;
+-				struct symbol *fst_res = NULL;
+-
+-				if (!relasec2->twin && relasec2->base->sym) {
+-					/*
+-					 * The static twin might have been in a .part. symbol in the
+-					 * original object that got removed in the patched object.
+-					 */
+-					struct symbol *parent = NULL;
+-
+-					parent = kpatch_get_correlated_parent(relasec2->base->sym);
+-					if (parent)
+-						relasec2 = parent->sec->rela;
+-
+-				}
+-
+-				if (relasec2->twin) {
+-					fst_res = kpatch_find_uncorrelated_rela(relasec2->twin, sym);
+-					if (!fst_res && relasec2->twin->base->sym)
+-						/* reference may have moved to child functions' sections */
+-						fst_res = kpatch_find_static_twin_in_children(relasec2->twin->base->sym,
+-										    sym);
+-				}
+-
+-				patched_sym = fst_res;
+-			}
++			patched_sym = kpatch_find_static_twin(relasec, sym);
+ 			if (!patched_sym)
+ 				DIFF_FATAL("reference to static local variable %s in %s was removed",
+ 					   sym->name,
+@@ -4249,6 +4239,242 @@ static error_t parse_opt (int key, char *arg, struct argp_state *state)
+ 	return 0;
+ }
+ 
++static bool rela_equal(struct rela *rela1, struct rela *rela2)
++{
++	struct rela *rela_toc1, *rela_toc2;
++	unsigned long toc_data1 = 0, toc_data2 = 0; /* = 0 to prevent gcc warning */
++	bool rela_same = false;
++
++	if (rela1->type == rela2->type &&
++	    rela1->offset == rela2->offset) {
++
++		/*
++		 * On x86, .altinstr_aux is used to store temporary code which
++		 * allows static_cpu_has() to work before apply_alternatives() has
++		 * run.  This code is completely inert for modules, because
++		 * apply_alternatives() runs during module init, before the module is
++		 * fully formed.  Any changed references to it (i.e. changed addend)
++		 * can be ignored.  As long as they're both references to
++		 * .altinstr_aux, they can be considered equal, even if the addends
++		 * differ.
++		 */
++		if (!strcmp(rela1->sym->name, ".altinstr_aux") &&
++		    !strcmp(rela2->sym->name, ".altinstr_aux")) {
++			return true;
++		}
++
++		/*
++		 * With -mcmodel=large on ppc64le, GCC might generate entries in the
++		 * .toc section for relocation symbol references.  The .toc offsets
++		 * may change between the original and patched .o, so comparing
++		 * ".toc + offset" isn't right.  Compare the .toc-based symbols by
++		 * reading the corresponding relas from the .toc section.
++		 */
++		rela_toc1 = toc_rela(rela1);
++		if (!rela_toc1) {
++			/*
++			 * .toc section entries are mostly place holder for relocation
++			 * entries, specified in .rela.toc section.  Sometimes, .toc
++			 * section may have constants as entries.  These constants are
++			 * not reference to any symbols, but plain instructions mostly
++			 * due to some arithmetics in the functions referring them.
++			 */
++			memcpy(&toc_data1, rela1->sym->sec->data->d_buf + rela1->addend, sizeof(toc_data1));
++			if (!toc_data1)
++				ERROR(".toc entry not found %s + %lx", rela1->sym->name, rela1->addend);
++		}
++
++		rela_toc2 = toc_rela(rela2);
++		if (!rela_toc2) {
++			memcpy(&toc_data2, rela2->sym->sec->data->d_buf + rela2->addend, sizeof(toc_data2));
++			if (!toc_data2)
++				ERROR(".toc entry not found %s + %lx", rela2->sym->name, rela2->addend);
++		}
++
++		if (!rela_toc1 && !rela_toc2) {
++			rela_same = toc_data1 == toc_data2;
++		} else if (rela_toc1 && rela_toc2) {
++			if (rela_toc1->string)
++				rela_same = rela_toc2->string && !strcmp(rela_toc1->string, rela_toc2->string);
++			else if (rela_toc1->addend == rela_toc2->addend)
++				rela_same = !kpatch_mangled_strcmp(rela_toc1->sym->name, rela_toc2->sym->name);
++		}
++	}
++
++	return rela_same;
++}
++
++static void kpatch_compare_correlated_rela_section(struct section *sec)
++{
++	struct rela *rela1, *rela2;
++
++	if (!strcmp(sec->name, ".rela.toc")) {
++		/*
++		 * On ppc64le, don't compare the .rela.toc section.
++		 * The .toc and .rela.toc sections are included as
++		 * standard elements.
++		 */
++		sec->status = SAME;
++		return;
++	}
++
++	rela2 = list_entry(sec->twin->relas.next, struct rela, list);
++	list_for_each_entry(rela1, &sec->relas, list) {
++		if (rela_equal(rela1, rela2)) {
++			rela2 = list_entry(rela2->list.next, struct rela, list);
++			continue;
++		}
++		sec->status = CHANGED;
++		return;
++	}
++	sec->status = SAME;
++}
++
++static void kpatch_compare_correlated_nonrela_section(struct section *sec)
++{
++	struct section *sec1 = sec, *sec2 = sec->twin;
++
++	if (sec1->sh.sh_type != SHT_NOBITS &&
++	    memcmp(sec1->data->d_buf, sec2->data->d_buf, sec1->data->d_size))
++		sec->status = CHANGED;
++	else
++		sec->status = SAME;
++}
++
++static void kpatch_compare_correlated_section(struct section *sec)
++{
++	struct section *sec1 = sec, *sec2 = sec->twin;
++
++	/* Compare section headers (must match or fatal) */
++	if (sec1->sh.sh_type != sec2->sh.sh_type ||
++	    sec1->sh.sh_flags != sec2->sh.sh_flags ||
++	    sec1->sh.sh_entsize != sec2->sh.sh_entsize ||
++	    (sec1->sh.sh_addralign != sec2->sh.sh_addralign &&
++	     !is_text_section(sec1)))
++		DIFF_FATAL("%s section header details differ from %s", sec1->name, sec2->name);
++
++	/*
++	 * Short circuit for mcount and patchable_function_entries
++	 * sections, we rebuild regardless
++	 */
++	if (!strcmp(sec->name, ".rela__mcount_loc") ||
++	    !strcmp(sec->name, "__mcount_loc") ||
++	    !strcmp(sec->name, ".sframe") ||
++	    !strcmp(sec->name, ".rela.sframe") ||
++	    !strcmp(sec->name, ".rela__patchable_function_entries") ||
++	    !strcmp(sec->name, "__patchable_function_entries")) {
++		sec->status = SAME;
++		return;
++	}
++
++	if (sec1->sh.sh_size != sec2->sh.sh_size ||
++	    sec1->data->d_size != sec2->data->d_size ||
++	    (sec1->rela && !sec2->rela) ||
++	    (sec2->rela && !sec1->rela)) {
++		sec->status = CHANGED;
++		goto out;
++	}
++
++	if (is_rela_section(sec))
++		kpatch_compare_correlated_rela_section(sec);
++	else
++		kpatch_compare_correlated_nonrela_section(sec);
++out:
++	if (sec->status == CHANGED)
++		log_debug("section %s has changed\n", sec->name);
++}
++
++static void kpatch_compare_correlated_elements(struct kpatch_elf *kelf_patched)
++{
++	struct section *sec;
++	struct list_head *seclist = &kelf_patched->sections;
++
++	/* compare all sections */
++	list_for_each_entry(sec, seclist, list) {
++		if (sec->twin)
++			kpatch_compare_correlated_section(sec);
++		else
++			sec->status = NEW;
++	}
++
++	/* exclude WARN-only, might_sleep changes */
++	list_for_each_entry(sec, seclist, list) {
++		if (kpatch_line_macro_change_only(kelf_patched, sec)) {
++			log_debug("reverting macro / line number section %s status to SAME\n",
++				  sec->name);
++			sec->status = SAME;
++		}
++	}
++
++	/* sync symbol status */
++	list_for_each_entry(sec, seclist, list) {
++		if (is_rela_section(sec)) {
++			if (sec->base->sym && sec->base->sym->status != CHANGED)
++				sec->base->sym->status = sec->status;
++		} else {
++			struct symbol *sym = sec->sym;
++
++			if (sym && sym->status != CHANGED)
++				sym->status = sec->status;
++
++			if (sym && sym->status == SAME &&
++			    kpatch_changed_child_needs_parent_profiling(sym))
++				sym->status = CHANGED;
++		}
++	}
++}
++
++static void kpatch_compare_correlated_symbol(struct symbol *sym)
++{
++	struct symbol *sym1 = sym, *sym2 = sym->twin;
++
++	if (sym1->sym.st_info != sym2->sym.st_info ||
++	    (sym1->sec && !sym2->sec) ||
++	    (sym2->sec && !sym1->sec))
++		DIFF_FATAL("symbol info mismatch: %s", sym1->name);
++
++	/*
++	 * If two symbols are correlated but their sections are not, then the
++	 * symbol has changed sections.  This is only allowed if the symbol is
++	 * moving out of an ignored section, or moving between normal/hot/unlikely
++	 * subsections.
++	 */
++	if (sym1->sec && sym2->sec && sym1->sec->twin != sym2->sec) {
++		if ((sym2->sec->twin && sym2->sec->twin->ignore) ||
++		    kpatch_subsection_changed(sym1->sec, sym2->sec))
++			sym->status = CHANGED;
++		else
++			DIFF_FATAL("symbol changed sections: %s", sym1->name);
++	}
++
++	if (sym1->type == STT_OBJECT &&
++	    sym1->sym.st_size != sym2->sym.st_size)
++		DIFF_FATAL("object size mismatch: %s", sym1->name);
++
++	if (sym1->sym.st_shndx == SHN_UNDEF ||
++	     sym1->sym.st_shndx == SHN_ABS)
++		sym1->status = SAME;
++
++	/*
++	 * The status of LOCAL symbols is dependent on the status of their
++	 * matching section and is set during section comparison.
++	 */
++}
++
++static void kpatch_compare_symbols(struct kpatch_elf *kelf_patched)
++{
++	struct symbol *sym;
++
++	list_for_each_entry(sym, &kelf_patched->symbols, list) {
++		if (sym->twin)
++			kpatch_compare_correlated_symbol(sym);
++		else
++			sym->status = NEW;
++
++		log_debug("symbol %s is %s\n", sym->name, status_str(sym->status));
++	}
++}
++
+ static struct argp argp = { options, parse_opt, args_doc, NULL };
+ 
+ int main(int argc, char *argv[])
+@@ -4313,241 +4539,8 @@ int main(int argc, char *argv[])
+ 	 * section, symbol, and rela lists of kelf_patched.
+ 	 */
+ 	kpatch_mark_ignored_sections(kelf_patched);
+-	/*
+-	 * Compare all correlated elements of the patched object (unrolled
+-	 * kpatch_compare_correlated_elements()).
+-	 */
+-	{
+-		struct section *sec;
+-		struct list_head *seclist = &kelf_patched->sections;
+-		struct rela *rela1, *rela2 = NULL;
+-
+-		/* compare all sections */
+-		list_for_each_entry(sec, seclist, list) {
+-			if (sec->twin) {
+-				/*
+-				 * Unrolled kpatch_compare_correlated_section():
+-				 * compare the headers, then the contents.
+-				 */
+-				struct section *sec1 = sec, *sec2 = sec->twin;
+-
+-				/* Compare section headers (must match or fatal) */
+-				if (sec1->sh.sh_type != sec2->sh.sh_type ||
+-				    sec1->sh.sh_flags != sec2->sh.sh_flags ||
+-				    sec1->sh.sh_entsize != sec2->sh.sh_entsize ||
+-				    (sec1->sh.sh_addralign != sec2->sh.sh_addralign &&
+-				     !is_text_section(sec1)))
+-					DIFF_FATAL("%s section header details differ from %s", sec1->name, sec2->name);
+-
+-				/*
+-				 * Short circuit for mcount and patchable_function_entries
+-				 * sections, we rebuild regardless
+-				 */
+-				if (!strcmp(sec->name, ".rela__mcount_loc") ||
+-				    !strcmp(sec->name, "__mcount_loc") ||
+-				    !strcmp(sec->name, ".sframe") ||
+-				    !strcmp(sec->name, ".rela.sframe") ||
+-				    !strcmp(sec->name, ".rela__patchable_function_entries") ||
+-				    !strcmp(sec->name, "__patchable_function_entries")) {
+-					sec->status = SAME;
+-					goto out;
+-				}
+-
+-				if (sec1->sh.sh_size != sec2->sh.sh_size ||
+-				    sec1->data->d_size != sec2->data->d_size ||
+-				    (sec1->rela && !sec2->rela) ||
+-				    (sec2->rela && !sec1->rela)) {
+-					sec->status = CHANGED;
+-					goto out;
+-				}
+-
+-				if (is_rela_section(sec)) {
+-					/*
+-					 * Unrolled
+-					 * kpatch_compare_correlated_rela_section().
+-					 */
+-					if (!strcmp(sec->name, ".rela.toc")) {
+-						/*
+-						 * On ppc64le, don't compare the .rela.toc section.
+-						 * The .toc and .rela.toc sections are included as
+-						 * standard elements.
+-						 */
+-						sec->status = SAME;
+-						goto out;
+-					}
+-
+-					rela2 = list_entry(sec->twin->relas.next, struct rela, list);
+-					list_for_each_entry(rela1, &sec->relas, list) {
+-						/*
+-						 * Unrolled rela_equal().
+-						 */
+-						{
+-							struct rela *rela_toc1, *rela_toc2;
+-							unsigned long toc_data1 = 0, toc_data2 = 0; /* = 0 to prevent gcc warning */
+-							bool rela_same = false;
+-
+-							if (rela1->type == rela2->type &&
+-							    rela1->offset == rela2->offset) {
+-
+-								/*
+-								 * On x86, .altinstr_aux is used to store temporary code which
+-								 * allows static_cpu_has() to work before apply_alternatives() has
+-								 * run.  This code is completely inert for modules, because
+-								 * apply_alternatives() runs during module init, before the module is
+-								 * fully formed.  Any changed references to it (i.e. changed addend)
+-								 * can be ignored.  As long as they're both references to
+-								 * .altinstr_aux, they can be considered equal, even if the addends
+-								 * differ.
+-								 */
+-								if (!strcmp(rela1->sym->name, ".altinstr_aux") &&
+-								    !strcmp(rela2->sym->name, ".altinstr_aux")) {
+-									rela_same = true;
+-									goto rela_checked;
+-								}
+-
+-								/*
+-								 * With -mcmodel=large on ppc64le, GCC might generate entries in the
+-								 * .toc section for relocation symbol references.  The .toc offsets
+-								 * may change between the original and patched .o, so comparing
+-								 * ".toc + offset" isn't right.  Compare the .toc-based symbols by
+-								 * reading the corresponding relas from the .toc section.
+-								 */
+-								rela_toc1 = toc_rela(rela1);
+-								if (!rela_toc1) {
+-									/*
+-									 * .toc section entries are mostly place holder for relocation
+-									 * entries, specified in .rela.toc section.  Sometimes, .toc
+-									 * section may have constants as entries.  These constants are
+-									 * not reference to any symbols, but plain instructions mostly
+-									 * due to some arithmetics in the functions referring them.
+-									 */
+-									memcpy(&toc_data1, rela1->sym->sec->data->d_buf + rela1->addend, sizeof(toc_data1));
+-									if (!toc_data1)
+-										ERROR(".toc entry not found %s + %lx", rela1->sym->name, rela1->addend);
+-								}
+-
+-								rela_toc2 = toc_rela(rela2);
+-								if (!rela_toc2) {
+-									memcpy(&toc_data2, rela2->sym->sec->data->d_buf + rela2->addend, sizeof(toc_data2));
+-									if (!toc_data2)
+-										ERROR(".toc entry not found %s + %lx", rela2->sym->name, rela2->addend);
+-								}
+-
+-								if (!rela_toc1 && !rela_toc2) {
+-									rela_same = toc_data1 == toc_data2;
+-								} else if (rela_toc1 && rela_toc2) {
+-									if (rela_toc1->string)
+-										rela_same = rela_toc2->string && !strcmp(rela_toc1->string, rela_toc2->string);
+-									else if (rela_toc1->addend == rela_toc2->addend)
+-										rela_same = !kpatch_mangled_strcmp(rela_toc1->sym->name, rela_toc2->sym->name);
+-								}
+-							}
+-rela_checked:
+-							if (rela_same) {
+-								rela2 = list_entry(rela2->list.next, struct rela, list);
+-								continue;
+-							}
+-							sec->status = CHANGED;
+-							goto out;
+-						}
+-					}
+-					sec->status = SAME;
+-				} else {
+-					/*
+-					 * Unrolled
+-					 * kpatch_compare_correlated_nonrela_section().
+-					 */
+-					if (sec1->sh.sh_type != SHT_NOBITS &&
+-					    memcmp(sec1->data->d_buf, sec2->data->d_buf, sec1->data->d_size))
+-						sec->status = CHANGED;
+-					else
+-						sec->status = SAME;
+-				}
+-out:
+-				if (sec->status == CHANGED)
+-					log_debug("section %s has changed\n", sec->name);
+-			} else {
+-				sec->status = NEW;
+-			}
+-		}
+-
+-		/* exclude WARN-only, might_sleep changes */
+-		list_for_each_entry(sec, seclist, list) {
+-			if (kpatch_line_macro_change_only(kelf_patched, sec)) {
+-				log_debug("reverting macro / line number section %s status to SAME\n",
+-					  sec->name);
+-				sec->status = SAME;
+-			}
+-		}
+-
+-		/* sync symbol status */
+-		list_for_each_entry(sec, seclist, list) {
+-			if (is_rela_section(sec)) {
+-				if (sec->base->sym && sec->base->sym->status != CHANGED)
+-					sec->base->sym->status = sec->status;
+-			} else {
+-				struct symbol *sym = sec->sym;
+-
+-				if (sym && sym->status != CHANGED)
+-					sym->status = sec->status;
+-
+-				if (sym && sym->status == SAME &&
+-				    kpatch_changed_child_needs_parent_profiling(sym))
+-					sym->status = CHANGED;
+-			}
+-		}
+-	}
+-
+-	/* compare all symbols (unrolled kpatch_compare_symbols()) */
+-	{
+-		struct symbol *sym;
+-
+-		list_for_each_entry(sym, &kelf_patched->symbols, list) {
+-			if (sym->twin) {
+-				/*
+-				 * Unrolled
+-				 * kpatch_compare_correlated_symbol().
+-				 */
+-				struct symbol *sym1 = sym, *sym2 = sym->twin;
+-
+-				if (sym1->sym.st_info != sym2->sym.st_info ||
+-				    (sym1->sec && !sym2->sec) ||
+-				    (sym2->sec && !sym1->sec))
+-					DIFF_FATAL("symbol info mismatch: %s", sym1->name);
+-
+-				/*
+-				 * If two symbols are correlated but their sections are not, then the
+-				 * symbol has changed sections.  This is only allowed if the symbol is
+-				 * moving out of an ignored section, or moving between normal/hot/unlikely
+-				 * subsections.
+-				 */
+-				if (sym1->sec && sym2->sec && sym1->sec->twin != sym2->sec) {
+-					if ((sym2->sec->twin && sym2->sec->twin->ignore) ||
+-					    kpatch_subsection_changed(sym1->sec, sym2->sec))
+-						sym->status = CHANGED;
+-					else
+-						DIFF_FATAL("symbol changed sections: %s", sym1->name);
+-				}
+-
+-				if (sym1->type == STT_OBJECT &&
+-				    sym1->sym.st_size != sym2->sym.st_size)
+-					DIFF_FATAL("object size mismatch: %s", sym1->name);
+-
+-				if (sym1->sym.st_shndx == SHN_UNDEF ||
+-				     sym1->sym.st_shndx == SHN_ABS)
+-					sym1->status = SAME;
+-
+-				/*
+-				 * The status of LOCAL symbols is dependent on the status of their
+-				 * matching section and is set during section comparison.
+-				 */
+-			} else {
+-				sym->status = NEW;
+-			}
+-
+-			log_debug("symbol %s is %s\n", sym->name, status_str(sym->status));
+-		}
+-	}
++	kpatch_compare_correlated_elements(kelf_patched);
++	kpatch_compare_symbols(kelf_patched);
+ 	kpatch_mark_ignored_functions_same(kelf_patched);
+ 	kpatch_mark_ignored_sections_same(kelf_patched);
+ 	kpatch_check_func_profiling_calls(kelf_patched);
+@@ -4625,43 +4618,8 @@ out:
+ 			continue;
+ 		relasec->sh.sh_link = symtab->index;
+ 		relasec->sh.sh_info = relasec->base->index;
+-		{
+-			/*
+-			 * Unrolled kpatch_rebuild_rela_section_data():
+-			 * regenerate the rela section data buffer from the
+-			 * relas list.
+-			 */
+-			struct section *sec = relasec;
+-			struct rela *rela;
+-			int nr = 0, index = 0;
+-			GElf_Rela *relas;
+-			size_t size;
+-
+-			list_for_each_entry(rela, &sec->relas, list)
+-				nr++;
+-
+-			size = nr * sizeof(*relas);
+-			relas = malloc(size);
+-			if (!relas)
+-				ERROR("malloc");
+-
+-			sec->data->d_buf = relas;
+-			sec->data->d_size = size;
+-			/* d_type remains ELF_T_RELA */
+-
+-			sec->sh.sh_size = size;
+-
+-			list_for_each_entry(rela, &sec->relas, list) {
+-				relas[index].r_offset = rela->offset;
+-				relas[index].r_addend = rela->addend;
+-				relas[index].r_info = GELF_R_INFO(rela->sym->index, rela->type);
+-				index++;
+-			}
+-
+-			/* sanity check, index should equal nr */
+-			if (index != nr)
+-				ERROR("size mismatch in rebuilt rela section");
+-		}
++		/* regenerate the rela section data buffer from the relas list */
++		kpatch_rebuild_rela_section_data(relasec);
+ 	}
+ 	kpatch_check_relocations(kelf_out);
+ 

@@ -1,0 +1,366 @@
+diff --git a/src/buf/cursor.rs b/src/buf/cursor.rs
+index 457a067..23f04e5 100644
+--- a/src/buf/cursor.rs
++++ b/src/buf/cursor.rs
+@@ -1,8 +1,7 @@
+-//! Shared cursor mechanics for the buffer adapter family.
++//! Shared cursor mechanics for the windowing and pairing adapters.
+ //!
+-//! Every adapter in this module tree — [`Take`], [`Limit`], [`Chain`],
+-//! [`Reader`], [`Writer`] and the byte [`IntoIter`] — is a windowed view over
+-//! one or two byte regions. They used to each re-implement the same cursor
++//! [`Take`], [`Limit`] and [`Chain`] are windowed views over one — or, for
++//! `Chain`, two — byte regions. They used to each re-implement the same cursor
+ //! arithmetic (region traversal, windowing, slice accounting) with slightly
+ //! different rules, and their `advance` bookkeeping drifted apart.
+ //!
+@@ -12,12 +11,20 @@
+ //! cursor. The adapters keep their public shapes and delegate the mechanics
+ //! here.
+ //!
++//! The protocol adapters [`Reader`], [`Writer`] and the byte [`IntoIter`] sit
++//! beside the cursor rather than on top of it: each owns its own `io` /
++//! iterator implementation and drives the wrapped value straight through the
++//! [`Buf`] and [`BufMut`] traits, since they neither pair regions nor apply a
++//! window.
++//!
+ //! [`Take`]: crate::buf::Take
+ //! [`Limit`]: crate::buf::Limit
+ //! [`Chain`]: crate::buf::Chain
+ //! [`Reader`]: crate::buf::Reader
+ //! [`Writer`]: crate::buf::Writer
+ //! [`IntoIter`]: crate::buf::IntoIter
++//! [`Buf`]: crate::Buf
++//! [`BufMut`]: crate::BufMut
+ 
+ use crate::buf::UninitSlice;
+ use crate::{Buf, BufMut};
+@@ -87,16 +94,6 @@ pub(crate) struct BufCursor<T, U = ()> {
+ }
+ 
+ impl<T> BufCursor<T> {
+-    /// Creates a single-region cursor over `front` with no window.
+-    pub(crate) fn single(front: T) -> Self {
+-        BufCursor {
+-            front,
+-            tail: None,
+-            limit: usize::MAX,
+-            consumed: 0,
+-        }
+-    }
+-
+     /// Creates a single-region cursor over `front` whose window admits at
+     /// most `limit` bytes.
+     pub(crate) fn with_limit(front: T, limit: usize) -> Self {
+@@ -353,92 +350,3 @@ unsafe impl<T: BufMut, U: BufMut> BufMut for BufCursor<T, U> {
+         self.consumed += requested;
+     }
+ }
+-
+-/// Bridges the cursor's read side into the framed `io` read family.
+-#[cfg(feature = "std")]
+-impl<T: Buf, U: Buf> std::io::Read for BufCursor<T, U> {
+-    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+-        // Fast path: a single-region cursor transfers straight out of its
+-        // front region and books the traffic locally, without entering the
+-        // generic cursor machinery.
+-        if self.tail.is_none() {
+-            let len = cmp::min(self.front.remaining(), dst.len());
+-            Buf::copy_to_slice(&mut self.front, &mut dst[0..len]);
+-            self.consumed += len;
+-            return Ok(len);
+-        }
+-
+-        let len = cmp::min(self.remaining(), dst.len());
+-        Buf::copy_to_slice(self, &mut dst[0..len]);
+-        Ok(len)
+-    }
+-}
+-
+-/// Presents the active region's bytes as an `io` buffer.
+-#[cfg(feature = "std")]
+-impl<T: Buf, U: Buf> std::io::BufRead for BufCursor<T, U> {
+-    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+-        let chunk: &[u8] = Buf::chunk(self);
+-        Ok(chunk)
+-    }
+-
+-    fn consume(&mut self, amt: usize) {
+-        self.advance(amt)
+-    }
+-}
+-
+-/// Bridges the cursor's write side into the framed `io` write family.
+-#[cfg(feature = "std")]
+-impl<T: BufMut, U: BufMut> std::io::Write for BufCursor<T, U> {
+-    fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+-        // Fast path: a single-region cursor accepts straight into its front
+-        // region and books the traffic locally.
+-        if self.tail.is_none() {
+-            let n = cmp::min(self.front.remaining_mut(), src.len());
+-            self.front.put_slice(&src[..n]);
+-            self.consumed += n;
+-            return Ok(n);
+-        }
+-
+-        let n = cmp::min(self.remaining_mut(), src.len());
+-        BufMut::put_slice(self, &src[..n]);
+-        Ok(n)
+-    }
+-
+-    fn flush(&mut self) -> std::io::Result<()> {
+-        Ok(())
+-    }
+-}
+-
+-/// Presents the cursor as a stream of individual bytes.
+-impl<T: Buf, U: Buf> Iterator for BufCursor<T, U> {
+-    type Item = u8;
+-
+-    fn next(&mut self) -> Option<u8> {
+-        // Fast path: a single-region cursor yields straight from its front
+-        // region and books the traffic locally.
+-        if self.tail.is_none() {
+-            if !self.front.has_remaining() {
+-                return None;
+-            }
+-
+-            let b = self.front.chunk()[0];
+-            self.front.advance(1);
+-            self.consumed += 1;
+-            return Some(b);
+-        }
+-
+-        if !self.has_remaining() {
+-            return None;
+-        }
+-
+-        let b = self.chunk()[0];
+-        self.advance(1);
+-        Some(b)
+-    }
+-
+-    fn size_hint(&self) -> (usize, Option<usize>) {
+-        let rem = self.remaining();
+-        (rem, Some(rem))
+-    }
+-}
+diff --git a/src/buf/iter.rs b/src/buf/iter.rs
+index a6150fd..c0963d6 100644
+--- a/src/buf/iter.rs
++++ b/src/buf/iter.rs
+@@ -1,4 +1,3 @@
+-use crate::buf::cursor::BufCursor;
+ use crate::Buf;
+ 
+ /// Iterator over the bytes contained by the buffer.
+@@ -20,7 +19,7 @@ use crate::Buf;
+ /// ```
+ #[derive(Debug)]
+ pub struct IntoIter<T> {
+-    cursor: BufCursor<T>,
++    buf: T,
+ }
+ 
+ impl<T> IntoIter<T> {
+@@ -40,9 +39,7 @@ impl<T> IntoIter<T> {
+     /// assert_eq!(iter.next(), None);
+     /// ```
+     pub fn new(inner: T) -> IntoIter<T> {
+-        IntoIter {
+-            cursor: BufCursor::single(inner),
+-        }
++        IntoIter { buf: inner }
+     }
+ 
+     /// Consumes this `IntoIter`, returning the underlying value.
+@@ -61,7 +58,7 @@ impl<T> IntoIter<T> {
+     /// assert_eq!(2, buf.remaining());
+     /// ```
+     pub fn into_inner(self) -> T {
+-        self.cursor.into_front()
++        self.buf
+     }
+ 
+     /// Gets a reference to the underlying `Buf`.
+@@ -81,7 +78,7 @@ impl<T> IntoIter<T> {
+     /// assert_eq!(2, iter.get_ref().remaining());
+     /// ```
+     pub fn get_ref(&self) -> &T {
+-        self.cursor.first_ref()
++        &self.buf
+     }
+ 
+     /// Gets a mutable reference to the underlying `Buf`.
+@@ -103,7 +100,7 @@ impl<T> IntoIter<T> {
+     /// assert_eq!(iter.next(), Some(b'c'));
+     /// ```
+     pub fn get_mut(&mut self) -> &mut T {
+-        self.cursor.first_mut()
++        &mut self.buf
+     }
+ }
+ 
+@@ -111,11 +108,18 @@ impl<T: Buf> Iterator for IntoIter<T> {
+     type Item = u8;
+ 
+     fn next(&mut self) -> Option<u8> {
+-        self.cursor.next()
++        if !self.buf.has_remaining() {
++            return None;
++        }
++
++        let b = self.buf.chunk()[0];
++        self.buf.advance(1);
++        Some(b)
+     }
+ 
+     fn size_hint(&self) -> (usize, Option<usize>) {
+-        self.cursor.size_hint()
++        let rem = self.buf.remaining();
++        (rem, Some(rem))
+     }
+ }
+ 
+diff --git a/src/buf/reader.rs b/src/buf/reader.rs
+index 3ab4931..f13b282 100644
+--- a/src/buf/reader.rs
++++ b/src/buf/reader.rs
+@@ -1,6 +1,6 @@
+-use crate::buf::cursor::BufCursor;
+ use crate::Buf;
+ 
++use core::cmp;
+ use std::io;
+ 
+ /// A `Buf` adapter which implements `io::Read` for the inner value.
+@@ -10,13 +10,11 @@ use std::io;
+ /// details.
+ #[derive(Debug)]
+ pub struct Reader<B> {
+-    cursor: BufCursor<B>,
++    buf: B,
+ }
+ 
+ pub fn new<B>(buf: B) -> Reader<B> {
+-    Reader {
+-        cursor: BufCursor::single(buf),
+-    }
++    Reader { buf }
+ }
+ 
+ impl<B: Buf> Reader<B> {
+@@ -34,14 +32,14 @@ impl<B: Buf> Reader<B> {
+     /// assert_eq!(b"hello world", buf.get_ref());
+     /// ```
+     pub fn get_ref(&self) -> &B {
+-        self.cursor.first_ref()
++        &self.buf
+     }
+ 
+     /// Gets a mutable reference to the underlying `Buf`.
+     ///
+     /// It is inadvisable to directly read from the underlying `Buf`.
+     pub fn get_mut(&mut self) -> &mut B {
+-        self.cursor.first_mut()
++        &mut self.buf
+     }
+ 
+     /// Consumes this `Reader`, returning the underlying value.
+@@ -61,21 +59,24 @@ impl<B: Buf> Reader<B> {
+     /// assert_eq!(0, buf.remaining());
+     /// ```
+     pub fn into_inner(self) -> B {
+-        self.cursor.into_front()
++        self.buf
+     }
+ }
+ 
+ impl<B: Buf + Sized> io::Read for Reader<B> {
+     fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+-        self.cursor.read(dst)
++        let n = cmp::min(self.buf.remaining(), dst.len());
++        Buf::copy_to_slice(&mut self.buf, &mut dst[..n]);
++        Ok(n)
+     }
+ }
+ 
+ impl<B: Buf + Sized> io::BufRead for Reader<B> {
+     fn fill_buf(&mut self) -> io::Result<&[u8]> {
+-        self.cursor.fill_buf()
++        Ok(Buf::chunk(&self.buf))
+     }
++
+     fn consume(&mut self, amt: usize) {
+-        self.cursor.consume(amt)
++        self.buf.advance(amt)
+     }
+ }
+diff --git a/src/buf/writer.rs b/src/buf/writer.rs
+index 7f7977b..507e292 100644
+--- a/src/buf/writer.rs
++++ b/src/buf/writer.rs
+@@ -1,6 +1,6 @@
+-use crate::buf::cursor::BufCursor;
+ use crate::BufMut;
+ 
++use core::cmp;
+ use std::io;
+ 
+ /// A `BufMut` adapter which implements `io::Write` for the inner value.
+@@ -10,13 +10,11 @@ use std::io;
+ /// details.
+ #[derive(Debug)]
+ pub struct Writer<B> {
+-    cursor: BufCursor<B>,
++    buf: B,
+ }
+ 
+ pub fn new<B>(buf: B) -> Writer<B> {
+-    Writer {
+-        cursor: BufCursor::single(buf),
+-    }
++    Writer { buf }
+ }
+ 
+ impl<B: BufMut> Writer<B> {
+@@ -34,7 +32,7 @@ impl<B: BufMut> Writer<B> {
+     /// assert_eq!(1024, buf.get_ref().capacity());
+     /// ```
+     pub fn get_ref(&self) -> &B {
+-        self.cursor.first_ref()
++        &self.buf
+     }
+ 
+     /// Gets a mutable reference to the underlying `BufMut`.
+@@ -53,7 +51,7 @@ impl<B: BufMut> Writer<B> {
+     /// assert_eq!(1024, buf.get_ref().capacity());
+     /// ```
+     pub fn get_mut(&mut self) -> &mut B {
+-        self.cursor.first_mut()
++        &mut self.buf
+     }
+ 
+     /// Consumes this `Writer`, returning the underlying value.
+@@ -73,16 +71,18 @@ impl<B: BufMut> Writer<B> {
+     /// assert_eq!(*buf, b"hello world"[..]);
+     /// ```
+     pub fn into_inner(self) -> B {
+-        self.cursor.into_front()
++        self.buf
+     }
+ }
+ 
+ impl<B: BufMut + Sized> io::Write for Writer<B> {
+     fn write(&mut self, src: &[u8]) -> io::Result<usize> {
+-        self.cursor.write(src)
++        let n = cmp::min(self.buf.remaining_mut(), src.len());
++        BufMut::put_slice(&mut self.buf, &src[..n]);
++        Ok(n)
+     }
+ 
+     fn flush(&mut self) -> io::Result<()> {
+-        self.cursor.flush()
++        Ok(())
+     }
+ }

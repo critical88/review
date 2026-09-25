@@ -1,0 +1,579 @@
+--- a/src/tlv.c
++++ b/src/tlv.c
+@@ -79,62 +79,20 @@
+ }
+ 
+ int tlv_add_tlv_value(tlv_values_t *values, byte type, tlv_values_t *value) {
+-    size_t flat_size = 0;
+-    tlv_t *item = value->head;
+-    while (item) {
+-        flat_size += item->size + 2 * ((item->size + 254) / 255);
+-        item = item->next;
+-    }
+-
+-    byte *flat_data = malloc(flat_size);
+-    if (!flat_data)
++    size_t tlv_size = 0;
++    tlv_format(value, NULL, &tlv_size);
++    byte *tlv_data = malloc(tlv_size);
++    if (!tlv_data)
+         return TLV_ERROR_MEMORY;
+-
+-    byte *flat_pos = flat_data;
+-    item = value->head;
+-    while (item) {
+-        if (!item->size) {
+-            flat_pos[0] = item->type;
+-            flat_pos[1] = 0;
+-            flat_pos += 2;
+-            item = item->next;
+-            continue;
+-        }
+-
+-        byte *item_data = item->value;
+-        size_t item_left = item->size;
+-        while (item_left) {
+-            size_t piece_size = (item_left > 255) ? 255 : item_left;
+-            flat_pos[0] = item->type;
+-            flat_pos[1] = piece_size;
+-            memcpy(&flat_pos[2], item_data, piece_size);
+-            item_left -= piece_size;
+-            flat_pos += piece_size + 2;
+-            item_data += piece_size;
+-        }
+-
+-        item = item->next;
+-    }
+-
+-    tlv_t *flat_tlv = malloc(sizeof(tlv_t));
+-    if (!flat_tlv)
+-        return TLV_ERROR_MEMORY;
+-
+-    flat_tlv->type = type;
+-    flat_tlv->size = flat_size;
+-    flat_tlv->value = flat_data;
+-    flat_tlv->next = NULL;
+-
+-    if (!values->head) {
+-        values->head = flat_tlv;
+-    } else {
+-        tlv_t *tail = values->head;
+-        while (tail->next)
+-            tail = tail->next;
+-        tail->next = flat_tlv;
+-    }
+-
+-    return 0;
++    int r = tlv_format(value, tlv_data, &tlv_size);
++    if (r) {
++        free(tlv_data);
++        return r;
++    }
++
++    r = tlv_add_value_(values, type, tlv_data, tlv_size);
++
++    return r;
+ }
+ 
+ 
+@@ -174,74 +132,16 @@
+ // Deserializes a TLV value and returns it. Returns NULL if value does not exist
+ // or incorrect. Caller is responsible for freeing returned value.
+ tlv_values_t *tlv_get_tlv_value(const tlv_values_t *values, byte type) {
+-    tlv_t *record = values->head;
+-    while (record) {
+-        if (record->type == type)
+-            break;
+-        record = record->next;
+-    }
+-    if (!record)
+-        return NULL;
+-
+-    tlv_values_t *value = malloc(sizeof(tlv_values_t));
+-    if (!value)
+-        return NULL;
+-
+-    value->head = NULL;
+-
+-    const byte *buffer = record->value;
+-    size_t length = record->size;
+-    size_t i = 0;
+-    while (i < length) {
+-        byte record_type = buffer[i];
+-        size_t total_size = 0;
+-        byte *value_data = NULL;
+-
+-        // look ahead over chunked records of the same type to learn how much
+-        // data they carry in total
+-        size_t lookahead = i;
+-        while (lookahead < length && buffer[lookahead] == record_type && buffer[lookahead+1] == 255) {
+-            total_size += 255;
+-            lookahead += 255 + 2;
+-        }
+-        if (lookahead < length && buffer[lookahead] == record_type)
+-            total_size += buffer[lookahead+1];
+-
+-        // gather every chunk of the chunked record into one allocation
+-        if (total_size != 0) {
+-            value_data = malloc(total_size);
+-            if (!value_data) {
+-                tlv_free(value);
+-                return NULL;
+-            }
+-
+-            byte *fill = value_data;
+-            size_t size_left = total_size;
+-            while (size_left) {
+-                size_t piece_size = buffer[i+1];
+-                memcpy(fill, &buffer[i+2], piece_size);
+-                fill += piece_size;
+-                i += piece_size + 2;
+-                size_left -= piece_size;
+-            }
+-        }
+-
+-        tlv_t *item = malloc(sizeof(tlv_t));
+-        if (!item)
+-            continue;
+-        item->type = record_type;
+-        item->size = total_size;
+-        item->value = value_data;
+-        item->next = NULL;
+-
+-        if (!value->head) {
+-            value->head = item;
+-        } else {
+-            tlv_t *tail = value->head;
+-            while (tail->next)
+-                tail = tail->next;
+-            tail->next = item;
+-        }
++    tlv_t *t = tlv_get_value(values, type);
++    if (!t)
++        return NULL;
++
++    tlv_values_t *value = tlv_new();
++    int r = tlv_parse(t->value, t->size, value);
++
++    if (r) {
++        tlv_free(value);
++        return NULL;
+     }
+ 
+     return value;
+@@ -446,104 +346,19 @@
+ }
+ 
+ int tlv_stream_add_tlv_value(tlv_stream_t *tlv, uint8_t type, tlv_values_t *value) {
+-    size_t flat_size = 0;
+-    for (tlv_t *item = value->head; item; item = item->next)
+-        flat_size += item->size + 2 * ((item->size + 254) / 255);
+-
+-    uint8_t *flat_data = malloc(flat_size);
+-    if (!flat_data)
++    size_t tlv_size = 0;
++    tlv_format(value, NULL, &tlv_size);
++    uint8_t *tlv_data = malloc(tlv_size);
++    if (!tlv_data)
+         return TLV_ERROR_MEMORY;
+-
+-    byte *flat_pos = flat_data;
+-    for (tlv_t *item = value->head; item; item = item->next) {
+-        if (!item->size) {
+-            flat_pos[0] = item->type;
+-            flat_pos[1] = 0;
+-            flat_pos += 2;
+-            continue;
+-        }
+-
+-        byte *item_data = item->value;
+-        size_t item_left = item->size;
+-        while (item_left) {
+-            size_t piece_size = (item_left > 255) ? 255 : item_left;
+-            flat_pos[0] = item->type;
+-            flat_pos[1] = piece_size;
+-            memcpy(&flat_pos[2], item_data, piece_size);
+-            item_left -= piece_size;
+-            flat_pos += piece_size + 2;
+-            item_data += piece_size;
+-        }
+-    }
+-
+-    size_t size_left = flat_size;
+-    byte *piece_data = flat_data;
+-    if (!size_left) {
+-        tlv->buffer[tlv->pos++] = type;
+-        if (tlv->pos >= tlv->size) {
+-            if (tlv->pos) {
+-                if (tlv->on_flush)
+-                    tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                tlv->pos = 0;
+-            }
+-        }
+-        tlv->buffer[tlv->pos++] = 0;
+-        if (tlv->pos >= tlv->size) {
+-            if (tlv->pos) {
+-                if (tlv->on_flush)
+-                    tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                tlv->pos = 0;
+-            }
+-        }
+-        free(flat_data);
+-        return 0;
+-    }
+-
+-    while (size_left) {
+-        uint8_t piece_size = (size_left > 255) ? 255 : size_left;
+-
+-        tlv->buffer[tlv->pos++] = type;
+-        if (tlv->pos >= tlv->size) {
+-            if (tlv->pos) {
+-                if (tlv->on_flush)
+-                    tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                tlv->pos = 0;
+-            }
+-        }
+-
+-        tlv->buffer[tlv->pos++] = piece_size;
+-        if (tlv->pos >= tlv->size) {
+-            if (tlv->pos) {
+-                if (tlv->on_flush)
+-                    tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                tlv->pos = 0;
+-            }
+-        }
+-
+-        uint8_t pending = piece_size;
+-        while (pending) {
+-            size_t fit = pending;
+-            if (fit > tlv->size - tlv->pos)
+-                fit = tlv->size - tlv->pos;
+-
+-            memcpy(&tlv->buffer[tlv->pos], piece_data, fit);
+-            pending -= fit;
+-            piece_data += fit;
+-            tlv->pos += fit;
+-
+-            if (tlv->pos >= tlv->size) {
+-                if (tlv->pos) {
+-                    if (tlv->on_flush)
+-                        tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                    tlv->pos = 0;
+-                }
+-            }
+-        }
+-
+-        size_left -= piece_size;
+-    }
+-
+-    free(flat_data);
+-
+-    return 0;
+-}
++    int r = tlv_format(value, tlv_data, &tlv_size);
++    if (r) {
++        free(tlv_data);
++        return r;
++    }
++
++    r = tlv_stream_add_value(tlv, type, tlv_data, tlv_size);
++    free(tlv_data);
++
++    return r;
++}
+--- a/src/accessories.c
++++ b/src/accessories.c
+@@ -124,97 +124,7 @@
+ 
+ homekit_value_t *homekit_value_clone(homekit_value_t *value) {
+     homekit_value_t *copy = malloc(sizeof(homekit_value_t));
+-
+-    memset(copy, 0, sizeof(*copy));
+-
+-    copy->format = value->format;
+-    copy->is_null = value->is_null;
+-    copy->is_static = value->is_static;
+-
+-    if (!value->is_null) {
+-        switch (value->format) {
+-            case homekit_format_bool:
+-                copy->bool_value = value->bool_value;
+-                break;
+-            case homekit_format_uint8:
+-                copy->uint8_value = value->uint8_value;
+-                break;
+-            case homekit_format_uint16:
+-                copy->uint16_value = value->uint16_value;
+-                break;
+-            case homekit_format_uint32:
+-                copy->uint32_value = value->uint32_value;
+-                break;
+-            case homekit_format_uint64:
+-                copy->uint64_value = value->uint64_value;
+-                break;
+-            case homekit_format_int:
+-                copy->int_value = value->int_value;
+-                break;
+-            case homekit_format_float:
+-                copy->float_value = value->float_value;
+-                break;
+-            case homekit_format_string:
+-                if (value->is_static) {
+-                    copy->string_value = value->string_value;
+-                } else {
+-                    copy->string_value = strdup(value->string_value);
+-                }
+-                break;
+-            case homekit_format_tlv:
+-                if (value->is_static) {
+-                    copy->tlv_values = value->tlv_values;
+-                } else {
+-                    copy->tlv_values = malloc(sizeof(tlv_values_t));
+-                    copy->tlv_values->head = NULL;
+-
+-                    for (tlv_t *item = value->tlv_values->head; item; item = item->next) {
+-                        size_t item_size = item->size;
+-                        byte *item_data = NULL;
+-
+-                        if (item_size) {
+-                            item_data = malloc(item_size);
+-                            if (!item_data)
+-                                continue;
+-                            memcpy(item_data, item->value, item_size);
+-                        }
+-
+-                        tlv_t *item_tlv = malloc(sizeof(tlv_t));
+-                        if (!item_tlv)
+-                            continue;
+-
+-                        item_tlv->type = item->type;
+-                        item_tlv->size = item_size;
+-                        item_tlv->value = item_data;
+-                        item_tlv->next = NULL;
+-
+-                        if (!copy->tlv_values->head) {
+-                            copy->tlv_values->head = item_tlv;
+-                        } else {
+-                            tlv_t *tail = copy->tlv_values->head;
+-                            while (tail->next)
+-                                tail = tail->next;
+-                            tail->next = item_tlv;
+-                        }
+-                    }
+-                }
+-                break;
+-            case homekit_format_data:
+-                if (value->is_static) {
+-                    copy->data_value = value->data_value;
+-                    copy->data_size = value->data_size;
+-                } else {
+-                    copy->data_size = value->data_size;
+-                    copy->data_value = malloc(value->data_size);
+-                    memcpy(copy->data_value, value->data_value, value->data_size);
+-                }
+-                break;
+-            default:
+-                // unknown format
+-                break;
+-        }
+-    }
+-
++    homekit_value_copy(copy, value);
+     return copy;
+ }
+ 
+@@ -256,14 +166,20 @@
+     return size;
+ }
+ 
++static void *align_pointer(void *ptr) {
++    uintptr_t p = (uintptr_t) ptr;
++    if (p % sizeof(void*)) {
++        p += sizeof(void*) - p % sizeof(void*);
++    }
++    return (void*) p;
++}
++
+ 
+ homekit_characteristic_t* homekit_characteristic_clone(homekit_characteristic_t* ch) {
+     size_t type_len = strlen(ch->type) + 1;
+     size_t description_len = ch->description ? strlen(ch->description) + 1 : 0;
+ 
+-    size_t size = sizeof(homekit_characteristic_t) + type_len + description_len;
+-    if (size % sizeof(void*))
+-        size += sizeof(void*) - size % sizeof(void*);
++    size_t size = align_size(sizeof(homekit_characteristic_t) + type_len + description_len);
+ 
+     if (ch->min_value)
+         size += sizeof(float);
+@@ -275,25 +191,14 @@
+         size += sizeof(int);
+     if (ch->max_data_len)
+         size += sizeof(int);
+-    if (ch->valid_values.count) {
+-        size_t valid_values_bytes = sizeof(uint8_t) * ch->valid_values.count;
+-        if (valid_values_bytes % sizeof(void*))
+-            valid_values_bytes += sizeof(void*) - valid_values_bytes % sizeof(void*);
+-        size += valid_values_bytes;
+-    }
+-    if (ch->valid_values_ranges.count) {
+-        size_t ranges_bytes = sizeof(homekit_valid_values_range_t) * ch->valid_values_ranges.count;
+-        if (ranges_bytes % sizeof(void*))
+-            ranges_bytes += sizeof(void*) - ranges_bytes % sizeof(void*);
+-        size += ranges_bytes;
+-    }
++    if (ch->valid_values.count)
++        size += align_size(sizeof(uint8_t) * ch->valid_values.count);
++    if (ch->valid_values_ranges.count)
++        size += align_size(sizeof(homekit_valid_values_range_t) * ch->valid_values_ranges.count);
+     if (ch->callback) {
+         homekit_characteristic_change_callback_t *c = ch->callback;
+         while (c) {
+-            size_t callback_bytes = sizeof(homekit_characteristic_change_callback_t);
+-            if (callback_bytes % sizeof(void*))
+-                callback_bytes += sizeof(void*) - callback_bytes % sizeof(void*);
+-            size += callback_bytes;
++            size += align_size(sizeof(homekit_characteristic_change_callback_t));
+             c = c->next;
+         }
+     }
+@@ -315,101 +220,12 @@
+     p[description_len - 1] = 0;
+     p += description_len;
+ 
+-    if ((size_t)p % sizeof(void*))
+-        p += sizeof(void*) - (size_t)p % sizeof(void*);
++    p = align_pointer(p);
+ 
+     clone->format = ch->format;
+     clone->unit = ch->unit;
+     clone->permissions = ch->permissions;
+-
+-    // take over the current characteristic value, duplicating every
+-    // dynamically owned payload along the way
+-    memset(&clone->value, 0, sizeof(clone->value));
+-    clone->value.format = ch->value.format;
+-    clone->value.is_null = ch->value.is_null;
+-    clone->value.is_static = ch->value.is_static;
+-
+-    if (!ch->value.is_null) {
+-        switch (ch->value.format) {
+-            case homekit_format_bool:
+-                clone->value.bool_value = ch->value.bool_value;
+-                break;
+-            case homekit_format_uint8:
+-                clone->value.uint8_value = ch->value.uint8_value;
+-                break;
+-            case homekit_format_uint16:
+-                clone->value.uint16_value = ch->value.uint16_value;
+-                break;
+-            case homekit_format_uint32:
+-                clone->value.uint32_value = ch->value.uint32_value;
+-                break;
+-            case homekit_format_uint64:
+-                clone->value.uint64_value = ch->value.uint64_value;
+-                break;
+-            case homekit_format_int:
+-                clone->value.int_value = ch->value.int_value;
+-                break;
+-            case homekit_format_float:
+-                clone->value.float_value = ch->value.float_value;
+-                break;
+-            case homekit_format_string:
+-                clone->value.string_value = ch->value.is_static
+-                    ? ch->value.string_value
+-                    : strdup(ch->value.string_value);
+-                break;
+-            case homekit_format_tlv:
+-                if (ch->value.is_static) {
+-                    clone->value.tlv_values = ch->value.tlv_values;
+-                } else {
+-                    clone->value.tlv_values = malloc(sizeof(tlv_values_t));
+-                    clone->value.tlv_values->head = NULL;
+-
+-                    for (tlv_t *item = ch->value.tlv_values->head; item; item = item->next) {
+-                        size_t item_size = item->size;
+-                        byte *item_data = NULL;
+-
+-                        if (item_size) {
+-                            item_data = malloc(item_size);
+-                            if (!item_data)
+-                                continue;
+-                            memcpy(item_data, item->value, item_size);
+-                        }
+-
+-                        tlv_t *item_tlv = malloc(sizeof(tlv_t));
+-                        if (!item_tlv)
+-                            continue;
+-
+-                        item_tlv->type = item->type;
+-                        item_tlv->size = item_size;
+-                        item_tlv->value = item_data;
+-                        item_tlv->next = NULL;
+-
+-                        if (!clone->value.tlv_values->head) {
+-                            clone->value.tlv_values->head = item_tlv;
+-                        } else {
+-                            tlv_t *tail = clone->value.tlv_values->head;
+-                            while (tail->next)
+-                                tail = tail->next;
+-                            tail->next = item_tlv;
+-                        }
+-                    }
+-                }
+-                break;
+-            case homekit_format_data:
+-                if (ch->value.is_static) {
+-                    clone->value.data_value = ch->value.data_value;
+-                    clone->value.data_size = ch->value.data_size;
+-                } else {
+-                    clone->value.data_size = ch->value.data_size;
+-                    clone->value.data_value = malloc(ch->value.data_size);
+-                    memcpy(clone->value.data_value, ch->value.data_value, ch->value.data_size);
+-                }
+-                break;
+-            default:
+-                // unknown format
+-                break;
+-        }
+-    }
++    homekit_value_copy(&clone->value, &ch->value);
+ 
+     if (ch->min_value) {
+         clone->min_value = (float*) p;
+@@ -447,10 +263,7 @@
+         memcpy(clone->valid_values.values, ch->valid_values.values,
+                sizeof(uint8_t) * ch->valid_values.count);
+ 
+-        size_t valid_values_bytes = sizeof(uint8_t) * ch->valid_values.count;
+-        if (valid_values_bytes % sizeof(void*))
+-            valid_values_bytes += sizeof(void*) - valid_values_bytes % sizeof(void*);
+-        p += valid_values_bytes;
++        p += align_size(sizeof(uint8_t) * ch->valid_values.count);
+     }
+ 
+     if (ch->valid_values_ranges.count) {
+@@ -461,10 +274,7 @@
+                ch->valid_values_ranges.ranges,
+                sizeof(homekit_valid_values_range_t*) * c);
+ 
+-        size_t ranges_bytes = sizeof(homekit_valid_values_range_t*) * c;
+-        if (ranges_bytes % sizeof(void*))
+-            ranges_bytes += sizeof(void*) - ranges_bytes % sizeof(void*);
+-        p += ranges_bytes;
++        p += align_size(sizeof(homekit_valid_values_range_t*) * c);
+     }
+ 
+     if (ch->callback) {
+@@ -484,10 +294,7 @@
+         }
+         callback_out->next = NULL;
+ 
+-        size_t callback_bytes = sizeof(homekit_characteristic_change_callback_t);
+-        if (callback_bytes % sizeof(void*))
+-            callback_bytes += sizeof(void*) - callback_bytes % sizeof(void*);
+-        p += callback_bytes * c;
++        p += align_size(sizeof(homekit_characteristic_change_callback_t)) * c;
+     }
+ 
+     clone->getter = ch->getter;

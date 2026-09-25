@@ -1,0 +1,310 @@
+diff --git a/src/commands.ts b/src/commands.ts
+index 4f4667a..ccc6e4e 100644
+--- a/src/commands.ts
++++ b/src/commands.ts
+@@ -1,24 +1,17 @@
+-import { DiagnosticSink } from '@zzzen/pyright-internal/dist/common/diagnosticSink';
+-import { printParseNodeType } from '@zzzen/pyright-internal/dist/analyzer/parseTreeUtils';
+-import {
+-  type ClassNode,
+-  type FunctionNode,
+-  type ParseNode,
+-  ParseNodeType,
+-  type SuiteNode,
+-} from '@zzzen/pyright-internal/dist/parser/parseNodes';
+-import { getChildNodes } from '@zzzen/pyright-internal/dist/parser/parseTreeUtils';
+-import { ParseOptions, type ParseFileResults, Parser } from '@zzzen/pyright-internal/dist/parser/parser';
+ import * as child_process from 'node:child_process';
+-import { type Terminal, Uri, window, workspace } from 'coc.nvim';
+ import path from 'node:path';
++import { type LinesTextDocument, type Position, type Terminal, Uri, window, workspace } from 'coc.nvim';
+ import { PythonSettings } from './configSettings';
++import { parse, TestFrameworkWalker } from './parsers';
+ import type { TestingFramework } from './types';
+ 
+ let terminal: Terminal | undefined;
+ 
+ const framework = workspace.getConfiguration('pyright').get<TestingFramework>('testing.provider', 'unittest');
+ 
++// pytest joins a test id onto its module with `::`; unittest uses a dotted path.
++const frameworkSeparator = framework === 'pytest' ? '::' : '.';
++
+ function pythonSupportsPathFinder(pythonPath: string) {
+   try {
+     const pythonProcess = child_process.spawnSync(
+@@ -46,20 +39,24 @@ function validPythonModule(pythonPath: string, moduleName: string) {
+   }
+ }
+ 
+-async function runTest(uri: string, testFunction?: string) {
++function isPythonTestFile(document: LinesTextDocument) {
++  const fileName = path.basename(Uri.parse(document.uri).fsPath);
++  return document.languageId === 'python' && (fileName.startsWith('test_') || fileName.endsWith('_test.py'));
++}
++
++// Resolves a file uri to the test id that `-m <framework>` consumes: pytest
++// takes a filesystem path, unittest takes a dotted module path without `.py`.
++function relativeTestTarget(uri: string) {
+   const workspaceUri = Uri.parse(workspace.root).toString();
+   const relativeFileUri = uri.replace(`${workspaceUri}/`, '');
+-  let testFile = '';
+-  if (framework === 'pytest') {
+-    testFile = relativeFileUri.split('/').join(path.sep);
+-  } else {
+-    testFile = relativeFileUri.replace(/.py$/, '').split('/').join('.');
+-  }
+-
+-  const pythonPath = PythonSettings.getInstance().pythonPath;
+-  const exists = validPythonModule(pythonPath, framework);
+-  if (!exists) return window.showErrorMessage(`${framework} does not exist!`);
++  return framework === 'pytest'
++    ? relativeFileUri.split('/').join(path.sep)
++    : relativeFileUri.replace(/.py$/, '').split('/').join('.');
++}
+ 
++// Tear down any terminal left over from a previous run and open a fresh one for
++// this framework; the single shared `terminal` keeps the lifecycle in one place.
++async function prepareTestTerminal() {
+   if (terminal) {
+     if (terminal.bufnr) {
+       await workspace.nvim.command(`bd! ${terminal.bufnr}`);
+@@ -67,195 +64,74 @@ async function runTest(uri: string, testFunction?: string) {
+     terminal.dispose();
+     terminal = undefined;
+   }
+-
+   terminal = await window.createTerminal({ name: framework, cwd: workspace.root });
+-  const args: string[] = [];
++  return terminal;
++}
+ 
++// Builds the argv tail after `<pythonPath> -m <framework>`: the configured
++// framework args, then the resolved test target (optionally narrowed to one test).
++function buildTestArgs(testFile: string, testFunction?: string) {
++  const args: string[] = [];
+   const testArgs = workspace.getConfiguration('pyright').get<string[]>(`testing.${framework}Args`, []);
+-  if (testArgs) {
+-    if (Array.isArray(testArgs)) {
+-      args.push(...testArgs);
+-    }
++  if (testArgs && Array.isArray(testArgs)) {
++    args.push(...testArgs);
+   }
+-
+-  // MEMO: pytest is string concatenation with '::'
+-  // MEMO: unittest is string concatenation with '.'
+-  const sep = framework === 'pytest' ? '::' : '.';
+-  args.push(testFunction ? testFile + sep + testFunction : testFile);
+-
+-  terminal.sendText(`${pythonPath} -m ${framework} ${args.join(' ')}`);
++  args.push(testFunction ? testFile + frameworkSeparator + testFunction : testFile);
++  return args;
+ }
+ 
+-export async function runFileTest() {
+-  const { document } = await workspace.getCurrentState();
+-
+-  const fileName = path.basename(Uri.parse(document.uri).fsPath);
+-  if (document.languageId !== 'python' || (!fileName.startsWith('test_') && !fileName.endsWith('_test.py'))) {
+-    return window.showErrorMessage('This file is not a python test file!');
++// Shared launch machinery: verify the framework imports on the active
++// interpreter, then run `<python> -m <framework> <args>` in a fresh terminal.
++async function runTest(uri: string, testFunction?: string) {
++  const pythonPath = PythonSettings.getInstance().pythonPath;
++  if (!validPythonModule(pythonPath, framework)) {
++    return window.showErrorMessage(`${framework} does not exist!`);
+   }
+ 
+-  runTest(document.uri);
++  const term = await prepareTestTerminal();
++  const args = buildTestArgs(relativeTestTarget(uri), testFunction);
++  term.sendText(`${pythonPath} -m ${framework} ${args.join(' ')}`);
+ }
+ 
+-export async function runSingleTest() {
+-  const { document, position } = await workspace.getCurrentState();
+-  const fileName = path.basename(Uri.parse(document.uri).fsPath);
+-  if (document.languageId !== 'python' || (!fileName.startsWith('test_') && !fileName.endsWith('_test.py'))) {
+-    return window.showErrorMessage('This file is not a python test file!');
+-  }
++// Parses the document and returns the fully-qualified id of the test function
++// spanning `position`, or undefined when there is no parse or no match. The walk
++// itself lives once, in `TestFrameworkWalker`, shared with the code lens provider.
++function findTestFunctionAtPosition(document: LinesTextDocument, position: Position) {
++  const parsed = parse(document.getText());
++  if (!parsed) return undefined;
+ 
+-  // Parse the python source in place.
+-  const parseOptions = new ParseOptions();
+-  const diagSink = new DiagnosticSink();
+-  const pythonParser = new Parser();
+-  let parsed: ParseFileResults | undefined;
+-  try {
+-    parsed = pythonParser.parseSourceFile(document.getText(), parseOptions, diagSink);
+-  } catch (_e) {}
+-  if (!parsed) return window.showErrorMessage('Test not found');
+-
+-  // Collect the test functions straight from the tree: every function whose
+-  // name starts with test_ inside a suite (or at module level for pytest).
+-  const featureItems: { value: string; startOffset: number; endOffset: number }[] = [];
+-  const collectTestFunctions = (node: ParseNode): void => {
+-    if (node.nodeType === ParseNodeType.Function) {
+-      const fNode = node as FunctionNode;
+-      if (fNode.d.name.d.value.startsWith('test_')) {
+-        if (fNode.parent && printParseNodeType(fNode.parent.nodeType) === 'Suite') {
+-          let fullyQualifiedTestName = '';
+-          let currentNode: FunctionNode | ParseNode | undefined = fNode;
+-          let parentSuiteNode = currentNode?.parent as SuiteNode;
+-          while (parentSuiteNode.parent && printParseNodeType(parentSuiteNode.parent.nodeType) === 'Class') {
+-            const classNode = parentSuiteNode.parent as ClassNode;
+-
+-            let combineString: string | undefined;
+-            if (framework === 'unittest') {
+-              combineString = '.';
+-            } else if (framework === 'pytest') {
+-              combineString = '::';
+-            }
+-            fullyQualifiedTestName = classNode.d.name.d.value + combineString + fullyQualifiedTestName;
+-            currentNode = currentNode?.parent?.parent;
+-            parentSuiteNode = currentNode?.parent as SuiteNode;
+-          }
+-          featureItems.push({
+-            value: fullyQualifiedTestName + fNode.d.name.d.value,
+-            startOffset: fNode.start,
+-            endOffset: fNode.start + fNode.length - 1,
+-          });
+-        } else {
+-          if (framework === 'pytest') {
+-            featureItems.push({
+-              value: fNode.d.name.d.value,
+-              startOffset: fNode.start,
+-              endOffset: fNode.start + fNode.length - 1,
+-            });
+-          }
+-        }
+-      }
+-    }
+-    for (const child of getChildNodes(node)) {
+-      if (child) {
+-        collectTestFunctions(child);
+-      }
+-    }
+-  };
+-  collectTestFunctions(parsed.parserOutput.parseTree);
++  const walker = new TestFrameworkWalker(framework);
++  walker.walk(parsed.parserOutput.parseTree);
+ 
+   let testFunction: string | undefined;
+-  for (const item of featureItems) {
++  for (const item of walker.featureItems) {
+     const itemStartPosition = document.positionAt(item.startOffset);
+     const itemEndPosition = document.positionAt(item.endOffset);
+     if (position.line >= itemStartPosition.line && position.line <= itemEndPosition.line) {
+       testFunction = item.value;
+     }
+   }
++  return testFunction;
++}
+ 
+-  if (!testFunction) return window.showErrorMessage('Test not found');
+-
+-  // Everything the terminal launcher used to do for the single test, in place.
+-  const workspaceUri = Uri.parse(workspace.root).toString();
+-  const relativeFileUri = document.uri.replace(`${workspaceUri}/`, '');
+-  let testFile = '';
+-  if (framework === 'pytest') {
+-    testFile = relativeFileUri.split('/').join(path.sep);
+-  } else {
+-    testFile = relativeFileUri.replace(/.py$/, '').split('/').join('.');
+-  }
+-
+-  const pythonPath = PythonSettings.getInstance().pythonPath;
+-
+-  // Does the testing framework resolve on this interpreter?
+-  // First: does python even know about importlib.machinery.PathFinder?
+-  let pySupportsPathFinder = false;
+-  try {
+-    const versionProcess = child_process.spawnSync(
+-      pythonPath,
+-      ['-c', 'from sys import version_info; exit(0) if (version_info[0] >= 3 and version_info[1] >= 4) else exit(1)'],
+-      { encoding: 'utf8' },
+-    );
+-    if (versionProcess.error) {
+-      pySupportsPathFinder = false;
+-    } else {
+-      pySupportsPathFinder = versionProcess.status === 0;
+-    }
+-  } catch (_ex) {
+-    pySupportsPathFinder = false;
+-  }
+-
+-  let moduleProbeArgs: string[];
+-  if (pySupportsPathFinder) {
+-    moduleProbeArgs = [
+-      '-c',
+-      `from importlib.machinery import PathFinder; assert PathFinder.find_spec("${framework}") is not None`,
+-    ];
+-  } else {
+-    moduleProbeArgs = ['-m', framework, '--help'];
+-  }
+-  let moduleUsable = false;
+-  try {
+-    const moduleProcess = child_process.spawnSync(pythonPath, moduleProbeArgs, { encoding: 'utf8' });
+-    if (moduleProcess.error) {
+-      moduleUsable = false;
+-    } else {
+-      moduleUsable = moduleProcess.status === 0;
+-    }
+-  } catch (_ex) {
+-    moduleUsable = false;
+-  }
+-  if (!moduleUsable) return window.showErrorMessage(`${framework} does not exist!`);
+-
+-  if (terminal) {
+-    if (terminal.bufnr) {
+-      await workspace.nvim.command(`bd! ${terminal.bufnr}`);
+-    }
+-    terminal.dispose();
+-    terminal = undefined;
++export async function runFileTest() {
++  const { document } = await workspace.getCurrentState();
++  if (!isPythonTestFile(document)) {
++    return window.showErrorMessage('This file is not a python test file!');
+   }
++  await runTest(document.uri);
++}
+ 
+-  terminal = await window.createTerminal({ name: framework, cwd: workspace.root });
+-  const args: string[] = [];
+-
+-  const testArgs = workspace.getConfiguration('pyright').get<string[]>(`testing.${framework}Args`, []);
+-  if (testArgs && Array.isArray(testArgs)) {
+-    for (const item of testArgs) {
+-      args.push(item);
+-    }
++export async function runSingleTest() {
++  const { document, position } = await workspace.getCurrentState();
++  if (!isPythonTestFile(document)) {
++    return window.showErrorMessage('This file is not a python test file!');
+   }
+ 
+-  // MEMO: pytest is string concatenation with '::'
+-  // MEMO: unittest is string concatenation with '.'
+-  let sep: string;
+-  if (framework === 'pytest') {
+-    sep = '::';
+-  } else {
+-    sep = '.';
+-  }
+-  if (testFunction) {
+-    args.push(testFile + sep + testFunction);
+-  } else {
+-    args.push(testFile);
++  const testFunction = findTestFunctionAtPosition(document, position);
++  if (!testFunction) {
++    return window.showErrorMessage('Test not found');
+   }
+ 
+-  terminal.sendText(`${pythonPath} -m ${framework} ${args.join(' ')}`);
++  await runTest(document.uri, testFunction);
+ }

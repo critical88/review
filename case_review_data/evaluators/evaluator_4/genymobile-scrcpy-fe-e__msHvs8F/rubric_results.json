@@ -1,0 +1,147 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent's patch deletes the entire locally-duplicated `im_convert_window_to_frame_coords` helper (along with `im_get_vfinger_position`, `im_is_point_outside_content`, and `inverse_point`) from input_manager.c. Every pointer-processing path is rewired to the display side: `sc_input_manager_get_position` calls `sc_screen_convert_window_to_frame_coords`, `sc_input_manager_process_touch` calls `sc_screen_convert_window_to_frame_coords`, `sc_input_manager_process_mouse_motion` calls `sc_screen_get_vfinger_position`, and `sc_input_manager_process_mouse_button` calls `sc_screen_is_point_outside_content` and `sc_screen_get_vfinger_position`. The corresponding implementations are added to screen.c (the display owner) with declarations in screen.h, restoring the single-owner geometry interpretation.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The window-to-frame coordinate interpretation (content-rectangle normalization plus all client orientation variants) that the input component currently computes locally is no longer implemented on the input side: the locally duplicated conversion helper is removed and every pointer-processing path (shortcut position query, mouse motion, touch) obtains the mapping from the display side (a restored or equivalently re-homed single owner implementation).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch deletes `im_is_point_outside_content` from input_manager.c and, in the mouse-button double-click path, replaces `im_is_point_outside_content(im->screen, event->x, event->y)` with `sc_screen_is_point_outside_content(im->screen, event->x, event->y)`. It defines `sc_screen_is_point_outside_content` in screen.c and declares it in screen.h, so the border-click containment decision is now reached through the display side rather than a local direct reader of `screen->rect` fields in the input component.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The geometry decision predicate used by the mouse-button double-click path (whether the click point lies outside the displayed content rectangle) is no longer defined in the input component as a direct reader of the display rectangle fields; the containment decision is reached through the display side.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the input-local helpers im_get_vfinger_position, im_convert_window_to_frame_coords, and inverse_point from input_manager.c and adds a display-side sc_screen_get_vfinger_position in screen.c/screen.h. In sc_input_manager_process_mouse_button, the Ctrl/Shift virtual-finger path now calls sc_screen_get_vfinger_position(im->screen, event->x, event->y, im->vfinger_invert_x, im->vfinger_invert_y), and mouse_motion uses the same API. The new screen helper performs sc_screen_convert_window_to_frame_coords followed by frame_size.width/height inversions gated by invert_x/invert_y, preserving the prior mirrored/inverted positions and flag semantics.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The virtual-finger placement used by the Ctrl/Shift right-click emulation (coordinate conversion followed by inversions against the frame size) is no longer computed inside the input component by reading the display frame size and window state through local helpers; the display-side interpretation is used instead, preserving the exact mirrored/inverted positions and inversion-flag semantics.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The problem statement identifies the smell that the mouse-capture component \"has been handed the whole display object, and it now inspects display-internal state to decide by itself when it is allowed to consume events.\" The agent.patch contains no changes to mouse_capture.c or mouse_capture.h, so the smell's capture-side relative-mode gate remains: sc_mouse_capture_is_relative_mode() still reads mc->screen->im.mp->relative_mode, sc_mouse_capture_handle_event() still returns false when that gate is false, and sc_screen_handle_event() still delegates without the display-side sc_screen_is_relative_mode() check. The patch only moves input_manager helpers to screen.c; it does not remove the capture subsystem's inspection of display state, so R4 is not satisfied.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The mouse-capture component no longer inspects display state to decide whether it may consume events: the relative-mode gate that reads through the display object (window handle and the embedded input pipeline's mode flag) is not implemented inside the capture subsystem, and event delegation across the display event loop and the capture handler produces the same accept/forward outcomes as before.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch touches only input_manager.c, screen.c, and screen.h and leaves mouse_capture.c/h unchanged; per smell.diff the capture struct holds struct sc_screen *screen, sc_mouse_capture_init takes struct sc_screen*, set_active/is_active reach the window via mc->screen->window, and screen.c calls sc_mouse_capture_init(&screen->mc, screen, ...). No patch changes introduce a mismatched dependency or initializer call site.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The capture component's collaborator state and initializer signature are consistent with the chosen repair: whatever object the capture subsystem holds (display object or bare window handle), all of its window-manipulating operations reach the window through that single consistent dependency, and the display-side initializer call site matches the signature.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the local input_manager helpers (im_convert_window_to_frame_coords, im_get_vfinger_position, im_is_point_outside_content, and inverse_point) and adds matching screen.h declarations plus screen.c definitions for sc_screen_is_point_outside_content and sc_screen_get_vfinger_position. All input_manager.c call sites are updated to the screen API (sc_input_manager_get_position, process_touch, process_mouse_motion, and both process_mouse_button paths), leaving no remaining references to the removed helpers; the new declarations are used.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "If display-side state or entry points were consolidated, the client still builds as a whole: headers, forward declarations and call sites on both sides of the input/capture/display boundaries were updated together (no unused declarations left dangling for the consolidated paths, no removed helper still referenced).",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The patch removes/re-homes the input-manager helpers (im_convert_window_to_frame_coords, im_is_point_outside_content, im_get_vfinger_position) to screen.c/screen.h, but it contains no changes to mouse_capture.c or the sc_screen_handle_event call site. The smell introduced sc_mouse_capture_is_relative_mode and the `if (!sc_mouse_capture_is_relative_mode(mc)) return false;` gate in sc_mouse_capture_handle_event, and removed the `sc_screen_is_relative_mode(screen)` check from screen.c; these remain untouched, so the capture-side relative-mode gate is neither removed nor re-homed.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No dead copy of the displaced behavior remains: the input-manager-local conversion helper, the containment predicate, the virtual-finger helper and the capture-side relative-mode gate introduced by the change are all removed or re-homed, and the final source contains exactly one active implementation reachable from all the affected pointer-processing paths.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch moves input_manager geometry helpers into screen.c APIs, but it does not modify mouse_capture.c/h: the capture component still stores `struct sc_screen *screen`, and `sc_mouse_capture_is_relative_mode` directly reads `screen->im.mp && screen->im.mp->relative_mode`; `sc_mouse_capture_set_active`/`is_active` also read `mc->screen->window`. Thus an affected capture path still inspects display-internal mode/window-handle fields locally.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair does not merely cosmetically re-inline the same display-state reads: it does not leave the affected pointer-processing paths computing window-to-frame mapping or containment locally by directly reading the display component's rectangle, orientation, content size, frame size, window handle or mode fields from the input or capture components.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch deletes the duplicated im_convert_window_to_frame_coords (which contained the full 8-case orientation switch and (int64_t) scaling) and routes sc_input_manager_get_position, process_touch, and the vfinger path through sc_screen_convert_window_to_frame_coords. The new sc_screen_get_vfinger_position in screen.c calls that same function and applies the same frame_size.width/height inversion as the removed im_get_vfinger_position/inverse_point, preserving all orientation cases and integer arithmetic.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "For every client orientation (0, 90, 180, 270 and the flipped variants) the window-to-device coordinate mapping after the repair is identical to before, evaluated on the same content-rectangle and frame-size inputs.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch contains no hunks modifying mouse_capture.c or the sc_screen_handle_event capture dispatch, so it neither adds a second relative-mode gate nor removes the existing internal guard. Input-manager event handling is changed only by replacing local duplicate helpers with equivalent screen API calls: sc_screen_convert_window_to_frame_coords, sc_screen_is_point_outside_content, and sc_screen_get_vfinger_position, preserving the same coordinate/outside/vfinger logic used in mouse motion, touch, and button processing.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The relative-mode event flow does not become double-gated or un-gated: mouse capture does not end up consuming events while the pipeline is not in relative mode, nor forwarding every event when relative mode is active; shortcut-toggle capture, wheel/motion/button consumption rules while active, touch-event consumption, and focus-loss deactivation behave exactly as before the change.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch touches only input_manager.c, screen.c, and screen.h and does not modify, weaken, or remove any test files. It deletes the duplicated static helpers (im_convert_window_to_frame_coords, im_get_vfinger_position, im_is_point_outside_content, inverse_point) and replaces their call sites with screen API equivalents (sc_screen_convert_window_to_frame_coords, sc_screen_is_point_outside_content, sc_screen_get_vfinger_position) that preserve the same coordinate/border/vfinger logic, so no behavior-preserving test should newly fail.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The full client test suite passes without new failures, and the repair does not weaken or remove existing tests to make that happen.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch consolidates the input-manager manifestations: it removes im_convert_window_to_frame_coords, im_get_vfinger_position, im_is_point_outside_content, and inverse_point from input_manager.c and replaces their call sites with sc_screen_convert_window_to_frame_coords, sc_screen_get_vfinger_position, and sc_screen_is_point_outside_content. However, it does not touch mouse_capture.c or mouse_capture.h at all, so the smell's capture gate remains: sc_mouse_capture_is_relative_mode still reads screen->im.mp->relative_mode locally, and sc_mouse_capture_handle_event still gates on it. Thus one identified manifestation keeps its local display-state reading in the capture component, making the repair partial.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair is not a partial fix: the position query, motion, touch and mouse-button paths, the border-click resize interaction, the virtual-finger emulation and the capture gate are all consolidated; none of the identified manifestations keeps its local display-state reading in the input or capture components.",
+      "passes": false
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0,
+    "associated_changes": 1,
+    "core_resolution": 0.6
+  },
+  "valid_count": 12,
+  "pass_count": 8,
+  "must_have_pass": false,
+  "macro_score": 0.65
+}

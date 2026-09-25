@@ -1,0 +1,136 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the `installer *Installer` forwarding field from all four verifier structs and restores a `verifier` client field for cosign, SLSA, minisign, and GitHub Artifact Attestations. It deletes the coordinator methods `Installer.verifyArtifactCosign`, `verifyArtifactSLSA`, `verifyArtifactMinisign`, and `verifyArtifactGitHubAttestations`, moving the full Verify body into each family type. For example, `cosignVerifier.Verify` now calls `c.toolInstaller.install(...)`, templates the asset with `pkg.TemplateArtifact(c.runtime, c.asset)`, and invokes `c.verifier.Verify(...)` using its own fields; the other three families similarly use `s.verifier.Verify`/`g.verifier.Verify` inside their own methods. No verification logic remains forwarded into the central Installer.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Each of the four downloaded-asset verification families (Cosign signature, SLSA provenance, minisign, GitHub Artifact Attestations) owns its verification logic again: installing the verification tool it needs, templating the asset, and invoking its verification client run inside the family's own type using that type's own fields, not inside a method of the central package installation coordinator that the family forwards into.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch restores the source-install bodies to each helper: GoInstallInstallerImpl.Install builds the `go install` command and runs `is.exec.ExecStderr` directly; GoBuildInstallerImpl.Install builds the `go build` command directly; CargoPackageInstallerImpl.Install constructs args via `is.cargoArgs`, runs cargo, and performs the failed-install `os.RemoveAll(root)` cleanup. `cargoArgs` is moved from `*Installer` to `*CargoPackageInstallerImpl`. The coordinator methods `runGoInstall`, `runGoBuild`, and `runCargoInstall` are deleted, and `Installer.exec` plus `absorbInstallerHelpers` are removed, so no central coordinator retains these command-execution bodies.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The three language-source installation modes (installing a Go module, building a local Go source, installing a Rust crate) own their command preparation and execution again: command construction, the cargo argument list in particular, and the cleanup of a partially installed crate on failure live in each mode's own installer implementation, while no central coordinator method retains these bodies.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The smell moved DedicatedInstaller.install into a central coordinator method: DedicatedInstaller.install delegates to di.installer.installDedicatedTool(ctx, logger, di), which locks di.mutex and reads di.pkg()/di.checksums while using is.runtime/is.InstallPackage. The agent patch never modifies dedicated_installer.go and does not remove or relocate installDedicatedTool; it only moves artifact verification back into cosignVerifier/slsaVerifier/minisignVerifier/gitHubArtifactAttestationsVerifier and removes helper absorption. Thus dedicated verification-tool installation remains a central coordinator method that receives the tool component and reads its fields, so R3 is not satisfied.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Dedicated verification-tool installation (installing cosign, slsa-verifier, minisign or the GitHub CLI on first use) is executed by the component representing one verification tool, using that component's mutex, package accessor and checksum store directly, instead of by a central coordinator method that receives the tool component and reads its fields.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch leaves the unified mode-flagged factory on the coordinator: checksum.go still defines `func (is *Installer) newFileVerifiers(pkg *config.Package, assetName string, checksumFile bool) []FileVerifier`, and the patch only changes `installer: is` to `verifier: is.*` inside it. download.go and VerifyChecksumFileContent remain unchanged and still call `is.newFileVerifiers(..., false/true)`, so verifier-set construction and asset/checksum policy selection remain concentrated on the Installer rather than moved to the verifier families or another owner.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "File-verifier construction and policy selection no longer concentrate on the central installation coordinator: building the verifier set for a download (asset branch) and for checksum file content (checksum branch) resides with the verifier families or an owner other than the coordinator, while the asset branch keeps reading policies from asset configuration, the checksum branch from checksum configuration, and the provenance verifier keeps applying only to the asset branch.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes the `absorbInstallerHelpers` method entirely from `installer.go` and deletes the call `installer.absorbInstallerHelpers(...)` from the `New` constructor. The `exec Executor` field is removed from the `Installer` struct, and the `installer *Installer` back-reference field is removed from `CargoPackageInstallerImpl`, `GoBuildInstallerImpl`, and `GoInstallInstallerImpl`. Each helper implementation regains its own `Install` method and `cargoArgs`/`exec` ownership (e.g., `cargo.go` moves `cargoArgs` back to `*CargoPackageInstallerImpl` and inlines the install logic; `go_build.go` and `go_install.go` restore their `Install` methods). No type assertions to concrete helper types remain in the coordinator's construction path.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The construction path no longer re-parents helper implementations: the coordinator's constructor does not mutate shared helper implementations by pointing them at itself or adopting their executor state, and each helper receives what it needs without being cast to its concrete type by the coordinator.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the coordinator's shadow-copied executor: in installer.go it deletes the `exec Executor` field from `Installer` and removes `absorbInstallerHelpers` (which had done `is.exec = impl.exec`) plus its call in `New`. The source-installation helpers retain and use their own `exec`: `CargoPackageInstallerImpl.Install` calls `is.exec.ExecStderr` and `cargoArgs` is moved back to `CargoPackageInstallerImpl`; `GoBuildInstallerImpl.Install` and `GoInstallInstallerImpl.Install` also use `is.exec` directly. Thus external-command executor state is held by the command-running helpers, not duplicated onto the coordinator.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "External-command executor state is held by the component(s) that run those commands (the source-installation helpers and whatever other command-running owner exists), not shadow-copied onto the installation coordinator during construction.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch does not touch dedicated_installer.go, where smell.diff reduced DedicatedInstaller.install to a one-line forward `return di.installer.installDedicatedTool(ctx, logger, di)` and moved the body onto `Installer.installDedicatedTool`. Since the agent leaves this untouched, a helper method still only forwards into the coordinator, the obsolete wiring R7 forbids.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The submitted change leaves obsolete wiring behind: a helper still declares a coordinator pointer field, a helper method still only forwards into the coordinator, or coordinator methods remain that duplicate a restored implementation without any call site needing them.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the `installer *Installer` back-reference from each verifier struct and deletes the `Installer.verifyArtifact*` methods, so each family owns its behavior and reads only its own fields. In verify_cosign.go, `cosignVerifier.Verify` calls `c.toolInstaller.install` and `c.verifier.Verify` using `c.cosign`, `c.runtime`, `c.asset`, `c.pkg`; verify_slsa.go, verify_minisign.go, and verify_github_artifact_attestation.go similarly restore `Verify` on the family type. In checksum.go, construction passes `verifier: is.cosign`/`is.slsaVerifier`/`is.minisignVerifier`/`is.ghVerifier` instead of `installer: is`, giving each family its own verification client. The helper installers (cargo.go, go_build.go, go_install.go) also regain their own `Install` methods and drop the `installer` field. No other type reads a verifier family's per-instance fields for verification.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The relocation strands per-family data: a verification family's own fields (policy, runtimes, asset, tool installer, verification client) end up read by some other type's methods, so the same ownership violation reappears with renamed participants instead of the family owning its data.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In checksum.go, newFileVerifiers preserves both policy branches and order: checksumFile=true builds GAA, cosign, minisign reading pkgInfo.Checksum.Get... and omits slsaVerifier; checksumFile=false builds GAA, cosign, slsa, minisign reading pkgInfo.GitHubArtifactAttestations/Cosign/Minisign. The patch restores verifier-owned behavior: each verifier struct holds its own verifier service (e.g., cosignVerifier.verifier, slsaVerifier.verifier) and Verify calls c.verifier.Verify/g.verifier.Verify/s.verifier.Verify after toolInstaller.install. Enabled methods and disabled flags are not modified, so no family is silently disabled, SLSA is not applied to checksum file content, and relative verifier order is unchanged.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The submitted change silently disables or re-orders a verification family: a scheme's enablement is read from the wrong configuration source (asset configuration versus checksum configuration), provenance verification starts applying to checksum file content, a family is skipped for configurations that previously enabled it, or the relative order in which enabled verifiers run changes.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch restores the source-install helpers without changing their command semantics. go_install keeps `cmd.Env = append(os.Environ(), \"GOBIN=\"+gobin)`; go_build keeps `cmd := osexec.Command(ctx, \"go\", \"build\", \"-o\", exePath, src)` and `cmd.Dir = exeDir`; cargo keeps `args := is.cargoArgs(version, opts)` with `osexec.Command(ctx, \"cargo\", append(args, \"--root\", root, crate)...)`, and on failure still runs `os.RemoveAll(root)` with the same cleanup/error handling. No GOBIN, output path, working directory, argument list, or crate cleanup behavior drifted.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "External command execution semantics drift for a source-installation mode: the go install path loses its GOBIN environment, the go build invocation changes its output path, arguments or working directory, the cargo invocation changes its argument list, or the removal of a partially installed crate on failure no longer happens.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch does not modify dedicated_installer.go, where smell.diff shows the provisioning path still acquires di.mutex.Lock() and runs pkgInfo.Override then pkgInfo.CheckSupported(is.runtime, is.runtime.Env()) before is.InstallPackage. The verifier Verify methods retain tool installation as the first step: verify_cosign.go calls c.toolInstaller.install(ctx, logger), verify_slsa.go and verify_minisign.go call s.toolInstaller.install(ctx, logger), and verify_github_artifact_attestation.go calls g.ghInstaller.install(ctx, logger). No mutex or eligibility check is removed or reordered.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Verification-tool provisioning loses its concurrency or eligibility discipline: two concurrent first uses of the same verification tool can interleave their installations, or the version-constraint and environment-support checks before installation are skipped, reordered, or silently install an unsupported tool against the real host platform.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 0.6666666666666666
+  },
+  "valid_count": 11,
+  "pass_count": 8,
+  "must_have_pass": false,
+  "macro_score": 0.7083333333333333
+}

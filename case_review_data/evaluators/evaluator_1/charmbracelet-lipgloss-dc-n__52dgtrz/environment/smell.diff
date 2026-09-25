@@ -1,0 +1,965 @@
+diff --git a/table/resizing.go b/table/resizing.go
+index ce5fd5f..3e5447b 100644
+--- a/table/resizing.go
++++ b/table/resizing.go
+@@ -48,19 +48,8 @@ func (t *Table) resize() {
+ 	hasHeaders := len(t.headers) > 0
+ 	rows := DataToMatrix(t.data)
+ 	r := newResizer(t.width, t.height, t.headers, rows)
+-	r.wrap = t.wrap
+-	r.borderColumn = t.borderColumn
+ 	r.yPaddings = make([][]int, len(r.allRows))
+ 
+-	r.yOffset = t.yOffset
+-	r.useManualHeight = t.useManualHeight
+-	r.borderTop = t.borderTop
+-	r.borderBottom = t.borderBottom
+-	r.borderLeft = t.borderLeft
+-	r.borderRight = t.borderRight
+-	r.borderHeader = t.borderHeader
+-	r.borderRow = t.borderRow
+-
+ 	var allRows [][]string
+ 	if hasHeaders {
+ 		allRows = append([][]string{t.headers}, rows...)
+@@ -101,16 +90,16 @@ func (t *Table) resize() {
+ 	case r.tableWidth <= 0:
+ 		// A table width wasn't specified. In this case, detect according to
+ 		// content width.
+-		r.tableWidth = r.detectTableWidth()
++		r.tableWidth = r.detectTableWidth(t.borderLeft, t.borderRight, t.borderColumn)
+ 	case t.fitContent:
+ 		// Render at content width, treating the specified width as a maximum.
+-		if cw := r.detectTableWidth(); cw < r.tableWidth {
++		if cw := r.detectTableWidth(t.borderLeft, t.borderRight, t.borderColumn); cw < r.tableWidth {
+ 			r.tableWidth = cw
+ 		}
+ 	}
+ 
+-	t.widths, t.heights = r.optimizedWidths()
+-	t.firstVisibleRowIndex, t.lastVisibleRowIndex, t.overflowHeight = r.visibleRowIndexes()
++	t.widths, t.heights = r.optimizedWidths(t.borderLeft, t.borderRight, t.borderColumn, t.wrap)
++	t.firstVisibleRowIndex, t.lastVisibleRowIndex, t.overflowHeight = r.visibleRowIndexes(t.borderTop, t.borderBottom, t.borderHeader, t.borderRow, t.yOffset, t.useManualHeight)
+ }
+ 
+ // resizerColumn is a column in the resizer.
+@@ -133,18 +122,7 @@ type resizer struct {
+ 	rowHeights  []int
+ 	columns     []resizerColumn
+ 
+-	wrap         bool
+-	borderColumn bool
+-	yPaddings    [][]int // vertical paddings
+-
+-	yOffset         int
+-	useManualHeight bool
+-	borderTop       bool
+-	borderBottom    bool
+-	borderLeft      bool
+-	borderRight     bool
+-	borderHeader    bool
+-	borderRow       bool
++	yPaddings [][]int // vertical paddings
+ }
+ 
+ // newResizer creates a new resizer.
+@@ -193,24 +171,24 @@ func newResizer(tableWidth, tableHeight int, headers []string, rows [][]string)
+ }
+ 
+ // optimizedWidths returns the optimized column widths and row heights.
+-func (r *resizer) optimizedWidths() (colWidths, rowHeights []int) {
++func (r *resizer) optimizedWidths(borderLeft, borderRight, borderColumn, wrap bool) (colWidths, rowHeights []int) {
+ 	if r.maxTotal() <= r.tableWidth {
+-		return r.expandTableWidth(), r.rowHeights
++		return r.expandTableWidth(borderLeft, borderRight, borderColumn, wrap), r.rowHeights
+ 	}
+-	return r.shrinkTableWidth(), r.rowHeights
++	return r.shrinkTableWidth(borderLeft, borderRight, borderColumn, wrap), r.rowHeights
+ }
+ 
+ // detectTableWidth detects the table width.
+-func (r *resizer) detectTableWidth() int {
+-	return r.maxCharCount() + r.totalHorizontalPadding() + r.totalHorizontalBorder()
++func (r *resizer) detectTableWidth(borderLeft, borderRight, borderColumn bool) int {
++	return r.maxCharCount() + r.totalHorizontalPadding() + r.totalHorizontalBorder(borderLeft, borderRight, borderColumn)
+ }
+ 
+ // expandTableWidth expands the table width.
+-func (r *resizer) expandTableWidth() (colWidths []int) {
++func (r *resizer) expandTableWidth(borderLeft, borderRight, borderColumn, wrap bool) (colWidths []int) {
+ 	colWidths = r.maxColumnWidths()
+ 
+ 	for {
+-		totalWidth := sum(colWidths) + r.totalHorizontalBorder()
++		totalWidth := sum(colWidths) + r.totalHorizontalBorder(borderLeft, borderRight, borderColumn)
+ 		if totalWidth >= r.tableWidth {
+ 			break
+ 		}
+@@ -231,7 +209,7 @@ func (r *resizer) expandTableWidth() (colWidths []int) {
+ 		colWidths[shorterColumnIndex]++
+ 	}
+ 
+-	r.expandRowHeights(colWidths)
++	r.expandRowHeights(colWidths, wrap)
+ 
+ 	return
+ }
+@@ -244,13 +222,13 @@ func (r *resizer) minWidth(j int) int {
+ }
+ 
+ // shrinkTableWidth shrinks the table width.
+-func (r *resizer) shrinkTableWidth() (colWidths []int) {
++func (r *resizer) shrinkTableWidth(borderLeft, borderRight, borderColumn, wrap bool) (colWidths []int) {
+ 	colWidths = r.maxColumnWidths()
+ 
+ 	// Cut width of columns that are way too big.
+ 	shrinkBiggestColumns := func(veryBigOnly, useFloor bool) {
+ 		for {
+-			totalWidth := sum(colWidths) + r.totalHorizontalBorder()
++			totalWidth := sum(colWidths) + r.totalHorizontalBorder(borderLeft, borderRight, borderColumn)
+ 			if totalWidth <= r.tableWidth {
+ 				break
+ 			}
+@@ -288,7 +266,7 @@ func (r *resizer) shrinkTableWidth() (colWidths []int) {
+ 	// Cut width of columns that differ the most from the median.
+ 	shrinkToMedian := func(useFloor bool) {
+ 		for {
+-			totalWidth := sum(colWidths) + r.totalHorizontalBorder()
++			totalWidth := sum(colWidths) + r.totalHorizontalBorder(borderLeft, borderRight, borderColumn)
+ 			if totalWidth <= r.tableWidth {
+ 				break
+ 			}
+@@ -325,21 +303,21 @@ func (r *resizer) shrinkTableWidth() (colWidths []int) {
+ 
+ 	// If the table is still too wide (e.g. impossible width budgets like
+ 	// Width(1)), fall back to unreserved shrinking without a floor.
+-	if sum(colWidths)+r.totalHorizontalBorder() > r.tableWidth {
++	if sum(colWidths)+r.totalHorizontalBorder(borderLeft, borderRight, borderColumn) > r.tableWidth {
+ 		shrinkBiggestColumns(true, false)
+ 		shrinkToMedian(false)
+ 		shrinkBiggestColumns(false, false)
+ 	}
+ 
+-	r.expandRowHeights(colWidths)
++	r.expandRowHeights(colWidths, wrap)
+ 
+ 	return colWidths
+ }
+ 
+ // expandRowHeights expands the row heights.
+-func (r *resizer) expandRowHeights(colWidths []int) {
++func (r *resizer) expandRowHeights(colWidths []int, wrap bool) {
+ 	r.rowHeights = r.defaultRowHeights()
+-	if !r.wrap {
++	if !wrap {
+ 		return
+ 	}
+ 	hasHeaders := len(r.headers) > 0
+@@ -437,8 +415,8 @@ func (r *resizer) yPaddingForCell(i, j int) int {
+ }
+ 
+ // totalHorizontalBorder returns the total border.
+-func (r *resizer) totalHorizontalBorder() int {
+-	return btoi(r.borderLeft) + btoi(r.borderRight) + (r.columnCount()-1)*btoi(r.borderColumn)
++func (r *resizer) totalHorizontalBorder(borderLeft, borderRight, borderColumn bool) int {
++	return btoi(borderLeft) + btoi(borderRight) + (r.columnCount()-1)*btoi(borderColumn)
+ }
+ 
+ // detectContentHeight detects the content height.
+@@ -460,8 +438,8 @@ func (r *resizer) detectContentHeight(content string, width int) (height int) {
+ // the first data row. The header row is always visible if it exists.
+ // The last return value is the number of cells that the overflow row should
+ // take up for the table to fill the available height.
+-func (r *resizer) visibleRowIndexes() (firstVisibleRowIndex, lastVisibleRowIndex, overflowHeight int) {
+-	if !r.useManualHeight {
++func (r *resizer) visibleRowIndexes(borderTop, borderBottom, borderHeader, borderRow bool, yOffset int, useManualHeight bool) (firstVisibleRowIndex, lastVisibleRowIndex, overflowHeight int) {
++	if !useManualHeight {
+ 		return 0, -2, 0
+ 	}
+ 
+@@ -469,22 +447,22 @@ func (r *resizer) visibleRowIndexes() (firstVisibleRowIndex, lastVisibleRowIndex
+ 	lastIndex := len(r.allRows) - 1 - btoi(hasHeaders)
+ 
+ 	// Account for fixed elements (top/bottom borders, headers with their border).
+-	available := r.tableHeight - btoi(r.borderTop) -
+-		btoi(r.borderBottom) -
++	available := r.tableHeight - btoi(borderTop) -
++		btoi(borderBottom) -
+ 		bton(hasHeaders, r.rowHeights[0]) -
+-		btoi(hasHeaders && r.borderHeader)
++		btoi(hasHeaders && borderHeader)
+ 
+ 	// The first row we add does not need a row border.
+-	available += btoi(r.borderRow)
++	available += btoi(borderRow)
+ 
+ 	// Start from the offset with no visible rows.
+-	firstVisibleRowIndex = r.yOffset
++	firstVisibleRowIndex = yOffset
+ 	lastVisibleRowIndex = firstVisibleRowIndex - 1
+ 
+ 	// First add rows at the bottom until we reach the available height, or the last row.
+ 	for available > 0 && lastVisibleRowIndex < lastIndex {
+-		row := r.rowHeights[lastVisibleRowIndex+1+btoi(hasHeaders)] + btoi(r.borderRow)
+-		overflow := bton(lastVisibleRowIndex+1 < lastIndex, 1+btoi(r.borderRow)+r.yPaddingForCell(lastVisibleRowIndex+2, 0))
++		row := r.rowHeights[lastVisibleRowIndex+1+btoi(hasHeaders)] + btoi(borderRow)
++		overflow := bton(lastVisibleRowIndex+1 < lastIndex, 1+btoi(borderRow)+r.yPaddingForCell(lastVisibleRowIndex+2, 0))
+ 
+ 		if available-row-overflow < 0 {
+ 			break
+@@ -497,7 +475,7 @@ func (r *resizer) visibleRowIndexes() (firstVisibleRowIndex, lastVisibleRowIndex
+ 	if lastVisibleRowIndex == lastIndex {
+ 		// Then add rows at the top until we reach the available height, or the first row.
+ 		for available > 0 && firstVisibleRowIndex > 0 {
+-			row := r.rowHeights[firstVisibleRowIndex-1+btoi(hasHeaders)] + btoi(r.borderRow)
++			row := r.rowHeights[firstVisibleRowIndex-1+btoi(hasHeaders)] + btoi(borderRow)
+ 
+ 			if available-row < 0 {
+ 				break
+diff --git a/table/table.go b/table/table.go
+index bc65544..6b848bf 100644
+--- a/table/table.go
++++ b/table/table.go
+@@ -344,17 +344,17 @@ func (t *Table) String() string {
+ 	var sb strings.Builder
+ 
+ 	if t.borderTop {
+-		sb.WriteString(t.constructTopBorder())
++		sb.WriteString(constructTopBorder(t.border, t.borderStyle, t.borderLeft, t.borderRight, t.borderColumn, t.widths))
+ 		sb.WriteString("\n")
+ 	}
+ 
+ 	if hasHeaders {
+-		sb.WriteString(t.constructHeaders())
++		sb.WriteString(t.constructHeaders(t.border, t.borderStyle, t.borderLeft, t.borderRight, t.borderHeader, t.borderColumn, t.headers, hasHeaders, t.widths, t.heights))
+ 	}
+ 
+ 	var bottom string
+ 	if t.borderBottom {
+-		bottom = t.constructBottomBorder()
++		bottom = constructBottomBorder(t.border, t.borderStyle, t.borderLeft, t.borderRight, t.borderColumn, t.widths)
+ 	}
+ 
+ 	// If there are no data rows render nothing.
+@@ -363,29 +363,28 @@ func (t *Table) String() string {
+ 			if t.lastVisibleRowIndex != -2 && r > t.lastVisibleRowIndex {
+ 				break
+ 			}
+-			sb.WriteString(t.constructRow(r, false))
++			sb.WriteString(t.constructRow(r, false, t.border, t.borderStyle, t.borderRow, t.borderLeft, t.borderRight, t.borderColumn, t.headers, hasHeaders, t.wrap, t.widths, t.heights, t.overflowHeight))
+ 		}
+ 
+ 		// Add an overflow row to show that there are more rows not being rendered.
+ 		if t.lastVisibleRowIndex != -2 {
+-			sb.WriteString(t.constructRow(t.lastVisibleRowIndex+1, true))
++			sb.WriteString(t.constructRow(t.lastVisibleRowIndex+1, true, t.border, t.borderStyle, t.borderRow, t.borderLeft, t.borderRight, t.borderColumn, t.headers, hasHeaders, t.wrap, t.widths, t.heights, t.overflowHeight))
+ 		}
+ 	}
+ 
+ 	sb.WriteString(bottom)
+ 
+ 	return lipgloss.NewStyle().
+-		MaxHeight(min(t.height, t.computeHeight())).
++		MaxHeight(min(t.height, t.computeHeight(t.heights, hasHeaders, t.borderTop, t.borderBottom, t.borderHeader, t.borderRow))).
+ 		MaxWidth(t.width).
+ 		Render(strings.TrimSuffix(sb.String(), "\n"))
+ }
+ 
+ // computeHeight computes the height of the table in its current configuration.
+-func (t *Table) computeHeight() int {
+-	hasHeaders := len(t.headers) > 0
+-	return sum(t.heights) - 1 + btoi(hasHeaders) +
+-		btoi(t.borderTop) + btoi(t.borderBottom) +
+-		btoi(t.borderHeader) + t.data.Rows()*btoi(t.borderRow)
++func (t *Table) computeHeight(heights []int, hasHeaders bool, borderTop, borderBottom, borderHeader, borderRow bool) int {
++	return sum(heights) - 1 + btoi(hasHeaders) +
++		btoi(borderTop) + btoi(borderBottom) +
++		btoi(borderHeader) + t.data.Rows()*btoi(borderRow)
+ }
+ 
+ // Render returns the table as a string.
+@@ -395,74 +394,74 @@ func (t *Table) Render() string {
+ 
+ // constructTopBorder constructs the top border for the table given it's current
+ // border configuration and data.
+-func (t *Table) constructTopBorder() string {
++func constructTopBorder(border lipgloss.Border, borderStyle lipgloss.Style, borderLeft, borderRight, borderColumn bool, widths []int) string {
+ 	var s strings.Builder
+-	if t.borderLeft {
+-		s.WriteString(t.borderStyle.Render(t.border.TopLeft))
++	if borderLeft {
++		s.WriteString(borderStyle.Render(border.TopLeft))
+ 	}
+-	for i := range t.widths {
+-		s.WriteString(t.borderStyle.Render(strings.Repeat(t.border.Top, t.widths[i])))
+-		if i < len(t.widths)-1 && t.borderColumn {
+-			s.WriteString(t.borderStyle.Render(t.border.MiddleTop))
++	for i := range widths {
++		s.WriteString(borderStyle.Render(strings.Repeat(border.Top, widths[i])))
++		if i < len(widths)-1 && borderColumn {
++			s.WriteString(borderStyle.Render(border.MiddleTop))
+ 		}
+ 	}
+-	if t.borderRight {
+-		s.WriteString(t.borderStyle.Render(t.border.TopRight))
++	if borderRight {
++		s.WriteString(borderStyle.Render(border.TopRight))
+ 	}
+ 	return s.String()
+ }
+ 
+ // constructBottomBorder constructs the bottom border for the table given it's current
+ // border configuration and data.
+-func (t *Table) constructBottomBorder() string {
++func constructBottomBorder(border lipgloss.Border, borderStyle lipgloss.Style, borderLeft, borderRight, borderColumn bool, widths []int) string {
+ 	var s strings.Builder
+-	if t.borderLeft {
+-		s.WriteString(t.borderStyle.Render(t.border.BottomLeft))
++	if borderLeft {
++		s.WriteString(borderStyle.Render(border.BottomLeft))
+ 	}
+-	for i := range t.widths {
+-		s.WriteString(t.borderStyle.Render(strings.Repeat(t.border.Bottom, t.widths[i])))
+-		if i < len(t.widths)-1 && t.borderColumn {
+-			s.WriteString(t.borderStyle.Render(t.border.MiddleBottom))
++	for i := range widths {
++		s.WriteString(borderStyle.Render(strings.Repeat(border.Bottom, widths[i])))
++		if i < len(widths)-1 && borderColumn {
++			s.WriteString(borderStyle.Render(border.MiddleBottom))
+ 		}
+ 	}
+-	if t.borderRight {
+-		s.WriteString(t.borderStyle.Render(t.border.BottomRight))
++	if borderRight {
++		s.WriteString(borderStyle.Render(border.BottomRight))
+ 	}
+ 	return s.String()
+ }
+ 
+ // constructHeaders constructs the headers for the table given it's current
+ // header configuration and data.
+-func (t *Table) constructHeaders() string {
++func (t *Table) constructHeaders(border lipgloss.Border, borderStyle lipgloss.Style, borderLeft, borderRight, borderHeader, borderColumn bool, headers []string, hasHeaders bool, widths, heights []int) string {
+ 	var s strings.Builder
+-	cells := make([]string, 0, len(t.headers)*2+1)
+-	height := t.heights[0]
++	cells := make([]string, 0, len(headers)*2+1)
++	height := heights[0]
+ 
+-	left := strings.Repeat(t.borderStyle.Render(t.border.Left)+"\n", height)
+-	if t.borderLeft {
++	left := strings.Repeat(borderStyle.Render(border.Left)+"\n", height)
++	if borderLeft {
+ 		cells = append(cells, left)
+ 	}
+ 
+-	for j, header := range t.headers {
++	for j, header := range headers {
+ 		cellStyle := t.style(HeaderRow, j)
+ 
+ 		// NOTE(@andreynering): We always truncate headers.
+-		header = t.truncateCell(header, HeaderRow, j)
++		header = t.truncateCell(header, HeaderRow, j, hasHeaders, widths[j], heights)
+ 
+ 		cells = append(cells,
+ 			cellStyle.
+ 				Height(height-cellStyle.GetVerticalMargins()).
+-				Width(t.widths[j]-cellStyle.GetHorizontalMargins()).
++				Width(widths[j]-cellStyle.GetHorizontalMargins()).
+ 				Render(header),
+ 		)
+ 
+-		if j < len(t.headers)-1 && t.borderColumn {
++		if j < len(headers)-1 && borderColumn {
+ 			cells = append(cells, left)
+ 		}
+ 	}
+ 
+-	if t.borderRight {
+-		right := strings.Repeat(t.borderStyle.Render(t.border.Right)+"\n", height)
++	if borderRight {
++		right := strings.Repeat(borderStyle.Render(border.Right)+"\n", height)
+ 		cells = append(cells, right)
+ 	}
+ 
+@@ -472,18 +471,18 @@ func (t *Table) constructHeaders() string {
+ 
+ 	s.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, cells...) + "\n")
+ 
+-	if t.borderHeader {
+-		if t.borderLeft {
+-			s.WriteString(t.borderStyle.Render(t.border.MiddleLeft))
++	if borderHeader {
++		if borderLeft {
++			s.WriteString(borderStyle.Render(border.MiddleLeft))
+ 		}
+-		for i := range t.headers {
+-			s.WriteString(t.borderStyle.Render(strings.Repeat(t.border.Top, t.widths[i])))
+-			if i < len(t.headers)-1 && t.borderColumn {
+-				s.WriteString(t.borderStyle.Render(t.border.Middle))
++		for i := range headers {
++			s.WriteString(borderStyle.Render(strings.Repeat(border.Top, widths[i])))
++			if i < len(headers)-1 && borderColumn {
++				s.WriteString(borderStyle.Render(border.Middle))
+ 			}
+ 		}
+-		if t.borderRight {
+-			s.WriteString(t.borderStyle.Render(t.border.MiddleRight))
++		if borderRight {
++			s.WriteString(borderStyle.Render(border.MiddleRight))
+ 		}
+ 		s.WriteString("\n")
+ 	}
+@@ -494,21 +493,19 @@ func (t *Table) constructHeaders() string {
+ // constructRow constructs the row for the table given an index and row data
+ // based on the current configuration. If isOverflow is true, the row is
+ // rendered as an overflow row (using ellipsis).
+-func (t *Table) constructRow(index int, isOverflow bool) string {
++func (t *Table) constructRow(index int, isOverflow bool, border lipgloss.Border, borderStyle lipgloss.Style, borderRow, borderLeft, borderRight, borderColumn bool, headers []string, hasHeaders bool, wrap bool, widths, heights []int, overflowHeight int) string {
+ 	var s strings.Builder
+ 	cells := make([]string, 0, t.data.Columns()*2+1)
+ 
+-	hasHeaders := len(t.headers) > 0
+-
+ 	var height int
+ 	if !isOverflow {
+-		height = t.heights[index+btoi(hasHeaders)]
++		height = heights[index+btoi(hasHeaders)]
+ 	} else {
+-		height = t.overflowHeight
++		height = overflowHeight
+ 	}
+ 
+-	left := strings.Repeat(t.borderStyle.Render(t.border.Left)+"\n", height)
+-	if t.borderLeft {
++	left := strings.Repeat(borderStyle.Render(border.Left)+"\n", height)
++	if borderLeft {
+ 		cells = append(cells, left)
+ 	}
+ 
+@@ -519,24 +516,24 @@ func (t *Table) constructRow(index int, isOverflow bool) string {
+ 		}
+ 
+ 		cellStyle := t.style(index, c)
+-		if !t.wrap {
+-			cell = t.truncateCell(cell, index, c)
++		if !wrap {
++			cell = t.truncateCell(cell, index, c, hasHeaders, widths[c], heights)
+ 		}
+ 		cells = append(cells, cellStyle.
+ 			// Account for the margins in the cell sizing.
+ 			Height(height-cellStyle.GetVerticalMargins()).
+ 			MaxHeight(height).
+-			Width(t.widths[c]-cellStyle.GetHorizontalMargins()).
+-			MaxWidth(t.widths[c]).
++			Width(widths[c]-cellStyle.GetHorizontalMargins()).
++			MaxWidth(widths[c]).
+ 			Render(cell))
+ 
+-		if c < t.data.Columns()-1 && t.borderColumn {
++		if c < t.data.Columns()-1 && borderColumn {
+ 			cells = append(cells, left)
+ 		}
+ 	}
+ 
+-	if t.borderRight {
+-		right := strings.Repeat(t.borderStyle.Render(t.border.Right)+"\n", height)
++	if borderRight {
++		right := strings.Repeat(borderStyle.Render(border.Right)+"\n", height)
+ 		cells = append(cells, right)
+ 	}
+ 
+@@ -546,18 +543,18 @@ func (t *Table) constructRow(index int, isOverflow bool) string {
+ 
+ 	s.WriteString(lipgloss.JoinHorizontal(lipgloss.Top, cells...) + "\n")
+ 
+-	if t.borderRow && !isOverflow && index < t.data.Rows()-1 {
+-		if t.borderLeft {
+-			s.WriteString(t.borderStyle.Render(t.border.MiddleLeft))
++	if borderRow && !isOverflow && index < t.data.Rows()-1 {
++		if borderLeft {
++			s.WriteString(borderStyle.Render(border.MiddleLeft))
+ 		}
+-		for i := range t.widths {
+-			s.WriteString(t.borderStyle.Render(strings.Repeat(t.border.Bottom, t.widths[i])))
+-			if i < len(t.widths)-1 && t.borderColumn {
+-				s.WriteString(t.borderStyle.Render(t.border.Middle))
++		for i := range widths {
++			s.WriteString(borderStyle.Render(strings.Repeat(border.Bottom, widths[i])))
++			if i < len(widths)-1 && borderColumn {
++				s.WriteString(borderStyle.Render(border.Middle))
+ 			}
+ 		}
+-		if t.borderRight {
+-			s.WriteString(t.borderStyle.Render(t.border.MiddleRight))
++		if borderRight {
++			s.WriteString(borderStyle.Render(border.MiddleRight))
+ 		}
+ 		s.WriteString("\n")
+ 	}
+@@ -565,10 +562,8 @@ func (t *Table) constructRow(index int, isOverflow bool) string {
+ 	return s.String()
+ }
+ 
+-func (t *Table) truncateCell(cell string, rowIndex, colIndex int) string {
+-	hasHeaders := len(t.headers) > 0
+-	height := t.heights[rowIndex+btoi(hasHeaders)]
+-	cellWidth := t.widths[colIndex]
++func (t *Table) truncateCell(cell string, rowIndex, colIndex int, hasHeaders bool, cellWidth int, heights []int) string {
++	height := heights[rowIndex+btoi(hasHeaders)]
+ 	cellStyle := t.style(rowIndex, colIndex)
+ 
+ 	// NOTE(@andreynering): We always truncate headers to 1 line.
+diff --git a/tree/renderer.go b/tree/renderer.go
+index 55371b4..2261b7e 100644
+--- a/tree/renderer.go
++++ b/tree/renderer.go
+@@ -17,55 +17,16 @@ type Style struct {
+ 	root           lipgloss.Style
+ }
+ 
+-// newRenderer returns the renderer used to render a tree.
+-func newRenderer() *renderer {
+-	return &renderer{
+-		style: Style{
+-			enumeratorFunc: func(Children, int) lipgloss.Style {
+-				return lipgloss.NewStyle().PaddingRight(1)
+-			},
+-			indenterFunc: func(Children, int) lipgloss.Style {
+-				return lipgloss.NewStyle().PaddingRight(1)
+-			},
+-			itemFunc: func(Children, int) lipgloss.Style {
+-				return lipgloss.NewStyle()
+-			},
+-		},
+-		enumerator: DefaultEnumerator,
+-		indenter:   DefaultIndenter,
+-	}
+-}
+-
+-type renderer struct {
+-	style      Style
+-	enumerator Enumerator
+-	indenter   Indenter
+-	width      int
++// enumPrefix renders the enumerator prefix of the item at index i.
++func enumPrefix(children Children, i int, enumerator Enumerator, enumeratorFunc StyleFunc) string {
++	prefix := enumerator(children, i)
++	return enumeratorFunc(children, i).Render(prefix)
+ }
+ 
+-// render is responsible for actually rendering the tree.
+-func (r *renderer) render(node Node, root bool, prefix string) string {
+-	if node.Hidden() {
+-		return ""
+-	}
+-
++// maxEnumPrefix returns the children with hidden trailing items removed, along
++// with the width of the widest rendered enumerator prefix.
++func maxEnumPrefix(children Children, enumerator Enumerator, enumeratorFunc StyleFunc) (Children, int) {
+ 	var maxLen int
+-	children := node.Children()
+-	enumerator := r.enumerator
+-	indenter := r.indenter
+-
+-	strs := make([]string, 0, children.Length())
+-
+-	// print the root node name if its not empty.
+-	if name := node.Value(); name != "" && root {
+-		line := r.style.root.Render(name)
+-		// If the line is shorter than the desired width, we pad it with spaces.
+-		if pad := r.width - lipgloss.Width(line); pad > 0 {
+-			line = name + r.style.root.Render(strings.Repeat(" ", pad))
+-		}
+-		strs = append(strs, r.style.root.Render(line))
+-	}
+-
+ 	for i := range children.Length() {
+ 		if i < children.Length()-1 {
+ 			if child := children.At(i + 1); child.Hidden() {
+@@ -76,90 +37,158 @@ func (r *renderer) render(node Node, root bool, prefix string) string {
+ 				children = children.(NodeChildren).Remove(i + 1)
+ 			}
+ 		}
+-		prefix := enumerator(children, i)
+-		prefix = r.style.enumeratorFunc(children, i).Render(prefix)
++		prefix := enumPrefix(children, i, enumerator, enumeratorFunc)
+ 		maxLen = max(lipgloss.Width(prefix), maxLen)
+ 	}
++	return children, maxLen
++}
+ 
+-	for i := range children.Length() {
+-		child := children.At(i)
+-		if child.Hidden() {
+-			continue
+-		}
+-		indentStyle := r.style.indenterFunc(children, i)
+-		enumStyle := r.style.enumeratorFunc(children, i)
+-
+-		itemStyle := r.style.itemFunc(children, i)
++// renderTree is responsible for actually rendering a tree node with the given
++// rendering configuration.
++func renderTree(node Node, root bool, prefix string, enumerator Enumerator, indenter Indenter, rootStyle lipgloss.Style, enumeratorFunc, indenterFunc, itemFunc StyleFunc, width int) string {
++	if node.Hidden() {
++		return ""
++	}
+ 
+-		indent := indentStyle.Render(indenter(children, i))
+-		nodePrefix := enumStyle.Render(enumerator(children, i))
++	children := node.Children()
+ 
+-		// Preserve the background color of the enumerator when adding the padding
+-		enumBgStyle := lipgloss.NewStyle().Background(enumStyle.GetBackground())
++	strs := make([]string, 0, children.Length())
+ 
+-		// Add padding to the left of the node to align it with the longest prefix of its siblings
+-		if l := maxLen - lipgloss.Width(nodePrefix); l > 0 {
+-			nodePrefix = enumBgStyle.Render(strings.Repeat(" ", l)) + nodePrefix
++	// print the root node name if its not empty.
++	if name := node.Value(); name != "" && root {
++		line := rootStyle.Render(name)
++		// If the line is shorter than the desired width, we pad it with spaces.
++		if pad := width - lipgloss.Width(line); pad > 0 {
++			line = name + rootStyle.Render(strings.Repeat(" ", pad))
+ 		}
++		strs = append(strs, rootStyle.Render(line))
++	}
+ 
+-		item := itemStyle.Render(child.Value())
+-		multineLinePrefix := enumBgStyle.Render(prefix)
+-
+-		// This dance below is to account for multiline prefixes, e.g. "|\n|".
+-		// In that case, we need to make sure that both the parent prefix and
+-		// the current node's prefix have the same height.
+-		for lipgloss.Height(item) > lipgloss.Height(nodePrefix) {
+-			nodePrefix = lipgloss.JoinVertical(
+-				lipgloss.Left,
+-				nodePrefix,
+-				indent,
+-			)
+-		}
+-		for lipgloss.Height(nodePrefix) > lipgloss.Height(multineLinePrefix) {
+-			multineLinePrefix = lipgloss.JoinVertical(
+-				lipgloss.Left,
+-				multineLinePrefix,
+-				prefix,
+-			)
+-		}
++	children, maxLen := maxEnumPrefix(children, enumerator, enumeratorFunc)
++
++	strs = append(
++		strs,
++		renderChildren(
++			children,
++			prefix,
++			enumerator,
++			indenter,
++			rootStyle,
++			enumeratorFunc,
++			indenterFunc,
++			itemFunc,
++			width,
++			maxLen,
++		)...,
++	)
+ 
+-		line := lipgloss.JoinHorizontal(
+-			lipgloss.Top,
+-			multineLinePrefix,
+-			nodePrefix,
+-			item,
+-		)
++	return strings.Join(strs, "\n")
++}
+ 
+-		// If the line is shorter than the desired width, we pad it with spaces.
+-		if pad := r.width - lipgloss.Width(line); pad > 0 {
+-			line = line + itemStyle.Render(strings.Repeat(" ", pad))
++// renderChildren renders the visible children of a node, recursing into each
++// child subtree with its own rendering configuration when it has one.
++func renderChildren(children Children, prefix string, enumerator Enumerator, indenter Indenter, rootStyle lipgloss.Style, enumeratorFunc, indenterFunc, itemFunc StyleFunc, width int, maxLen int) []string {
++	strs := make([]string, 0, children.Length())
++	for i := range children.Length() {
++		child := children.At(i)
++		if child.Hidden() {
++			continue
+ 		}
+-		strs = append(
+-			strs,
+-			line,
+-		)
++		line, indent := renderChild(children, i, prefix, enumerator, indenter, enumeratorFunc, indenterFunc, itemFunc, width, maxLen)
++		strs = append(strs, line)
+ 
+ 		if children.Length() > 0 {
+-			// Here we see if the child has a custom renderer, which means the
+-			// user set a custom enumerator/indenter/item style, etc.
++			// Here we see if the child has a custom render configuration, which
++			// means the user set a custom enumerator/indenter/item style, etc.
+ 			// If it has one, we'll use it to render itself.
+-			// otherwise, we keep using the current renderer.
+-			// Note that the renderer doesn't inherit its parent's styles.
+-			renderer := r
++			// otherwise, we keep using the current configuration.
++			// Note that the configuration doesn't inherit its parent's.
++			childEnumerator, childIndenter, childRootStyle := enumerator, indenter, rootStyle
++			childEnumeratorFunc, childIndenterFunc, childItemFunc := enumeratorFunc, indenterFunc, itemFunc
++			childWidth := width
+ 			switch child := child.(type) {
+ 			case *Tree:
+-				if child.r != nil {
+-					renderer = child.r
++				if child.renderSet {
++					childEnumerator = child.enumerator
++					childIndenter = child.indenter
++					childRootStyle = child.style.root
++					childEnumeratorFunc = child.style.enumeratorFunc
++					childIndenterFunc = child.style.indenterFunc
++					childItemFunc = child.style.itemFunc
++					childWidth = child.width
+ 				}
+ 			}
+-			if s := renderer.render(
++			if s := renderTree(
+ 				child,
+ 				false,
+ 				prefix+indent,
++				childEnumerator,
++				childIndenter,
++				childRootStyle,
++				childEnumeratorFunc,
++				childIndenterFunc,
++				childItemFunc,
++				childWidth,
+ 			); s != "" {
+ 				strs = append(strs, s)
+ 			}
+ 		}
+ 	}
+-	return strings.Join(strs, "\n")
++	return strs
++}
++
++// renderChild renders the child at index i, returning the rendered line along
++// with the indent to use when rendering the child's own children.
++func renderChild(children Children, i int, prefix string, enumerator Enumerator, indenter Indenter, enumeratorFunc, indenterFunc, itemFunc StyleFunc, width int, maxLen int) (string, string) {
++	child := children.At(i)
++	indentStyle := indenterFunc(children, i)
++	enumStyle := enumeratorFunc(children, i)
++
++	itemStyle := itemFunc(children, i)
++
++	indent := indentStyle.Render(indenter(children, i))
++	nodePrefix := enumPrefix(children, i, enumerator, enumeratorFunc)
++
++	// Preserve the background color of the enumerator when adding the padding
++	enumBgStyle := lipgloss.NewStyle().Background(enumStyle.GetBackground())
++
++	// Add padding to the left of the node to align it with the longest prefix of its siblings
++	if l := maxLen - lipgloss.Width(nodePrefix); l > 0 {
++		nodePrefix = enumBgStyle.Render(strings.Repeat(" ", l)) + nodePrefix
++	}
++
++	item := itemStyle.Render(child.Value())
++	multineLinePrefix := enumBgStyle.Render(prefix)
++
++	// This dance below is to account for multiline prefixes, e.g. "|\n|".
++	// In that case, we need to make sure that both the parent prefix and
++	// the current node's prefix have the same height.
++	for lipgloss.Height(item) > lipgloss.Height(nodePrefix) {
++		nodePrefix = lipgloss.JoinVertical(
++			lipgloss.Left,
++			nodePrefix,
++			indent,
++		)
++	}
++	for lipgloss.Height(nodePrefix) > lipgloss.Height(multineLinePrefix) {
++		multineLinePrefix = lipgloss.JoinVertical(
++			lipgloss.Left,
++			multineLinePrefix,
++			prefix,
++		)
++	}
++
++	line := lipgloss.JoinHorizontal(
++		lipgloss.Top,
++		multineLinePrefix,
++		nodePrefix,
++		item,
++	)
++
++	// If the line is shorter than the desired width, we pad it with spaces.
++	if pad := width - lipgloss.Width(line); pad > 0 {
++		line = line + itemStyle.Render(strings.Repeat(" ", pad))
++	}
++
++	return line, indent
+ }
+diff --git a/tree/tree.go b/tree/tree.go
+index 61bdbda..d47f6c6 100644
+--- a/tree/tree.go
++++ b/tree/tree.go
+@@ -99,7 +99,12 @@ type Tree struct {
+ 	offset   [2]int
+ 	children Children
+ 
+-	r     *renderer
++	style      Style
++	enumerator Enumerator
++	indenter   Indenter
++	width      int
++	renderSet  bool
++
+ 	ronce sync.Once
+ }
+ 
+@@ -151,7 +156,19 @@ func (t *Tree) SetValue(value any) {
+ 
+ // String returns the string representation of the Tree node.
+ func (t *Tree) String() string {
+-	return t.ensureRenderer().render(t, true, "")
++	t.ensureRenderConfig()
++	return renderTree(
++		t,
++		true,
++		"",
++		t.enumerator,
++		t.indenter,
++		t.style.root,
++		t.style.enumeratorFunc,
++		t.style.indenterFunc,
++		t.style.itemFunc,
++		t.width,
++	)
+ }
+ 
+ // Child adds a child to this Tree.
+@@ -223,16 +240,35 @@ func ensureParent(nodes Children, item *Tree) (*Tree, int) {
+ 	return item, -1
+ }
+ 
+-func (t *Tree) ensureRenderer() *renderer {
+-	t.ronce.Do(func() { t.r = newRenderer() })
+-	return t.r
++// ensureRenderConfig lazily fills in the default rendering configuration for
++// this tree. Trees that were never given an explicit configuration (or
++// rendered on their own) render with the configuration of their nearest
++// configured ancestor instead; see renderChildren.
++func (t *Tree) ensureRenderConfig() {
++	t.ronce.Do(func() {
++		t.style = Style{
++			enumeratorFunc: func(Children, int) lipgloss.Style {
++				return lipgloss.NewStyle().PaddingRight(1)
++			},
++			indenterFunc: func(Children, int) lipgloss.Style {
++				return lipgloss.NewStyle().PaddingRight(1)
++			},
++			itemFunc: func(Children, int) lipgloss.Style {
++				return lipgloss.NewStyle()
++			},
++		}
++		t.enumerator = DefaultEnumerator
++		t.indenter = DefaultIndenter
++		t.renderSet = true
++	})
+ }
+ 
+ // EnumeratorStyle sets a static style for all enumerators.
+ //
+ // Use EnumeratorStyleFunc to conditionally set styles based on the tree node.
+ func (t *Tree) EnumeratorStyle(style lipgloss.Style) *Tree {
+-	t.ensureRenderer().style.enumeratorFunc = func(Children, int) lipgloss.Style {
++	t.ensureRenderConfig()
++	t.style.enumeratorFunc = func(Children, int) lipgloss.Style {
+ 		return style
+ 	}
+ 	return t
+@@ -252,7 +288,8 @@ func (t *Tree) EnumeratorStyleFunc(fn StyleFunc) *Tree {
+ 	if fn == nil {
+ 		fn = func(Children, int) lipgloss.Style { return lipgloss.NewStyle() }
+ 	}
+-	t.ensureRenderer().style.enumeratorFunc = fn
++	t.ensureRenderConfig()
++	t.style.enumeratorFunc = fn
+ 	return t
+ }
+ 
+@@ -260,7 +297,8 @@ func (t *Tree) EnumeratorStyleFunc(fn StyleFunc) *Tree {
+ //
+ // Use IndenterStyleFunc to conditionally set styles based on the tree node.
+ func (t *Tree) IndenterStyle(style lipgloss.Style) *Tree {
+-	t.ensureRenderer().style.indenterFunc = func(Children, int) lipgloss.Style {
++	t.ensureRenderConfig()
++	t.style.indenterFunc = func(Children, int) lipgloss.Style {
+ 		return style
+ 	}
+ 	return t
+@@ -280,13 +318,15 @@ func (t *Tree) IndenterStyleFunc(fn StyleFunc) *Tree {
+ 	if fn == nil {
+ 		fn = func(Children, int) lipgloss.Style { return lipgloss.NewStyle() }
+ 	}
+-	t.ensureRenderer().style.indenterFunc = fn
++	t.ensureRenderConfig()
++	t.style.indenterFunc = fn
+ 	return t
+ }
+ 
+ // RootStyle sets a style for the root element.
+ func (t *Tree) RootStyle(style lipgloss.Style) *Tree {
+-	t.ensureRenderer().style.root = style
++	t.ensureRenderConfig()
++	t.style.root = style
+ 	return t
+ }
+ 
+@@ -294,7 +334,8 @@ func (t *Tree) RootStyle(style lipgloss.Style) *Tree {
+ //
+ // Use ItemStyleFunc to conditionally set styles based on the tree node.
+ func (t *Tree) ItemStyle(style lipgloss.Style) *Tree {
+-	t.ensureRenderer().style.itemFunc = func(Children, int) lipgloss.Style { return style }
++	t.ensureRenderConfig()
++	t.style.itemFunc = func(Children, int) lipgloss.Style { return style }
+ 	return t
+ }
+ 
+@@ -312,7 +353,8 @@ func (t *Tree) ItemStyleFunc(fn StyleFunc) *Tree {
+ 	if fn == nil {
+ 		fn = func(Children, int) lipgloss.Style { return lipgloss.NewStyle() }
+ 	}
+-	t.ensureRenderer().style.itemFunc = fn
++	t.ensureRenderConfig()
++	t.style.itemFunc = fn
+ 	return t
+ }
+ 
+@@ -323,7 +365,8 @@ func (t *Tree) ItemStyleFunc(fn StyleFunc) *Tree {
+ //	tree.New().
+ //		Enumerator(RoundedEnumerator)
+ func (t *Tree) Enumerator(enum Enumerator) *Tree {
+-	t.ensureRenderer().enumerator = enum
++	t.ensureRenderConfig()
++	t.enumerator = enum
+ 	return t
+ }
+ 
+@@ -349,7 +392,8 @@ func (t *Tree) Enumerator(enum Enumerator) *Tree {
+ //	→ → → → Qux
+ //	→ → → → → Quux
+ func (t *Tree) Indenter(indenter Indenter) *Tree {
+-	t.ensureRenderer().indenter = indenter
++	t.ensureRenderConfig()
++	t.indenter = indenter
+ 	return t
+ }
+ 
+@@ -357,7 +401,8 @@ func (t *Tree) Indenter(indenter Indenter) *Tree {
+ //
+ // Items will be padded to account for the entire width of the tree.
+ func (t *Tree) Width(width int) *Tree {
+-	t.ensureRenderer().width = width
++	t.ensureRenderConfig()
++	t.width = width
+ 	return t
+ }
+ 

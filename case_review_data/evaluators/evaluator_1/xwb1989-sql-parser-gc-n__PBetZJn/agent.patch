@@ -1,0 +1,525 @@
+diff --git a/bind_value.go b/bind_value.go
+new file mode 100644
+index 0000000..d5d1e60
+--- /dev/null
++++ b/bind_value.go
+@@ -0,0 +1,94 @@
++/*
++Copyright 2017 Google Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sqlparser
++
++import (
++	"bytes"
++	"fmt"
++
++	"github.com/xwb1989/sqlparser/dependency/querypb"
++	"github.com/xwb1989/sqlparser/dependency/sqltypes"
++)
++
++// This file holds the single, shared implementations for resolving a bind
++// variable reference against a namespace and for encoding one bind variable
++// value into an output buffer. bound-query construction, redaction and the
++// public helpers below all dispatch through these functions instead of each
++// owning a private copy of the lookup or encoding rules.
++
++// resolveBindVar looks up name (a ":name" or "::name" reference) in bindVars,
++// applying the single/list validation that bound-query construction and the
++// fetch helper both expect.
++func resolveBindVar(name string, bindVars map[string]*querypb.BindVariable) (val *querypb.BindVariable, isList bool, err error) {
++	name = name[1:]
++	if name[0] == ':' {
++		name = name[1:]
++		isList = true
++	}
++	supplied, ok := bindVars[name]
++	if !ok {
++		return nil, false, fmt.Errorf("missing bind var %s", name)
++	}
++
++	if isList {
++		if supplied.Type != querypb.Type_TUPLE {
++			return nil, false, fmt.Errorf("unexpected list arg type (%v) for key %s", supplied.Type, name)
++		}
++		if len(supplied.Values) == 0 {
++			return nil, false, fmt.Errorf("empty list supplied for %s", name)
++		}
++		return supplied, true, nil
++	}
++
++	if supplied.Type == querypb.Type_TUPLE {
++		return nil, false, fmt.Errorf("unexpected arg type (TUPLE) for non-list key %s", name)
++	}
++
++	return supplied, false, nil
++}
++
++// encodeBindValue writes one bind variable value into out, expanding tuple
++// values into a parenthesized list. Used by bound-query construction and the
++// encode helper.
++func encodeBindValue(out *bytes.Buffer, value *querypb.BindVariable) {
++	if value.Type != querypb.Type_TUPLE {
++		// Since we already check for TUPLE, we don't expect an error.
++		v, _ := sqltypes.BindVariableToValue(value)
++		v.EncodeSQL(out)
++		return
++	}
++
++	// It's a TUPLE.
++	out.WriteByte('(')
++	for i, bv := range value.Values {
++		if i != 0 {
++			out.WriteString(", ")
++		}
++		sqltypes.ProtoToValue(bv).EncodeSQL(out)
++	}
++	out.WriteByte(')')
++}
++
++// EncodeValue encodes one bind variable value into the query.
++func EncodeValue(buf *bytes.Buffer, value *querypb.BindVariable) {
++	encodeBindValue(buf, value)
++}
++
++// FetchBindVar resolves the bind variable by fetching it from bindVariables.
++func FetchBindVar(name string, bindVariables map[string]*querypb.BindVariable) (val *querypb.BindVariable, isList bool, err error) {
++	return resolveBindVar(name, bindVariables)
++}
+diff --git a/bound_query.go b/bound_query.go
+new file mode 100644
+index 0000000..38ea897
+--- /dev/null
++++ b/bound_query.go
+@@ -0,0 +1,69 @@
++/*
++Copyright 2017 Google Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package sqlparser
++
++import (
++	"bytes"
++
++	"github.com/xwb1989/sqlparser/dependency/querypb"
++)
++
++// This file owns bound-query construction: materializing a parsed query
++// template into its final, executable form by substituting supplied bind
++// variables. The owner works purely at the byte level — it walks the
++// template's precomputed bind locations and copies literal text plus
++// encoded values into an output buffer — so it carries its own bind
++// namespace and encoders rather than borrowing state from a render buffer.
++// Resolve and encode rules are dispatched through the shared codec in
++// bind_value.go.
++
++// boundQueryBuilder assembles a parsed query's text and bind values into a
++// fully substituted statement.
++type boundQueryBuilder struct {
++	out      *bytes.Buffer
++	bindVars map[string]*querypb.BindVariable
++	extras   map[string]Encodable
++}
++
++// newBoundQueryBuilder binds a destination buffer to the bind-variable
++// namespace and custom encoders a bound statement substitutes against.
++func newBoundQueryBuilder(out *bytes.Buffer, bindVars map[string]*querypb.BindVariable, extras map[string]Encodable) *boundQueryBuilder {
++	return &boundQueryBuilder{out: out, bindVars: bindVars, extras: extras}
++}
++
++// build walks pq's precomputed bind locations, copying the literal text
++// between them and substituting each bind reference with either a custom
++// encoder (from extras) or a resolved value from the namespace.
++func (b *boundQueryBuilder) build(pq *ParsedQuery) ([]byte, error) {
++	current := 0
++	for _, loc := range pq.bindLocations {
++		b.out.WriteString(pq.Query[current:loc.offset])
++		name := pq.Query[loc.offset : loc.offset+loc.length]
++		if encodable, ok := b.extras[name[1:]]; ok {
++			encodable.EncodeSQL(b.out)
++		} else {
++			supplied, _, err := resolveBindVar(name, b.bindVars)
++			if err != nil {
++				return nil, err
++			}
++			encodeBindValue(b.out, supplied)
++		}
++		current = loc.offset + loc.length
++	}
++	b.out.WriteString(pq.Query[current:])
++	return b.out.Bytes(), nil
++}
+diff --git a/go.mod b/go.mod
+new file mode 100644
+index 0000000..65fd84a
+--- /dev/null
++++ b/go.mod
+@@ -0,0 +1,3 @@
++module github.com/xwb1989/sqlparser
++
++go 1.22.12
+diff --git a/impossible_query.go b/impossible_query.go
+index c699d97..033dfc2 100644
+--- a/impossible_query.go
++++ b/impossible_query.go
+@@ -7,7 +7,7 @@ You may obtain a copy of the License at
+ 
+     http://www.apache.org/licenses/LICENSE-2.0
+ 
+-Unless required by applicable law or agreedto in writing, software
++Unless required by applicable law or agreed to in writing, software
+ distributed under the License is distributed on an "AS IS" BASIS,
+ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ See the License for the specific language governing permissions and
+@@ -16,14 +16,48 @@ limitations under the License.
+ 
+ package sqlparser
+ 
+-// FormatImpossibleQuery creates an impossible query in a TrackedBuffer.
+-// An impossible query is a modified version of a query where all selects have where clauses that are
+-// impossible for mysql to resolve. This is used in the vtgate and vttablet:
++// This file owns impossible-query production: rendering a zero-row shadow
++// statement for a node, used by vtgate/vttablet to fetch field metadata
++// without selecting any rows. The owner rewrites select and union forms and
++// falls back to the node's own formatting, writing the result into a render
++// buffer it is handed. It carries no bind-variable or redaction state.
+ //
+-// - In the vtgate it's used for joins: if the first query returns no result, then vtgate uses the impossible
+-// query just to fetch field info from vttablet
+-// - In the vttablet, it's just an optimization: the field info is fetched once form MySQL, cached and reused
+-// for subsequent queries
++// - In the vtgate it's used for joins: if the first query returns no result,
++// then vtgate uses the impossible query just to fetch field info from vttablet.
++// - In the vttablet, it's just an optimization: the field info is fetched once
++// form MySQL, cached and reused for subsequent queries.
++
++// impossibleQueryBuilder renders a node as a zero-row shadow statement into
++// the supplied render buffer.
++type impossibleQueryBuilder struct {
++	buf *TrackedBuffer
++}
++
++func newImpossibleQueryBuilder(buf *TrackedBuffer) *impossibleQueryBuilder {
++	return &impossibleQueryBuilder{buf: buf}
++}
++
++// build rewrites node so every select yields no rows. For a Select it emits
++// "select <cols> from <from> where 1 != 1" plus any group by; for a Union it
++// preserves the shape through the recursive branches; anything else is
++// formatted as-is.
++func (q *impossibleQueryBuilder) build(node SQLNode) {
++	switch node := node.(type) {
++	case *Select:
++		q.buf.Myprintf("select %v from %v where 1 != 1", node.SelectExprs, node.From)
++		if node.GroupBy != nil {
++			node.GroupBy.Format(q.buf)
++		}
++	case *Union:
++		q.buf.Myprintf("%v %s %v", node.Left, node.Type, node.Right)
++	default:
++		node.Format(q.buf)
++	}
++}
++
++// FormatImpossibleQuery creates an impossible query in a TrackedBuffer.
++// An impossible query is a modified version of a query where all selects have
++// where clauses that are impossible for mysql to resolve.
+ func FormatImpossibleQuery(buf *TrackedBuffer, node SQLNode) {
+-	buf.WriteImpossibleQuery(node)
++	newImpossibleQueryBuilder(buf).build(node)
+ }
+diff --git a/parsed_query.go b/parsed_query.go
+index 844c58f..5c8de64 100644
+--- a/parsed_query.go
++++ b/parsed_query.go
+@@ -24,6 +24,8 @@ import (
+ 
+ // ParsedQuery represents a parsed query where
+ // bind locations are precompued for fast substitutions.
++// Bound-query construction is owned by bound_query.go; this type holds the
++// template and the locations, and delegates substitution to that owner.
+ type ParsedQuery struct {
+ 	Query         string
+ 	bindLocations []bindLocation
+@@ -47,19 +49,6 @@ func (pq *ParsedQuery) GenerateQuery(bindVariables map[string]*querypb.BindVaria
+ 	if len(pq.bindLocations) == 0 {
+ 		return []byte(pq.Query), nil
+ 	}
+-	buf := &TrackedBuffer{
+-		Buffer:   bytes.NewBuffer(make([]byte, 0, len(pq.Query))),
+-		bindVars: bindVariables,
+-	}
+-	return buf.GenerateBoundQuery(pq, extras)
+-}
+-
+-// EncodeValue encodes one bind variable value into the query.
+-func EncodeValue(buf *bytes.Buffer, value *querypb.BindVariable) {
+-	(&TrackedBuffer{Buffer: buf}).EncodeBindValue(value)
+-}
+-
+-// FetchBindVar resolves the bind variable by fetching it from bindVariables.
+-func FetchBindVar(name string, bindVariables map[string]*querypb.BindVariable) (val *querypb.BindVariable, isList bool, err error) {
+-	return (&TrackedBuffer{bindVars: bindVariables}).ResolveBindVar(name)
++	out := bytes.NewBuffer(make([]byte, 0, len(pq.Query)))
++	return newBoundQueryBuilder(out, bindVariables, extras).build(pq)
+ }
+diff --git a/redact_query.go b/redact_query.go
+index 1c8c5a4..4961892 100644
+--- a/redact_query.go
++++ b/redact_query.go
+@@ -1,7 +1,52 @@
++/*
++Copyright 2017 Google Inc.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
+ package sqlparser
+ 
+ import querypb "github.com/xwb1989/sqlparser/dependency/querypb"
+ 
++// This file owns redaction: rendering a statement with its literal values
++// replaced by generated bind variables, framed by any surrounding margin
++// comments, for safe logging. The owner carries the bind-variable namespace
++// it populates while normalizing and the prefix used to name those variables,
++// then writes the redacted statement into a render buffer it is handed. It
++// shares neither the namespace nor the prefix with the buffer; the buffer is
++// only an output sink.
++
++// redactor renders a statement into buf with literal values scrubbed into
++// generated bind variables named with redactPrefix.
++type redactor struct {
++	buf          *TrackedBuffer
++	bindVars     map[string]*querypb.BindVariable
++	redactPrefix string
++}
++
++func newRedactor(buf *TrackedBuffer, bindVars map[string]*querypb.BindVariable, redactPrefix string) *redactor {
++	return &redactor{buf: buf, bindVars: bindVars, redactPrefix: redactPrefix}
++}
++
++// render normalizes stmt into bindVars under redactPrefix, then writes the
++// leading comments, the (now redacted) statement, and the trailing comments.
++func (r *redactor) render(leading, trailing string, stmt Statement) {
++	Normalize(stmt, r.bindVars, r.redactPrefix)
++	r.buf.WriteString(leading)
++	r.buf.WriteNode(stmt)
++	r.buf.WriteString(trailing)
++}
++
+ // RedactSQLQuery returns a sql string with the params stripped out for display
+ func RedactSQLQuery(sql string) (string, error) {
+ 	sqlStripped, comments := SplitMarginComments(sql)
+@@ -11,9 +56,9 @@ func RedactSQLQuery(sql string) (string, error) {
+ 		return "", err
+ 	}
+ 
++	bindVars := map[string]*querypb.BindVariable{}
+ 	buf := NewTrackedBuffer(nil)
+-	buf.SetBindVars(map[string]*querypb.BindVariable{}).SetRedactPrefix("redacted")
+-	buf.WriteRedacted(comments.Leading, comments.Trailing, stmt)
++	newRedactor(buf, bindVars, "redacted").render(comments.Leading, comments.Trailing, stmt)
+ 
+ 	return buf.String(), nil
+ }
+diff --git a/tracked_buffer.go b/tracked_buffer.go
+index a2c6842..62dcd83 100644
+--- a/tracked_buffer.go
++++ b/tracked_buffer.go
+@@ -19,9 +19,6 @@ package sqlparser
+ import (
+ 	"bytes"
+ 	"fmt"
+-
+-	"github.com/xwb1989/sqlparser/dependency/querypb"
+-	"github.com/xwb1989/sqlparser/dependency/sqltypes"
+ )
+ 
+ // NodeFormatter defines the signature of a custom node formatter
+@@ -36,17 +33,13 @@ type NodeFormatter func(buf *TrackedBuffer, node SQLNode)
+ // But you can supply a different formatting function if you
+ // want to generate a query that's different from the default.
+ //
+-// bindVars is the bind-variable namespace the buffer resolves
+-// names against while it is also producing the query text, so
+-// the same object that renders the template can materialize the
+-// final bound statement. redactPrefix drives literal scrubbing
+-// when the buffer is asked to render a redacted form.
++// The buffer is focused on rendering: bound-query construction,
++// redaction and impossible-query production each have their own
++// owner types, which write into a TrackedBuffer only as a sink.
+ type TrackedBuffer struct {
+ 	*bytes.Buffer
+ 	bindLocations []bindLocation
+ 	nodeFormatter NodeFormatter
+-	bindVars      map[string]*querypb.BindVariable
+-	redactPrefix  string
+ }
+ 
+ // NewTrackedBuffer creates a new TrackedBuffer.
+@@ -57,22 +50,6 @@ func NewTrackedBuffer(nodeFormatter NodeFormatter) *TrackedBuffer {
+ 	}
+ }
+ 
+-// SetBindVars configures the bind-variable namespace the buffer
+-// resolves names against while materializing the query. It returns
+-// the receiver so callers can chain configuration when building a
+-// buffer for bound-query or redaction work.
+-func (buf *TrackedBuffer) SetBindVars(bindVars map[string]*querypb.BindVariable) *TrackedBuffer {
+-	buf.bindVars = bindVars
+-	return buf
+-}
+-
+-// SetRedactPrefix configures the prefix used to name generated
+-// bind variables while the buffer renders a redacted statement.
+-func (buf *TrackedBuffer) SetRedactPrefix(prefix string) *TrackedBuffer {
+-	buf.redactPrefix = prefix
+-	return buf
+-}
+-
+ // WriteNode function, initiates the writing of a single SQLNode tree by passing
+ // through to Myprintf with a default format string
+ func (buf *TrackedBuffer) WriteNode(node SQLNode) *TrackedBuffer {
+@@ -165,108 +142,3 @@ func BuildParsedQuery(in string, vars ...interface{}) *ParsedQuery {
+ 	buf.Myprintf(in, vars...)
+ 	return buf.ParsedQuery()
+ }
+-
+-// GenerateBoundQuery walks the precomputed bind locations of a parsed
+-// query and writes the final, fully substituted statement into the
+-// buffer, resolving supplied bind vars through the buffer's own
+-// namespace. extras supplies custom encoders for named arguments.
+-func (buf *TrackedBuffer) GenerateBoundQuery(pq *ParsedQuery, extras map[string]Encodable) ([]byte, error) {
+-	current := 0
+-	for _, loc := range pq.bindLocations {
+-		buf.WriteString(pq.Query[current:loc.offset])
+-		name := pq.Query[loc.offset : loc.offset+loc.length]
+-		if encodable, ok := extras[name[1:]]; ok {
+-			encodable.EncodeSQL(buf.Buffer)
+-		} else {
+-			supplied, _, err := buf.ResolveBindVar(name)
+-			if err != nil {
+-				return nil, err
+-			}
+-			buf.EncodeBindValue(supplied)
+-		}
+-		current = loc.offset + loc.length
+-	}
+-	buf.WriteString(pq.Query[current:])
+-	return buf.Buffer.Bytes(), nil
+-}
+-
+-// ResolveBindVar fetches a bind variable by name from the buffer's
+-// configured namespace, applying the same single/list validation the
+-// runtime substitution expects.
+-func (buf *TrackedBuffer) ResolveBindVar(name string) (val *querypb.BindVariable, isList bool, err error) {
+-	name = name[1:]
+-	if name[0] == ':' {
+-		name = name[1:]
+-		isList = true
+-	}
+-	supplied, ok := buf.bindVars[name]
+-	if !ok {
+-		return nil, false, fmt.Errorf("missing bind var %s", name)
+-	}
+-
+-	if isList {
+-		if supplied.Type != querypb.Type_TUPLE {
+-			return nil, false, fmt.Errorf("unexpected list arg type (%v) for key %s", supplied.Type, name)
+-		}
+-		if len(supplied.Values) == 0 {
+-			return nil, false, fmt.Errorf("empty list supplied for %s", name)
+-		}
+-		return supplied, true, nil
+-	}
+-
+-	if supplied.Type == querypb.Type_TUPLE {
+-		return nil, false, fmt.Errorf("unexpected arg type (TUPLE) for non-list key %s", name)
+-	}
+-
+-	return supplied, false, nil
+-}
+-
+-// EncodeBindValue encodes one bind variable value into the buffer's
+-// embedded byte buffer, expanding tuple values into a parenthesized
+-// list.
+-func (buf *TrackedBuffer) EncodeBindValue(value *querypb.BindVariable) {
+-	if value.Type != querypb.Type_TUPLE {
+-		// Since we already check for TUPLE, we don't expect an error.
+-		v, _ := sqltypes.BindVariableToValue(value)
+-		v.EncodeSQL(buf.Buffer)
+-		return
+-	}
+-
+-	// It's a TUPLE.
+-	buf.WriteByte('(')
+-	for i, bv := range value.Values {
+-		if i != 0 {
+-			buf.WriteString(", ")
+-		}
+-		sqltypes.ProtoToValue(bv).EncodeSQL(buf.Buffer)
+-	}
+-	buf.WriteByte(')')
+-}
+-
+-// WriteRedacted renders a statement with its literal values replaced
+-// by generated bind vars, framed by the surrounding margin comments.
+-// The buffer's configured redact prefix drives the generated names.
+-func (buf *TrackedBuffer) WriteRedacted(leading, trailing string, stmt Statement) {
+-	Normalize(stmt, buf.bindVars, buf.redactPrefix)
+-	buf.WriteString(leading)
+-	buf.WriteNode(stmt)
+-	buf.WriteString(trailing)
+-}
+-
+-// WriteImpossibleQuery renders a zero-row shadow statement for the
+-// given node, used by vtgate/vttablet to fetch field metadata without
+-// selecting any rows. It rewrites select and union forms and falls
+-// back to the node's own formatting for anything else.
+-func (buf *TrackedBuffer) WriteImpossibleQuery(node SQLNode) {
+-	switch node := node.(type) {
+-	case *Select:
+-		buf.Myprintf("select %v from %v where 1 != 1", node.SelectExprs, node.From)
+-		if node.GroupBy != nil {
+-			node.GroupBy.Format(buf)
+-		}
+-	case *Union:
+-		buf.Myprintf("%v %s %v", node.Left, node.Type, node.Right)
+-	default:
+-		node.Format(buf)
+-	}
+-}

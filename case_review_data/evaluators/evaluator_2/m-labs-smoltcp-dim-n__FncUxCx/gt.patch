@@ -1,0 +1,1272 @@
+diff --git a/src/iface/interface/mod.rs b/src/iface/interface/mod.rs
+index 5158771..e823f31 100644
+--- a/src/iface/interface/mod.rs
++++ b/src/iface/interface/mod.rs
+@@ -1058,6 +1058,17 @@ impl InterfaceInner {
+         }
+     }
+ 
++    /// Resolve the link-layer destination address for `dst_addr`, returning it
++    /// together with the (possibly consumed-and-reobtained) transmit token.
++    ///
++    /// This is the shared link-layer destination resolution used by both the
++    /// IEEE 802.15.4 and the Ethernet dispatch paths. A broadcast maps onto the
++    /// medium's broadcast address, a multicast is mapped per address family, and a
++    /// unicast is looked up in the neighbor cache. If the neighbor is not yet
++    /// known, a resolution request is transmitted instead of the packet itself
++    /// (ARP for IPv4, an NDP neighbor solicitation for IPv6), consuming the
++    /// transmit token, and `Err(DispatchError::NeighborPending)` is returned so
++    /// that the dispatch can be retried once the answer arrives.
+     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+     fn lookup_hardware_addr<Tx>(
+         &mut self,
+@@ -1223,186 +1234,19 @@ impl InterfaceInner {
+         let mut ip_repr = packet.ip_repr();
+         assert!(!ip_repr.dst_addr().is_unspecified());
+ 
+-        // Dispatch IEEE802.15.4:
+-
++        // IEEE 802.15.4 dispatch path: resolve the link-layer destination for the
++        // packet's destination IP, then hand the packet to `dispatch_ieee802154`.
++        //
++        // A broadcast maps onto the broadcast address, a multicast is mapped per
++        // address family, and a unicast is looked up in the neighbor cache. If the
++        // neighbor is unknown, `lookup_hardware_addr` transmits a resolution request
++        // (ARP for IPv4, an NDP neighbor solicitation for IPv6) and the dispatch is
++        // retried once the answer arrives. The Ethernet path below resolves addresses
++        // the same way, through the same helper.
+         #[cfg(feature = "medium-ieee802154")]
+         if matches!(self.caps.medium, Medium::Ieee802154) {
+-            // Link destination resolution: map the destination IP address onto
+-            // a link-layer (short or extended) address. A broadcast maps onto the
+-            // broadcast address, a multicast is mapped per address family, and a unicast
+-            // is looked up in the neighbor cache. If the neighbor is unknown, a
+-            // resolution request is transmitted instead of the packet itself, and the
+-            // dispatch is retried once the answer arrives.
+             let dst_addr = ip_repr.dst_addr();
+-
+-            if self.is_broadcast(&dst_addr) {
+-                let hardware_addr = match self.caps.medium {
+-                    #[cfg(feature = "medium-ethernet")]
+-                    Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress::BROADCAST),
+-                    #[cfg(feature = "medium-ieee802154")]
+-                    Medium::Ieee802154 => HardwareAddress::Ieee802154(Ieee802154Address::BROADCAST),
+-                    #[cfg(feature = "medium-ip")]
+-                    Medium::Ip => unreachable!(),
+-                };
+-                self.dispatch_ieee802154(
+-                    hardware_addr.ieee802154_or_panic(),
+-                    tx_token,
+-                    meta,
+-                    packet,
+-                    frag,
+-                );
+-                return Ok(());
+-            }
+-
+-            if dst_addr.is_multicast() {
+-                let hardware_addr = match dst_addr {
+-                    #[cfg(feature = "proto-ipv4")]
+-                    IpAddress::Ipv4(addr) => match self.caps.medium {
+-                        #[cfg(feature = "medium-ethernet")]
+-                        Medium::Ethernet => {
+-                            let b = addr.octets();
+-                            HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
+-                                0x01,
+-                                0x00,
+-                                0x5e,
+-                                b[1] & 0x7F,
+-                                b[2],
+-                                b[3],
+-                            ]))
+-                        }
+-                        #[cfg(feature = "medium-ieee802154")]
+-                        Medium::Ieee802154 => unreachable!(),
+-                        #[cfg(feature = "medium-ip")]
+-                        Medium::Ip => unreachable!(),
+-                    },
+-                    #[cfg(feature = "proto-ipv6")]
+-                    IpAddress::Ipv6(addr) => match self.caps.medium {
+-                        #[cfg(feature = "medium-ethernet")]
+-                        Medium::Ethernet => {
+-                            let b = addr.octets();
+-                            HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
+-                                0x33, 0x33, b[12], b[13], b[14], b[15],
+-                            ]))
+-                        }
+-                        #[cfg(feature = "medium-ieee802154")]
+-                        Medium::Ieee802154 => {
+-                            // Not sure if this is correct
+-                            HardwareAddress::Ieee802154(Ieee802154Address::BROADCAST)
+-                        }
+-                        #[cfg(feature = "medium-ip")]
+-                        Medium::Ip => unreachable!(),
+-                    },
+-                };
+-                self.dispatch_ieee802154(
+-                    hardware_addr.ieee802154_or_panic(),
+-                    tx_token,
+-                    meta,
+-                    packet,
+-                    frag,
+-                );
+-                return Ok(());
+-            }
+-
+-            let routed_dst_addr = self
+-                .route(&dst_addr, self.now)
+-                .ok_or(DispatchError::NoRoute)?;
+-
+-            let hardware_addr = match self.neighbor_cache.lookup(&routed_dst_addr, self.now) {
+-                NeighborAnswer::Found(hardware_addr) => hardware_addr,
+-                NeighborAnswer::RateLimited => return Err(DispatchError::NeighborPending),
+-                _ => {
+-                    // The neighbor is not in the cache (yet): transmit a request that
+-                    // makes the neighbor announce its link-layer address. The request
+-                    // consumes the transmit token, so nothing else can go out with it.
+-                    match routed_dst_addr {
+-                        #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+-                        IpAddress::Ipv4(dst_addr)
+-                            if matches!(self.caps.medium, Medium::Ethernet) =>
+-                        {
+-                            net_debug!(
+-                                "address {} not in neighbor cache, sending ARP request",
+-                                dst_addr
+-                            );
+-
+-                            // Every field that goes on the wire is prepared here, so
+-                            // the frame writing below stays minimal.
+-                            let operation = ArpOperation::Request;
+-                            let source_hardware_addr = self.hardware_addr.ethernet_or_panic();
+-                            let source_protocol_addr = self
+-                                .get_source_address_ipv4(&dst_addr)
+-                                .ok_or(DispatchError::NoRoute)?;
+-                            let target_hardware_addr = EthernetAddress::BROADCAST;
+-                            let arp_repr = ArpRepr::EthernetIpv4 {
+-                                operation,
+-                                source_hardware_addr,
+-                                source_protocol_addr,
+-                                target_hardware_addr,
+-                                target_protocol_addr: dst_addr,
+-                            };
+-                            let arp_frame_len = arp_repr.buffer_len();
+-
+-                            if let Err(e) = self.dispatch_ethernet(
+-                                tx_token,
+-                                arp_frame_len,
+-                                |mut frame| {
+-                                    frame.set_dst_addr(EthernetAddress::BROADCAST);
+-                                    frame.set_ethertype(EthernetProtocol::Arp);
+-
+-                                    arp_repr.emit(&mut ArpPacket::new_unchecked(
+-                                        frame.payload_mut(),
+-                                    ))
+-                                },
+-                            ) {
+-                                net_debug!("Failed to dispatch ARP request: {:?}", e);
+-                                return Err(DispatchError::NeighborPending);
+-                            }
+-                        }
+-
+-                        #[cfg(feature = "proto-ipv6")]
+-                        IpAddress::Ipv6(dst_addr) => {
+-                            net_debug!(
+-                                "address {} not in neighbor cache, sending Neighbor Solicitation",
+-                                dst_addr
+-                            );
+-
+-                            // Every field that goes on the wire is prepared here, so
+-                            // the packet emission below stays minimal.
+-                            let lladdr = Some(self.hardware_addr.into());
+-                            let solicit = Icmpv6Repr::Ndisc(NdiscRepr::NeighborSolicit {
+-                                target_addr: dst_addr,
+-                                lladdr,
+-                            });
+-                            let solicit_src_addr = self.get_source_address_ipv6(&dst_addr);
+-                            let solicit_dst_addr = dst_addr.solicited_node();
+-                            let solicit_payload_len = solicit.buffer_len();
+-                            let solicit_ipv6_repr = Ipv6Repr {
+-                                src_addr: solicit_src_addr,
+-                                dst_addr: solicit_dst_addr,
+-                                next_header: IpProtocol::Icmpv6,
+-                                payload_len: solicit_payload_len,
+-                                hop_limit: 0xff,
+-                            };
+-                            let solicit_packet =
+-                                Packet::new_ipv6(solicit_ipv6_repr, IpPayload::Icmpv6(solicit));
+-
+-                            if let Err(e) =
+-                                self.dispatch_ip(tx_token, PacketMeta::default(), solicit_packet, frag)
+-                            {
+-                                net_debug!("Failed to dispatch NDISC solicit: {:?}", e);
+-                                return Err(DispatchError::NeighborPending);
+-                            }
+-                        }
+-
+-                        #[allow(unreachable_patterns)]
+-                        _ => (),
+-                    }
+-
+-                    // The request got dispatched, limit the rate on the cache.
+-                    self.neighbor_cache.limit_rate(self.now);
+-                    return Err(DispatchError::NeighborPending);
+-                }
+-            };
+-
++            let (hardware_addr, tx_token) = self.lookup_hardware_addr(tx_token, &dst_addr, frag)?;
+             self.dispatch_ieee802154(
+                 hardware_addr.ieee802154_or_panic(),
+                 tx_token,
+@@ -1413,7 +1257,8 @@ impl InterfaceInner {
+             return Ok(());
+         }
+ 
+-        // Dispatch IP/Ethernet:
++        // IP/Ethernet dispatch path: size the frame, resolve the Ethernet
++        // link-layer destination, then emit the packet (fragmenting IPv4 if needed).
+ 
+         let caps = self.caps.clone();
+ 
+@@ -1429,208 +1274,23 @@ impl InterfaceInner {
+             total_len = EthernetFrame::<&[u8]>::buffer_len(total_len);
+         }
+ 
+-        // If the medium is Ethernet, then we need to retrieve the destination hardware
+-        // address. A broadcast or multicast maps onto a derived address directly,
+-        // while a unicast is looked up in the neighbor cache. An unknown neighbor
+-        // causes a resolution request to be transmitted instead of the packet itself,
+-        // and the dispatch is retried once the answer arrives.
++        // Resolve the Ethernet destination hardware address. Broadcast and
++        // multicast map onto a derived address, and a unicast is looked up in the
++        // neighbor cache. An unknown neighbor triggers a resolution request (ARP or
++        // NDP solicit) via `lookup_hardware_addr`, and the dispatch is retried once
++        // the answer arrives. For non-Ethernet mediums there is no link-layer header
++        // to fill in, so the destination hardware address is left as a placeholder.
+         #[cfg(feature = "medium-ethernet")]
+         let (dst_hardware_addr, mut tx_token) = match self.caps.medium {
+             Medium::Ethernet => {
+                 let dst_addr = ip_repr.dst_addr();
+-
+-                if self.is_broadcast(&dst_addr) {
+-                    let hardware_addr = match self.caps.medium {
+-                        #[cfg(feature = "medium-ethernet")]
+-                        Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress::BROADCAST),
+-                        #[cfg(feature = "medium-ieee802154")]
+-                        Medium::Ieee802154 => HardwareAddress::Ieee802154(Ieee802154Address::BROADCAST),
+-                        #[cfg(feature = "medium-ip")]
+-                        Medium::Ip => unreachable!(),
+-                    };
+-                    (
+-                        match hardware_addr {
+-                            HardwareAddress::Ethernet(addr) => addr,
+-                            _ => unreachable!(),
+-                        },
+-                        tx_token,
+-                    )
+-                } else if dst_addr.is_multicast() {
+-                    let hardware_addr = match dst_addr {
+-                        #[cfg(feature = "proto-ipv4")]
+-                        IpAddress::Ipv4(addr) => match self.caps.medium {
+-                            #[cfg(feature = "medium-ethernet")]
+-                            Medium::Ethernet => {
+-                                let b = addr.octets();
+-                                HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
+-                                    0x01,
+-                                    0x00,
+-                                    0x5e,
+-                                    b[1] & 0x7F,
+-                                    b[2],
+-                                    b[3],
+-                                ]))
+-                            }
+-                            #[cfg(feature = "medium-ieee802154")]
+-                            Medium::Ieee802154 => unreachable!(),
+-                            #[cfg(feature = "medium-ip")]
+-                            Medium::Ip => unreachable!(),
+-                        },
+-                        #[cfg(feature = "proto-ipv6")]
+-                        IpAddress::Ipv6(addr) => match self.caps.medium {
+-                            #[cfg(feature = "medium-ethernet")]
+-                            Medium::Ethernet => {
+-                                let b = addr.octets();
+-                                HardwareAddress::Ethernet(EthernetAddress::from_bytes(&[
+-                                    0x33, 0x33, b[12], b[13], b[14], b[15],
+-                                ]))
+-                            }
+-                            #[cfg(feature = "medium-ieee802154")]
+-                            Medium::Ieee802154 => {
+-                                // Not sure if this is correct
+-                                HardwareAddress::Ieee802154(Ieee802154Address::BROADCAST)
+-                            }
+-                            #[cfg(feature = "medium-ip")]
+-                            Medium::Ip => unreachable!(),
+-                        },
+-                    };
+-                    (
+-                        match hardware_addr {
+-                            HardwareAddress::Ethernet(addr) => addr,
+-                            _ => unreachable!(),
+-                        },
+-                        tx_token,
+-                    )
+-                } else {
+-                    let routed_dst_addr = self
+-                        .route(&dst_addr, self.now)
+-                        .ok_or(DispatchError::NoRoute)?;
+-
+-                    let (hardware_addr, tx_token) =
+-                        match self.neighbor_cache.lookup(&routed_dst_addr, self.now) {
+-                            NeighborAnswer::Found(hardware_addr) => (hardware_addr, tx_token),
+-                            NeighborAnswer::RateLimited => {
+-                                return Err(DispatchError::NeighborPending)
+-                            }
+-                            _ => {
+-                                // The neighbor is not in the cache (yet): transmit a
+-                                // request that makes the neighbor announce its
+-                                // link-layer address. The request consumes the
+-                                // transmit token, so nothing else can go out with it.
+-                                match routed_dst_addr {
+-                                    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+-                                    IpAddress::Ipv4(dst_addr)
+-                                        if matches!(self.caps.medium, Medium::Ethernet) =>
+-                                    {
+-                                        net_debug!(
+-                                            "address {} not in neighbor cache, sending ARP request",
+-                                            dst_addr
+-                                        );
+-
+-                                        // Every field that goes on the wire is prepared
+-                                        // here, so the frame writing below stays
+-                                        // minimal.
+-                                        let operation = ArpOperation::Request;
+-                                        let source_hardware_addr =
+-                                            self.hardware_addr.ethernet_or_panic();
+-                                        let source_protocol_addr = self
+-                                            .get_source_address_ipv4(&dst_addr)
+-                                            .ok_or(DispatchError::NoRoute)?;
+-                                        let target_hardware_addr = EthernetAddress::BROADCAST;
+-                                        let arp_repr = ArpRepr::EthernetIpv4 {
+-                                            operation,
+-                                            source_hardware_addr,
+-                                            source_protocol_addr,
+-                                            target_hardware_addr,
+-                                            target_protocol_addr: dst_addr,
+-                                        };
+-                                        let arp_frame_len = arp_repr.buffer_len();
+-
+-                                        if let Err(e) = self.dispatch_ethernet(
+-                                            tx_token,
+-                                            arp_frame_len,
+-                                            |mut frame| {
+-                                                frame.set_dst_addr(EthernetAddress::BROADCAST);
+-                                                frame.set_ethertype(EthernetProtocol::Arp);
+-
+-                                                arp_repr.emit(&mut ArpPacket::new_unchecked(
+-                                                    frame.payload_mut(),
+-                                                ))
+-                                            },
+-                                        ) {
+-                                            net_debug!(
+-                                                "Failed to dispatch ARP request: {:?}",
+-                                                e
+-                                            );
+-                                            return Err(DispatchError::NeighborPending);
+-                                        }
+-                                    }
+-
+-                                    #[cfg(feature = "proto-ipv6")]
+-                                    IpAddress::Ipv6(dst_addr) => {
+-                                        net_debug!(
+-                                            "address {} not in neighbor cache, sending Neighbor Solicitation",
+-                                            dst_addr
+-                                        );
+-
+-                                        // Every field that goes on the wire is prepared
+-                                        // here, so the packet emission below stays
+-                                        // minimal.
+-                                        let lladdr = Some(self.hardware_addr.into());
+-                                        let solicit = Icmpv6Repr::Ndisc(
+-                                            NdiscRepr::NeighborSolicit {
+-                                                target_addr: dst_addr,
+-                                                lladdr,
+-                                            },
+-                                        );
+-                                        let solicit_src_addr =
+-                                            self.get_source_address_ipv6(&dst_addr);
+-                                        let solicit_dst_addr = dst_addr.solicited_node();
+-                                        let solicit_payload_len = solicit.buffer_len();
+-                                        let solicit_ipv6_repr = Ipv6Repr {
+-                                            src_addr: solicit_src_addr,
+-                                            dst_addr: solicit_dst_addr,
+-                                            next_header: IpProtocol::Icmpv6,
+-                                            payload_len: solicit_payload_len,
+-                                            hop_limit: 0xff,
+-                                        };
+-                                        let solicit_packet = Packet::new_ipv6(
+-                                            solicit_ipv6_repr,
+-                                            IpPayload::Icmpv6(solicit),
+-                                        );
+-
+-                                        if let Err(e) = self.dispatch_ip(
+-                                            tx_token,
+-                                            PacketMeta::default(),
+-                                            solicit_packet,
+-                                            frag,
+-                                        ) {
+-                                            net_debug!(
+-                                                "Failed to dispatch NDISC solicit: {:?}",
+-                                                e
+-                                            );
+-                                            return Err(DispatchError::NeighborPending);
+-                                        }
+-                                    }
+-
+-                                    #[allow(unreachable_patterns)]
+-                                    _ => (),
+-                                }
+-
+-                                // The request got dispatched, limit the rate on the cache.
+-                                self.neighbor_cache.limit_rate(self.now);
+-                                return Err(DispatchError::NeighborPending);
+-                            }
+-                        };
+-
+-                    (
+-                        match hardware_addr {
+-                            HardwareAddress::Ethernet(addr) => addr,
+-                            _ => unreachable!(),
+-                        },
+-                        tx_token,
+-                    )
+-                }
++                let (hardware_addr, tx_token) =
++                    self.lookup_hardware_addr(tx_token, &dst_addr, frag)?;
++                let dst_hardware_addr = match hardware_addr {
++                    HardwareAddress::Ethernet(addr) => addr,
++                    _ => unreachable!(),
++                };
++                (dst_hardware_addr, tx_token)
+             }
+             _ => (EthernetAddress([0; 6]), tx_token),
+         };
+diff --git a/src/iface/interface/sixlowpan.rs b/src/iface/interface/sixlowpan.rs
+index cb801c9..244e6f5 100644
+--- a/src/iface/interface/sixlowpan.rs
++++ b/src/iface/interface/sixlowpan.rs
+@@ -571,7 +571,7 @@ impl InterfaceInner {
+         ieee_repr: Ieee802154Repr,
+         frag: &mut Fragmenter,
+     ) {
+-        let mut packet = match packet {
++        let packet = match packet {
+             #[cfg(feature = "proto-ipv4")]
+             Packet::Ipv4(_) => unreachable!(),
+             Packet::Ipv6(packet) => packet,
+@@ -701,138 +701,13 @@ impl InterfaceInner {
+ 
+                 let payload_length = packet.header.payload_len;
+ 
+-                // Compression stage: emit the compressed 6LoWPAN packet into the
+-                // fragmentation buffer. The compression result is what gets fragmented in
+-                // the next step, so the header building and the buffer filling belong
+-                // together here.
++                // Compression stage: compress the IPv6 packet into the
++                // fragmentation buffer via `Self::emit_sixlowpan_compressed`.
++                // The compressed result is what gets fragmented in the next
++                // step, so the header building and buffer filling belong
++                // together there.
+                 let checksum_caps = self.checksum_caps();
+-
+-                let last_header = packet.payload.as_sixlowpan_next_header();
+-                let next_header = last_header;
+-
+-                #[cfg(feature = "proto-ipv6-hbh")]
+-                let next_header = if packet.hop_by_hop.is_some() {
+-                    SixlowpanNextHeader::Compressed
+-                } else {
+-                    next_header
+-                };
+-
+-                #[cfg(feature = "proto-ipv6-routing")]
+-                let next_header = if packet.routing.is_some() {
+-                    SixlowpanNextHeader::Compressed
+-                } else {
+-                    next_header
+-                };
+-
+-                let iphc_repr = SixlowpanIphcRepr {
+-                    src_addr: packet.header.src_addr,
+-                    ll_src_addr: ieee_repr.src_addr,
+-                    dst_addr: packet.header.dst_addr,
+-                    ll_dst_addr: ieee_repr.dst_addr,
+-                    next_header,
+-                    hop_limit: packet.header.hop_limit,
+-                    ecn: None,
+-                    dscp: None,
+-                    flow_label: None,
+-                };
+-
+-                let mut buffer = &mut pkt.buffer[..];
+-                iphc_repr.emit(&mut SixlowpanIphcPacket::new_unchecked(
+-                    &mut buffer[..iphc_repr.buffer_len()],
+-                ));
+-                buffer = &mut buffer[iphc_repr.buffer_len()..];
+-
+-                // Emit the Hop-by-Hop header
+-                #[cfg(feature = "proto-ipv6-hbh")]
+-                if let Some(hbh) = packet.hop_by_hop {
+-                    #[allow(unused)]
+-                    let next_header = last_header;
+-
+-                    #[cfg(feature = "proto-ipv6-routing")]
+-                    let next_header = if packet.routing.is_some() {
+-                        SixlowpanNextHeader::Compressed
+-                    } else {
+-                        last_header
+-                    };
+-
+-                    let ext_hdr = SixlowpanExtHeaderRepr {
+-                        ext_header_id: SixlowpanExtHeaderId::HopByHopHeader,
+-                        next_header,
+-                        length: hbh.options.iter().map(|o| o.buffer_len()).sum::<usize>() as u8,
+-                    };
+-                    ext_hdr.emit(&mut SixlowpanExtHeaderPacket::new_unchecked(
+-                        &mut buffer[..ext_hdr.buffer_len()],
+-                    ));
+-                    buffer = &mut buffer[ext_hdr.buffer_len()..];
+-
+-                    for opt in &hbh.options {
+-                        opt.emit(&mut Ipv6Option::new_unchecked(
+-                            &mut buffer[..opt.buffer_len()],
+-                        ));
+-
+-                        buffer = &mut buffer[opt.buffer_len()..];
+-                    }
+-                }
+-
+-                // Emit the Routing header
+-                #[cfg(feature = "proto-ipv6-routing")]
+-                if let Some(routing) = &packet.routing {
+-                    let ext_hdr = SixlowpanExtHeaderRepr {
+-                        ext_header_id: SixlowpanExtHeaderId::RoutingHeader,
+-                        next_header,
+-                        length: routing.buffer_len() as u8,
+-                    };
+-                    ext_hdr.emit(&mut SixlowpanExtHeaderPacket::new_unchecked(
+-                        &mut buffer[..ext_hdr.buffer_len()],
+-                    ));
+-                    buffer = &mut buffer[ext_hdr.buffer_len()..];
+-
+-                    routing.emit(&mut Ipv6RoutingHeader::new_unchecked(
+-                        &mut buffer[..routing.buffer_len()],
+-                    ));
+-                    buffer = &mut buffer[routing.buffer_len()..];
+-                }
+-
+-                match &mut packet.payload {
+-                    IpPayload::Icmpv6(icmp_repr) => {
+-                        icmp_repr.emit(
+-                            &packet.header.src_addr,
+-                            &packet.header.dst_addr,
+-                            &mut Icmpv6Packet::new_unchecked(
+-                                &mut buffer[..icmp_repr.buffer_len()],
+-                            ),
+-                            &checksum_caps,
+-                        );
+-                    }
+-                    #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
+-                    IpPayload::Udp(udp_repr, payload) => {
+-                        let udp_repr = SixlowpanUdpNhcRepr(*udp_repr);
+-                        udp_repr.emit(
+-                            &mut SixlowpanUdpNhcPacket::new_unchecked(
+-                                &mut buffer[..udp_repr.header_len() + payload.len()],
+-                            ),
+-                            &iphc_repr.src_addr,
+-                            &iphc_repr.dst_addr,
+-                            payload.len(),
+-                            |buf| buf.copy_from_slice(payload),
+-                            &checksum_caps,
+-                        );
+-                    }
+-                    #[cfg(feature = "socket-tcp")]
+-                    IpPayload::Tcp(tcp_repr) => {
+-                        tcp_repr.emit(
+-                            &mut TcpPacket::new_unchecked(&mut buffer[..tcp_repr.buffer_len()]),
+-                            &packet.header.src_addr.into(),
+-                            &packet.header.dst_addr.into(),
+-                            &checksum_caps,
+-                        );
+-                    }
+-                    #[cfg(feature = "socket-raw")]
+-                    IpPayload::Raw(_raw) => todo!(),
+-
+-                    #[allow(unreachable_patterns)]
+-                    _ => unreachable!(),
+-                }
++                Self::emit_sixlowpan_compressed(&packet, &ieee_repr, &mut pkt.buffer, &checksum_caps);
+ 
+                 pkt.sixlowpan.ll_dst_addr = ieee_repr.dst_addr.unwrap();
+                 pkt.sixlowpan.ll_src_addr = ieee_repr.src_addr.unwrap();
+@@ -919,136 +794,158 @@ impl InterfaceInner {
+                 ieee_repr.emit(&mut ieee_packet);
+                 tx_buf = &mut tx_buf[ieee_len..];
+ 
+-                // Compression stage: emit the compressed 6LoWPAN packet into the rest of
+-                // the transmit buffer.
++                // Compression stage: compress the IPv6 packet directly into
++                // the transmit frame after the IEEE 802.15.4 header via
++                // `Self::emit_sixlowpan_compressed`.
+                 let checksum_caps = self.checksum_caps();
++                Self::emit_sixlowpan_compressed(&packet, &ieee_repr, tx_buf, &checksum_caps);
++            });
++        }
++    }
+ 
+-                let last_header = packet.payload.as_sixlowpan_next_header();
+-                let next_header = last_header;
++    /// Emit the compressed 6LoWPAN representation of `packet` — the IPHC header,
++    /// the optional hop-by-hop and routing extension headers, and the
++    /// (possibly NHC-compressed) payload — into `buffer`.
++    ///
++    /// This is the single compression stage shared by both `dispatch_sixlowpan`
++    /// egress paths: the fragmentation path compresses into the fragmentation
++    /// buffer, the non-fragmentation path compresses directly into the transmit
++    /// frame after the IEEE 802.15.4 header. `buffer` starts where the compressed
++    /// bytes go; the caller sizes it so the compressed packet fits.
++    ///
++    /// The checksum capabilities are passed in rather than read off `self` so
++    /// this stage does not borrow the interface — the fragmentation path calls it
++    /// with `buffer` pointing at the interface's own fragmentation buffer.
++    fn emit_sixlowpan_compressed(
++        packet: &PacketV6<'_>,
++        ieee_repr: &Ieee802154Repr,
++        mut buffer: &mut [u8],
++        checksum_caps: &ChecksumCapabilities,
++    ) {
++        let last_header = packet.payload.as_sixlowpan_next_header();
++        let next_header = last_header;
+ 
+-                #[cfg(feature = "proto-ipv6-hbh")]
+-                let next_header = if packet.hop_by_hop.is_some() {
+-                    SixlowpanNextHeader::Compressed
+-                } else {
+-                    next_header
+-                };
++        #[cfg(feature = "proto-ipv6-hbh")]
++        let next_header = if packet.hop_by_hop.is_some() {
++            SixlowpanNextHeader::Compressed
++        } else {
++            next_header
++        };
+ 
+-                #[cfg(feature = "proto-ipv6-routing")]
+-                let next_header = if packet.routing.is_some() {
+-                    SixlowpanNextHeader::Compressed
+-                } else {
+-                    next_header
+-                };
++        #[cfg(feature = "proto-ipv6-routing")]
++        let next_header = if packet.routing.is_some() {
++            SixlowpanNextHeader::Compressed
++        } else {
++            next_header
++        };
+ 
+-                let iphc_repr = SixlowpanIphcRepr {
+-                    src_addr: packet.header.src_addr,
+-                    ll_src_addr: ieee_repr.src_addr,
+-                    dst_addr: packet.header.dst_addr,
+-                    ll_dst_addr: ieee_repr.dst_addr,
+-                    next_header,
+-                    hop_limit: packet.header.hop_limit,
+-                    ecn: None,
+-                    dscp: None,
+-                    flow_label: None,
+-                };
++        let iphc_repr = SixlowpanIphcRepr {
++            src_addr: packet.header.src_addr,
++            ll_src_addr: ieee_repr.src_addr,
++            dst_addr: packet.header.dst_addr,
++            ll_dst_addr: ieee_repr.dst_addr,
++            next_header,
++            hop_limit: packet.header.hop_limit,
++            ecn: None,
++            dscp: None,
++            flow_label: None,
++        };
+ 
+-                iphc_repr.emit(&mut SixlowpanIphcPacket::new_unchecked(
+-                    &mut tx_buf[..iphc_repr.buffer_len()],
+-                ));
+-                tx_buf = &mut tx_buf[iphc_repr.buffer_len()..];
+-
+-                // Emit the Hop-by-Hop header
+-                #[cfg(feature = "proto-ipv6-hbh")]
+-                if let Some(hbh) = packet.hop_by_hop {
+-                    #[allow(unused)]
+-                    let next_header = last_header;
+-
+-                    #[cfg(feature = "proto-ipv6-routing")]
+-                    let next_header = if packet.routing.is_some() {
+-                        SixlowpanNextHeader::Compressed
+-                    } else {
+-                        last_header
+-                    };
++        iphc_repr.emit(&mut SixlowpanIphcPacket::new_unchecked(
++            &mut buffer[..iphc_repr.buffer_len()],
++        ));
++        buffer = &mut buffer[iphc_repr.buffer_len()..];
+ 
+-                    let ext_hdr = SixlowpanExtHeaderRepr {
+-                        ext_header_id: SixlowpanExtHeaderId::HopByHopHeader,
+-                        next_header,
+-                        length: hbh.options.iter().map(|o| o.buffer_len()).sum::<usize>() as u8,
+-                    };
+-                    ext_hdr.emit(&mut SixlowpanExtHeaderPacket::new_unchecked(
+-                        &mut tx_buf[..ext_hdr.buffer_len()],
+-                    ));
+-                    tx_buf = &mut tx_buf[ext_hdr.buffer_len()..];
++        // Emit the Hop-by-Hop header
++        #[cfg(feature = "proto-ipv6-hbh")]
++        if let Some(hbh) = &packet.hop_by_hop {
++            #[allow(unused)]
++            let next_header = last_header;
+ 
+-                    for opt in &hbh.options {
+-                        opt.emit(&mut Ipv6Option::new_unchecked(
+-                            &mut tx_buf[..opt.buffer_len()],
+-                        ));
++            #[cfg(feature = "proto-ipv6-routing")]
++            let next_header = if packet.routing.is_some() {
++                SixlowpanNextHeader::Compressed
++            } else {
++                last_header
++            };
+ 
+-                        tx_buf = &mut tx_buf[opt.buffer_len()..];
+-                    }
+-                }
++            let ext_hdr = SixlowpanExtHeaderRepr {
++                ext_header_id: SixlowpanExtHeaderId::HopByHopHeader,
++                next_header,
++                length: hbh.options.iter().map(|o| o.buffer_len()).sum::<usize>() as u8,
++            };
++            ext_hdr.emit(&mut SixlowpanExtHeaderPacket::new_unchecked(
++                &mut buffer[..ext_hdr.buffer_len()],
++            ));
++            buffer = &mut buffer[ext_hdr.buffer_len()..];
++
++            for opt in &hbh.options {
++                opt.emit(&mut Ipv6Option::new_unchecked(
++                    &mut buffer[..opt.buffer_len()],
++                ));
+ 
+-                // Emit the Routing header
+-                #[cfg(feature = "proto-ipv6-routing")]
+-                if let Some(routing) = &packet.routing {
+-                    let ext_hdr = SixlowpanExtHeaderRepr {
+-                        ext_header_id: SixlowpanExtHeaderId::RoutingHeader,
+-                        next_header,
+-                        length: routing.buffer_len() as u8,
+-                    };
+-                    ext_hdr.emit(&mut SixlowpanExtHeaderPacket::new_unchecked(
+-                        &mut tx_buf[..ext_hdr.buffer_len()],
+-                    ));
+-                    tx_buf = &mut tx_buf[ext_hdr.buffer_len()..];
+-
+-                    routing.emit(&mut Ipv6RoutingHeader::new_unchecked(
+-                        &mut tx_buf[..routing.buffer_len()],
+-                    ));
+-                    tx_buf = &mut tx_buf[routing.buffer_len()..];
+-                }
++                buffer = &mut buffer[opt.buffer_len()..];
++            }
++        }
+ 
+-                match &mut packet.payload {
+-                    IpPayload::Icmpv6(icmp_repr) => {
+-                        icmp_repr.emit(
+-                            &packet.header.src_addr,
+-                            &packet.header.dst_addr,
+-                            &mut Icmpv6Packet::new_unchecked(
+-                                &mut tx_buf[..icmp_repr.buffer_len()],
+-                            ),
+-                            &checksum_caps,
+-                        );
+-                    }
+-                    #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
+-                    IpPayload::Udp(udp_repr, payload) => {
+-                        let udp_repr = SixlowpanUdpNhcRepr(*udp_repr);
+-                        udp_repr.emit(
+-                            &mut SixlowpanUdpNhcPacket::new_unchecked(
+-                                &mut tx_buf[..udp_repr.header_len() + payload.len()],
+-                            ),
+-                            &iphc_repr.src_addr,
+-                            &iphc_repr.dst_addr,
+-                            payload.len(),
+-                            |buf| buf.copy_from_slice(payload),
+-                            &checksum_caps,
+-                        );
+-                    }
+-                    #[cfg(feature = "socket-tcp")]
+-                    IpPayload::Tcp(tcp_repr) => {
+-                        tcp_repr.emit(
+-                            &mut TcpPacket::new_unchecked(&mut tx_buf[..tcp_repr.buffer_len()]),
+-                            &packet.header.src_addr.into(),
+-                            &packet.header.dst_addr.into(),
+-                            &checksum_caps,
+-                        );
+-                    }
+-                    #[cfg(feature = "socket-raw")]
+-                    IpPayload::Raw(_raw) => todo!(),
++        // Emit the Routing header
++        #[cfg(feature = "proto-ipv6-routing")]
++        if let Some(routing) = &packet.routing {
++            let ext_hdr = SixlowpanExtHeaderRepr {
++                ext_header_id: SixlowpanExtHeaderId::RoutingHeader,
++                next_header,
++                length: routing.buffer_len() as u8,
++            };
++            ext_hdr.emit(&mut SixlowpanExtHeaderPacket::new_unchecked(
++                &mut buffer[..ext_hdr.buffer_len()],
++            ));
++            buffer = &mut buffer[ext_hdr.buffer_len()..];
++
++            routing.emit(&mut Ipv6RoutingHeader::new_unchecked(
++                &mut buffer[..routing.buffer_len()],
++            ));
++            buffer = &mut buffer[routing.buffer_len()..];
++        }
+ 
+-                    #[allow(unreachable_patterns)]
+-                    _ => unreachable!(),
+-                }
+-            });
++        match &packet.payload {
++            IpPayload::Icmpv6(icmp_repr) => {
++                icmp_repr.emit(
++                    &packet.header.src_addr,
++                    &packet.header.dst_addr,
++                    &mut Icmpv6Packet::new_unchecked(
++                        &mut buffer[..icmp_repr.buffer_len()],
++                    ),
++                    checksum_caps,
++                );
++            }
++            #[cfg(any(feature = "socket-udp", feature = "socket-dns"))]
++            IpPayload::Udp(udp_repr, payload) => {
++                let udp_repr = SixlowpanUdpNhcRepr(*udp_repr);
++                udp_repr.emit(
++                    &mut SixlowpanUdpNhcPacket::new_unchecked(
++                        &mut buffer[..udp_repr.header_len() + payload.len()],
++                    ),
++                    &iphc_repr.src_addr,
++                    &iphc_repr.dst_addr,
++                    payload.len(),
++                    |buf| buf.copy_from_slice(payload),
++                    checksum_caps,
++                );
++            }
++            #[cfg(feature = "socket-tcp")]
++            IpPayload::Tcp(tcp_repr) => {
++                tcp_repr.emit(
++                    &mut TcpPacket::new_unchecked(&mut buffer[..tcp_repr.buffer_len()]),
++                    &packet.header.src_addr.into(),
++                    &packet.header.dst_addr.into(),
++                    checksum_caps,
++                );
++            }
++            #[cfg(feature = "socket-raw")]
++            IpPayload::Raw(_raw) => todo!(),
++
++            #[allow(unreachable_patterns)]
++            _ => unreachable!(),
+         }
+     }
+ 
+diff --git a/src/socket/dhcpv4.rs b/src/socket/dhcpv4.rs
+index 5bde914..61d7bba 100644
+--- a/src/socket/dhcpv4.rs
++++ b/src/socket/dhcpv4.rs
+@@ -364,6 +364,11 @@ impl<'a> Socket<'a> {
+             buffer.copy_from_slice(payload);
+         }
+ 
++        // `now` and the configured lease-time cap are shared by both ACK arms
++        // below; read them up front so the extracted helper doesn't borrow self.
++        let now = cx.now();
++        let max_lease_duration = self.max_lease_duration;
++
+         match (&mut self.state, dhcp_repr.message_type) {
+             (ClientState::Discovering(_state), DhcpMessageType::Offer) => {
+                 if !dhcp_repr.your_ip.x_is_unicast() {
+@@ -382,114 +387,10 @@ impl<'a> Socket<'a> {
+                 });
+             }
+             (ClientState::Requesting(state), DhcpMessageType::Ack) => {
+-                let subnet_mask = match dhcp_repr.subnet_mask {
+-                    Some(subnet_mask) => subnet_mask,
+-                    None => {
+-                        net_debug!("DHCP ignoring ACK because missing subnet_mask");
+-                        return;
+-                    }
+-                };
+-
+-                let prefix_len = match IpAddress::Ipv4(subnet_mask).prefix_len() {
+-                    Some(prefix_len) => prefix_len,
+-                    None => {
+-                        net_debug!("DHCP ignoring ACK because subnet_mask is not a valid mask");
+-                        return;
+-                    }
+-                };
+-
+-                let your_ip = dhcp_repr.your_ip;
+-                if !your_ip.x_is_unicast() {
+-                    net_debug!("DHCP ignoring ACK because your_ip is not unicast");
++                let Some((config, renew_at, rebind_at, expires_at)) =
++                    Self::ack_lease_config(&dhcp_repr, state.server, now, max_lease_duration)
++                else {
+                     return;
+-                }
+-
+-                let mut lease_duration = dhcp_repr
+-                    .lease_duration
+-                    .map(|d| Duration::from_secs(d as _))
+-                    .unwrap_or(DEFAULT_LEASE_DURATION);
+-                if let Some(max_lease_duration) = self.max_lease_duration {
+-                    lease_duration = lease_duration.min(max_lease_duration);
+-                }
+-
+-                let (config, renew_at, rebind_at, expires_at) = {
+-                    // Cleanup the DNS servers list, keeping only unicasts/
+-                    // TP-Link TD-W8970 sends 0.0.0.0 as second DNS server if there's only one configured :(
+-                    let mut dns_servers = Vec::new();
+-
+-                    dhcp_repr
+-                        .dns_servers
+-                        .iter()
+-                        .flatten()
+-                        .filter(|s| s.x_is_unicast())
+-                        .for_each(|a| {
+-                            // This will never produce an error, as both the arrays and `dns_servers`
+-                            // have length DHCP_MAX_DNS_SERVER_COUNT
+-                            dns_servers.push(*a).ok();
+-                        });
+-
+-                    let config = Config {
+-                        server: state.server,
+-                        address: Ipv4Cidr::new(your_ip, prefix_len),
+-                        router: dhcp_repr.router,
+-                        dns_servers,
+-                        packet: None,
+-                    };
+-
+-                    // Set renew and rebind times as per RFC 2131:
+-                    // Times T1 and T2 are configurable by the server through
+-                    // options. T1 defaults to (0.5 * duration_of_lease). T2
+-                    // defaults to (0.875 * duration_of_lease).
+-                    // When receiving T1 and T2, they must be in the order:
+-                    // T1 < T2 < lease_duration
+-                    let (renew_duration, rebind_duration) = match (
+-                        dhcp_repr
+-                            .renew_duration
+-                            .map(|d| Duration::from_secs(d as u64)),
+-                        dhcp_repr
+-                            .rebind_duration
+-                            .map(|d| Duration::from_secs(d as u64)),
+-                    ) {
+-                        (Some(renew_duration), Some(rebind_duration))
+-                            if renew_duration < rebind_duration
+-                                && rebind_duration < lease_duration =>
+-                        {
+-                            (renew_duration, rebind_duration)
+-                        }
+-                        // RFC 2131 does not say what to do if only one value is
+-                        // provided, so:
+-
+-                        // If only T1 is provided, set T2 to be 0.75 through the gap
+-                        // between T1 and the duration of the lease. If T1 is set to
+-                        // the default (0.5 * duration_of_lease), then T2 will also
+-                        // be set to the default (0.875 * duration_of_lease).
+-                        (Some(renew_duration), None) if renew_duration < lease_duration => (
+-                            renew_duration,
+-                            renew_duration + (lease_duration - renew_duration) * 3 / 4,
+-                        ),
+-
+-                        // If only T2 is provided, then T1 will be set to be
+-                        // whichever is smaller of the default (0.5 *
+-                        // duration_of_lease) or T2.
+-                        (None, Some(rebind_duration)) if rebind_duration < lease_duration => {
+-                            ((lease_duration / 2).min(rebind_duration), rebind_duration)
+-                        }
+-
+-                        // Use the defaults if the following order is not met:
+-                        // T1 < T2 < lease_duration
+-                        (_, _) => {
+-                            net_debug!(
+-                                "using default T1 and T2 values since the provided values are invalid"
+-                            );
+-                            (lease_duration / 2, lease_duration * 7 / 8)
+-                        }
+-                    };
+-                    let now = cx.now();
+-                    let renew_at = now + renew_duration;
+-                    let rebind_at = now + rebind_duration;
+-                    let expires_at = now + lease_duration;
+-
+-                    (config, renew_at, rebind_at, expires_at)
+                 };
+                 self.state = ClientState::Renewing(RenewState {
+                     config,
+@@ -506,114 +407,13 @@ impl<'a> Socket<'a> {
+                 }
+             }
+             (ClientState::Renewing(state), DhcpMessageType::Ack) => {
+-                let subnet_mask = match dhcp_repr.subnet_mask {
+-                    Some(subnet_mask) => subnet_mask,
+-                    None => {
+-                        net_debug!("DHCP ignoring ACK because missing subnet_mask");
+-                        return;
+-                    }
+-                };
+-
+-                let prefix_len = match IpAddress::Ipv4(subnet_mask).prefix_len() {
+-                    Some(prefix_len) => prefix_len,
+-                    None => {
+-                        net_debug!("DHCP ignoring ACK because subnet_mask is not a valid mask");
+-                        return;
+-                    }
+-                };
+-
+-                let your_ip = dhcp_repr.your_ip;
+-                if !your_ip.x_is_unicast() {
+-                    net_debug!("DHCP ignoring ACK because your_ip is not unicast");
++                let Some((config, renew_at, rebind_at, expires_at)) = Self::ack_lease_config(
++                    &dhcp_repr,
++                    state.config.server,
++                    now,
++                    max_lease_duration,
++                ) else {
+                     return;
+-                }
+-
+-                let mut lease_duration = dhcp_repr
+-                    .lease_duration
+-                    .map(|d| Duration::from_secs(d as _))
+-                    .unwrap_or(DEFAULT_LEASE_DURATION);
+-                if let Some(max_lease_duration) = self.max_lease_duration {
+-                    lease_duration = lease_duration.min(max_lease_duration);
+-                }
+-
+-                let (config, renew_at, rebind_at, expires_at) = {
+-                    // Cleanup the DNS servers list, keeping only unicasts/
+-                    // TP-Link TD-W8970 sends 0.0.0.0 as second DNS server if there's only one configured :(
+-                    let mut dns_servers = Vec::new();
+-
+-                    dhcp_repr
+-                        .dns_servers
+-                        .iter()
+-                        .flatten()
+-                        .filter(|s| s.x_is_unicast())
+-                        .for_each(|a| {
+-                            // This will never produce an error, as both the arrays and `dns_servers`
+-                            // have length DHCP_MAX_DNS_SERVER_COUNT
+-                            dns_servers.push(*a).ok();
+-                        });
+-
+-                    let config = Config {
+-                        server: state.config.server,
+-                        address: Ipv4Cidr::new(your_ip, prefix_len),
+-                        router: dhcp_repr.router,
+-                        dns_servers,
+-                        packet: None,
+-                    };
+-
+-                    // Set renew and rebind times as per RFC 2131:
+-                    // Times T1 and T2 are configurable by the server through
+-                    // options. T1 defaults to (0.5 * duration_of_lease). T2
+-                    // defaults to (0.875 * duration_of_lease).
+-                    // When receiving T1 and T2, they must be in the order:
+-                    // T1 < T2 < lease_duration
+-                    let (renew_duration, rebind_duration) = match (
+-                        dhcp_repr
+-                            .renew_duration
+-                            .map(|d| Duration::from_secs(d as u64)),
+-                        dhcp_repr
+-                            .rebind_duration
+-                            .map(|d| Duration::from_secs(d as u64)),
+-                    ) {
+-                        (Some(renew_duration), Some(rebind_duration))
+-                            if renew_duration < rebind_duration
+-                                && rebind_duration < lease_duration =>
+-                        {
+-                            (renew_duration, rebind_duration)
+-                        }
+-                        // RFC 2131 does not say what to do if only one value is
+-                        // provided, so:
+-
+-                        // If only T1 is provided, set T2 to be 0.75 through the gap
+-                        // between T1 and the duration of the lease. If T1 is set to
+-                        // the default (0.5 * duration_of_lease), then T2 will also
+-                        // be set to the default (0.875 * duration_of_lease).
+-                        (Some(renew_duration), None) if renew_duration < lease_duration => (
+-                            renew_duration,
+-                            renew_duration + (lease_duration - renew_duration) * 3 / 4,
+-                        ),
+-
+-                        // If only T2 is provided, then T1 will be set to be
+-                        // whichever is smaller of the default (0.5 *
+-                        // duration_of_lease) or T2.
+-                        (None, Some(rebind_duration)) if rebind_duration < lease_duration => {
+-                            ((lease_duration / 2).min(rebind_duration), rebind_duration)
+-                        }
+-
+-                        // Use the defaults if the following order is not met:
+-                        // T1 < T2 < lease_duration
+-                        (_, _) => {
+-                            net_debug!(
+-                                "using default T1 and T2 values since the provided values are invalid"
+-                            );
+-                            (lease_duration / 2, lease_duration * 7 / 8)
+-                        }
+-                    };
+-                    let now = cx.now();
+-                    let renew_at = now + renew_duration;
+-                    let rebind_at = now + rebind_duration;
+-                    let expires_at = now + lease_duration;
+-
+-                    (config, renew_at, rebind_at, expires_at)
+                 };
+                 state.renew_at = renew_at;
+                 state.rebind_at = rebind_at;
+@@ -646,6 +446,130 @@ impl<'a> Socket<'a> {
+         }
+     }
+ 
++    /// Validate an incoming DHCPv4 ACK and compute the lease configuration the
++    /// client should adopt: the assigned [`Config`] plus the renew, rebind and
++    /// expiry instants.
++    ///
++    /// `server` is the server the lease is held against (the server we are
++    /// `Requesting` from, or the already-leased server while `Renewing`).
++    /// `max_lease_duration` optionally clamps the server-advertised lease time.
++    ///
++    /// Returns `None` (after logging why) when the ACK must be ignored because
++    /// a required option is missing or carries an invalid value; the caller then
++    /// drops the ACK and leaves the existing client state untouched.
++    fn ack_lease_config(
++        dhcp_repr: &DhcpRepr,
++        server: ServerInfo,
++        now: Instant,
++        max_lease_duration: Option<Duration>,
++    ) -> Option<(Config<'static>, Instant, Instant, Instant)> {
++        let subnet_mask = match dhcp_repr.subnet_mask {
++            Some(subnet_mask) => subnet_mask,
++            None => {
++                net_debug!("DHCP ignoring ACK because missing subnet_mask");
++                return None;
++            }
++        };
++
++        let prefix_len = match IpAddress::Ipv4(subnet_mask).prefix_len() {
++            Some(prefix_len) => prefix_len,
++            None => {
++                net_debug!("DHCP ignoring ACK because subnet_mask is not a valid mask");
++                return None;
++            }
++        };
++
++        let your_ip = dhcp_repr.your_ip;
++        if !your_ip.x_is_unicast() {
++            net_debug!("DHCP ignoring ACK because your_ip is not unicast");
++            return None;
++        }
++
++        let mut lease_duration = dhcp_repr
++            .lease_duration
++            .map(|d| Duration::from_secs(d as _))
++            .unwrap_or(DEFAULT_LEASE_DURATION);
++        if let Some(max_lease_duration) = max_lease_duration {
++            lease_duration = lease_duration.min(max_lease_duration);
++        }
++
++        // Cleanup the DNS servers list, keeping only unicasts/
++        // TP-Link TD-W8970 sends 0.0.0.0 as second DNS server if there's only one configured :(
++        let mut dns_servers = Vec::new();
++        dhcp_repr
++            .dns_servers
++            .iter()
++            .flatten()
++            .filter(|s| s.x_is_unicast())
++            .for_each(|a| {
++                // This will never produce an error, as both the arrays and `dns_servers`
++                // have length DHCP_MAX_DNS_SERVER_COUNT
++                dns_servers.push(*a).ok();
++            });
++
++        let config = Config {
++            server,
++            address: Ipv4Cidr::new(your_ip, prefix_len),
++            router: dhcp_repr.router,
++            dns_servers,
++            packet: None,
++        };
++
++        // Set renew and rebind times as per RFC 2131:
++        // Times T1 and T2 are configurable by the server through
++        // options. T1 defaults to (0.5 * duration_of_lease). T2
++        // defaults to (0.875 * duration_of_lease).
++        // When receiving T1 and T2, they must be in the order:
++        // T1 < T2 < lease_duration
++        let (renew_duration, rebind_duration) = match (
++            dhcp_repr
++                .renew_duration
++                .map(|d| Duration::from_secs(d as u64)),
++            dhcp_repr
++                .rebind_duration
++                .map(|d| Duration::from_secs(d as u64)),
++        ) {
++            (Some(renew_duration), Some(rebind_duration))
++                if renew_duration < rebind_duration && rebind_duration < lease_duration =>
++            {
++                (renew_duration, rebind_duration)
++            }
++            // RFC 2131 does not say what to do if only one value is
++            // provided, so:
++
++            // If only T1 is provided, set T2 to be 0.75 through the gap
++            // between T1 and the duration of the lease. If T1 is set to
++            // the default (0.5 * duration_of_lease), then T2 will also
++            // be set to the default (0.875 * duration_of_lease).
++            (Some(renew_duration), None) if renew_duration < lease_duration => (
++                renew_duration,
++                renew_duration + (lease_duration - renew_duration) * 3 / 4,
++            ),
++
++            // If only T2 is provided, then T1 will be set to be
++            // whichever is smaller of the default (0.5 *
++            // duration_of_lease) or T2.
++            (None, Some(rebind_duration)) if rebind_duration < lease_duration => {
++                ((lease_duration / 2).min(rebind_duration), rebind_duration)
++            }
++
++            // Use the defaults if the following order is not met:
++            // T1 < T2 < lease_duration
++            (_, _) => {
++                net_debug!(
++                    "using default T1 and T2 values since the provided values are invalid"
++                );
++                (lease_duration / 2, lease_duration * 7 / 8)
++            }
++        };
++
++        let renew_at = now + renew_duration;
++        let rebind_at = now + rebind_duration;
++        let expires_at = now + lease_duration;
++
++        Some((config, renew_at, rebind_at, expires_at))
++    }
++
+ 
+     #[cfg(not(test))]
+     fn random_transaction_id(cx: &mut Context) -> u32 {

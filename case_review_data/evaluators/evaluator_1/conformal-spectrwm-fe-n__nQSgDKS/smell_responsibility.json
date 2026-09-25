@@ -1,0 +1,116 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Clang-Tidy",
+  "smell_type": "feature_envy",
+  "rule": {
+    "id": "swm-feature-envy",
+    "description": "A function hosted by one locally defined struct (first parameter that is a pointer to a record defined in the main source file) whose body performs at least 36 member accesses spanning at least 8 distinct fields of a different locally defined struct, with the envied access count at least 12 times its own host accesses plus one. This is feature envy in C: window-lifecycle logic reached through the data owner's fields by a screen- or region-level function instead of living on the struct that owns the data."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "spectrwm.c",
+      "class_name": null,
+      "function_name": "focus"
+    },
+    {
+      "id": "E2",
+      "file_path": "spectrwm.c",
+      "class_name": null,
+      "function_name": "update_region_mapping"
+    },
+    {
+      "id": "E3",
+      "file_path": "spectrwm.c",
+      "class_name": null,
+      "function_name": "iconify"
+    }
+  ],
+  "injected_match_count": 3,
+  "checks": [
+    {
+      "id": "focus-cyclist-runs-window-lifecycle-inline",
+      "description": "The screen-level focus binding dispatcher seeds focus candidates, follows focus_redirect chains, probes urgency through ICCCM hints, and computes and stamps stacking layers for the focus family by reading and writing the internals of multiple ws_win records directly.",
+      "detected_relation": "swm_screen-hosted dispatcher -> ws_win field cluster (main, focus_redirect, focus/focus_redirect guard inputs, quirks, hints, st->layer publication, ws linkage, mapping state, ewmh_flags)",
+      "why_this_is_the_smell": "Resolving the next focus candidate, deciding urgency and re-stacking the whole focus family is per-window lifecycle logic; performed field-by-field from the keybinding driver it couples the screen dispatcher to ten interior fields of the window record, so ws_win owns none of the behavior that operates on its own state.",
+      "matches": [
+        {
+          "file": "spectrwm.c",
+          "symbol": "focus",
+          "entry_ids": ["E1"],
+          "evidence": "focus(struct swm_screen *s, ...) resolves candidates across the FOCUSCYCLE, FOCUSPREV, FOCUSNEXT, FOCUSURGENT and FOCUSFREE paths: it seeds from workspace focus state, chases w->main -> focus_redirect chains inline on several distinct window variables, checks !(head->quirks & SWM_Q_IGNOREURGENT) with xcb_icccm_wm_hints_get_urgency(&head->hints), and then decides and writes the stacking layer for redirect and every related window lw of the family before stack() refresh.",
+          "measurement": {
+            "host_struct": "swm_screen",
+            "host_field_accesses": 4,
+            "envied_struct": "ws_win",
+            "envied_field_accesses": 89,
+            "envied_distinct_fields": 10,
+            "criterion": "89 >= 36 accesses, 10 >= 8 distinct fields, 89 >= 12*(4+1)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "mapping-walk-performs-window-transitions",
+      "description": "The region-level mapping refresh walk decides per window whether it must be mapped or unmapped and then performs the window's own X map/unmap transition and WM_STATE restamp inline, together with all relatedness and frame bookkeeping.",
+      "detected_relation": "swm_region-hosted refresh walk -> ws_win field cluster (frame, id, debug, mapped, mapping, unmapping, state, main identity, type/quirk gating)",
+      "why_this_is_the_smell": "Visibility bookkeeping for the region is legitimately the walker's job, but the transition itself - which X windows to map, the mapping counters, the paired WM_STATE restamp - belongs to the window record; re-implementing it in the walk leaves the mapping state machine duplicated outside its owner.",
+      "matches": [
+        {
+          "file": "spectrwm.c",
+          "symbol": "update_region_mapping",
+          "entry_ids": ["E2"],
+          "evidence": "update_region_mapping(struct swm_region *r, ...) walks &ws->winlist twice; each pass tests (!HIDDEN(w) && (w && wf && w->main == wf->main || WINDOCK(w))) and then maps or unmaps w->frame, w->id and w->debug inline, bumps w->mapping/w->unmapping, flips w->mapped and writes w->state paired with a_state property changes as XCB_ICCCM_WM_STATE_NORMAL or ICONIC.",
+          "measurement": {
+            "host_struct": "swm_region",
+            "host_field_accesses": 3,
+            "envied_struct": "ws_win",
+            "envied_field_accesses": 67,
+            "envied_distinct_fields": 14,
+            "criterion": "67 >= 36 accesses, 14 >= 8 distinct fields, 67 >= 12*(3+1)"
+          }
+        }
+      ]
+    },
+    {
+      "id": "iconify-hides-the-window-from-outside",
+      "description": "The screen-level hide transition performs the window's focus drop, applies the EWMH_F_HIDDEN flag flip with its iconified-list membership change, and rebuilds the window's _NET_WM_STATE property set by reading and writing the window record inline.",
+      "detected_relation": "swm_screen-hosted hide driver -> ws_win field cluster (focus/focus family guard inputs, ws focus mirrors, bordered and quirks, ewmh_flags, iconify_entry membership, geometry moves, id for property publication)",
+      "why_this_is_the_smell": "Dropping focus from a window, flipping its hidden flag, adjusting its floating geometry and republishing its EWMH state are the window's own transitions; doing them from the binding driver means the EWMH state machine and the iconified-list discipline live outside the struct that owns the flags and the list entries.",
+      "matches": [
+        {
+          "file": "spectrwm.c",
+          "symbol": "iconify",
+          "entry_ids": ["E3"],
+          "evidence": "iconify(struct swm_screen *s, ...) takes the target from win->s->focus-relative state and clears the window's own focus mirrors (setting win->s->focus and win->ws->focus / focus_raise to NULL under validation guards), guards the border path with win_notile(win) || win->ewmh_flags & EWMH_F_UNTILED || ws_floating(win->ws) || WINDOCK(win) || win_below(win), computes pending/changed from win->ewmh_flags, inserts/removes win on iconified via iconify_entry, and rebuilds the _NET_WM_STATE atom list from win's flag word before publishing on win->id.",
+          "measurement": {
+            "host_struct": "swm_screen",
+            "host_field_accesses": 5,
+            "envied_struct": "ws_win",
+            "envied_field_accesses": 88,
+            "envied_distinct_fields": 12,
+            "criterion": "88 >= 36 accesses, 12 >= 8 distinct fields, 88 >= 12*(5+1)"
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "location": "spectrwm.c:map_window / unmap_window / set_win_state / unfocus_win / ewmh_apply_flags / ewmh_update_wm_state / update_win_layer",
+      "reason": "These are hosted by struct ws_win (their first parameter is the window) and are the correct owner-side homes for the transition logic; their ws_win accesses are host accesses, not envy, and the rule does not flag them."
+    },
+    {
+      "location": "spectrwm.c:apply_struts",
+      "reason": "Envies struct swm_strut for struts negotiation but stays below the count conjunct (35 accesses) and close to the host in ratio; the geometry math is screen-side work, so it is intentionally outside this rule's remit."
+    },
+    {
+      "location": "spectrwm.c:bar_parse_markup",
+      "reason": "Envies struct text_fragment but across only 6 distinct fields and inside the bar text pipeline; below the field conjunct, and unrelated to the window lifecycle cluster this case's relation models."
+    },
+    {
+      "location": "spectrwm.c:new_region / swapwin / workspace_insert / cyclews / switchlayout / maximize_toggle",
+      "reason": "Workspace and layout orchestration where window writes are incidental; each measures 12-19 accesses over 4-5 distinct fields with host ratios far below the rule's ratio conjunct, so none satisfies the relation."
+    }
+  ]
+}

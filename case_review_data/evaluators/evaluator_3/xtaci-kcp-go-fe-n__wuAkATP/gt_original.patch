@@ -1,0 +1,562 @@
+diff --git a/autotune.go b/autotune.go
+index b160f1a..5491bb1 100644
+--- a/autotune.go
++++ b/autotune.go
+@@ -24,8 +24,6 @@ package kcp
+ 
+ import (
+ 	"sort"
+-
+-	"github.com/klauspost/reedsolomon"
+ )
+ 
+ const maxAutoTuneSamples = 258 // 256 + 2 extra samples for edge detection
+@@ -157,43 +155,3 @@ func (tune *autoTune) FindPeriod(bit bool) int {
+ 
+ 	return rightEdge - leftEdge
+ }
+-
+-// retune reconfigures a decoder with the shard parameters detected so far.
+-//
+-// The periods learned from the sampled signal give the data/parity shard
+-// counts; when both are detected and valid, the decoder's FEC parameters,
+-// caches and codec are rebuilt to match, and the tuning request is cleared.
+-// A decoder whose current parameters already match the detection is only
+-// unblocked.
+-func (tune *autoTune) retune(dec *fecDecoder) {
+-	autoDS := tune.FindPeriod(true)  // detect data shard period
+-	autoPS := tune.FindPeriod(false) // detect parity shard period
+-
+-	// validate the auto-tuned parameters
+-	if autoDS > 0 && autoPS > 0 && autoDS+autoPS < 256 {
+-		if autoDS != dec.dataShards || autoPS != dec.parityShards {
+-			// apply the new FEC parameters
+-			dec.dataShards = autoDS
+-			dec.parityShards = autoPS
+-			dec.shardSize = autoDS + autoPS
+-			// recycle old shards before creating new shardSet
+-			for _, shard := range dec.shardSet {
+-				for _, pkt := range shard.elements {
+-					defaultBufferPool.Put(pkt)
+-				}
+-			}
+-			dec.shardSet = make(map[uint32]*shardHeap) // empty the shard set
+-			codec, err := reedsolomon.New(autoDS, autoPS)
+-			if err != nil {
+-				return
+-			}
+-			dec.codec = codec
+-			dec.decodeCache = make([][]byte, dec.shardSize)
+-			dec.flagCache = make([]bool, dec.shardSize)
+-			dec.paws = 0xffffffff / uint32(dec.shardSize) * uint32(dec.shardSize)
+-		}
+-		// reset shouldTune flag regardless of whether parameters changed
+-		// to avoid permanent blocking when detected parameters match current ones
+-		dec.shouldTune = false
+-	}
+-}
+diff --git a/fec.go b/fec.go
+index 8ad5f8c..80a4962 100644
+--- a/fec.go
++++ b/fec.go
+@@ -184,10 +184,38 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
+ 
+ 	// perform auto-tuning if the decoder detects packet type mismatches.
+ 	// This means the peer has changed FEC parameters and we must adapt.
+-	// The adaptation procedure belongs to the tuner: from the parameters it
+-	// has learned it reconfigures this decoder in one step.
+ 	if dec.shouldTune {
+-		dec.autoTune.retune(dec)
++		autoDS := dec.autoTune.FindPeriod(true)  // detect data shard period
++		autoPS := dec.autoTune.FindPeriod(false) // detect parity shard period
++
++		// validate the auto-tuned parameters
++		if autoDS > 0 && autoPS > 0 && autoDS+autoPS < 256 {
++			if autoDS != dec.dataShards || autoPS != dec.parityShards {
++				// apply the new FEC parameters
++				dec.dataShards = autoDS
++				dec.parityShards = autoPS
++				dec.shardSize = autoDS + autoPS
++				// recycle old shards before creating new shardSet
++				for _, shard := range dec.shardSet {
++					for _, pkt := range shard.elements {
++						defaultBufferPool.Put(pkt)
++					}
++				}
++				dec.shardSet = make(map[uint32]*shardHeap) // empty the shard set
++				codec, err := reedsolomon.New(autoDS, autoPS)
++				if err != nil {
++					return nil
++				}
++				dec.codec = codec
++				dec.decodeCache = make([][]byte, dec.shardSize)
++				dec.flagCache = make([]bool, dec.shardSize)
++				dec.paws = 0xffffffff / uint32(dec.shardSize) * uint32(dec.shardSize)
++				//log.Println("autotune to :", dec.dataShards, dec.parityShards)
++			}
++			// reset shouldTune flag regardless of whether parameters changed
++			// to avoid permanent blocking when detected parameters match current ones
++			dec.shouldTune = false
++		}
+ 		return nil
+ 	}
+ 
+diff --git a/kcp.go b/kcp.go
+index 7a16a6d..b2d506a 100644
+--- a/kcp.go
++++ b/kcp.go
+@@ -318,6 +318,131 @@ func (kcp *KCP) PeekSize() (length int) {
+ 	return
+ }
+ 
++// Receive data from kcp state machine
++//
++// Return number of bytes read.
++//
++// Return -1 when there is no readable data.
++//
++// Return -2 if len(buffer) is smaller than kcp.PeekSize().
++func (kcp *KCP) Recv(buffer []byte) (n int) {
++	peeksize := kcp.PeekSize()
++	if peeksize < 0 {
++		return -1
++	}
++
++	if peeksize > len(buffer) {
++		return -2
++	}
++
++	var fast_recover bool
++	if kcp.rcv_queue.Len() >= int(kcp.rcv_wnd) {
++		fast_recover = true
++	}
++
++	// merge fragment
++	for {
++		seg, ok := kcp.rcv_queue.Pop()
++		if !ok {
++			break
++		}
++
++		copy(buffer, seg.data)
++		buffer = buffer[len(seg.data):]
++		n += len(seg.data)
++		kcp.recycleSegment(&seg)
++		if seg.frg == 0 {
++			kcp.debugLog(IKCP_LOG_RECV, "stream", kcp.stream, "conv", kcp.conv, "sn", seg.sn, "ts", seg.ts, "datalen", n)
++			break
++		}
++	}
++
++	// move available data from rcv_buf -> rcv_queue
++	for kcp.rcv_buf.Len() > 0 {
++		seg := heap.Pop(kcp.rcv_buf).(segment)
++		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
++			kcp.rcv_queue.Push(seg)
++			kcp.rcv_nxt++
++		} else {
++			// push back segment
++			heap.Push(kcp.rcv_buf, seg)
++			break
++		}
++	}
++
++	// fast recover
++	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && fast_recover {
++		// ready to send back IKCP_CMD_WINS in ikcp_flush
++		// tell remote my window size
++		kcp.probe |= IKCP_ASK_TELL
++	}
++	return
++}
++
++// Send is user/upper level send, returns below zero for error
++func (kcp *KCP) Send(buffer []byte) int {
++	var count int
++	if len(buffer) == 0 {
++		return -1
++	}
++
++	kcp.debugLog(IKCP_LOG_SEND, "stream", kcp.stream, "conv", kcp.conv, "datalen", len(buffer))
++
++	// append to previous segment in streaming mode (if possible)
++	if kcp.stream != 0 {
++		if n := kcp.snd_queue.Len(); n > 0 {
++			for seg := range kcp.snd_queue.ForEachReverse {
++				if len(seg.data) < int(kcp.mss) {
++					capacity := int(kcp.mss) - len(seg.data)
++					extend := min(len(buffer), capacity)
++
++					// grow slice, the underlying cap is guaranteed to
++					// be larger than kcp.mss
++					oldlen := len(seg.data)
++					seg.data = seg.data[:oldlen+extend]
++					copy(seg.data[oldlen:], buffer)
++					buffer = buffer[extend:]
++				}
++				break
++			}
++		}
++
++		if len(buffer) == 0 {
++			return 0
++		}
++	}
++
++	if len(buffer) <= int(kcp.mss) {
++		count = 1
++	} else {
++		count = (len(buffer) + int(kcp.mss) - 1) / int(kcp.mss)
++	}
++
++	if count > 255 {
++		return -2
++	}
++
++	if count == 0 {
++		count = 1
++	}
++
++	for i := 0; i < count; i++ {
++		var size int
++		size = min(len(buffer), int(kcp.mss))
++		seg := kcp.newSegment(size)
++		copy(seg.data, buffer[:size])
++		if kcp.stream == 0 { // message mode
++			seg.frg = uint8(count - i - 1)
++		} else { // stream mode
++			seg.frg = 0
++		}
++
++		kcp.snd_queue.Push(seg)
++		buffer = buffer[size:]
++	}
++	return 0
++}
++
+ // update_ack updates the smoothed RTT and RTO based on a new RTT sample.
+ // Algorithm follows RFC 6298: Computing TCP's Retransmission Timer.
+ func (kcp *KCP) update_ack(rtt int32) {
+diff --git a/sess.go b/sess.go
+index 3b4ec24..4b7d611 100644
+--- a/sess.go
++++ b/sess.go
+@@ -46,7 +46,6 @@
+ package kcp
+ 
+ import (
+-	"container/heap"
+ 	"context"
+ 	"crypto/rand"
+ 	"encoding/binary"
+@@ -272,67 +271,6 @@ func newUDPSession(conv uint32, dataShards, parityShards int, l *Listener, conn
+ 	return sess
+ }
+ 
+-// kcpRecv drains the reassembly queue of the embedded KCP state machine
+-// into 'buffer'. This is the session-level read datapath: readable fragments
+-// are merged in sequence, buffered segments are promoted to the receive
+-// queue, and the tell-probe is armed when the window opens up again.
+-//
+-// It returns the number of bytes read, -1 when there is no readable data,
+-// and -2 if len(buffer) is smaller than the readable message size.
+-func (s *UDPSession) kcpRecv(buffer []byte) (n int) {
+-	peeksize := s.kcp.PeekSize()
+-	if peeksize < 0 {
+-		return -1
+-	}
+-
+-	if peeksize > len(buffer) {
+-		return -2
+-	}
+-
+-	var fast_recover bool
+-	if s.kcp.rcv_queue.Len() >= int(s.kcp.rcv_wnd) {
+-		fast_recover = true
+-	}
+-
+-	// merge fragment
+-	for {
+-		seg, ok := s.kcp.rcv_queue.Pop()
+-		if !ok {
+-			break
+-		}
+-
+-		copy(buffer, seg.data)
+-		buffer = buffer[len(seg.data):]
+-		n += len(seg.data)
+-		s.kcp.recycleSegment(&seg)
+-		if seg.frg == 0 {
+-			s.kcp.debugLog(IKCP_LOG_RECV, "stream", s.kcp.stream, "conv", s.kcp.conv, "sn", seg.sn, "ts", seg.ts, "datalen", n)
+-			break
+-		}
+-	}
+-
+-	// move available data from rcv_buf -> rcv_queue
+-	for s.kcp.rcv_buf.Len() > 0 {
+-		seg := heap.Pop(s.kcp.rcv_buf).(segment)
+-		if seg.sn == s.kcp.rcv_nxt && s.kcp.rcv_queue.Len() < int(s.kcp.rcv_wnd) {
+-			s.kcp.rcv_queue.Push(seg)
+-			s.kcp.rcv_nxt++
+-		} else {
+-			// push back segment
+-			heap.Push(s.kcp.rcv_buf, seg)
+-			break
+-		}
+-	}
+-
+-	// fast recover
+-	if s.kcp.rcv_queue.Len() < int(s.kcp.rcv_wnd) && fast_recover {
+-		// ready to send back IKCP_CMD_WINS in ikcp_flush
+-		// tell remote my window size
+-		s.kcp.probe |= IKCP_ASK_TELL
+-	}
+-	return
+-}
+-
+ // Read implements net.Conn
+ func (s *UDPSession) Read(b []byte) (n int, err error) {
+ 	var timeout *time.Timer
+@@ -372,7 +310,7 @@ RESET_TIMER:
+ 			// if 'b' is large enough to accommodate the data, read directly
+ 			// from kcp.recv() to 'b', like 'DMA'.
+ 			if len(b) >= size {
+-				s.kcpRecv(b)
++				s.kcp.Recv(b)
+ 				s.mu.Unlock()
+ 				atomic.AddUint64(&DefaultSnmp.BytesReceived, uint64(size))
+ 				return size, nil
+@@ -387,7 +325,7 @@ RESET_TIMER:
+ 
+ 			// resize the length of recvbuf to match the data size
+ 			s.recvbuf = s.recvbuf[:size]
+-			s.kcpRecv(s.recvbuf)     // read data to recvbuf first
++			s.kcp.Recv(s.recvbuf)    // read data to recvbuf first
+ 			n = copy(b, s.recvbuf)   // then copy bytes to 'b' as many as possible
+ 			s.bufptr = s.recvbuf[n:] // pointer update
+ 
+@@ -424,76 +362,6 @@ RESET_TIMER:
+ // Write implements net.Conn
+ func (s *UDPSession) Write(b []byte) (n int, err error) { return s.WriteBuffers([][]byte{b}) }
+ 
+-// kcpSend appends an application buffer to the send queue of the embedded KCP
+-// state machine. This is the session-level write datapath: in streaming mode
+-// the tail segment of the queue is grown in place, otherwise 'buffer' is
+-// sliced into segments sized by the KCP maximum segment size.
+-//
+-// It returns 0 on success, -1 for an empty buffer, and -2 when the buffer
+-// would require more than 255 segments.
+-func (s *UDPSession) kcpSend(buffer []byte) int {
+-	var count int
+-	if len(buffer) == 0 {
+-		return -1
+-	}
+-
+-	s.kcp.debugLog(IKCP_LOG_SEND, "stream", s.kcp.stream, "conv", s.kcp.conv, "datalen", len(buffer))
+-
+-	// append to previous segment in streaming mode (if possible)
+-	if s.kcp.stream != 0 {
+-		if n := s.kcp.snd_queue.Len(); n > 0 {
+-			for seg := range s.kcp.snd_queue.ForEachReverse {
+-				if len(seg.data) < int(s.kcp.mss) {
+-					capacity := int(s.kcp.mss) - len(seg.data)
+-					extend := min(len(buffer), capacity)
+-
+-					// grow slice, the underlying cap is guaranteed to
+-					// be larger than kcp.mss
+-					oldlen := len(seg.data)
+-					seg.data = seg.data[:oldlen+extend]
+-					copy(seg.data[oldlen:], buffer)
+-					buffer = buffer[extend:]
+-				}
+-				break
+-			}
+-		}
+-
+-		if len(buffer) == 0 {
+-			return 0
+-		}
+-	}
+-
+-	if len(buffer) <= int(s.kcp.mss) {
+-		count = 1
+-	} else {
+-		count = (len(buffer) + int(s.kcp.mss) - 1) / int(s.kcp.mss)
+-	}
+-
+-	if count > 255 {
+-		return -2
+-	}
+-
+-	if count == 0 {
+-		count = 1
+-	}
+-
+-	for i := 0; i < count; i++ {
+-		var size int
+-		size = min(len(buffer), int(s.kcp.mss))
+-		seg := s.kcp.newSegment(size)
+-		copy(seg.data, buffer[:size])
+-		if s.kcp.stream == 0 { // message mode
+-			seg.frg = uint8(count - i - 1)
+-		} else { // stream mode
+-			seg.frg = 0
+-		}
+-
+-		s.kcp.snd_queue.Push(seg)
+-		buffer = buffer[size:]
+-	}
+-	return 0
+-}
+-
+ // WriteBuffers write a vector of byte slices to the underlying connection
+ func (s *UDPSession) WriteBuffers(v [][]byte) (n int, err error) {
+ 	var timeout *time.Timer
+@@ -536,10 +404,10 @@ RESET_TIMER:
+ 				// handle each slice for packet splitting
+ 				for {
+ 					if len(b) <= int(s.kcp.mss) {
+-						s.kcpSend(b)
++						s.kcp.Send(b)
+ 						break
+ 					} else {
+-						s.kcpSend(b[:s.kcp.mss])
++						s.kcp.Send(b[:s.kcp.mss])
+ 						b = b[s.kcp.mss:]
+ 					}
+ 				}
+@@ -707,35 +575,11 @@ func (s *UDPSession) SetDUP(dup int) {
+ 	s.mu.Unlock()
+ }
+ 
+-// SetNoDelay tunes the pacing parameters of the embedded KCP state machine:
+-// nodelay toggles the aggressive retransmission profile, interval clamps the
+-// internal update timer in millisec, resend enables fast resend, and nc
+-// disables congestion control.
++// SetNoDelay calls nodelay() of kcp
+ // https://github.com/skywind3000/kcp/blob/master/README.en.md#protocol-configuration
+ func (s *UDPSession) SetNoDelay(nodelay, interval, resend, nc int) {
+ 	s.mu.Lock()
+-	if nodelay >= 0 {
+-		s.kcp.nodelay = uint32(nodelay)
+-		if nodelay != 0 {
+-			s.kcp.rx_minrto = IKCP_RTO_NDL
+-		} else {
+-			s.kcp.rx_minrto = IKCP_RTO_MIN
+-		}
+-	}
+-	if interval >= 0 {
+-		if interval > 5000 {
+-			interval = 5000
+-		} else if interval < 10 {
+-			interval = 10
+-		}
+-		s.kcp.interval = uint32(interval)
+-	}
+-	if resend >= 0 {
+-		s.kcp.fastresend = int32(resend)
+-	}
+-	if nc >= 0 {
+-		s.kcp.nocwnd = int32(nc)
+-	}
++	s.kcp.NoDelay(nodelay, interval, resend, nc)
+ 	s.mu.Unlock()
+ }
+ 
+@@ -827,87 +671,6 @@ func (s *UDPSession) Control(f func(conn net.PacketConn) error) error {
+ 	return f(s.conn)
+ }
+ 
+-// parityFor seals a data shard into the FEC encoder attached to this session
+-// and, once a quorum of data shards has been collected, produces the matching
+-// Reed-Solomon parity shards for the pipeline stage below.
+-//
+-// notice: the contents of 'ps' will be re-written in successive calling
+-func (s *UDPSession) parityFor(b []byte, rto uint32) (ps [][]byte) {
+-	// The header format:
+-	// | FEC SEQID(4B) | FEC TYPE(2B) | SIZE (2B) | PAYLOAD(SIZE-2) |
+-	// |<-headerOffset                |<-payloadOffset
+-	s.fecEncoder.sealData(b[s.fecEncoder.headerOffset:])
+-	binary.LittleEndian.PutUint16(b[s.fecEncoder.payloadOffset:], uint16(len(b[s.fecEncoder.payloadOffset:])))
+-
+-	// copy data from payloadOffset to fec shard cache
+-	sz := len(b)
+-	s.fecEncoder.shardCache[s.fecEncoder.shardCount] = s.fecEncoder.shardCache[s.fecEncoder.shardCount][:sz]
+-	copy(s.fecEncoder.shardCache[s.fecEncoder.shardCount][s.fecEncoder.payloadOffset:], b[s.fecEncoder.payloadOffset:])
+-	s.fecEncoder.shardCount++
+-
+-	// track max datashard length
+-	if sz > s.fecEncoder.maxSize {
+-		s.fecEncoder.maxSize = sz
+-	}
+-
+-	// Generation of Reed-Solomon Erasure Code when we have enough datashards
+-	now := time.Now().UnixMilli()
+-	if s.fecEncoder.shardCount == s.fecEncoder.dataShards {
+-		// Generate the parity shards if we collect enough datashards,
+-		// the continuity is determined by the time interval between
+-		// the latest 2 data packets.
+-		//
+-		// If the interval is larger than rto, we consider the data is non-continuous,
+-		// thus we skip this parity generation to avoid useless parity packets.
+-		//
+-		// Note that, even we skip this parity generation, we still need to
+-		// increase the seqid to keep the monotonic increasing property.
+-		// This is important for the receiver to detect lost packets.
+-		// see fecEncoder.skipParity()
+-		//
+-		if now-s.fecEncoder.tsLatestPacket < int64(rto) {
+-			// clear the tail of each datashard to make them equal-sized
+-			for i := 0; i < s.fecEncoder.dataShards; i++ {
+-				shard := s.fecEncoder.shardCache[i]
+-				slen := len(shard)
+-				clear(shard[slen:s.fecEncoder.maxSize])
+-			}
+-
+-			// construct equal-sized slice with stripped header
+-			cache := s.fecEncoder.encodeCache
+-			for k := range cache {
+-				cache[k] = s.fecEncoder.shardCache[k][s.fecEncoder.payloadOffset:s.fecEncoder.maxSize]
+-			}
+-
+-			// Reed-Solomon Erasure Code Encoding
+-			if err := s.fecEncoder.codec.Encode(cache); err == nil {
+-				ps = s.fecEncoder.shardCache[s.fecEncoder.dataShards:]
+-				for k := range ps {
+-					s.fecEncoder.sealParity(ps[k][s.fecEncoder.headerOffset:]) // NOTE(x): seal parity will increase the seqid by 1
+-					ps[k] = ps[k][:s.fecEncoder.maxSize]
+-				}
+-			} else {
+-				// encoding failed, record the error but keep the seqid monotonic increasing
+-				atomic.AddUint64(&DefaultSnmp.FECErrs, 1)
+-				s.fecEncoder.skipParity()
+-			}
+-		} else {
+-			// Non-continuous data detected, skip this parity generation.
+-			// Through we do not send non-continuous parity shard, we still need to increase seqid.
+-			s.fecEncoder.skipParity()
+-		}
+-
+-		// reset shard count and max size
+-		s.fecEncoder.shardCount = 0
+-		s.fecEncoder.maxSize = 0
+-	}
+-
+-	// record the time of the latest data packet
+-	s.fecEncoder.tsLatestPacket = now
+-
+-	return
+-}
+-
+ // postProcess is the goroutine that handles the outgoing packet pipeline.
+ // It runs the following stages sequentially for each packet:
+ //  1. FEC encoding   — generate parity shards (Reed-Solomon)
+@@ -932,7 +695,7 @@ func (s *UDPSession) postProcess() {
+ 			// --- Stage 1: FEC encoding ---
+ 			if s.fecEncoder != nil {
+ 				if !oob {
+-					ecc = s.parityFor(buf, maxFECEncodeLatency)
++					ecc = s.fecEncoder.encode(buf, maxFECEncodeLatency)
+ 				} else {
+ 					s.fecEncoder.encodeOOB(buf)
+ 				}

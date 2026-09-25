@@ -1,0 +1,903 @@
+diff --git a/src/wily/commands/diff.py b/src/wily/commands/diff.py
+index 731ca29..d3faebc 100644
+--- a/src/wily/commands/diff.py
++++ b/src/wily/commands/diff.py
+@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any
+ 
++from rich import box
++from rich.console import Console
++from rich.table import Table
+ from rich.text import Text
+ 
+ from wily import logger
+@@ -20,7 +23,7 @@ from wily.cache import get_default_metrics_path
+ from wily.config import DEFAULT_PATH
+ from wily.config.types import WilyConfig
+ from wily.defaults import DEFAULT_ARCHIVER, DEFAULT_TABLE_STYLE
+-from wily.helper import print_table
++from wily.helper import BOX_STYLES, print_table
+ from wily.operators import (
+     ALL_METRICS,
+     ALL_OPERATORS,
+@@ -62,331 +65,6 @@ class FileDiff:
+         return any(m.changed for m in self.metrics)
+ 
+ 
+-def _resolve_files_and_targets(
+-    config: WilyConfig,
+-    files: list[str],
+-) -> tuple[list[str], list[str]]:
+-    """
+-    Resolve target paths and expand directories to file paths.
+-
+-    Returns:
+-        Tuple of (normalized file paths, absolute target paths for analysis)
+-
+-    """
+-    # Resolve target paths when the cli has specified --path
+-    if config.path != DEFAULT_PATH:
+-        targets = [str(Path(config.path) / Path(file)) for file in files]
+-    else:
+-        targets = files
+-
+-    # Expand directories to paths (normalize to Unix-style paths)
+-    normalized_files = [os.path.relpath(fn, config.path).replace("\\", "/") for fn in iter_filenames(targets)]
+-    logger.debug("Targeting - %s", normalized_files)
+-
+-    return normalized_files, targets
+-
+-
+-def _resolve_metrics_and_operators(
+-    metrics: list[str] | None,
+-) -> tuple[list[Operator], list[tuple[str, Metric]]]:
+-    """
+-    Resolve which operators and metrics to use based on input.
+-
+-    Returns:
+-        Tuple of (operators list, resolved metrics as (operator_name, Metric) tuples)
+-
+-    """
+-    if metrics:
+-        operators = [resolve_operator(metric.split(".")[0]) for metric in metrics]
+-        resolved_metrics = [(metric.split(".")[0], resolve_metric(metric)) for metric in metrics]
+-    else:
+-        operators = list(ALL_OPERATORS.values())
+-        resolved_metrics = [(operator.name, metric) for operator, metric in ALL_METRICS if operator in operators]
+-
+-    return operators, resolved_metrics
+-
+-
+-def _load_indexed_metrics(
+-    index: WilyIndex,
+-    files: list[str],
+-    revision: str | None,
+-) -> dict[str, dict[str, Any]]:
+-    """
+-    Load cached metrics from the index for the given files.
+-
+-    Args:
+-        index: The WilyIndex to query
+-        files: List of file paths to load
+-        revision: Specific revision to load, or None for latest
+-
+-    Returns:
+-        Dict mapping file path to dict of metric values
+-
+-    """
+-    last_data: dict[str, dict[str, Any]] = defaultdict(dict)
+-
+-    for file in files:
+-        path_rows = index[file]
+-        if not path_rows:
+-            continue
+-
+-        if revision:
+-            data = next((row for row in path_rows if row.get("revision") == revision), None)
+-            if data is None:
+-                logger.error(f"Revision {revision} not found for {file}")
+-                raise SystemExit(1)
+-        else:
+-            data = path_rows[-1]
+-
+-        # Copy all metric values (exclude metadata fields)
+-        for key, value in data.items():
+-            if key not in (
+-                "revision",
+-                "revision_date",
+-                "revision_author",
+-                "revision_message",
+-                "path",
+-                "path_type",
+-            ):
+-                last_data[file][key] = value
+-
+-    return last_data
+-
+-
+-def _load_detailed_metrics(
+-    index: WilyIndex,
+-    current_data: dict[str, dict[str, Any]],
+-    files: list[str],
+-    revision: str | None,
+-) -> dict[str, dict[str, Any]]:
+-    """
+-    Load function/class level metrics from the index.
+-
+-    Args:
+-        index: The WilyIndex to query
+-        current_data: Current analysis data containing detailed info
+-        files: List of file paths
+-        revision: Specific revision to load, or None for latest
+-
+-    Returns:
+-        Dict mapping object paths (file:name) to dict of metric values
+-
+-    """
+-    detailed_data: dict[str, dict[str, Any]] = defaultdict(dict)
+-
+-    for file in files:
+-        file_data = current_data.get(file, {})
+-        detailed = file_data.get("detailed", {})
+-
+-        for obj_name in detailed.keys():
+-            obj_path = f"{file}:{obj_name}"
+-            obj_rows = index[obj_path]
+-
+-            if not obj_rows:
+-                continue
+-
+-            if revision:
+-                obj_data = next((row for row in obj_rows if row.get("revision") == revision), None)
+-                if obj_data is None:
+-                    logger.error(f"Revision {revision} not found for {obj_path}")
+-                    raise SystemExit(1)
+-            else:
+-                obj_data = obj_rows[-1]
+-
+-            for key, value in obj_data.items():
+-                if key not in (
+-                    "revision",
+-                    "revision_date",
+-                    "revision_author",
+-                    "revision_message",
+-                    "path",
+-                    "path_type",
+-                ):
+-                    detailed_data[obj_path][key] = value
+-
+-    return detailed_data
+-
+-
+-def _get_current_metric_value(
+-    current_data: dict[str, dict[str, Any]],
+-    file_path: str,
+-    metric_name: str,
+-) -> Any:
+-    """
+-    Get metric value from current analysis data.
+-
+-    Handles both file-level and function/class-level paths.
+-    """
+-    if ":" in file_path:
+-        # Function or class path like "src/foo.py:func_name"
+-        base_file, obj_name = file_path.rsplit(":", 1)
+-        file_data = current_data.get(base_file, {})
+-        detailed = file_data.get("detailed", {})
+-        obj_data = detailed.get(obj_name, {})
+-        return obj_data.get(metric_name)
+-    else:
+-        # File path
+-        file_data = current_data.get(file_path, {})
+-        return file_data.get(metric_name)
+-
+-
+-def _collect_detailed_paths(
+-    current_data: dict[str, dict[str, Any]],
+-    files: list[str],
+-    resolved_metrics: list[tuple[str, Metric]],
+-) -> set[str]:
+-    """
+-    Collect function/class paths from current analysis data.
+-
+-    Only includes paths if the metrics include object-level operators.
+-    """
+-    extra_paths: set[str] = set()
+-
+-    # Check if any operator has Object level (functions/classes)
+-    has_object_level = any(resolve_operator(operator).level == OperatorLevel.Object for operator, _ in resolved_metrics)
+-
+-    if not has_object_level:
+-        return extra_paths
+-
+-    for file in files:
+-        file_data = current_data.get(file, {})
+-        detailed = file_data.get("detailed", {})
+-        if detailed:
+-            for obj_name in detailed.keys():
+-                extra_paths.add(f"{file}:{obj_name}")
+-
+-    return extra_paths
+-
+-
+-def _compute_file_diff(
+-    file_path: str,
+-    indexed_data: dict[str, dict[str, Any]],
+-    current_data: dict[str, dict[str, Any]],
+-    resolved_metrics: list[tuple[str, Metric]],
+-) -> FileDiff:
+-    """
+-    Compute metric diffs for a single file or function.
+-
+-    Returns:
+-        FileDiff containing all metric comparisons
+-
+-    """
+-    file_diff = FileDiff(path=file_path)
+-
+-    for _, metric in resolved_metrics:
+-        # Get cached value
+-        before = indexed_data.get(file_path, {}).get(metric.name)
+-
+-        # Get current value
+-        after = _get_current_metric_value(current_data, file_path, metric.name)
+-
+-        file_diff.metrics.append(MetricDiff(name=metric.name, before=before, after=after, metric=metric))
+-
+-    return file_diff
+-
+-
+-def _format_json_output(
+-    diffs: list[FileDiff],
+-    changes_only: bool,
+-) -> list[dict[str, Any]]:
+-    """
+-    Format diffs as JSON-serializable output.
+-
+-    Args:
+-        diffs: List of FileDiff objects
+-        changes_only: If True, only include metrics that changed
+-
+-    Returns:
+-        List of dicts ready for JSON serialization
+-
+-    """
+-    results = []
+-
+-    for file_diff in diffs:
+-        if changes_only and not file_diff.has_changes:
+-            continue
+-
+-        file_entry: dict[str, Any] = {"file": file_diff.path, "metrics": {}}
+-
+-        for metric_diff in file_diff.metrics:
+-            # Skip unchanged metrics if changes_only
+-            if changes_only and not metric_diff.changed:
+-                continue
+-
+-            file_entry["metrics"][metric_diff.name] = {
+-                "before": metric_diff.before,
+-                "after": metric_diff.after,
+-            }
+-
+-        # Only add if there are metrics to show
+-        if file_entry["metrics"]:
+-            results.append(file_entry)
+-
+-    return results
+-
+-
+-def _format_table_cell(metric_diff: MetricDiff) -> str | Text:
+-    """Format a single metric diff as a table cell."""
+-    before = metric_diff.before
+-    after = metric_diff.after
+-    metric = metric_diff.metric
+-
+-    # Handle missing values
+-    before_display = "-" if before is None else before
+-    after_display = "-" if after is None else after
+-
+-    # Format numeric values with styling
+-    if metric.metric_type in (int, float) and before is not None and after is not None:
+-        cell = Text(f"{before_display:n} -> ")
+-        if before > after:
+-            cell.append(f"{after_display:n}", style=BAD_STYLES[metric.measure])
+-        elif before < after:
+-            cell.append(f"{after_display:n}", style=GOOD_STYLES[metric.measure])
+-        else:
+-            cell.append(f"{after_display:n}")
+-        return cell
+-
+-    # Handle non-numeric or missing values
+-    if before_display == "-" and after_display == "-":
+-        return "-"
+-    return f"{before_display} -> {after_display}"
+-
+-
+-def _format_table_output(
+-    diffs: list[FileDiff],
+-    resolved_metrics: list[tuple[str, Metric]],
+-    changes_only: bool,
+-    wrap: bool,
+-    table_style: str,
+-) -> None:
+-    """
+-    Format and print diffs as a table.
+-
+-    Args:
+-        diffs: List of FileDiff objects
+-        resolved_metrics: List of (operator_name, Metric) tuples for headers
+-        changes_only: If True, only include files with changes
+-        wrap: Whether to wrap table output
+-        table_style: Table box style
+-
+-    """
+-    results = []
+-
+-    for file_diff in diffs:
+-        if changes_only and not file_diff.has_changes:
+-            logger.debug("Skipping %s - no changes", file_diff.path)
+-            continue
+-
+-        row = [file_diff.path]
+-        for metric_diff in file_diff.metrics:
+-            row.append(_format_table_cell(metric_diff))
+-        results.append(tuple(row))
+-
+-    if results:
+-        headers = ("File", *(metric.description for _, metric in resolved_metrics))
+-        print_table(headers=headers, data=results, wrap=wrap, table_style=table_style)
+-
+-
+ def diff(
+     config: WilyConfig,
+     files: list[str],
+@@ -414,45 +92,217 @@ def diff(
+     config.targets = files
+     archiver = config.archiver or DEFAULT_ARCHIVER
+ 
+-    # Resolve paths and expand directories
+-    files, targets = _resolve_files_and_targets(config, files)
++    # =====================================================================
++    # Stage 1 - work out what to scan.
++    # NOTE: this branch looks like the natural split point for a
++    # "resolve targets" step, but `targets` is reused by Stage 5 below, so
++    # it cannot be lifted out on its own.
++    # =====================================================================
++    if config.path != DEFAULT_PATH:
++        targets = [str(Path(config.path) / Path(file)) for file in files]
++    else:
++        targets = files
++
++    scan_files = [os.path.relpath(fn, config.path).replace("\\", "/") for fn in iter_filenames(targets)]
++    logger.debug("Targeting - %s", scan_files)
+ 
+-    # Get path to parquet index
+-    parquet_path = get_default_metrics_path(config, archiver)
++    # =====================================================================
++    # Stage 2 - locate the parquet index for this archiver.
++    # Kept local: the cache layout is part of the diff flow now.
++    # =====================================================================
++    parquet_path = str(Path(config.cache_path) / archiver / "metrics.parquet")
+     if not Path(parquet_path).exists():
+         logger.error("Wily cache not found. Run 'wily build' first.")
+         sys.exit(1)
+ 
+-    # Determine which operators and metrics to use
+-    operators, resolved_metrics = _resolve_metrics_and_operators(metrics)
++    # =====================================================================
++    # Stage 3 - decide the operator/metric set for this run.
++    # =====================================================================
++    if metrics:
++        operators = [resolve_operator(metric.split(".")[0]) for metric in metrics]
++        delta_metrics = [(metric.split(".")[0], resolve_metric(metric)) for metric in metrics]
++    else:
++        operators = list(ALL_OPERATORS.values())
++        delta_metrics = [(operator.name, metric) for operator, metric in ALL_METRICS if operator in operators]
++
+     operator_names = [op.name for op in operators]
+ 
+-    # Load indexed data and run current analysis
++    # =====================================================================
++    # Stage 4/5 - read the indexed values, run the live analysis and pull
++    # the object-level history. All one stage now: the three used to be
++    # separate lookups but they share the open index.
++    # =====================================================================
+     with WilyIndex(parquet_path, operator_names) as index:
+-        # Load file-level metrics from index
+-        indexed_data = _load_indexed_metrics(index, files, revision)
++        # 4a. file-level history from the index
++        history: dict[str, dict[str, Any]] = defaultdict(dict)
++        for file in scan_files:
++            path_rows = index[file]
++            if not path_rows:
++                continue
++
++            if revision:
++                data = next((row for row in path_rows if row.get("revision") == revision), None)
++                if data is None:
++                    logger.error(f"Revision {revision} not found for {file}")
++                    raise SystemExit(1)
++            else:
++                data = path_rows[-1]
++
++            for key, value in data.items():
++                if key not in (
++                    "revision",
++                    "revision_date",
++                    "revision_author",
++                    "revision_message",
++                    "path",
++                    "path_type",
++                ):
++                    history[file][key] = value
+ 
+-        # Analyze current files
++        # 4b. live analysis of the working tree
+         current_data = index.analyze_files(targets, str(config.path), detail)
+ 
+-        # Load function/class metrics if detail mode
++        # 4c. object-level (function/class) history matched against the
++        # detailed section of the live analysis
+         if detail:
+-            detailed_indexed = _load_detailed_metrics(index, current_data, files, revision)
+-            indexed_data.update(detailed_indexed)
++            granular_history: dict[str, dict[str, Any]] = defaultdict(dict)
++            for file in scan_files:
++                file_data = current_data.get(file, {})
++                detailed = file_data.get("detailed", {})
++
++                for obj_name in detailed.keys():
++                    obj_path = f"{file}:{obj_name}"
++                    obj_rows = index[obj_path]
++
++                    if not obj_rows:
++                        continue
++
++                    if revision:
++                        obj_data = next((row for row in obj_rows if row.get("revision") == revision), None)
++                        if obj_data is None:
++                            logger.error(f"Revision {revision} not found for {obj_path}")
++                            raise SystemExit(1)
++                    else:
++                        obj_data = obj_rows[-1]
++
++                    for key, value in obj_data.items():
++                        if key not in (
++                            "revision",
++                            "revision_date",
++                            "revision_author",
++                            "revision_message",
++                            "path",
++                            "path_type",
++                        ):
++                            granular_history[obj_path][key] = value
++
++            history.update(granular_history)
++
++    # =====================================================================
++    # Stage 6 - add object paths for operators that support them.
++    # (Keeping this below the index block: it only reads live results.)
++    # =====================================================================
++    extra_paths: set[str] = set()
++    if any(resolve_operator(operator_name).level == OperatorLevel.Object for operator_name, _ in delta_metrics):
++        for file in scan_files:
++            file_data = current_data.get(file, {})
++            detailed = file_data.get("detailed", {})
++            if detailed:
++                for obj_name in detailed.keys():
++                    extra_paths.add(f"{file}:{obj_name}")
++
++    scan_files.extend(sorted(extra_paths))
++    logger.debug(scan_files)
++
++    # =====================================================================
++    # Stage 7 - compute every delta in one pass.
++    # =====================================================================
++    file_diffs: list[FileDiff] = []
++    for scan_path in scan_files:
++        file_diff = FileDiff(path=scan_path)
++        for _, metric in delta_metrics:
++            before = history.get(scan_path, {}).get(metric.name)
++
++            # current value: file-level or inside the detailed section
++            if ":" in scan_path:
++                base_file, obj_name = scan_path.rsplit(":", 1)
++                file_data = current_data.get(base_file, {})
++                live_detailed = file_data.get("detailed", {})
++                obj_data = live_detailed.get(obj_name, {})
++                after = obj_data.get(metric.name)
++            else:
++                file_data = current_data.get(scan_path, {})
++                after = file_data.get(metric.name)
+ 
+-    # Add function/class paths to file list
+-    if detail:
+-        extra_paths = _collect_detailed_paths(current_data, files, resolved_metrics)
+-        files.extend(sorted(extra_paths))
++            file_diff.metrics.append(MetricDiff(name=metric.name, before=before, after=after, metric=metric))
++        file_diffs.append(file_diff)
+ 
+-    logger.debug(files)
++    # =====================================================================
++    # Stage 8 - render. JSON and console share the computed deltas.
++    # =====================================================================
++    if json:
++        json_results = []
++        for file_diff in file_diffs:
++            if changes_only and not file_diff.has_changes:
++                continue
+ 
+-    # Compute diffs for all files
+-    diffs = [_compute_file_diff(file, indexed_data, current_data, resolved_metrics) for file in files]
++            file_entry: dict[str, Any] = {"file": file_diff.path, "metrics": {}}
++
++            for delta in file_diff.metrics:
++                if changes_only and not delta.changed:
++                    continue
++
++                file_entry["metrics"][delta.name] = {
++                    "before": delta.before,
++                    "after": delta.after,
++                }
++
++            if file_entry["metrics"]:
++                json_results.append(file_entry)
+ 
+-    # Output results
+-    if json:
+-        json_results = _format_json_output(diffs, changes_only)
+         print(json_module.dumps(json_results, indent=2))
+     else:
+-        _format_table_output(diffs, resolved_metrics, changes_only, wrap, table_style)
++        table_rows = []
++        for file_diff in file_diffs:
++            if changes_only and not file_diff.has_changes:
++                logger.debug("Skipping %s - no changes", file_diff.path)
++                continue
++
++            row = [file_diff.path]
++            for delta in file_diff.metrics:
++                # format one cell (kept inline: the styling rules and the
++                # missing-value handling belong with the table output)
++                before = delta.before
++                after = delta.after
++                before_display = "-" if before is None else before
++                after_display = "-" if after is None else after
++                if delta.metric.metric_type in (int, float) and before is not None and after is not None:
++                    cell = Text(f"{before_display:n} -> ")
++                    if before > after:
++                        cell.append(f"{after_display:n}", style=BAD_STYLES[delta.metric.measure])
++                    elif before < after:
++                        cell.append(f"{after_display:n}", style=GOOD_STYLES[delta.metric.measure])
++                    else:
++                        cell.append(f"{after_display:n}")
++                elif before_display == "-" and after_display == "-":
++                    cell = "-"
++                else:
++                    cell = f"{before_display} -> {after_display}"
++
++                row.append(cell)
++            table_rows.append(tuple(row))
++
++        if table_rows:
++            headers = ("File", *(metric.description for _, metric in delta_metrics))
++            console = Console()
++            box_style = BOX_STYLES.get(table_style.upper(), box.ROUNDED)
++            out_table = Table(show_header=True, header_style="bold", box=box_style)
++            for header in list(headers):
++                # fold/ignore per the `wrap` switch
++                out_table.add_column(header, overflow="fold" if wrap else "ignore")
++            for table_row in table_rows:
++                processed_row = [
++                    cell if isinstance(cell, Text) else str(cell) for cell in table_row
++                ]
++                out_table.add_row(*processed_row)
++            console.print(out_table)
+diff --git a/src/wily/commands/report.py b/src/wily/commands/report.py
+index 93c3995..c2884a8 100644
+--- a/src/wily/commands/report.py
++++ b/src/wily/commands/report.py
+@@ -11,6 +11,9 @@ from pathlib import Path
+ from shutil import copytree
+ from string import Template
+ 
++from rich import box
++from rich.console import Console
++from rich.table import Table
+ from rich.text import Text
+ 
+ from wily import MAX_MESSAGE_WIDTH, format_date, format_revision, logger
+@@ -18,7 +21,7 @@ from wily.backend import WilyIndex
+ from wily.cache import list_archivers
+ from wily.config.types import WilyConfig
+ from wily.defaults import DEFAULT_TABLE_STYLE
+-from wily.helper import print_table
++from wily.helper import BOX_STYLES, print_table
+ from wily.helper.custom_enums import ReportFormat
+ from wily.lang import _
+ from wily.operators import ALL_METRICS, MetricType, resolve_metric_as_tuple
+@@ -55,6 +58,12 @@ def report(
+     :param wrap: Wrap output
+     :param table_style: Table box style
+     """
++    # =====================================================================
++    # Stage 1 - bind the requested metrics to their display rules.
++    # NOTE: the style mapping below owns the delta colours for the whole
++    # command (console cells AND the HTML path), so it cannot be moved
++    # under the console branch alone.
++    # =====================================================================
+     if metrics is None:
+         resolved_metrics = ALL_METRICS
+     else:
+@@ -63,8 +72,7 @@ def report(
+ 
+     logger.debug("Running report command")
+ 
+-    # Build metric metadata for display styling
+-    metric_metas = []
++    column_specs = []
+     for operator, metric in resolved_metrics:
+         key = metric.name
+         # Set the delta styles depending on the metric type
+@@ -80,23 +88,32 @@ def report(
+         else:
+             increase_style = STYLE_YELLOW
+             decrease_style = STYLE_YELLOW
+-        metric_meta = {
+-            "key": key,
+-            "operator": operator.name,
+-            "increase_style": increase_style,
+-            "decrease_style": decrease_style,
+-            "title": metric.description,
+-            "type": metric.metric_type,
+-        }
+-        metric_metas.append(metric_meta)
+-
++        column_specs.append(
++            {
++                "key": key,
++                "operator": operator.name,
++                "increase_style": increase_style,
++                "decrease_style": decrease_style,
++                "title": metric.description,
++                "type": metric.metric_type,
++            }
++        )
++
++    # =====================================================================
++    # Stage 2 - find every archiver with cached data.
++    # =====================================================================
+     archivers = list_archivers(config)
+ 
+     if not archivers:
+         logger.error("No wily cache found. Run 'wily build' first.")
+         return
+ 
+-    data: list[tuple[str | Text, ...]] = []
++    # =====================================================================
++    # Stage 3 - scan the index and build the display rows in one pass.
++    # The delta book-keeping (`last` below) is shared per metric column,
++    # which is why this loop cannot simply be cut in half.
++    # =====================================================================
++    report_rows: list[tuple[str | Text, ...]] = []
+ 
+     for archiver in archivers:
+         parquet_path = pathlib.Path(config.cache_path) / archiver / "metrics.parquet"
+@@ -104,8 +121,7 @@ def report(
+             logger.debug("No parquet file for archiver %s", archiver)
+             continue
+ 
+-        # Use WilyIndex to query data for the path
+-        operator_names = [meta["operator"] for meta in metric_metas]
++        operator_names = [meta["operator"] for meta in column_specs]
+         with WilyIndex(str(parquet_path), operator_names) as index:
+             # Check if this is a granular query (e.g., "file.py:function_name")
+             is_granular = ":" in path
+@@ -125,7 +141,7 @@ def report(
+                 deltas = []
+                 vals: list[str | Text] = []
+ 
+-                for meta in metric_metas:
++                for meta in column_specs:
+                     try:
+                         val = row.get(meta["key"])
+                         if val is None:
+@@ -170,7 +186,7 @@ def report(
+                 message = row.get("revision_message", "")
+ 
+                 if include_message:
+-                    data.append(
++                    report_rows.append(
+                         (
+                             format_revision(revision_key),
+                             (message or "")[:MAX_MESSAGE_WIDTH],
+@@ -180,7 +196,7 @@ def report(
+                         )
+                     )
+                 else:
+-                    data.append(
++                    report_rows.append(
+                         (
+                             format_revision(revision_key),
+                             str(author or ""),
+@@ -189,91 +205,106 @@ def report(
+                         )
+                     )
+ 
+-    if not data:
++    if not report_rows:
+         logger.error("No data found for %s.", path)
+         return
+ 
+-    descriptions = [meta["title"] for meta in metric_metas]
++    # =====================================================================
++    # Stage 4 - pick the header set for the chosen output format.
++    # =====================================================================
++    descriptions = [meta["title"] for meta in column_specs]
+     if include_message:
+         headers = (_("Revision"), _("Message"), _("Author"), _("Date"), *descriptions)
+     else:
+         headers = (_("Revision"), _("Author"), _("Date"), *descriptions)
+ 
++    # =====================================================================
++    # Stage 5 - publish. Console and HTML are both handled right here so
++    # the row order (newest first) stays in one place.
++    # =====================================================================
+     if format == ReportFormat.HTML:
+-        _render_html_report(output, headers, data)
+-    else:
+-        print_table(headers=headers, data=data[::-1], wrap=wrap, table_style=table_style)
++        # -- resolve the destination -------------------------------------
++        if output.suffix == ".html":
++            report_path = output.parents[0]
++            report_output = output
++        else:
++            report_path = output
++            report_output = output.joinpath("index.html")
+ 
++        report_path.mkdir(exist_ok=True, parents=True)
+ 
+-def _render_html_report(output: Path, headers: tuple, data: list) -> None:
+-    """Render the report as HTML."""
+-    if output.suffix == ".html":
+-        report_path = output.parents[0]
+-        report_output = output
+-    else:
+-        report_path = output
+-        report_output = output.joinpath("index.html")
+-
+-    report_path.mkdir(exist_ok=True, parents=True)
+-
+-    templates_dir = (Path(__file__).parents[1] / "templates").resolve()
+-    report_template = Template((templates_dir / "report_template.html").read_text())
+-
+-    # Style to HTML class mapping
+-    style_to_html = {
+-        "green": "green-color",
+-        "red": "red-color",
+-        "yellow": "orange-color",
+-    }
+-
+-    def text_to_html(text_obj: Text) -> str:
+-        """Convert a Rich Text object to HTML."""
+-        result = ""
+-        plain = text_obj.plain
+-        # If no styles, just return plain text
+-        if not text_obj._spans:  # noqa: SLF001
+-            return plain
+-        # Build HTML from spans
+-        last_end = 0
+-        for start, end, style in text_obj._spans:  # noqa: SLF001
+-            # Add unstyled text before this span
+-            if start > last_end:
+-                result += plain[last_end:start]
+-            # Add styled text
+-            span_text = plain[start:end]
+-            if style:
+-                html_class = style_to_html.get(str(style), "")
+-                if html_class:
+-                    result += f"<span class='{html_class}'>{span_text}</span>"
++        templates_dir = (Path(__file__).parents[1] / "templates").resolve()
++        page_template = Template((templates_dir / "report_template.html").read_text())
++
++        # Style to HTML class mapping
++        style_to_html = {
++            "green": "green-color",
++            "red": "red-color",
++            "yellow": "orange-color",
++        }
++
++        # -- build the <th> row --------------------------------------------
++        table_headers = "".join([f"<th>{header}</th>" for header in headers])
++
++        # -- build the <td> body, converting Rich Text spans inline -----
++        rows_html = ""
++        for line in report_rows[::-1]:
++            rows_html += "<tr>"
++            for element in line:
++                if isinstance(element, Text):
++                    # convert one Text cell (span conversion kept inline:
++                    # class mapping and the span cursor walk together)
++                    element_html = element.plain
++                    if element._spans:  # noqa: SLF001
++                        element_html = ""
++                        plain_text = element.plain
++                        span_cursor = 0
++                        for start, end, span_style in element._spans:  # noqa: SLF001
++                            # Add unstyled text before this span
++                            if start > span_cursor:
++                                element_html += plain_text[span_cursor:start]
++                            # Add styled text
++                            span_text = plain_text[start:end]
++                            if span_style:
++                                html_class = style_to_html.get(str(span_style), "")
++                                if html_class:
++                                    element_html += f"<span class='{html_class}'>{span_text}</span>"
++                                else:
++                                    element_html += span_text
++                            else:
++                                element_html += span_text
++                            span_cursor = end
++                        # Add any remaining text
++                        if span_cursor < len(plain_text):
++                            element_html += plain_text[span_cursor:]
++                    rows_html += f"<td>{element_html}</td>"
+                 else:
+-                    result += span_text
+-            else:
+-                result += span_text
+-            last_end = end
+-        # Add any remaining unstyled text
+-        if last_end < len(plain):
+-            result += plain[last_end:]
+-        return result
+-
+-    table_headers = "".join([f"<th>{header}</th>" for header in headers])
+-    table_content = ""
+-    for line in data[::-1]:
+-        table_content += "<tr>"
+-        for element in line:
+-            if isinstance(element, Text):
+-                table_content += f"<td>{text_to_html(element)}</td>"
+-            else:
+-                table_content += f"<td>{element}</td>"
+-        table_content += "</tr>"
++                    rows_html += f"<td>{element}</td>"
++            rows_html += "</tr>"
+ 
+-    rendered_report = report_template.safe_substitute(headers=table_headers, content=table_content)
++        rendered_report = page_template.safe_substitute(headers=table_headers, content=rows_html)
++
++        with report_output.open("w", errors="xmlcharrefreplace") as output_f:
++            output_f.write(rendered_report)
++
++        try:
++            copytree(str(templates_dir / "css"), str(report_path / "css"))
++        except FileExistsError:
++            pass
++
++        logger.info("wily report was saved to %s", report_path)
++    else:
++        # -- console path: newest first, rendered straight to the table --
++        console = Console()
++        box_style = BOX_STYLES.get(table_style.upper(), box.ROUNDED)
++        out_table = Table(show_header=True, header_style="bold", box=box_style)
+ 
+-    with report_output.open("w", errors="xmlcharrefreplace") as output_f:
+-        output_f.write(rendered_report)
++        for header in list(headers):
++            # fold/ignore per the `wrap` switch
++            out_table.add_column(header, overflow="fold" if wrap else "ignore")
+ 
+-    try:
+-        copytree(str(templates_dir / "css"), str(report_path / "css"))
+-    except FileExistsError:
+-        pass
++        for row in report_rows[::-1]:
++            processed_row = [cell if isinstance(cell, Text) else str(cell) for cell in row]
++            out_table.add_row(*processed_row)
+ 
+-    logger.info("wily report was saved to %s", report_path)
++        console.print(out_table)

@@ -1,0 +1,183 @@
+{
+  "schema_version": "smellbench.solve_rubrics.v3",
+  "execution_mode": "one_independent_call_per_rubric",
+  "aggregation": "macro_average_by_category",
+  "rubrics": [
+    {
+      "id": "R1",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The shared audio session's lifecycle operations (instantiate-time buffer zeroing, rolling-window append, stall silence padding, and the mutex-guarded per-frame drain) are defined in the audio input layer next to the code that owns the shared session struct (the translated-unit and contract header hosting the named-pipe backend, its session struct, and the backend registry), so the re-homed behavior lives where the data it manipulates lives.",
+      "rationale": "This case's central outcome: the injected session services sit in the render core while every field they touch belongs to the audio input side; the repair is judged on whether that entire family of operations returned to the owning side, whatever interface shape or names it uses."
+    },
+    {
+      "id": "R2",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, the render core (the module defining the renderer struct and the render-side API) contains no function that reads or writes members of the shared audio session struct, and the render-side public API header no longer declares session-lifecycle entry points operating on that struct.",
+      "rationale": "The boundary is violated only if render-side code still opens the session struct member by member; declarations left in the render API header would invite the same violation to regrow, so both the definitions and the API surface count."
+    },
+    {
+      "id": "R3",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Neither audio backend retains attach-time code that reads the renderer's request members (rate, sample size, buffer size, audio source, input mirroring) directly to re-derive its session parameters; whatever configuration route the repair keeps (values passed through the attach contract, or render-side accessors) communicates without member access on the audio side.",
+      "rationale": "The second direction of the same boundary: both backends gained helper plumbing that mines renderer request fields at attach time. A sound repair can hand values over or expose accessor functions, but the member digging itself must be gone from both backends."
+    },
+    {
+      "id": "R4",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Both audio streaming threads (named-pipe and PulseAudio) consume one shared roll-and-append implementation provided on the audio input side; neither thread's loop retains an inline copy of the buffer-roll choreography.",
+      "rationale": "The stimulus feature deliberately de-duplicated the two backends' identical roll logic but placed the shared implementation on the wrong side; the repair must keep the single implementation while returning it to the audio side."
+    },
+    {
+      "id": "R5",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The named-pipe backend's stall path (poll timeout) still rolls the window and pads it with silence through the shared audio-side implementation, replacing the injected render-side call without losing the padding behavior or inlining a private copy.",
+      "rationale": "The stall path is the smallest consumer of the session services and the easiest one to leave behind or re-inline; it is one of the six displaced responsibilities this case tracks."
+    },
+    {
+      "id": "R6",
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not merely relabel or re-park the displaced session behavior: the render-side session functions are not kept under new names, and their definitions are not stashed in a non-owning host (a render-side or utility header, or a new third translation unit outside the audio input layer) while everything else stays as-is.",
+      "rationale": "Renaming the helpers or parking them in any module that is not an owner of the audio session preserves the exact boundary violation this case tests; relocation sites that are not the audio input layer are placebo repairs for this instance."
+    },
+    {
+      "id": "R7",
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "important",
+      "criterion": "The repair does not leave the boundary violated in only one direction: it resolves both the render-side session operations and the audio-side renderer-request interpretation, rather than fixing one family (for example only the backend attach plumbing) and leaving the session services on the render side.",
+      "rationale": "The case injects both boundary directions as one feature story, so partial one-directional repairs — the most plausible solver shortcut — leave half of the displaced responsibilities in place."
+    },
+    {
+      "id": "A1",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The process entry point uses the re-homed audio-side operations for both instantiate-time zeroing and the per-frame drain, without re-growing inline session internals (no reinstated zero loop and no re-inlined lock/copy/flag-reset block in the main render loop).",
+      "rationale": "The injected change rewired the composition root's call sites; when the services move back, the main loop must follow them through and must not solve the wiring by copying the session manipulation back inline."
+    },
+    {
+      "id": "A2",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The backend attach contract left by the repair is coherent end to end: the registry's init callback signature, both backends' attach implementations, and the composition-root call site all agree, and backends obtain every session-configuration value they need through that agreed contract.",
+      "rationale": "The feature silently widened the shared backend attach signature; the repair is free to settle that contract however is sound, but the three participants (registry, both backends, entry point) must be consistent and complete."
+    },
+    {
+      "id": "A3",
+      "category": "associated_changes",
+      "polarity": "negative",
+      "importance": "important",
+      "criterion": "The two streaming threads do not end up asymmetric after the repair: both adopt the re-homed shared operations, and no thread is switched to the new placement while the other silently keeps its previous cross-boundary call.",
+      "rationale": "The two backends were given structurally different plumbing on purpose; a solver working through one backend's file may realistically leave its sibling half-migrated, which leaves the displaced behavior intact on one side."
+    },
+    {
+      "id": "A4",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "important",
+      "criterion": "The PulseAudio backend no longer keeps the module-level renderer handle that the feature added solely so attach-time plumbing could mine renderer request fields (an unused handle, or one still used to reach renderer state, fails this item; the pre-existing mainloop handle is unrelated).",
+      "rationale": "That handle exists only to support the envious request interpretation; leaving it behind is the concrete residue of the audio-side half of the injection and misleads later maintainers about what the module may reach into."
+    },
+    {
+      "id": "A5",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "important",
+      "criterion": "Audio-source selection semantics survive the re-homing identically: an explicit non-default source request resolves to the same source string for the same backend, and automatic/default selection keeps the PulseAudio default-sink monitor discovery and the named-pipe backend's default path fallback.",
+      "rationale": "Source resolution was split between the entry point's constructor shorthand and the feature's new attach-time plumbing; moving the interpretation back to the render/owning side must not drop the guarded install-an-explicit-source behavior the injected change added."
+    },
+    {
+      "id": "C1",
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No orphaned declarations or definitions remain: every prototype the affected headers still declare corresponds to a defined and used function, and no unreferenced session/request helper definition survives on either side after the re-homing.",
+      "rationale": "The repair removes an entire family of render-side API prototypes and helpers; leaving stale declarations around (a plausible by-product of editing two headers and three implementation files) strands the feature's scaffolding in the interface."
+    },
+    {
+      "id": "C2",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "important",
+      "criterion": "The repaired files do not retain the injected narrative comments that justify the misplaced arrangement: no comment still describes session lifecycle services as part of the render-side API, and no comment still tells the reader that renderer objects or requests are handed to the audio input layer to be interpreted there, once the code no longer works that way.",
+      "rationale": "The injection seeded rationale comments at every site to make the arrangement read as deliberate; a repair that moves the code but keeps those comments leaves the misleading design narrative in place for the next maintainer."
+    },
+    {
+      "id": "C3",
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Dangling scaffolding is removed with the code it served: the audio backend contract header no longer forward-declares the renderer type if the contract no longer mentions renderer arguments, and neither backend still includes the render-side API header if it is left with no extern declaration it consumes.",
+      "rationale": "The feature added a forward declaration and cross-includes purely to let each side reach the other's types; once the behavior is re-homed, keeping that visibility scaffolding invites the boundary to be re-crossed."
+    },
+    {
+      "id": "N1",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Named-pipe backend sample arithmetic is byte-identical in effect: raw int16 chunks are decoded with the same two-frame channel merge and the same integer truncation order before the division into floats, writing the same values to the same destinations as before the repair.",
+      "rationale": "The deduplication moved the FIFO decode's results through per-frame local buffers; regressing the truncation order or merge would silently change the visualizer's signal, and the repository's preprocessor test suite would never notice."
+    },
+    {
+      "id": "N2",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "PulseAudio backend stream and merge behavior is unchanged: native-float recording spec (requested rate, two recorded channels), the same per-chunk size, and the same mono merge of two recorded frames into one sample on mirrored input.",
+      "rationale": "The repair re-routes the request interpretation that constructs this backend's stream spec; a subtle change in rate, channel count, or merge would only appear as a changed or broken visual, not a test failure."
+    },
+    {
+      "id": "N3",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Rolling-window geometry is unchanged everywhere it is used: both backends shift the window by the same one-read-chunk amount, and the stall path silences exactly the same number of new samples, so frames line up at the same offsets as before the repair.",
+      "rationale": "The roll/append/silence geometry was lifted verbatim during injection; any off-by-one in the re-homed implementation (offset or chunk size) would shift the window and distort the spectrum rendered from it."
+    },
+    {
+      "id": "N4",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The synchronization protocol is unchanged: each streaming thread still performs its roll and append inside one critical section per chunk between lock and unlock, the stall path holds its own mutex window, and the per-frame drain keeps the lock, conditional copy, modified-flag reset, then unlock order.",
+      "rationale": "The injected moves deliberately preserved the exact lock scoping of the clean tree; the repair must not 'improve' the locking by moving session mutation outside the sections or dropping the conditional copy discipline, which would introduce real races."
+    },
+    {
+      "id": "N5",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A repair fails this item if it makes the session buffers reachable for mutation by one thread while another is copying them (widening, splitting, or removing the guarded regions), or if it resets the session's modified flag outside the mutex it still uses elsewhere.",
+      "rationale": "This is the concrete concurrency regression this instance invites: re-homing the drain and roll operations makes it tempting to lock once at a caller or to copy without the flag discipline, and the preprocessor-only test suite cannot catch the resulting race."
+    },
+    {
+      "id": "N6",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "important",
+      "criterion": "Input mirroring stays semantically intact: a mirrored configuration still collapses the session to mono capture and produces identical left and right frames, rather than inverting the stereo/mono selection or dropping the merge.",
+      "rationale": "The injected request interpretation derives the channel count from the renderer's mirroring flag; re-homing that decision is exactly where an inverted condition (mono becoming stereo) would slip through unobserved."
+    },
+    {
+      "id": "N7",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "important",
+      "criterion": "The repair does not disturb per-frame flow control around the session: the drain is still performed once per rendered frame, the modified flag is still set by the streaming threads for every appended chunk and every silence-padded stall, and the terminate checks still break the loops and release the backend's resources exactly as before.",
+      "rationale": "The entry point and both threads coordinate through the shared session's flag; a repair that drains on a different cadence, stops setting the flag on the stall path, or leaks the stream/descriptor at termination would change observable behavior without failing the preprocessor suite."
+    }
+  ]
+}

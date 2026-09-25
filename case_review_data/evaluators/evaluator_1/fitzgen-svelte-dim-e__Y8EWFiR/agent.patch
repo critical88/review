@@ -1,0 +1,434 @@
+diff --git a/analyze/analyses/diff.rs b/analyze/analyses/diff.rs
+index d7613f7..706ae09 100644
+--- a/analyze/analyses/diff.rs
++++ b/analyze/analyses/diff.rs
+@@ -139,14 +139,46 @@ pub fn diff(
+         }
+     };
+ 
+-    // Create a set of item names from the new and old item collections.
++    // Create a set of item names from the new and old item collections, then
++    // narrow it to the names the caller asked for.
+     let names = old_sizes
+         .keys()
+         .chain(new_sizes.keys())
+         .map(|k| k.to_string());
++    let names = filter_item_names(names, opts)?;
+ 
+-    // If arguments were given to the command, we should filter out items that
+-    // do not match any of the given names or expressions.
++    // Iterate through the set of item names, map each into a `DiffEntry`, drop
++    // the unchanged ones, and sort the collection.
++    let mut deltas = names
++        .into_iter()
++        .map(get_item_delta)
++        .filter(unchanged_items_filter)
++        .collect::<anyhow::Result<Vec<_>>>()?;
++    deltas.sort();
++
++    // Build the "... and N more" and total summary entries, then truncate the
++    // displayed deltas and append the summaries.
++    let (rem_cnt, remaining, total) =
++        build_diff_summaries(&deltas, max_items, opts, old_items, new_items);
++    deltas.truncate(max_items);
++    if rem_cnt > 0 {
++        deltas.push(remaining);
++    }
++    deltas.push(total);
++
++    // Return the results so that they can be emitted.
++    let diff = Diff { deltas };
++    Ok(Box::new(diff) as Box<_>)
++}
++
++/// Narrow a stream of item names to those the caller asked for.
++///
++/// When no items were named, every name is kept. Otherwise the names are
++/// filtered by regular expression or by exact match, according to the options.
++fn filter_item_names(
++    names: impl Iterator<Item = String>,
++    opts: &opt::Diff,
++) -> anyhow::Result<HashSet<String>> {
+     let names: HashSet<String> = if !opts.items().is_empty() {
+         if opts.using_regexps() {
+             let regexps = regex::RegexSet::new(opts.items())?;
+@@ -158,16 +190,22 @@ pub fn diff(
+     } else {
+         names.collect()
+     };
++    Ok(names)
++}
+ 
+-    // Iterate through the set of item names, and use the closure above to map
+-    // each item into a `DiffEntry` object. Then, sort the collection.
+-    let mut deltas = names
+-        .into_iter()
+-        .map(get_item_delta)
+-        .filter(unchanged_items_filter)
+-        .collect::<anyhow::Result<Vec<_>>>()?;
+-    deltas.sort();
+-
++/// Build the summary entries that truncate and total the diff rows.
++///
++/// Returns the count of truncated rows, the "... and N more" entry, and the
++/// total entry. The total spans the whole binary when no items were named, and
++/// otherwise only the entries in `deltas`; the truncated count comes from the
++/// rows beyond `max_items`.
++fn build_diff_summaries(
++    deltas: &[DiffEntry],
++    max_items: usize,
++    opts: &opt::Diff,
++    old_items: &ir::Items,
++    new_items: &ir::Items,
++) -> (u32, DiffEntry, DiffEntry) {
+     // Create an entry to summarize the diff rows that will be truncated.
+     let (rem_cnt, rem_delta): (u32, i64) = deltas
+         .iter()
+@@ -200,16 +238,5 @@ pub fn diff(
+         delta: total_delta,
+     };
+ 
+-    // Now that the 'remaining' and 'total' summary entries have been created,
+-    // truncate the vector of deltas before we box up the result, and push
+-    // the remaining and total rows to the deltas vector.
+-    deltas.truncate(max_items);
+-    if rem_cnt > 0 {
+-        deltas.push(remaining);
+-    }
+-    deltas.push(total);
+-
+-    // Return the results so that they can be emitted.
+-    let diff = Diff { deltas };
+-    Ok(Box::new(diff) as Box<_>)
++    (rem_cnt, remaining, total)
+ }
+diff --git a/analyze/analyses/dominators/mod.rs b/analyze/analyses/dominators/mod.rs
+index 409bb7d..d2a01fa 100644
+--- a/analyze/analyses/dominators/mod.rs
++++ b/analyze/analyses/dominators/mod.rs
+@@ -1,13 +1,13 @@
+-use std::collections::{BTreeMap, BTreeSet};
++use std::collections::BTreeMap;
+ 
+ use regex;
+ 
+-use petgraph::visit::Walker;
+-
+ use twiggy_ir as ir;
+ use twiggy_opt as opt;
+ use twiggy_traits as traits;
+ 
++use crate::analyses::garbage::get_unreachable_items;
++
+ mod emit;
+ 
+ struct DominatorTree {
+@@ -28,11 +28,38 @@ pub fn dominators(
+     items: &mut ir::Items,
+     opts: &opt::Dominators,
+ ) -> anyhow::Result<Box<dyn traits::Emit>> {
++    // Populate the dominator-tree structures that the rest of the analysis and
++    // the emitters rely on.
+     items.compute_dominator_tree();
+     items.compute_dominators();
+     items.compute_retained_sizes();
+     items.compute_predecessors();
+ 
++    // Choose whose dominator subtrees to report, narrowing by the caller's
++    // named items or regular expressions.
++    let dominator_items = select_dominator_items(items, opts)?;
++
++    // Summarize the items that no export or public function reaches, reusing
++    // the reachability walk shared with the `garbage` analysis.
++    let unreachable_items_summary = unreachable_items_summary(items, opts);
++
++    Ok(Box::new(DominatorTree {
++        tree: items.dominator_tree().clone(),
++        items: dominator_items,
++        opts: opts.clone(),
++        unreachable_items_summary,
++    }) as Box<_>)
++}
++
++/// Collect the items whose dominator subtrees should be reported.
++///
++/// When the caller names no items we report the whole tree from the meta root.
++/// Otherwise we match either by regular expression (ordered by descending
++/// retained size) or by exact name, according to the configured options.
++fn select_dominator_items(
++    items: &ir::Items,
++    opts: &opt::Dominators,
++) -> anyhow::Result<Vec<ir::Id>> {
+     let arguments = opts.items();
+     let dominator_items = if arguments.is_empty() {
+         vec![items.meta_root()]
+@@ -40,12 +67,11 @@ pub fn dominators(
+         // Match every item whose name matches any of the given regular
+         // expressions, then order the survivors by descending retained size.
+         let regexps = regex::RegexSet::new(arguments)?;
+-        let mut sorted_items: Vec<ir::Id> = Vec::new();
+-        for item in items.iter() {
+-            if regexps.is_match(&item.name()) {
+-                sorted_items.push(item.id());
+-            }
+-        }
++        let mut sorted_items: Vec<ir::Id> = items
++            .iter()
++            .filter(|item| regexps.is_match(&item.name()))
++            .map(|item| item.id())
++            .collect();
+         sorted_items.sort_by_key(|id| -i64::from(items.retained_size(*id)));
+         sorted_items
+     } else {
+@@ -58,39 +84,37 @@ pub fn dominators(
+         }
+         matched_items
+     };
++    Ok(dominator_items)
++}
+ 
+-    // Summarize the items that no export or public function reaches. A DFS from
+-    // the meta root finds everything retained transitively; everything left over
+-    // is unreachable. This is only surfaced when the caller did not name any
+-    // item explicitly and there is at least one unreachable byte to report.
+-    let mut reachable_set: BTreeSet<ir::Id> = BTreeSet::new();
+-    for id in petgraph::visit::Dfs::new(&*items, items.meta_root()).iter(&*items) {
+-        reachable_set.insert(id);
+-    }
+-    let mut size = 0;
+-    let mut count = 0;
+-    for item in items.iter() {
+-        if !reachable_set.contains(&item.id()) {
+-            size += item.size();
+-            count += 1;
+-        }
++/// Summarize the items that no export or public function reaches.
++///
++/// A traversal from the meta root finds everything retained transitively; the
++/// items left over are unreachable. This is only surfaced when the caller did
++/// not name any item explicitly and there is at least one unreachable byte to
++/// report. The reachability walk itself is shared with the `garbage` analysis.
++fn unreachable_items_summary(
++    items: &ir::Items,
++    opts: &opt::Dominators,
++) -> Option<UnreachableItemsSummary> {
++    if !opts.items().is_empty() {
++        return None;
+     }
+-    let unreachable_items_summary = if opts.items().is_empty() && size > 0 {
++
++    // The reachability walk lives in the `garbage` analysis; fold its
++    // unreachable survivors into a count and total size.
++    let (count, size) = get_unreachable_items(items).fold(
++        (0, 0),
++        |(count, size), item| (count + 1, size + item.size()),
++    );
++
++    if size == 0 {
++        None
++    } else {
+         Some(UnreachableItemsSummary {
+             count,
+             size,
+-            size_percent: (f64::from(size)) / (f64::from(items.size())) * 100.0,
++            size_percent: f64::from(size) / f64::from(items.size()) * 100.0,
+         })
+-    } else {
+-        None
+-    };
+-
+-    let tree = DominatorTree {
+-        tree: items.dominator_tree().clone(),
+-        items: dominator_items,
+-        opts: opts.clone(),
+-        unreachable_items_summary,
+-    };
+-
+-    Ok(Box::new(tree) as Box<_>)
++    }
+ }
+diff --git a/analyze/analyses/monos/mod.rs b/analyze/analyses/monos/mod.rs
+index ff6ab8a..895c9d3 100644
+--- a/analyze/analyses/monos/mod.rs
++++ b/analyze/analyses/monos/mod.rs
+@@ -18,13 +18,40 @@ struct Monos {
+ 
+ /// Find bloaty monomorphizations of generic functions.
+ pub fn monos(items: &mut ir::Items, opts: &opt::Monos) -> anyhow::Result<Box<dyn traits::Emit>> {
++    let only_generics = opts.only_generics();
++    let max_monos = opts.max_monos() as usize;
++    let max_generics = opts.max_generics() as usize;
++
++    // Gather each generic's monomorphizations, narrowing to the caller's
++    // requested functions and sorting each set by descending size.
++    let monos_map = gather_monos(items, opts)?;
++
++    // Turn each generic into an entry, summarizing its bloat and truncating its
++    // instantiation list, then order the entries by how much bloat they carry.
++    let mut monos = build_monos_entries(monos_map, only_generics, max_monos);
++
++    // Append the rows that summarize the truncated generics and total the set.
++    append_monos_summaries(&mut monos, max_generics);
++
++    Ok(Box::new(Monos { monos }) as Box<_>)
++}
++
++/// Gather each generic function and its monomorphizations.
++///
++/// Duplicated instantiations of the same generic are collapsed, and every
++/// generic's instantiations are sorted by descending size (ties broken by
++/// name). When the caller names functions, generics are narrowed to those
++/// matching the supplied names or regular expressions.
++fn gather_monos<'items>(
++    items: &'items ir::Items,
++    opts: &opt::Monos,
++) -> anyhow::Result<BTreeMap<&'items str, Vec<(String, u32)>>> {
+     let args_given = !opts.functions().is_empty();
+     let using_regexps = opts.using_regexps();
+     let regexps = regex::RegexSet::new(opts.functions())?;
+ 
+-    // Gather each generic function and its monomorphizations. Duplicated
+-    // instantiations of the same generic are collapsed, then the instantiations
+-    // of every generic are sorted by descending size and, on ties, by name.
++    // Collect each generic's instantiations, collapsing duplicates, and skip
++    // any generic the caller did not ask for when arguments were supplied.
+     let mut per_generic: BTreeMap<&str, BTreeSet<(String, u32)>> = BTreeMap::new();
+     for item in items.iter() {
+         if let Some(generic) = item.monomorphization_of() {
+@@ -46,6 +73,8 @@ pub fn monos(items: &mut ir::Items, opts: &opt::Monos) -> anyhow::Result<Box<dyn
+         }
+     }
+ 
++    // Flatten each generic's deduplicated instantiations into a vector sorted
++    // by descending size, breaking ties by name.
+     let mut monos_map: BTreeMap<&str, Vec<(String, u32)>> = BTreeMap::new();
+     for (generic, inst_set) in per_generic {
+         let mut insts = inst_set.into_iter().collect::<Vec<_>>();
+@@ -55,50 +84,73 @@ pub fn monos(items: &mut ir::Items, opts: &opt::Monos) -> anyhow::Result<Box<dyn
+         monos_map.insert(generic, insts);
+     }
+ 
+-    // Walk each generic's instantiations, summarizing the bloat and truncating
+-    // the list according to the requested options.
+-    let only_generics = opts.only_generics();
+-    let max_monos = opts.max_monos() as usize;
+-    let mut monos: Vec<MonosEntry> = Vec::new();
+-    for (generic, mut insts) in monos_map {
+-        let max = insts.iter().map(|(_, size)| *size).max();
+-        if let Some(max) = max {
+-            let total_size = insts.iter().map(|(_, size)| *size).sum::<u32>();
+-            let inst_cnt = insts.len() as u32;
+-            let size_per_inst = total_size / inst_cnt;
+-            let avg_savings = size_per_inst * (inst_cnt - 1);
+-            let removing_largest_savings = total_size - max;
+-            let approx_potential_savings = cmp::min(avg_savings, removing_largest_savings);
+-
+-            if only_generics {
+-                insts.truncate(0);
+-            } else {
+-                let mut rem_cnt: u32 = 0;
+-                let mut rem_size: u32 = 0;
+-                for (_, size) in insts.iter().skip(max_monos) {
+-                    rem_cnt += 1;
+-                    rem_size += *size;
+-                }
+-                insts.truncate(max_monos);
+-                if rem_cnt > 0 {
+-                    insts.push((format!("... and {} more.", rem_cnt), rem_size));
+-                }
+-            }
++    Ok(monos_map)
++}
++
++/// Summarize a single generic's monomorphizations into a `MonosEntry`.
++///
++/// Computes the generic's total size and approximate bloat and truncates its
++/// instantiation list to `max_monos`, appending a "... and N more" entry when
++/// anything is dropped. Returns `None` for a generic with no instantiations.
++fn summarize_generic(
++    generic: &str,
++    mut insts: Vec<(String, u32)>,
++    only_generics: bool,
++    max_monos: usize,
++) -> Option<MonosEntry> {
++    let max = insts.iter().map(|(_, size)| *size).max()?;
++    let total_size = insts.iter().map(|(_, size)| *size).sum::<u32>();
++    let inst_cnt = insts.len() as u32;
++    let size_per_inst = total_size / inst_cnt;
++    let avg_savings = size_per_inst * (inst_cnt - 1);
++    let removing_largest_savings = total_size - max;
++    let approx_potential_savings = cmp::min(avg_savings, removing_largest_savings);
+ 
+-            monos.push(MonosEntry {
+-                name: generic.to_string(),
+-                insts,
+-                size: total_size,
+-                bloat: approx_potential_savings,
+-            });
++    if only_generics {
++        insts.truncate(0);
++    } else {
++        let mut rem_cnt: u32 = 0;
++        let mut rem_size: u32 = 0;
++        for (_, size) in insts.iter().skip(max_monos) {
++            rem_cnt += 1;
++            rem_size += *size;
++        }
++        insts.truncate(max_monos);
++        if rem_cnt > 0 {
++            insts.push((format!("... and {} more.", rem_cnt), rem_size));
+         }
+     }
++
++    Some(MonosEntry {
++        name: generic.to_string(),
++        insts,
++        size: total_size,
++        bloat: approx_potential_savings,
++    })
++}
++
++/// Build the ordered list of per-generic entries ready for summarization.
++fn build_monos_entries(
++    monos_map: BTreeMap<&str, Vec<(String, u32)>>,
++    only_generics: bool,
++    max_monos: usize,
++) -> Vec<MonosEntry> {
++    let mut monos: Vec<MonosEntry> = monos_map
++        .into_iter()
++        .filter_map(|(generic, insts)| summarize_generic(generic, insts, only_generics, max_monos))
++        .collect();
+     monos.sort();
++    monos
++}
+ 
+-    // Append a row that summarizes the generics we are truncating, plus a row
+-    // spanning the totals for the whole set, before truncating the display.
+-    let max_generics = opts.max_generics() as usize;
+-    let remaining: Option<MonosEntry> = if monos.len() > max_generics {
++/// Append the summary rows that truncate and total the entry list.
++///
++/// Computes one entry for the generics truncated past `max_generics` (when any
++/// are dropped) and one entry totaling every generic, then truncates the
++/// displayed list to `max_generics` and appends both summaries.
++fn append_monos_summaries(monos: &mut Vec<MonosEntry>, max_generics: usize) {
++    // One row summarizing the generics truncated out of the display.
++    let remaining = if monos.len() > max_generics {
+         let mut rem_cnt: usize = 0;
+         let mut rem_size: u32 = 0;
+         let mut rem_savings: u32 = 0;
+@@ -117,6 +169,7 @@ pub fn monos(items: &mut ir::Items, opts: &opt::Monos) -> anyhow::Result<Box<dyn
+         None
+     };
+ 
++    // One row totaling every entry before truncation.
+     let total = {
+         let mut total_cnt: usize = 0;
+         let mut total_size: u32 = 0;
+@@ -139,6 +192,4 @@ pub fn monos(items: &mut ir::Items, opts: &opt::Monos) -> anyhow::Result<Box<dyn
+         monos.push(remaining);
+     }
+     monos.push(total);
+-
+-    Ok(Box::new(Monos { monos }) as Box<_>)
+ }

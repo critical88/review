@@ -1,0 +1,103 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Clang-Tidy",
+  "smell_type": "feature_envy",
+  "rule": {
+    "id": "conn-ledger-owner-bookkeeping",
+    "description": "The per-connection activity ledger record is identified structurally as the record definition that embeds the connection 4-tuple as its key; the record and its rules belong to the in-memory cache module (the file defining the record plus the module files implementing its accessor API). A function defined in a different file that reaches into the record and directly manipulates its fields (two or more member accesses) assembles the ledger's accounting rules outside the module that owns the record."
+  },
+  "smell_entries": [
+    { "id": "E1", "file_path": "src/main.c", "class_name": null, "function_name": "process_tcp_packet" },
+    { "id": "E2", "file_path": "src/main.c", "class_name": null, "function_name": "process_udp_packet" },
+    { "id": "E3", "file_path": "src/cache.c", "class_name": null, "function_name": "_process_incoming_RST" },
+    { "id": "E4", "file_path": "src/cache.c", "class_name": null, "function_name": "process_timeout" },
+    { "id": "E5", "file_path": "src/discrepancy.c", "class_name": null, "function_name": "send_insertion_packet" },
+    { "id": "E6", "file_path": "src/ttl_probing.c", "class_name": null, "function_name": "process_synack_for_ttl_probing" },
+    { "id": "E7", "file_path": "src/strategies/rst_super.c", "class_name": null, "function_name": "x6_process_request" },
+    { "id": "E8", "file_path": "src/strategies/do_organic.c", "class_name": null, "function_name": "x20_process_request" }
+  ],
+  "injected_match_count": 8,
+  "checks": [
+    {
+      "id": "ledger-rules-assembled-at-consumers",
+      "description": "Detect functions outside the module owning the ledger record that directly manipulate the record's fields, i.e. that maintain the ledger's accounting at the consumer site instead of conveying observations to the owner.",
+      "detected_relation": "consumer function -> direct member manipulation of the per-connection activity ledger record owned by the cache module",
+      "why_this_is_the_smell": "The record, its evidence vocabulary and its storage are defined by the cache module, but the rules interpreting raw observations (which evidence bit to set, how evidence composes into a verdict, how the TTL estimate adapts, what to summarize) are written at each consumer site through direct field access. The behavior that primarily operates on the record's data lives away from the module that owns the data.",
+      "matches": [
+        {
+          "file": "src/main.c",
+          "symbol": "process_tcp_packet",
+          "entry_ids": ["E1"],
+          "evidence": "15 direct member accesses on the ledger record across the SYN dispatch, HTTP/DNS-over-TCP request, SYN-ACK response and HTTP response phases: provisions the cycle (sid, attempts, ttl_hint, events, plus the retry summary log guarded on attempts) and marks request/response evidence with last_mark.",
+          "measurement": { "direct_member_accesses": 15, "fields_touched": ["sid", "attempts", "ttl_hint", "events", "last_mark", "fourtp"] }
+        },
+        {
+          "file": "src/main.c",
+          "symbol": "process_udp_packet",
+          "entry_ids": ["E2"],
+          "evidence": "4 direct member accesses: marks request evidence (events |= REQ, last_mark = transaction id) on the redirected DNS request leg and response evidence (events |= RESP, last_mark = transaction id) on the completing response leg.",
+          "measurement": { "direct_member_accesses": 4, "fields_touched": ["events", "last_mark"] }
+        },
+        {
+          "file": "src/cache.c",
+          "symbol": "_process_incoming_RST",
+          "entry_ids": ["E3"],
+          "evidence": "3 direct member accesses at the reset-attack classification legs: type-1 leg marks the type-1 reset evidence bit; type-2 leg marks the type-2 bit and records the observed attack TTL in last_mark.",
+          "measurement": { "direct_member_accesses": 3, "fields_touched": ["events", "last_mark"] }
+        },
+        {
+          "file": "src/cache.c",
+          "symbol": "process_timeout",
+          "entry_ids": ["E4"],
+          "evidence": "32 direct member accesses in the two mirrored evaluation-verification branches: each reads the evidence bits, classifies a verdict from them, adapts the TTL hint within its bounds, marks the cycle verified and emits the cycle-closure summary log built from the record's key, verdict, evidence and hint.",
+          "measurement": { "direct_member_accesses": 32, "fields_touched": ["events", "verdict", "ttl_hint", "fourtp"] }
+        },
+        {
+          "file": "src/discrepancy.c",
+          "symbol": "send_insertion_packet",
+          "entry_ids": ["E5"],
+          "evidence": "2 direct member accesses at the single choke point all crafted packets pass through: marks the insertion evidence bit and accumulates the low bits of the applied discrepancy codes.",
+          "measurement": { "direct_member_accesses": 2, "fields_touched": ["events", "discreps"] }
+        },
+        {
+          "file": "src/ttl_probing.c",
+          "symbol": "process_synack_for_ttl_probing",
+          "entry_ids": ["E6"],
+          "evidence": "3 direct member accesses: applies the unset-or-tighter rule for the server-side TTL estimate from a confirmed probing response.",
+          "measurement": { "direct_member_accesses": 3, "fields_touched": ["ttl_hint"] }
+        },
+        {
+          "file": "src/strategies/rst_super.c",
+          "symbol": "x6_process_request",
+          "entry_ids": ["E7"],
+          "evidence": "2 direct member accesses: the strategy journals that it fired its treatment (injection evidence bit) with the sequence number it dispatched at.",
+          "measurement": { "direct_member_accesses": 2, "fields_touched": ["events", "last_mark"] }
+        },
+        {
+          "file": "src/strategies/do_organic.c",
+          "symbol": "x20_process_request",
+          "entry_ids": ["E8"],
+          "evidence": "3 direct member accesses: distinguishes a retransmission on a connection whose response was already seen (reads the evidence bits, then logs), then marks the injection evidence bit and the sequence number.",
+          "measurement": { "direct_member_accesses": 3, "fields_touched": ["events", "last_mark"] }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "file": "src/helper.c",
+      "symbol": "show_ledger_of",
+      "reason": "Consults the ledger record only through the owner module's lookup and getter API and reports; it is a read-only consumer, not a field manipulator, and is intentionally not a credited manifestation."
+    },
+    {
+      "file": "src/memcache.c",
+      "symbol": "create_ledger_entry, ledger_ref, ledger_open, ledger_sid, ledger_events, ledger_ttl_hint",
+      "reason": "Direct field manipulation inside the owning module itself (storage and accessors) is the correct location for these operations and is excluded by the rule."
+    },
+    {
+      "file": "src/strategies/*.c",
+      "symbol": "pre-existing field accesses over records other than the ledger (e.g. strategy implementations over the packet wrapper's fields)",
+      "reason": "The baseline contains mild liberties over unrelated records, including strategy code over the packet structure and per-host results stored by their own module. They predate this case and are not manifestations of the injected relation, which concerns only the 4-tuple-keyed activity ledger record."
+    }
+  ]
+}

@@ -1,0 +1,1720 @@
+diff --git a/notify-debouncer-full/src/file_id_map.rs b/notify-debouncer-full/src/file_id_map.rs
+index 0342292..e9d5738 100644
+--- a/notify-debouncer-full/src/file_id_map.rs
++++ b/notify-debouncer-full/src/file_id_map.rs
+@@ -1,17 +1,20 @@
+-use crate::FileIdCache;
+-use file_id::{FileId, get_file_id};
++use crate::{Debouncer, FileIdCache};
++use file_id::FileId;
+ use notify::RecursiveMode;
+ use rustc_hash::FxHashMap as HashMap;
+ use std::path::{Path, PathBuf};
+-use walkdir::WalkDir;
+ 
+ /// A cache to hold the file system IDs of all watched files.
+ ///
+ /// The file ID cache uses unique file IDs provided by the file system and is used to stitch together
+ /// rename events in case the notification back-end doesn't emit rename cookies.
++///
++/// This type is a data container: the scanning, forgetting and rescan logic lives on
++/// [`Debouncer`](crate::Debouncer), which coordinates file IDs together with the watch roots and
++/// event queues.
+ #[derive(Debug, Clone, Default)]
+ pub struct FileIdMap {
+-    paths: HashMap<PathBuf, FileId>,
++    pub(crate) paths: HashMap<PathBuf, FileId>,
+ }
+ 
+ impl FileIdMap {
+@@ -20,35 +23,22 @@ impl FileIdMap {
+     pub fn new() -> Self {
+         Default::default()
+     }
+-
+-    fn dir_scan_depth(is_recursive: bool) -> usize {
+-        if is_recursive { usize::MAX } else { 1 }
+-    }
+ }
+ 
+ impl FileIdCache for FileIdMap {
+     fn cached_file_id(&self, path: &Path) -> Option<impl AsRef<FileId>> {
+-        self.paths.get(path)
++        Debouncer::cached_file_id_of(self, path)
+     }
+ 
+     fn add_path(&mut self, path: &Path, recursive_mode: RecursiveMode) {
+-        let is_recursive = recursive_mode == RecursiveMode::Recursive;
+-
+-        for (path, file_id) in WalkDir::new(path)
+-            .follow_links(true)
+-            .max_depth(Self::dir_scan_depth(is_recursive))
+-            .into_iter()
+-            .filter_map(|entry| {
+-                let path = entry.ok()?.into_path();
+-                let file_id = get_file_id(&path).ok()?;
+-                Some((path, file_id))
+-            })
+-        {
+-            self.paths.insert(path, file_id);
+-        }
++        Debouncer::scan_file_ids(self, path, recursive_mode);
+     }
+ 
+     fn remove_path(&mut self, path: &Path) {
+-        self.paths.retain(|p, _| !p.starts_with(path));
++        Debouncer::forget_file_ids(self, path);
++    }
++
++    fn rescan(&mut self, root_paths: &[(PathBuf, RecursiveMode)]) {
++        Debouncer::rescan_file_ids(self, root_paths);
+     }
+ }
+diff --git a/notify-debouncer-full/src/lib.rs b/notify-debouncer-full/src/lib.rs
+index a5b023b..15104f4 100644
+--- a/notify-debouncer-full/src/lib.rs
++++ b/notify-debouncer-full/src/lib.rs
+@@ -62,8 +62,16 @@
+ //! # Caveats
+ //!
+ //! As all file events are sourced from notify, the [known problems](https://docs.rs/notify/latest/notify/#known-problems) section applies here too.
++//!
++//! # Architecture
++//!
++//! [`Debouncer`] is the single coordinator of the debouncing pipeline: it owns the debounced
++//! event queues, the rename and rescan bookkeeping, the watch roots, the file ID scanning, and
++//! the wiring of the watcher and the delivery thread. The state it works on is a plain data
++//! record ([`DebounceDataInner`]); every policy decision lives on the coordinator itself.
+ 
+ mod cache;
++#[cfg(test)]
+ mod time;
+ 
+ #[cfg(test)]
+@@ -84,7 +92,6 @@ use std::{
+ };
+ 
+ use rustc_hash::FxHashMap as HashMap;
+-use time::now;
+ 
+ pub use cache::{FileIdCache, NoCache, RecommendedCache};
+ 
+@@ -96,11 +103,15 @@ pub use notify;
+ pub use notify_types::debouncer_full::DebouncedEvent;
+ 
+ use file_id::FileId;
++#[cfg(not(target_family = "wasm"))]
++use file_id::get_file_id;
+ use notify::{
+     Error, ErrorKind, Event, EventKind, PathOp, RecommendedWatcher, RecursiveMode,
+     UpdatePathsError, Watcher, WatcherKind,
+     event::{ModifyKind, RemoveKind, RenameMode},
+ };
++#[cfg(not(target_family = "wasm"))]
++use walkdir::WalkDir;
+ 
+ /// The set of requirements for watcher debounce event handling functions.
+ ///
+@@ -174,134 +185,360 @@ impl DebounceEventHandler for std::sync::mpsc::Sender<DebounceEventResult> {
+ /// Comes with either a vec of events or vec of errors.
+ pub type DebounceEventResult = Result<Vec<DebouncedEvent>, Vec<Error>>;
+ 
+-type DebounceData<T> = Arc<SharedDebounceData<T>>;
++type DebounceData = Arc<SharedDebounceData>;
+ 
+ #[derive(Debug)]
+-struct SharedDebounceData<T> {
+-    inner: Mutex<DebounceDataInner<T>>,
++struct SharedDebounceData {
++    inner: Mutex<DebounceDataInner>,
+     changed: Condvar,
+ }
+ 
++/// The per-path queues the debouncer stores pending debounced events in.
++///
++/// Events must be stored in the following order:
++/// 1. `remove` or `move out` event
++/// 2. `rename` event
++/// 3. Other events
++///
++/// The queue itself is inert data; the ordering rules are enforced by
++/// [`Debouncer`], which owns the debouncing policy.
+ #[derive(Debug, Clone, Default, PartialEq, Eq)]
+ struct Queue {
+-    /// Events must be stored in the following order:
+-    /// 1. `remove` or `move out` event
+-    /// 2. `rename` event
+-    /// 3. Other events
+     events: VecDeque<DebouncedEvent>,
+ }
+ 
+-impl Queue {
+-    fn was_created(&self) -> bool {
+-        self.events.front().is_some_and(|event| {
+-            matches!(
+-                event.kind,
+-                EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To))
+-            )
+-        })
+-    }
+-
+-    fn was_removed(&self) -> bool {
+-        self.events.front().is_some_and(|event| {
+-            matches!(
+-                event.kind,
+-                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From))
+-            )
+-        })
+-    }
++/// The debouncer state: pending queues, watch roots, in-flight rename events
++/// and pending errors.
++///
++/// This is a plain data record. All behavior operating on it lives on
++/// [`Debouncer`], so every debouncing decision is in one place; the watcher
++/// thread and the delivery thread both hand the record to the coordinator.
++#[derive(Debug)]
++pub(crate) struct DebounceDataInner {
++    pub(crate) queues: HashMap<PathBuf, Queue>,
++    /// Registered watch roots, kept **sorted by path** so that the coordinator's
++    /// `add_root` can dedupe via binary search in O(log N) and doesn't suffer
++    /// from injection
++    pub(crate) roots: VecDeque<(PathBuf, RecursiveMode)>,
++    pub(crate) rename_event: Option<(DebouncedEvent, Option<FileId>)>,
++    pub(crate) rescan_event: Option<DebouncedEvent>,
++    pub(crate) errors: Vec<Error>,
++    pub(crate) timeout: Duration,
+ }
+ 
++/// Debouncer guard, stops the debouncer on drop.
++///
++/// `Debouncer` is the one object that owns the whole debouncing pipeline:
++/// the state record the watcher thread writes into, the file ID cache, the
++/// queue policy, the expiry logic, the watch roots and the delivery thread.
++///
++/// The state-handling and file-ID-scanning logic is exposed as associated
++/// functions so the watcher thread and the delivery thread can execute the
++/// full pipeline without holding a debouncer guard themselves.
+ #[derive(Debug)]
+-pub(crate) struct DebounceDataInner<T> {
+-    queues: HashMap<PathBuf, Queue>,
+-    /// Registered watch roots, kept **sorted by path** so that `add_root`
+-    /// can dedupe via binary search in O(log N) and doesn't suffer from injection
+-    roots: VecDeque<(PathBuf, RecursiveMode)>,
+-    cache: T,
+-    rename_event: Option<(DebouncedEvent, Option<FileId>)>,
+-    rescan_event: Option<DebouncedEvent>,
+-    errors: Vec<Error>,
+-    timeout: Duration,
++pub struct Debouncer<T: Watcher, C: FileIdCache> {
++    watcher: T,
++    debouncer_thread: Option<std::thread::JoinHandle<()>>,
++    data: DebounceData,
++    file_id_cache: Arc<Mutex<C>>,
++    stop: Arc<AtomicBool>,
+ }
+ 
+-impl<T: FileIdCache> DebounceDataInner<T> {
+-    pub(crate) fn new(cache: T, timeout: Duration) -> Self {
+-        Self {
+-            queues: HashMap::default(),
+-            roots: VecDeque::new(),
+-            cache,
+-            rename_event: None,
+-            rescan_event: None,
+-            errors: Vec::new(),
+-            timeout,
++impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
++    // ===== lifecycle =====================================================
++
++    /// Create a new debounced watcher with custom configuration.
++    ///
++    /// Timeout is the amount of time after which a debounced event is emitted.
++    ///
++    /// If `tick_rate` is `None`, notify will select a tick rate that is 1/4 of the provided timeout.
++    ///
++    /// The debouncer wires the three moving parts together: the watcher thread ingesting raw
++    /// events, the pending-event state, and the delivery thread that flushes expired buckets.
++    pub fn new_opt<F: DebounceEventHandler>(
++        timeout: Duration,
++        tick_rate: Option<Duration>,
++        mut event_handler: F,
++        file_id_cache: C,
++        config: notify::Config,
++    ) -> Result<Self, Error>
++    where
++        C: Send + 'static,
++    {
++        let data = Arc::new(SharedDebounceData {
++            inner: Mutex::new(DebounceDataInner {
++                queues: HashMap::default(),
++                roots: VecDeque::new(),
++                rename_event: None,
++                rescan_event: None,
++                errors: Vec::new(),
++                timeout,
++            }),
++            changed: Condvar::new(),
++        });
++        let file_id_cache = Arc::new(Mutex::new(file_id_cache));
++        let stop = Arc::new(AtomicBool::new(false));
++
++        let tick_div = 4;
++        let tick = match tick_rate {
++            Some(v) => {
++                if v > timeout {
++                    return Err(Error::new(ErrorKind::Generic(format!(
++                        "Invalid tick_rate, tick rate {v:?} > {timeout:?} timeout!"
++                    ))));
++                }
++                v
++            }
++            None => timeout.checked_div(tick_div).ok_or_else(|| {
++                Error::new(ErrorKind::Generic(format!(
++                    "Failed to calculate tick as {timeout:?}/{tick_div}!"
++                )))
++            })?,
++        };
++
++        let data_c = data.clone();
++        let stop_c = stop.clone();
++        let thread = std::thread::Builder::new()
++            .name("notify-rs debouncer loop".to_string())
++            .spawn(move || {
++                loop {
++                    let mut lock = data_c.inner.lock().unwrap();
++                    while lock.queues.is_empty()
++                        && lock.errors.is_empty()
++                        && lock.rescan_event.is_none()
++                        && !stop_c.load(Ordering::Acquire)
++                    {
++                        lock = data_c.changed.wait(lock).unwrap();
++                    }
++                    if stop_c.load(Ordering::Acquire) {
++                        break;
++                    }
++                    drop(lock);
++                    std::thread::sleep(tick);
++                    if stop_c.load(Ordering::Acquire) {
++                        break;
++                    }
++                    lock = data_c.inner.lock().unwrap();
++                    let send_data = Self::expire_events(&mut lock);
++                    let errors = Self::take_errors(&mut lock);
++                    drop(lock);
++                    if !send_data.is_empty() {
++                        event_handler.handle_event(Ok(send_data));
++                    }
++                    if !errors.is_empty() {
++                        event_handler.handle_event(Err(errors));
++                    }
++                }
++            })?;
++
++        let data_c = data.clone();
++        let file_id_cache_c = file_id_cache.clone();
++        let watcher = T::new(
++            move |e: Result<Event, Error>| {
++                let mut lock = data_c.inner.lock().unwrap();
++                let mut file_id_cache_guard = file_id_cache_c.lock().unwrap();
++                match e {
++                    Ok(e) => Self::dispatch_event(&mut lock, &mut *file_id_cache_guard, e),
++                    // can't have multiple TX, so we need to pipe that through our debouncer
++                    Err(e) => Self::push_error(&mut lock, e),
++                }
++                drop(file_id_cache_guard);
++                drop(lock);
++                data_c.changed.notify_all();
++            },
++            config,
++        )?;
++
++        let guard = Debouncer {
++            watcher,
++            debouncer_thread: Some(thread),
++            data,
++            file_id_cache,
++            stop,
++        };
++
++        Ok(guard)
++    }
++
++    /// Stop the debouncer, waits for the event thread to finish.
++    /// May block for the duration of one `tick_rate`.
++    pub fn stop(mut self) {
++        self.set_stop();
++        if let Some(t) = self.debouncer_thread.take() {
++            let _ = t.join();
+         }
+     }
+ 
+-    /// Retrieve a vec of debounced events, removing them if not continuous
+-    pub fn debounced_events(&mut self) -> Vec<DebouncedEvent> {
+-        let now = now();
+-        let mut events_expired = Vec::with_capacity(self.queues.len());
++    /// Stop the debouncer, does not wait for the event thread to finish.
++    pub fn stop_nonblocking(self) {
++        self.set_stop();
++    }
+ 
+-        if let Some(event) = self.rescan_event.take() {
+-            if now.saturating_duration_since(event.time) >= self.timeout {
+-                log::trace!("debounced event: {event:?}");
+-                events_expired.push(event);
+-            } else {
+-                self.rescan_event = Some(event);
++    fn set_stop(&self) {
++        let _lock = self.data.inner.lock().unwrap();
++        self.stop.store(true, Ordering::Relaxed);
++        self.data.changed.notify_all();
++    }
++
++    #[deprecated = "`Debouncer` provides all methods from `Watcher` itself now. Remove `.watcher()` and use those methods directly."]
++    pub fn watcher(&mut self) {}
++
++    #[deprecated = "`Debouncer` now manages root paths automatically. Remove all calls to `add_root` and `remove_root`."]
++    pub fn cache(&mut self) {}
++
++    // ===== watch roots ===================================================
++
++    /// Register a root path so the debouncer can pick the correct recursive
++    /// mode and rescan origin for events below it, and seed the file ID cache.
++    fn add_root(&mut self, path: impl Into<PathBuf>, recursive_mode: RecursiveMode) {
++        let path = path.into();
++
++        let mut data = self.data.inner.lock().unwrap();
++
++        match data
++            .roots
++            .binary_search_by(|(p, _)| p.as_path().cmp(path.as_path()))
++        {
++            Ok(_) => return, // already registered
++            Err(pos) => {
++                // `VecDeque::insert` is O(min(pos, len - pos))
++                data.roots.insert(pos, (path.clone(), recursive_mode));
+             }
+         }
+ 
+-        // Visit each queue in place and remove only the ones that become empty.
+-        self.queues
+-            .extract_if(|_, queue| {
+-                let mut kind_index: HashMap<EventKind, usize> = HashMap::default();
+-                let mut queue_expired = Vec::new();
++        let mut file_id_cache = self.file_id_cache.lock().unwrap();
+ 
+-                while let Some(event) = queue.events.pop_front() {
+-                    // remove previous event of the same kind
+-                    if now.saturating_duration_since(event.time) >= self.timeout {
+-                        if let Some(idx) = kind_index.insert(event.kind, queue_expired.len()) {
+-                            queue_expired[idx] = None;
+-                        }
++        file_id_cache.add_path(&path, recursive_mode);
++    }
+ 
+-                        queue_expired.push(Some(event));
+-                    } else {
+-                        if let Some(&idx) = kind_index.get(&event.kind) {
+-                            queue_expired[idx] = None;
+-                        }
+-                        queue.events.push_front(event);
+-                        break;
+-                    }
+-                }
++    /// Drop a root path (and everything below it) from the root set and the file ID cache.
++    fn remove_root(&mut self, path: impl AsRef<Path>) {
++        let mut data = self.data.inner.lock().unwrap();
+ 
+-                events_expired.extend(queue_expired.into_iter().flatten());
++        data.roots.retain(|(root, _)| !root.starts_with(path.as_ref()));
+ 
+-                queue.events.is_empty()
++        let mut file_id_cache = self.file_id_cache.lock().unwrap();
++
++        file_id_cache.remove_path(path.as_ref());
++    }
++
++    pub fn watch(
++        &mut self,
++        path: impl AsRef<Path>,
++        recursive_mode: RecursiveMode,
++    ) -> notify::Result<()> {
++        self.watcher.watch(path.as_ref(), recursive_mode)?;
++        self.add_root(path.as_ref(), recursive_mode);
++        Ok(())
++    }
++
++    pub fn unwatch(&mut self, path: impl AsRef<Path>) -> notify::Result<()> {
++        self.watcher.unwatch(path.as_ref())?;
++        self.remove_root(path);
++        Ok(())
++    }
++
++    pub fn watched_paths(&self) -> notify::Result<Vec<(PathBuf, RecursiveMode)>> {
++        self.watcher.watched_paths()
++    }
++
++    /// Add/remove paths to watch in batch.
++    ///
++    /// For some [`Watcher`] implementations this method provides better performance than multiple
++    /// calls to [`Watcher::watch`] and [`Watcher::unwatch`] if you want to add/remove many paths at once.
++    ///
++    /// # Errors
++    ///
++    /// Returns [`UpdatePathsError`] if any operation fails. Operations are applied sequentially.
++    /// When an error occurs, processing stops: operations before `origin` have been applied,
++    /// `origin` is the operation that failed (if known), and `remaining` are the operations that
++    /// were not attempted. `remaining` does not include `origin`.
++    ///
++    /// # Examples
++    ///
++    /// ```
++    /// # use notify::{Watcher, RecursiveMode, PathOp};
++    /// # use notify_debouncer_full::{RecommendedCache, new_debouncer_opt};
++    /// # use std::path::{Path, PathBuf};
++    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
++    /// # let mut debouncer = new_debouncer_opt::<_, notify::NullWatcher, _>(
++    /// #     std::time::Duration::from_secs(1),
++    /// #     None,
++    /// #     |e| {},
++    /// #     RecommendedCache::new(),
++    /// #     Default::default()
++    /// # )?;
++    /// debouncer.update_paths([
++    ///     PathOp::watch_recursive("path/to/file"),
++    ///     PathOp::unwatch("path/to/file2"),
++    /// ])?;
++    /// # Ok(())
++    /// # }
++    /// ```
++    pub fn update_paths<Op: Into<PathOp>>(
++        &mut self,
++        ops: impl IntoIterator<Item = Op>,
++    ) -> std::result::Result<(), UpdatePathsError> {
++        let mut paths = Vec::new();
++        let ops: Vec<_> = ops
++            .into_iter()
++            .map(Into::into)
++            .inspect(|op| {
++                paths.push((
++                    op.as_path().to_path_buf(),
++                    match op {
++                        PathOp::Watch(_, config) => Some(config.recursive_mode()),
++                        PathOp::Unwatch(_) => None,
++                    },
++                ));
+             })
+-            .for_each(drop);
++            .collect();
+ 
+-        sort_events(events_expired)
++        let res = self.watcher.update_paths(ops);
++        let updated_len = match res.as_ref() {
++            Ok(()) => paths.len(),
++            Err(e) => {
++                let failed = usize::from(e.origin.is_some());
++                paths.len().saturating_sub(e.remaining.len() + failed)
++            }
++        };
++        let updated_paths = &paths[..updated_len];
++        for (path, watch_mode) in updated_paths {
++            match watch_mode {
++                Some(recursive_mode) => self.add_root(path, *recursive_mode),
++                None => self.remove_root(path),
++            }
++        }
++        res
+     }
+ 
+-    /// Returns all currently stored errors
+-    pub fn errors(&mut self) -> Vec<Error> {
+-        std::mem::take(&mut self.errors)
++    pub fn configure(&mut self, option: notify::Config) -> notify::Result<bool> {
++        self.watcher.configure(option)
+     }
+ 
+-    /// Add an error entry to re-send later on
+-    pub fn add_error(&mut self, error: Error) {
+-        log::trace!("raw error: {error:?}");
+-        self.errors.push(error);
++    #[must_use]
++    pub fn kind() -> WatcherKind
++    where
++        Self: Sized,
++    {
++        T::kind()
+     }
+ 
+-    /// Add new event to debouncer cache
+-    pub fn add_event(&mut self, event: Event) {
++    // ===== event intake ==================================================
++
++    /// Intake for one raw watcher event.
++    ///
++    /// `inner` holds the pending queues and roots, `cache` holds the file IDs,
++    /// and both are owned by this coordinator; when the watcher thread reports
++    /// activity it locks are taken in the order used here and that exact record
++    /// pair is handed over.
++    pub(crate) fn dispatch_event(inner: &mut DebounceDataInner, cache: &mut C, event: Event) {
+         log::trace!("raw event: {event:?}");
+ 
+         if event.need_rescan() {
+-            let roots = self.roots.make_contiguous();
+-            self.cache.rescan(roots);
+-            self.rescan_event = Some(DebouncedEvent { event, time: now() });
++            let roots = inner.roots.make_contiguous();
++            cache.rescan(roots);
++            inner.rescan_event = Some(DebouncedEvent { event, time: Self::now() });
+             return;
+         }
+ 
+@@ -315,26 +552,26 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+ 
+         match &event.kind {
+             EventKind::Create(_) => {
+-                let recursive_mode = self.recursive_mode(path);
++                let recursive_mode = Self::recursive_mode_for(inner, path);
+ 
+-                self.cache.add_path(path, recursive_mode);
++                cache.add_path(path, recursive_mode);
+ 
+-                self.push_event(event, now());
++                Self::push_event(inner, event, Self::now());
+             }
+             EventKind::Modify(ModifyKind::Name(rename_mode)) => {
+                 match rename_mode {
+                     RenameMode::Any => {
+                         if event.paths[0].exists() {
+-                            self.handle_rename_to(event);
++                            Self::handle_rename_to(inner, cache, event);
+                         } else {
+-                            self.handle_rename_from(event);
++                            Self::handle_rename_from(inner, cache, event);
+                         }
+                     }
+                     RenameMode::To => {
+-                        self.handle_rename_to(event);
++                        Self::handle_rename_to(inner, cache, event);
+                     }
+                     RenameMode::From => {
+-                        self.handle_rename_from(event);
++                        Self::handle_rename_from(inner, cache, event);
+                     }
+                     RenameMode::Both => {
+                         // ignore and handle `To` and `From` events instead
+@@ -345,57 +582,55 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+                 }
+             }
+             EventKind::Remove(_) => {
+-                self.push_remove_event(event, now());
++                Self::push_remove_event(inner, cache, event, Self::now());
+             }
+             EventKind::Other => {
+                 // ignore meta events
+             }
+             _ => {
+-                if self.cache.cached_file_id(path).is_none() {
+-                    let recursive_mode = self.recursive_mode(path);
++                if cache.cached_file_id(path).is_none() {
++                    let recursive_mode = Self::recursive_mode_for(inner, path);
+ 
+-                    self.cache.add_path(path, recursive_mode);
++                    cache.add_path(path, recursive_mode);
+                 }
+ 
+-                self.push_event(event, now());
++                Self::push_event(inner, event, Self::now());
+             }
+         }
+     }
+ 
+-    fn recursive_mode(&self, path: &Path) -> RecursiveMode {
+-        for ancestor in path.ancestors() {
+-            if let Ok(index) = self
+-                .roots
+-                .binary_search_by(|(root, _)| root.as_path().cmp(ancestor))
+-            {
+-                if self.roots[index].1 == RecursiveMode::Recursive {
+-                    return RecursiveMode::Recursive;
+-                }
+-            }
+-        }
++    /// Record an error to re-send later on.
++    pub(crate) fn push_error(inner: &mut DebounceDataInner, error: Error) {
++        log::trace!("raw error: {error:?}");
++        inner.errors.push(error);
++    }
+ 
+-        RecursiveMode::NonRecursive
++    /// Take and return all currently stored errors.
++    pub(crate) fn take_errors(inner: &mut DebounceDataInner) -> Vec<Error> {
++        std::mem::take(&mut inner.errors)
+     }
+ 
+-    fn handle_rename_from(&mut self, event: Event) {
+-        let time = now();
++    // ===== rename handling ===============================================
++
++    fn handle_rename_from(inner: &mut DebounceDataInner, cache: &mut C, event: Event) {
++        let time = Self::now();
+         let path = &event.paths[0];
+ 
+         // store event
+-        let file_id = self.cache.cached_file_id(path).map(|id| *id.as_ref());
+-        self.rename_event = Some((DebouncedEvent::new(event.clone(), time), file_id));
++        let file_id = cache.cached_file_id(path).map(|id| *id.as_ref());
++        inner.rename_event = Some((DebouncedEvent::new(event.clone(), time), file_id));
+ 
+-        self.cache.remove_path(path);
++        cache.remove_path(path);
+ 
+-        self.push_event(event, time);
++        Self::push_event(inner, event, time);
+     }
+ 
+-    fn handle_rename_to(&mut self, event: Event) {
+-        let recursive_mode = self.recursive_mode(&event.paths[0]);
++    fn handle_rename_to(inner: &mut DebounceDataInner, cache: &mut C, event: Event) {
++        let recursive_mode = Self::recursive_mode_for(inner, &event.paths[0]);
+ 
+-        self.cache.add_path(&event.paths[0], recursive_mode);
++        cache.add_path(&event.paths[0], recursive_mode);
+ 
+-        let trackers_match = self
++        let trackers_match = inner
+             .rename_event
+             .as_ref()
+             .and_then(|(e, _)| e.tracker())
+@@ -407,12 +642,12 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+             })
+             .unwrap_or_default();
+ 
+-        let file_ids_match = self
++        let file_ids_match = inner
+             .rename_event
+             .as_ref()
+             .and_then(|(_, id)| id.as_ref())
+             .and_then(|from_file_id| {
+-                self.cache
++                cache
+                     .cached_file_id(&event.paths[0])
+                     .map(|to_file_id| from_file_id == to_file_id.as_ref())
+             })
+@@ -420,22 +655,29 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+ 
+         if trackers_match || file_ids_match {
+             // connect rename
+-            let (mut rename_event, _) = self.rename_event.take().unwrap(); // unwrap is safe because `rename_event` must be set at this point
++            let (mut rename_event, _) =
++                inner.rename_event.take().unwrap(); // unwrap is safe because `rename_event` must be set at this point
+             let path = rename_event.paths.remove(0);
+             let time = rename_event.time;
+-            self.push_rename_event(path, event, time);
++            Self::push_rename_event(inner, cache, path, event, time);
+         } else {
+             // move in
+-            self.push_event(event, now());
++            Self::push_event(inner, event, Self::now());
+         }
+ 
+-        self.rename_event = None;
++        inner.rename_event = None;
+     }
+ 
+-    fn push_rename_event(&mut self, path: PathBuf, event: Event, time: Instant) {
+-        self.cache.remove_path(&path);
++    fn push_rename_event(
++        inner: &mut DebounceDataInner,
++        cache: &mut C,
++        path: PathBuf,
++        event: Event,
++        time: Instant,
++    ) {
++        cache.remove_path(&path);
+ 
+-        let mut source_queue = self.queues.remove(&path).unwrap_or_default();
++        let mut source_queue = inner.queues.remove(&path).unwrap_or_default();
+ 
+         // remove rename `from` event
+         source_queue.events.pop_back();
+@@ -462,10 +704,10 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+         }
+ 
+         // split off remove or move out event and add it back to the events map
+-        if source_queue.was_removed() {
++        if Self::queue_was_removed(&source_queue) {
+             let event = source_queue.events.pop_front().unwrap();
+ 
+-            self.queues.insert(
++            inner.queues.insert(
+                 event.paths[0].clone(),
+                 Queue {
+                     events: [event].into(),
+@@ -479,7 +721,7 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+         }
+ 
+         // insert rename event at the front, unless the file was just created
+-        if !source_queue.was_created() {
++        if !Self::queue_was_created(&source_queue) {
+             source_queue.events.push_front(DebouncedEvent {
+                 event: Event {
+                     kind: EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+@@ -490,8 +732,8 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+             });
+         }
+ 
+-        if let Some(target_queue) = self.queues.get_mut(&event.paths[0]) {
+-            if !target_queue.was_created() {
++        if let Some(target_queue) = inner.queues.get_mut(&event.paths[0]) {
++            if !Self::queue_was_created(target_queue) {
+                 let mut remove_event = DebouncedEvent {
+                     event: Event {
+                         kind: EventKind::Remove(RemoveKind::Any),
+@@ -500,40 +742,45 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+                     },
+                     time: original_time,
+                 };
+-                if !target_queue.was_removed() {
++                if !Self::queue_was_removed(target_queue) {
+                     remove_event.event = remove_event.event.set_info("override");
+                 }
+                 source_queue.events.push_front(remove_event);
+             }
+             *target_queue = source_queue;
+         } else {
+-            self.queues.insert(event.paths[0].clone(), source_queue);
++            inner.queues.insert(event.paths[0].clone(), source_queue);
+         }
+     }
+ 
+-    fn push_remove_event(&mut self, event: Event, time: Instant) {
++    fn push_remove_event(
++        inner: &mut DebounceDataInner,
++        cache: &mut C,
++        event: Event,
++        time: Instant,
++    ) {
+         let path = &event.paths[0];
+ 
+         // remove child queues
+-        self.queues.retain(|p, _| !p.starts_with(path) || p == path);
++        inner.queues.retain(|p, _| !p.starts_with(path) || p == path);
+ 
+         // remove cached file ids
+-        self.cache.remove_path(path);
++        cache.remove_path(path);
+ 
+-        match self.queues.get_mut(path) {
++        match inner.queues.get_mut(path) {
+             Some(queue) => {
+                 queue.events = [DebouncedEvent::new(event, time)].into();
+             }
+             None => {
+-                self.push_event(event, time);
++                Self::push_event(inner, event, time);
+             }
+         }
+     }
+ 
+-    fn push_event(&mut self, event: Event, time: Instant) {
++    fn push_event(inner: &mut DebounceDataInner, event: Event, time: Instant) {
+         let path = &event.paths[0];
+ 
+-        if let Some(queue) = self.queues.get_mut(path) {
++        if let Some(queue) = inner.queues.get_mut(path) {
+             // Skip duplicate create events and modifications right after creation.
+             // This code relies on backends never emitting a `Modify` event with kind other than `Name` for a rename event.
+             if match event.kind {
+@@ -543,13 +790,13 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+                     | ModifyKind::Metadata(_)
+                     | ModifyKind::Other,
+                 )
+-                | EventKind::Create(_) => !queue.was_created(),
++                | EventKind::Create(_) => !Self::queue_was_created(queue),
+                 _ => true,
+             } {
+                 queue.events.push_back(DebouncedEvent::new(event, time));
+             }
+         } else {
+-            self.queues.insert(
++            inner.queues.insert(
+                 path.to_path_buf(),
+                 Queue {
+                     events: [DebouncedEvent::new(event, time)].into(),
+@@ -557,171 +804,226 @@ impl<T: FileIdCache> DebounceDataInner<T> {
+             );
+         }
+     }
+-}
+ 
+-/// Debouncer guard, stops the debouncer on drop.
+-#[derive(Debug)]
+-pub struct Debouncer<T: Watcher, C: FileIdCache> {
+-    watcher: T,
+-    debouncer_thread: Option<std::thread::JoinHandle<()>>,
+-    data: DebounceData<C>,
+-    stop: Arc<AtomicBool>,
+-}
++    // ===== queue policy ==================================================
+ 
+-impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
+-    /// Stop the debouncer, waits for the event thread to finish.
+-    /// May block for the duration of one `tick_rate`.
+-    pub fn stop(mut self) {
+-        self.set_stop();
+-        if let Some(t) = self.debouncer_thread.take() {
+-            let _ = t.join();
+-        }
++    /// Whether the queue's head event marks the path as freshly created.
++    ///
++    /// Freshly-created queues swallow create events and the modifications
++    /// that follow them, so this policy decides which events are kept`.
++    pub(crate) fn queue_was_created(queue: &Queue) -> bool {
++        queue.events.front().is_some_and(|event| {
++            matches!(
++                event.kind,
++                EventKind::Create(_) | EventKind::Modify(ModifyKind::Name(RenameMode::To))
++            )
++        })
+     }
+ 
+-    /// Stop the debouncer, does not wait for the event thread to finish.
+-    pub fn stop_nonblocking(self) {
+-        self.set_stop();
++    /// Whether the queue's head event marks the path as gone.
++    pub(crate) fn queue_was_removed(queue: &Queue) -> bool {
++        queue.events.front().is_some_and(|event| {
++            matches!(
++                event.kind,
++                EventKind::Remove(_) | EventKind::Modify(ModifyKind::Name(RenameMode::From))
++            )
++        })
+     }
+ 
+-    fn set_stop(&self) {
+-        let _lock = self.data.inner.lock().unwrap();
+-        self.stop.store(true, Ordering::Relaxed);
+-        self.data.changed.notify_all();
++    /// Find the recursive mode for `path` among the registered `roots`.
++    pub(crate) fn recursive_mode_for(inner: &DebounceDataInner, path: &Path) -> RecursiveMode {
++        for ancestor in path.ancestors() {
++            if let Ok(index) = inner
++                .roots
++                .binary_search_by(|(root, _)| root.as_path().cmp(ancestor))
++            {
++                if inner.roots[index].1 == RecursiveMode::Recursive {
++                    return RecursiveMode::Recursive;
++                }
++            }
++        }
++
++        RecursiveMode::NonRecursive
+     }
+ 
+-    #[deprecated = "`Debouncer` provides all methods from `Watcher` itself now. Remove `.watcher()` and use those methods directly."]
+-    pub fn watcher(&mut self) {}
++    // ===== expiry ========================================================
+ 
+-    #[deprecated = "`Debouncer` now manages root paths automatically. Remove all calls to `add_root` and `remove_root`."]
+-    pub fn cache(&mut self) {}
++    /// Collect the debounced events whose debounce window has elapsed, return them sorted.
++    pub(crate) fn expire_events(inner: &mut DebounceDataInner) -> Vec<DebouncedEvent> {
++        let now = Self::now();
++        let mut events_expired = Vec::with_capacity(inner.queues.len());
+ 
+-    fn add_root(&mut self, path: impl Into<PathBuf>, recursive_mode: RecursiveMode) {
+-        let path = path.into();
++        if let Some(event) = inner.rescan_event.take() {
++            if now.saturating_duration_since(event.time) >= inner.timeout {
++                log::trace!("debounced event: {event:?}");
++                events_expired.push(event);
++            } else {
++                inner.rescan_event = Some(event);
++            }
++        }
+ 
+-        let mut data = self.data.inner.lock().unwrap();
++        // Visit each queue in place and remove only the ones that become empty.
++        inner
++            .queues
++            .extract_if(|_, queue| {
++                let mut kind_index: HashMap<EventKind, usize> = HashMap::default();
++                let mut queue_expired = Vec::new();
+ 
+-        match data
+-            .roots
+-            .binary_search_by(|(p, _)| p.as_path().cmp(path.as_path()))
+-        {
+-            Ok(_) => return, // already registered
+-            Err(pos) => {
+-                // `VecDeque::insert` is O(min(pos, len - pos))
+-                data.roots.insert(pos, (path.clone(), recursive_mode));
++                while let Some(event) = queue.events.pop_front() {
++                    // remove previous event of the same kind
++                    if now.saturating_duration_since(event.time) >= inner.timeout {
++                        if let Some(idx) = kind_index.insert(event.kind, queue_expired.len()) {
++                            queue_expired[idx] = None;
++                        }
++
++                        queue_expired.push(Some(event));
++                    } else {
++                        if let Some(&idx) = kind_index.get(&event.kind) {
++                            queue_expired[idx] = None;
++                        }
++                        queue.events.push_front(event);
++                        break;
++                    }
++                }
++
++                events_expired.extend(queue_expired.into_iter().flatten());
++
++                queue.events.is_empty()
++            })
++            .for_each(drop);
++
++        Self::sorted_events(events_expired)
++    }
++
++    /// Return the given events order by time and path tail.
++    pub(crate) fn sorted_events(events: Vec<DebouncedEvent>) -> Vec<DebouncedEvent> {
++        let mut sorted = Vec::with_capacity(events.len());
++
++        // group events by path
++        let mut groups = Vec::<(PathBuf, VecDeque<DebouncedEvent>)>::new();
++        let mut group_indexes: HashMap<PathBuf, usize> = HashMap::default();
++        group_indexes.reserve(events.len());
++        groups.reserve(events.len());
++
++        for event in events {
++            let path = event.paths.last().cloned().unwrap_or_default();
++
++            if let Some(&index) = group_indexes.get(&path) {
++                groups[index].1.push_back(event);
++            } else {
++                group_indexes.insert(path.clone(), groups.len());
++                groups.push((path, [event].into()));
+             }
+         }
+ 
+-        data.cache.add_path(&path, recursive_mode);
+-    }
++        // Keep path order as the tie-breaker for identical timestamps.
++        groups.sort_unstable_by(|(left_path, _), (right_path, _)| left_path.cmp(right_path));
+ 
+-    fn remove_root(&mut self, path: impl AsRef<Path>) {
+-        let mut data = self.data.inner.lock().unwrap();
++        // push events for different paths in chronological order and keep the order of events with the same path
++
++        let mut min_time_heap = groups
++            .iter()
++            .enumerate()
++            .map(|(index, (_, events))| Reverse((events[0].time, index)))
++            .collect::<BinaryHeap<_>>();
++
++        while let Some(Reverse((min_time, index))) = min_time_heap.pop() {
++            let events = &mut groups[index].1;
+ 
+-        data.roots.retain(|(root, _)| !root.starts_with(&path));
++            let mut push_next = false;
++
++            while events.front().is_some_and(|event| event.time <= min_time) {
++                // unwrap is safe because `pop_front` mus return some in order to enter the loop
++                let event = events.pop_front().unwrap();
++                sorted.push(event);
++                push_next = true;
++            }
+ 
+-        data.cache.remove_path(path.as_ref());
++            if push_next {
++                if let Some(event) = events.front() {
++                    min_time_heap.push(Reverse((event.time, index)));
++                }
++            }
++        }
++
++        sorted
+     }
+ 
+-    pub fn watch(
+-        &mut self,
+-        path: impl AsRef<Path>,
+-        recursive_mode: RecursiveMode,
+-    ) -> notify::Result<()> {
+-        self.watcher.watch(path.as_ref(), recursive_mode)?;
+-        self.add_root(path.as_ref(), recursive_mode);
+-        Ok(())
++    // ===== time source ===================================================
++
++    /// The clock every debouncer timestamp comes from.
++    ///
++    /// The debouncer used to reach for a free-standing clock module; now that
++    /// the coordinator owns the whole pipeline the clock belongs to it as well.
++    #[cfg(not(test))]
++    pub(crate) fn now() -> Instant {
++        Instant::now()
+     }
+ 
+-    pub fn unwatch(&mut self, path: impl AsRef<Path>) -> notify::Result<()> {
+-        self.watcher.unwatch(path.as_ref())?;
+-        self.remove_root(path);
+-        Ok(())
++    /// Test builds keep using the mockable clock so state-machine tests can
++    /// fast-forward time.
++    #[cfg(test)]
++    pub(crate) fn now() -> Instant {
++        crate::time::now()
+     }
++}
+ 
+-    pub fn watched_paths(&self) -> notify::Result<Vec<(PathBuf, RecursiveMode)>> {
+-        self.watcher.watched_paths()
++/// [`Debouncer`]'s file ID bookkeeping for the built-in [`FileIdMap`] cache.
++///
++/// The coordinator owns the file ID duties as much as the queueing duties:
++/// scanning paths, forgetting subtrees, rescanning all roots after a backend
++/// hiccup, and answering membership queries. [`FileIdMap`] is therefore only a
++/// data container; its `FileIdCache` implementation forwards to the associated
++/// functions below. The watcher half is irrelevant to the file ID duties, so
++/// it is pinned to notify's inert `NullWatcher`.
++#[cfg(not(target_family = "wasm"))]
++impl Debouncer<notify::NullWatcher, FileIdMap> {
++    /// Look up the cached file ID of a path.
++    pub(crate) fn cached_file_id_of<'a>(
++        cache: &'a FileIdMap,
++        path: &Path,
++    ) -> Option<&'a FileId> {
++        cache.paths.get(path)
+     }
+ 
+-    /// Add/remove paths to watch in batch.
+-    ///
+-    /// For some [`Watcher`] implementations this method provides better performance than multiple
+-    /// calls to [`Watcher::watch`] and [`Watcher::unwatch`] if you want to add/remove many paths at once.
+-    ///
+-    /// # Errors
+-    ///
+-    /// Returns [`UpdatePathsError`] if any operation fails. Operations are applied sequentially.
+-    /// When an error occurs, processing stops: operations before `origin` have been applied,
+-    /// `origin` is the operation that failed (if known), and `remaining` are the operations that
+-    /// were not attempted. `remaining` does not include `origin`.
+-    ///
+-    /// # Examples
+-    ///
+-    /// ```
+-    /// # use notify::{Watcher, RecursiveMode, PathOp};
+-    /// # use notify_debouncer_full::{RecommendedCache, new_debouncer_opt};
+-    /// # use std::path::{Path, PathBuf};
+-    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+-    /// # let mut debouncer = new_debouncer_opt::<_, notify::NullWatcher, _>(
+-    /// #     std::time::Duration::from_secs(1),
+-    /// #     None,
+-    /// #     |e| {},
+-    /// #     RecommendedCache::new(),
+-    /// #     Default::default()
+-    /// # )?;
+-    /// debouncer.update_paths([
+-    ///     PathOp::watch_recursive("path/to/file"),
+-    ///     PathOp::unwatch("path/to/file2"),
+-    /// ])?;
+-    /// # Ok(())
+-    /// # }
+-    /// ```
+-    pub fn update_paths<Op: Into<PathOp>>(
+-        &mut self,
+-        ops: impl IntoIterator<Item = Op>,
+-    ) -> std::result::Result<(), UpdatePathsError> {
+-        let mut paths = Vec::new();
+-        let ops: Vec<_> = ops
++    /// Scan a path (recursively below a root, if requested) and remember the
++    /// file IDs of everything found.
++    pub(crate) fn scan_file_ids(
++        cache: &mut FileIdMap,
++        path: &Path,
++        recursive_mode: RecursiveMode,
++    ) {
++        let is_recursive = recursive_mode == RecursiveMode::Recursive;
++
++        for (path, file_id) in WalkDir::new(path)
++            .follow_links(true)
++            .max_depth(Self::dir_scan_depth(is_recursive))
+             .into_iter()
+-            .map(Into::into)
+-            .inspect(|op| {
+-                paths.push((
+-                    op.as_path().to_path_buf(),
+-                    match op {
+-                        PathOp::Watch(_, config) => Some(config.recursive_mode()),
+-                        PathOp::Unwatch(_) => None,
+-                    },
+-                ));
++            .filter_map(|entry| {
++                let path = entry.ok()?.into_path();
++                let file_id = get_file_id(&path).ok()?;
++                Some((path, file_id))
+             })
+-            .collect();
+-
+-        let res = self.watcher.update_paths(ops);
+-        let updated_len = match res.as_ref() {
+-            Ok(()) => paths.len(),
+-            Err(e) => {
+-                let failed = usize::from(e.origin.is_some());
+-                paths.len().saturating_sub(e.remaining.len() + failed)
+-            }
+-        };
+-        let updated_paths = &paths[..updated_len];
+-        for (path, watch_mode) in updated_paths {
+-            match watch_mode {
+-                Some(recursive_mode) => self.add_root(path, *recursive_mode),
+-                None => self.remove_root(path),
+-            }
++        {
++            cache.paths.insert(path, file_id);
+         }
+-        res
+     }
+ 
+-    pub fn configure(&mut self, option: notify::Config) -> notify::Result<bool> {
+-        self.watcher.configure(option)
++    /// Forget the file IDs of a path and everything below it.
++    pub(crate) fn forget_file_ids(cache: &mut FileIdMap, path: &Path) {
++        cache.paths.retain(|p, _| !p.starts_with(path));
+     }
+ 
+-    #[must_use]
+-    pub fn kind() -> WatcherKind
+-    where
+-        Self: Sized,
+-    {
+-        T::kind()
++    /// Re-scan all `root_paths` after the notification back-end has dropped
++    /// events and the debouncer asked for a full rescan.
++    pub(crate) fn rescan_file_ids(cache: &mut FileIdMap, root_paths: &[(PathBuf, RecursiveMode)]) {
++        for (path, recursive_mode) in root_paths {
++            Self::scan_file_ids(cache, path, *recursive_mode);
++        }
++    }
++
++    fn dir_scan_depth(is_recursive: bool) -> usize {
++        if is_recursive { usize::MAX } else { 1 }
+     }
+ }
+ 
+@@ -739,90 +1041,11 @@ impl<T: Watcher, C: FileIdCache> Drop for Debouncer<T, C> {
+ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + Send + 'static>(
+     timeout: Duration,
+     tick_rate: Option<Duration>,
+-    mut event_handler: F,
++    event_handler: F,
+     file_id_cache: C,
+     config: notify::Config,
+ ) -> Result<Debouncer<T, C>, Error> {
+-    let data = Arc::new(SharedDebounceData {
+-        inner: Mutex::new(DebounceDataInner::new(file_id_cache, timeout)),
+-        changed: Condvar::new(),
+-    });
+-    let stop = Arc::new(AtomicBool::new(false));
+-
+-    let tick_div = 4;
+-    let tick = match tick_rate {
+-        Some(v) => {
+-            if v > timeout {
+-                return Err(Error::new(ErrorKind::Generic(format!(
+-                    "Invalid tick_rate, tick rate {v:?} > {timeout:?} timeout!"
+-                ))));
+-            }
+-            v
+-        }
+-        None => timeout.checked_div(tick_div).ok_or_else(|| {
+-            Error::new(ErrorKind::Generic(format!(
+-                "Failed to calculate tick as {timeout:?}/{tick_div}!"
+-            )))
+-        })?,
+-    };
+-
+-    let data_c = data.clone();
+-    let stop_c = stop.clone();
+-    let thread = std::thread::Builder::new()
+-        .name("notify-rs debouncer loop".to_string())
+-        .spawn(move || {
+-            loop {
+-                let mut lock = data_c.inner.lock().unwrap();
+-                while lock.queues.is_empty()
+-                    && lock.errors.is_empty()
+-                    && lock.rescan_event.is_none()
+-                    && !stop_c.load(Ordering::Acquire)
+-                {
+-                    lock = data_c.changed.wait(lock).unwrap();
+-                }
+-                if stop_c.load(Ordering::Acquire) {
+-                    break;
+-                }
+-                drop(lock);
+-                std::thread::sleep(tick);
+-                if stop_c.load(Ordering::Acquire) {
+-                    break;
+-                }
+-                lock = data_c.inner.lock().unwrap();
+-                let send_data = lock.debounced_events();
+-                let errors = lock.errors();
+-                drop(lock);
+-                if !send_data.is_empty() {
+-                    event_handler.handle_event(Ok(send_data));
+-                }
+-                if !errors.is_empty() {
+-                    event_handler.handle_event(Err(errors));
+-                }
+-            }
+-        })?;
+-
+-    let data_c = data.clone();
+-    let watcher = T::new(
+-        move |e: Result<Event, Error>| {
+-            let mut lock = data_c.inner.lock().unwrap();
+-            match e {
+-                Ok(e) => lock.add_event(e),
+-                // can't have multiple TX, so we need to pipe that through our debouncer
+-                Err(e) => lock.add_error(e),
+-            }
+-            data_c.changed.notify_all();
+-        },
+-        config,
+-    )?;
+-
+-    let guard = Debouncer {
+-        watcher,
+-        debouncer_thread: Some(thread),
+-        data,
+-        stop,
+-    };
+-
+-    Ok(guard)
++    Debouncer::new_opt(timeout, tick_rate, event_handler, file_id_cache, config)
+ }
+ 
+ /// Short function to create a new debounced watcher with the recommended debouncer and the built-in file ID cache.
+@@ -844,59 +1067,6 @@ pub fn new_debouncer<F: DebounceEventHandler>(
+     )
+ }
+ 
+-fn sort_events(events: Vec<DebouncedEvent>) -> Vec<DebouncedEvent> {
+-    let mut sorted = Vec::with_capacity(events.len());
+-
+-    // group events by path
+-    let mut groups = Vec::<(PathBuf, VecDeque<DebouncedEvent>)>::new();
+-    let mut group_indexes: HashMap<PathBuf, usize> = HashMap::default();
+-    group_indexes.reserve(events.len());
+-    groups.reserve(events.len());
+-
+-    for event in events {
+-        let path = event.paths.last().cloned().unwrap_or_default();
+-
+-        if let Some(&index) = group_indexes.get(&path) {
+-            groups[index].1.push_back(event);
+-        } else {
+-            group_indexes.insert(path.clone(), groups.len());
+-            groups.push((path, [event].into()));
+-        }
+-    }
+-
+-    // Keep path order as the tie-breaker for identical timestamps.
+-    groups.sort_unstable_by(|(left_path, _), (right_path, _)| left_path.cmp(right_path));
+-
+-    // push events for different paths in chronological order and keep the order of events with the same path
+-
+-    let mut min_time_heap = groups
+-        .iter()
+-        .enumerate()
+-        .map(|(index, (_, events))| Reverse((events[0].time, index)))
+-        .collect::<BinaryHeap<_>>();
+-
+-    while let Some(Reverse((min_time, index))) = min_time_heap.pop() {
+-        let events = &mut groups[index].1;
+-
+-        let mut push_next = false;
+-
+-        while events.front().is_some_and(|event| event.time <= min_time) {
+-            // unwrap is safe because `pop_front` mus return some in order to enter the loop
+-            let event = events.pop_front().unwrap();
+-            sorted.push(event);
+-            push_next = true;
+-        }
+-
+-        if push_next {
+-            if let Some(event) = events.front() {
+-                min_time_heap.push(Reverse((event.time, index)));
+-            }
+-        }
+-    }
+-
+-    sorted
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use std::{
+@@ -913,6 +1083,11 @@ mod tests {
+     use testing::TestCase;
+     use time::MockTime;
+ 
++    /// Anchor for the coordinator's associated state-machine and ordering
++    /// functions; the test cases below hand plain state and cache parts to
++    /// the debouncer directly, so no guard is ever constructed.
++    type TestDebouncer = Debouncer<notify::NullWatcher, testing::TestCache>;
++
+     #[derive(Debug)]
+     struct FailingWatcher {
+         fail_path: PathBuf,
+@@ -1039,11 +1214,11 @@ mod tests {
+             fs::read_to_string(Path::new(&format!("./test_cases/{file_name}.hjson"))).unwrap();
+         let mut test_case = deser_hjson::from_str::<TestCase>(&file_content).unwrap();
+ 
+-        let time = now();
++        let time = time::now();
+         MockTime::set_time(time);
+ 
+-        let mut state = test_case.state.into_debounce_data_inner(time);
+-        state.roots = VecDeque::from([(PathBuf::from("/"), RecursiveMode::Recursive)]);
++        let (mut inner, mut cache) = test_case.state.into_debounce_parts(time);
++        inner.roots = VecDeque::from([(PathBuf::from("/"), RecursiveMode::Recursive)]);
+ 
+         let mut prev_event_time = Duration::default();
+ 
+@@ -1052,36 +1227,36 @@ mod tests {
+             let event = event.into_debounced_event(time, None);
+             MockTime::advance(event_time - prev_event_time);
+             prev_event_time = event_time;
+-            state.add_event(event.event);
++            TestDebouncer::dispatch_event(&mut inner, &mut cache, event.event);
+         }
+ 
+         for error in test_case.errors {
+             let error = error.into_notify_error();
+-            state.add_error(error);
++            TestDebouncer::push_error(&mut inner, error);
+         }
+ 
+         let expected_errors = std::mem::take(&mut test_case.expected.errors);
+         let expected_events = std::mem::take(&mut test_case.expected.events);
+-        let expected_state = test_case.expected.into_debounce_data_inner(time);
++        let (expected_inner, expected_cache) = test_case.expected.into_debounce_parts(time);
+         assert_eq!(
+-            state.queues, expected_state.queues,
++            inner.queues, expected_inner.queues,
+             "queues not as expected"
+         );
+         assert_eq!(
+-            state.rename_event, expected_state.rename_event,
++            inner.rename_event, expected_inner.rename_event,
+             "rename event not as expected"
+         );
+         assert_eq!(
+-            state.rescan_event, expected_state.rescan_event,
++            inner.rescan_event, expected_inner.rescan_event,
+             "rescan event not as expected"
+         );
+         assert_eq!(
+-            state.cache.paths, expected_state.cache.paths,
++            cache.paths, expected_cache.paths,
+             "cache not as expected"
+         );
+ 
+         assert_eq!(
+-            state
++            inner
+                 .errors
+                 .iter()
+                 .map(|e| format!("{e:?}"))
+@@ -1093,12 +1268,12 @@ mod tests {
+             "errors not as expected"
+         );
+ 
+-        let backup_time = now();
+-        let backup_queues = state.queues.clone();
++        let backup_time = time::now();
++        let backup_queues = inner.queues.clone();
+ 
+         for (delay, events) in expected_events {
+             MockTime::set_time(backup_time);
+-            state.queues = backup_queues.clone();
++            inner.queues = backup_queues.clone();
+ 
+             match delay.as_str() {
+                 "none" => {}
+@@ -1117,7 +1292,7 @@ mod tests {
+                 .collect::<Vec<_>>();
+ 
+             assert_eq!(
+-                state.debounced_events(),
++                TestDebouncer::expire_events(&mut inner),
+                 events,
+                 "debounced events after a `{delay}` delay"
+             );
+@@ -1126,13 +1301,12 @@ mod tests {
+ 
+     #[test]
+     fn recursive_mode_uses_recursive_root_for_overlapping_watches() {
+-        let state = DebounceDataInner {
++        let inner = DebounceDataInner {
+             queues: HashMap::default(),
+             roots: VecDeque::from([
+                 (PathBuf::from("root"), RecursiveMode::NonRecursive),
+                 (PathBuf::from("root/nested"), RecursiveMode::Recursive),
+             ]),
+-            cache: NoCache,
+             rename_event: None,
+             rescan_event: None,
+             errors: Vec::new(),
+@@ -1140,18 +1314,18 @@ mod tests {
+         };
+ 
+         assert_eq!(
+-            state.recursive_mode(Path::new("root/nested/child")),
++            TestDebouncer::recursive_mode_for(&inner, Path::new("root/nested/child")),
+             RecursiveMode::Recursive
+         );
+         assert_eq!(
+-            state.recursive_mode(Path::new("root/other")),
++            TestDebouncer::recursive_mode_for(&inner, Path::new("root/other")),
+             RecursiveMode::NonRecursive
+         );
+     }
+ 
+     #[test]
+     fn sort_events_ties_by_path() {
+-        let time = now();
++        let time = time::now();
+         let events = vec![
+             DebouncedEvent::new(
+                 Event::new(EventKind::Any).add_path(PathBuf::from("/watch/b")),
+@@ -1163,7 +1337,7 @@ mod tests {
+             ),
+         ];
+ 
+-        let sorted = sort_events(events);
++        let sorted = TestDebouncer::sorted_events(events);
+         let paths = sorted
+             .into_iter()
+             .map(|event| event.paths[0].clone())
+@@ -1217,8 +1391,9 @@ mod tests {
+     /// must not suppress the `Remove` event, even though a prior `Create`
+     /// for the same path exists in the queue.
+     ///
+-    /// Without the fix, `push_remove_event` would see `was_created() == true`
+-    /// and cancel the entire queue, swallowing the removal.
++    /// Without the fix, the coordinator's remove handling would see
++    /// `queue_was_created() == true` and cancel the entire queue, swallowing
++    /// the removal.
+     #[test]
+     #[cfg(all(target_os = "macos", feature = "macos_fsevent"))]
+     fn remove_event_not_swallowed_after_create() -> Result<(), Box<dyn std::error::Error>> {
+@@ -1286,9 +1461,9 @@ mod tests {
+     }
+ 
+     /// Unit-level reproducer for the same bug: feed a Create + Remove
+-    /// sequence into `DebounceDataInner` directly, with the queue already
+-    /// flushed between them (simulating the debounce tick).  The Remove
+-    /// must not be swallowed.
++    /// sequence into the coordinator directly, with the queue already flushed
++    /// between them (simulating the debounce tick).  The Remove must not be
++    /// swallowed.
+     #[test]
+     #[cfg(target_os = "macos")]
+     fn push_remove_after_flushed_create() {
+@@ -1296,7 +1471,17 @@ mod tests {
+         use notify::event::{CreateKind, RemoveKind};
+         use std::path::PathBuf;
+ 
+-        let mut state = DebounceDataInner::new(NoCache, Duration::from_millis(50));
++        type MacTestDebouncer = Debouncer<notify::NullWatcher, NoCache>;
++
++        let mut inner = DebounceDataInner {
++            queues: HashMap::default(),
++            roots: VecDeque::new(),
++            rename_event: None,
++            rescan_event: None,
++            errors: Vec::new(),
++            timeout: Duration::from_millis(50),
++        };
++        let mut cache = NoCache;
+ 
+         let time = std::time::Instant::now();
+         MockTime::set_time(time);
+@@ -1304,34 +1489,46 @@ mod tests {
+         let path = PathBuf::from("/tmp/test_file.txt");
+ 
+         // Simulate: file created → Create event added
+-        state.add_event(Event {
+-            kind: EventKind::Create(CreateKind::File),
+-            paths: vec![path.clone()],
+-            ..Default::default()
+-        });
++        MacTestDebouncer::dispatch_event(
++            &mut inner,
++            &mut cache,
++            Event {
++                kind: EventKind::Create(CreateKind::File),
++                paths: vec![path.clone()],
++                ..Default::default()
++            },
++        );
+ 
+         // Simulate: debounce tick flushes the Create
+         MockTime::advance(Duration::from_millis(100));
+-        let flushed = state.debounced_events();
++        let flushed = MacTestDebouncer::expire_events(&mut inner);
+         assert_eq!(flushed.len(), 1);
+         assert!(matches!(flushed[0].event.kind, EventKind::Create(_)));
+ 
+         // Simulate: FSEvents sends Create + Remove for the deletion
+         // (this is what macOS does)
+-        state.add_event(Event {
+-            kind: EventKind::Create(CreateKind::File),
+-            paths: vec![path.clone()],
+-            ..Default::default()
+-        });
+-        state.add_event(Event {
+-            kind: EventKind::Remove(RemoveKind::File),
+-            paths: vec![path.clone()],
+-            ..Default::default()
+-        });
++        MacTestDebouncer::dispatch_event(
++            &mut inner,
++            &mut cache,
++            Event {
++                kind: EventKind::Create(CreateKind::File),
++                paths: vec![path.clone()],
++                ..Default::default()
++            },
++        );
++        MacTestDebouncer::dispatch_event(
++            &mut inner,
++            &mut cache,
++            Event {
++                kind: EventKind::Remove(RemoveKind::File),
++                paths: vec![path.clone()],
++                ..Default::default()
++            },
++        );
+ 
+         // Flush again — we MUST get the Remove event
+         MockTime::advance(Duration::from_millis(100));
+-        let flushed = state.debounced_events();
++        let flushed = MacTestDebouncer::expire_events(&mut inner);
+         assert!(
+             flushed
+                 .iter()
+diff --git a/notify-debouncer-full/src/testing.rs b/notify-debouncer-full/src/testing.rs
+index e013178..718987b 100644
+--- a/notify-debouncer-full/src/testing.rs
++++ b/notify-debouncer-full/src/testing.rs
+@@ -217,7 +217,9 @@ impl schema::Event {
+ }
+ 
+ impl schema::State {
+-    pub(crate) fn into_debounce_data_inner(self, time: Instant) -> DebounceDataInner<TestCache> {
++    /// Split this state into the two parts the debouncer coordinates:
++    /// the pending-event record and the file ID cache.
++    pub(crate) fn into_debounce_parts(self, time: Instant) -> (DebounceDataInner, TestCache) {
+         let queues = self
+             .queues
+             .into_iter()
+@@ -265,15 +267,16 @@ impl schema::State {
+             .rescan_event
+             .map(|e| e.into_debounced_event(time, None));
+ 
+-        DebounceDataInner {
++        let inner = DebounceDataInner {
+             queues,
+             roots: VecDeque::new(),
+-            cache,
+             rename_event,
+             rescan_event,
+             errors: Vec::new(),
+             timeout: Duration::from_millis(self.timeout.unwrap_or(50)),
+-        }
++        };
++
++        (inner, cache)
+     }
+ }
+ 
+diff --git a/notify-debouncer-full/src/time.rs b/notify-debouncer-full/src/time.rs
+index 2e1f166..35c4ab3 100644
+--- a/notify-debouncer-full/src/time.rs
++++ b/notify-debouncer-full/src/time.rs
+@@ -1,47 +1,36 @@
+-#[cfg(not(test))]
+-pub use build::*;
+-
+-#[cfg(not(test))]
+-mod build {
+-    use std::time::Instant;
+-
+-    pub fn now() -> Instant {
+-        Instant::now()
+-    }
++//! Mockable clock for the debouncer tests.
++//!
++//! This module is only compiled for tests: the production clock is owned by
++//! [`crate::Debouncer`], and tests place it under the [`MockTime`] control
++//! implemented here so state-machine tests can fast-forward time.
++
++use std::{
++    sync::Mutex,
++    time::{Duration, Instant},
++};
++
++thread_local! {
++    static NOW: Mutex<Option<Instant>> = const { Mutex::new(None) };
+ }
+ 
+-#[cfg(test)]
+-pub use test::*;
+-
+-#[cfg(test)]
+-mod test {
+-    use std::{
+-        sync::Mutex,
+-        time::{Duration, Instant},
+-    };
++/// The current test clock reading.
++pub fn now() -> Instant {
++    let time = NOW.with(|now| *now.lock().unwrap());
++    time.unwrap_or_else(Instant::now)
++}
+ 
+-    thread_local! {
+-        static NOW: Mutex<Option<Instant>> = const { Mutex::new(None) };
+-    }
++pub struct MockTime;
+ 
+-    pub fn now() -> Instant {
+-        let time = NOW.with(|now| *now.lock().unwrap());
+-        time.unwrap_or_else(Instant::now)
++impl MockTime {
++    pub fn set_time(time: Instant) {
++        NOW.with(|now| *now.lock().unwrap() = Some(time));
+     }
+ 
+-    pub struct MockTime;
+-
+-    impl MockTime {
+-        pub fn set_time(time: Instant) {
+-            NOW.with(|now| *now.lock().unwrap() = Some(time));
+-        }
+-
+-        pub fn advance(delta: Duration) {
+-            NOW.with(|now| {
+-                if let Some(n) = &mut *now.lock().unwrap() {
+-                    *n += delta;
+-                }
+-            });
+-        }
++    pub fn advance(delta: Duration) {
++        NOW.with(|now| {
++            if let Some(n) = &mut *now.lock().unwrap() {
++                *n += delta;
++            }
++        });
+     }
+ }

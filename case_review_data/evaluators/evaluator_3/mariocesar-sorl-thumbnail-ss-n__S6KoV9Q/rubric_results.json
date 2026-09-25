@@ -1,0 +1,114 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The patch adds sorl/thumbnail/keys.py as the shared owner of the composite key layout, defining kvstore_key(identity, key) as KEY_SEPARATOR.join([settings.THUMBNAIL_KEY_PREFIX, identity, force_str(key)]) and kvstore_prefix(identity=None) for scan prefixes. In kvstores/base.py, _get, _set, and _delete now call kvstore_key(identity, key); _find_keys uses kvstore_prefix(identity); clear uses kvstore_prefix(). cached_db_kvstore.py also uses kvstore_prefix(). The previous inline rebuilds such as settings.THUMBNAIL_KEY_PREFIX + '||' and '||'.join([...]) are removed from the store driver bodies.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the patch, the layout of the composite raw store key (the configured key prefix, the record-identity segment and the record key joined with the `||` separator) is determined by exactly one shared production implementation, and the base store driver's read, write, delete and enumeration operations all obtain the raw keys they persist or sweep through that implementation instead of rebuilding the key in their own bodies.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch adds a single shared production implementation in `sorl/thumbnail/keys.py`: `digest(*parts)` joins parts with `KEY_SEPARATOR` (`'||'`) via `force_str` and returns `hashlib.md5(salt.encode(), usedforsecurity=False).hexdigest()`. Both digest sites now call it: `base.py` uses `key = digest(source.key, geometry_string, serialize(options))` for the thumbnail filename, and `images.py` uses `return digest(self.name, self.serialize_storage(use_backend_name=True))` for `ImageFile.key`. The previous inline `hashlib.md5`/`force_str` copies are removed from both files.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the patch, the record-identity digest (salt parts joined with the `||` separator and hashed with the FIPS-safe MD5 call) is computed by exactly one shared production implementation, and both digest sites — the derivation of a source image's stored identity and the derivation of the thumbnail destination filename — obtain their digests through it.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Both purge flows now call the shared key implementation. In kvstores/base.py, the emergency clear uses `all_keys = self._find_keys_raw(kvstore_prefix())` instead of the prior local `settings.THUMBNAIL_KEY_PREFIX + '||'`. In kvstores/cached_db_kvstore.py, the fast purge uses `prefix = kvstore_prefix()` for both `self.cache.delete(key)` and `KVStoreModel.objects.filter(key__startswith=prefix).delete()`. `kvstore_prefix()` is defined in the new shared module sorl/thumbnail/keys.py, so neither purge composes the prefix-and-separator term locally.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the patch, both bulk purge flows — the generic emergency clear of the store driver, and the database+cache store's purge that matches cache entries and key-value rows — derive their sweep/match terms from the shared key implementation rather than composing prefix-and-separator terms locally.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's `sorl/thumbnail/keys.py` defines only `digest`, `kvstore_key`, and `kvstore_prefix`; it provides no inverse/dismantle function for composite raw keys. In `sorl/thumbnail/kvstores/base.py`, `_find_keys` still strips the raw key inline: `for raw_key in raw_keys: yield raw_key.split(KEY_SEPARATOR)[-1]`. Thus the enumeration path does not delegate the raw-key dismantle to the shared key implementation; it continues to strip key segments inside the scanning method itself.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the patch, the enumeration path returns bare record keys by delegating the raw-key dismantle to the shared key implementation (recovering exactly the same record keys as before), rather than stripping key segments inside the scanning method itself.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch centralizes key construction in sorl/thumbnail/keys.py and rewires every previously inlined site: base.py uses `key = digest(source.key, geometry_string, serialize(options))`; images.py uses `return digest(self.name, self.serialize_storage(use_backend_name=True))`; kvstores/base.py uses `kvstore_prefix()` for clear, `kvstore_key(identity, key)` for _get/_set/_delete, `kvstore_prefix(identity)` for _find_keys, and `KEY_SEPARATOR` for splitting; cached_db_kvstore.py uses `prefix = kvstore_prefix()`. No inline `hashlib.md5` or locally composed `'||'` composite-key/prefix terms remain in those production call sites.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The patch leaves one or more of the previously scattered inline copies in place — for example an inline composite-key build inside any store lifecycle method (read, write, delete or enumeration), a locally composed prefix-and-separator term inside either bulk-clear flow, or an inline digest computation inside the image identity property or the thumbnail destination-filename derivation — even if a shared implementation was also added elsewhere.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent removed the smell's inline-digest support imports: `import hashlib` and `from django.utils.encoding import force_str` were deleted from `base.py`, and `import hashlib` was deleted from `images.py`. The now-unused `from sorl.thumbnail.conf import settings` was also removed from `kvstores/base.py` (all `settings.THUMBNAIL_KEY_PREFIX` references there replaced by `kvstore_key`/`kvstore_prefix`). Digest and composite-key logic was consolidated into a single new `sorl/thumbnail/keys.py` (`digest`, `kvstore_key`, `kvstore_prefix`); no parallel or caller-less helpers were left behind—the old `tokey`, `add_prefix`, and `del_prefix` were not re-added. `force_str` remains in `images.py` only because it predated the smell (the smell diff never added it there), so it is not dead.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The patch leaves behind machinery that only served the inline copies or that duplicates the new owner — for example digest-related imports (the hashing module or the stringification helper imported for local salt building) still imported by the backend and image modules that no longer compute digests inline, or more than one parallel helper left in the tree doing the raw-key or digest job with unused duplicates.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch centralizes identifier construction in sorl/thumbnail/keys.py without altering bytes: KEY_SEPARATOR is '||', digest() does force_str(arg) join with '||' then hashlib.md5(...).hexdigest(), matching the smell's inlined salt in base.py and images.py. kvstore_key() returns '||'.join([THUMBNAIL_KEY_PREFIX, identity, force_str(key)]), equivalent to the smell's '%s||%s||%s' % (prefix, identity, key) and '||'.join([prefix, identity, key]). kvstore_prefix() yields prefix+'||' and kvstore_prefix(identity) yields prefix+'||'+identity+'||', matching the smell's clear/_find_keys prefixes. _find_keys still splits on '||' (KEY_SEPARATOR) and takes [-1]. No reordering, different separator, different segment count, or differently scoped purge prefix is introduced.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The patch changes the byte content of any identifier the schemes produce — a composite raw key, an identity-scoped scan or purge term, a digest, or a generated thumbnail filename — for example by reordering salt parts, stringifying parts differently, using a different separator or number of separator segments, or matching purge terms against a differently scoped prefix.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Both purge flows keep the installation-wide prefix-plus-separator term: KVStoreBase.clear calls self._find_keys_raw(kvstore_prefix()) and cached_db_kvstore.KVStore.clear sets prefix = kvstore_prefix(); kvstore_prefix() returns settings.THUMBNAIL_KEY_PREFIX + '||', preserving the same boundary as before and sweeping all composite keys rather than a single identity. Record writes go through kvstore_key(identity, key) producing prefix||identity||key, so the purge term still matches every written key.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "After the patch, a bulk purge sweeps a different key set than before — for example matching only one record-identity segment because the purge term was rebuilt around a specific identity instead of all raw keys of the installation, or conversely missing the prefix-plus-separator boundary — so an emergency clear would leave cache entries or database rows behind or destroy keys it must not touch.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In sorl/thumbnail/keys.py, the agent reads settings.THUMBNAIL_KEY_PREFIX inside the kvstore_key and kvstore_prefix functions at call time, not as a module-level constant evaluated at import. The only module-level constant is KEY_SEPARATOR = '||', a static string not derived from Django settings, so the patch avoids freezing the configured key prefix before settings are finalized.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The new scheme owners capture part of the key layout at import time — for example module-level constants evaluated from Django settings before settings are finalized, instead of reading the configured key prefix inside the owning functions at call time.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0.5,
+    "core_resolution": 1
+  },
+  "valid_count": 9,
+  "pass_count": 8,
+  "must_have_pass": false,
+  "macro_score": 0.875
+}

@@ -1,0 +1,114 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent introduces a single owner `canonicalShortName` in the new shortname.go: `func canonicalShortName(short string) string { return strings.ReplaceAll(url.PathEscape(strings.ToLower(short)), \"-\", \"\") }`, which lower-cases, percent-escapes, then strips dashes. All six SQLiteDB accessors route through it: Load uses `canonicalShortName(short)`, Save uses `canonicalShortName(link.Short)`, Delete uses `canonicalShortName(short)`, LoadStats uses `canonicalShortName(link.Short)`, SaveStats uses `canonicalShortName(short)`, and DeleteStats uses `canonicalShortName(short)`. The previous inline idioms (`url.PathEscape(strings.ToLower(...))`, `strings.ReplaceAll(...)`, `strings.NewReplacer(\"-\", \"\")`) are removed from db.go, and the `net/url`/`strings` imports are dropped from db.go, so no accessor re-derives the ID inline.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The short-name storage identity (lower-case the name, percent-escape it for storage, then strip dashes) is computed by exactly one owner, and every SQLiteDB accessor that derives a row ID (Load, Save, Delete, LoadStats, SaveStats, DeleteStats) routes through that owner instead of spelling the computation out inline.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The patch does not introduce a single owner for request-side reconciliation. It adds only `trimTrailingPunctuation` and `canonicalShortName` in shortname.go, while handlers still inline different fold/trim combinations: serveDetail uses `trimTrailingPunctuation(strings.ToLower(raw))`, serveDelete uses `trimTrailingPunctuation(strings.ToLower(strings.TrimSpace(raw)))`, resolveLink uses `trimTrailingPunctuation(strings.ToLower(short))`, serveGo uses `trimTrailingPunctuation(short)` with a separate `strings.ToLower` fallback, and serveSave uses `canonicalShortName(short)`. Because each site reassembles case-folding/whitespace/punctuation handling inline, the request-side tolerance rule is not owned in one place.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The request-side name reconciliation (fold case, strip surrounding whitespace and the fixed trailing-punctuation set) is owned in one place, and the redirect, detail, delete, and save handlers route through it rather than each inlining its own fold/trim block.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "In golink.go serveSave, the agent replaces the inlined fold `conflict := strings.ReplaceAll(strings.ToLower(short), \"-\", \"\")` with `conflict := canonicalShortName(short)` and then calls `db.Load(conflict)`. `canonicalShortName` is defined in shortname.go as the single owner of the canonical storage identity, so the conflict check routes through that owner instead of re-deriving a partial fold inline in the handler.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "serveSave's conflict check detects a shadowing name by reusing the canonical identity (e.g. asking the storage layer to load the incoming name) rather than computing a separate inlined fold of the name inside the handler.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch adds a shared canonicalShortName owner in shortname.go and routes both layers through it: db.go SQLiteDB accessors such as Load, Save, Delete, LoadStats, SaveStats, and DeleteStats now call canonicalShortName(...), and golink.go serveSave calls canonicalShortName(short) for the conflict check, so the rule is shared across storage and HTTP serving rather than re-centralized in one layer.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The consolidation spans the storage layer and the HTTP serving layer: at least one SQLiteDB accessor and at least one serving handler route through the shared owner, so the rule is genuinely shared across layers rather than re-centralized within a single layer.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The resolver in resolve.go still derives the request-side fold inline: `short = trimTrailingPunctuation(strings.ToLower(short))`. It only delegates punctuation trimming to `trimTrailingPunctuation`; the case fold and the overall tolerance composition remain inline and are not obtained from a shared request-side reconciliation owner. `shortname.go` adds `canonicalShortName` for storage identity and `trimTrailingPunctuation` for punctuation only, but no full request-side tolerance owner is used by resolve.go.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The --resolve-from-backup resolver, extracted into its own file, is updated to obtain its request-side reconciliation from the shared owner rather than retaining its local inlined fold of the name before lookup.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the listed inline drift: db.go Load/Save/Delete/LoadStats/SaveStats/DeleteStats now call canonicalShortName(short), deleting the local temporaries esc/id/repl and the strings.NewReplacer dash-stripping site; LoadStats now uses canonicalShortName(link.Short) instead of the lower-case+dash-only form that omitted percent-escaping; serveSave uses canonicalShortName(short) for the conflict check; serving handlers and resolve.go use trimTrailingPunctuation. The obsolete scattered copies are gone in favor of the owner.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No obsolete inline copy of the rule is left behind: specifically, the scattered idiom drift is removed — a dash-stripping site that used strings.NewReplacer while siblings used strings.ReplaceAll, a stats-map builder that lower-cased and stripped dashes but omitted percent-escaping, and the per-accessor local temporaries that held a re-derived ID are gone in favor of calling the owner.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent introduces shared owners canonicalShortName (shortname.go) and trimTrailingPunctuation (shortname.go) and routes every previously-inlined site through them: db.go Load/Save/Delete/LoadStats/SaveStats/DeleteStats all call canonicalShortName(...) instead of inline strings.ReplaceAll(url.PathEscape(strings.ToLower(...)), \"-\", \"\"); golink.go serveSave calls canonicalShortName(short); serveGo/serveDetail/serveDelete and resolve.go call trimTrailingPunctuation(...) instead of inline strings.TrimRight(..., \".,()[]{}\"). No new inline copy of the lower-case/dash-strip/escape/trim computation is introduced; the only remaining inline strings.ToLower calls are pre-existing (present in smell.diff) and not newly added by the patch.",
+      "valid": true,
+      "attempts": 3,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "No new inlined copy of the lower-case/dash-strip/escape/trim computation is introduced: everywhere the shared owner would do, the shared owner is called, rather than re-spelling the rule inline in a different place.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's canonicalShortName in shortname.go is `strings.ReplaceAll(url.PathEscape(strings.ToLower(short)), \"-\", \"\")`, which preserves the exact original linkID order and semantics: lowercase first, then url.PathEscape, then strip dashes. All storage methods (Load, Save, Delete, LoadStats, SaveStats, DeleteStats) and serveSave's conflict check route through canonicalShortName, so each short name maps to the same row ID as before. No reordering (e.g. stripping dashes before escaping) or escape change was introduced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The canonical storage identity for any given short name is unchanged: same lower-case + percent-escape + dash-strip semantics and result, so each name maps to the same row ID it mapped to before the change and existing rows and recorded statistics keep resolving to the same links.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch preserves all specified behaviors: canonicalShortName applies strings.ToLower + url.PathEscape + dash removal (matching original linkID semantics); trimTrailingPunctuation uses the identical punctuation set \".,()[]{}\" via the linkPunctuation const; serveDelete retains strings.TrimSpace; serveGo keeps both its trailing-punctuation retry (now via trimTrailingPunctuation) and its case-fold fallback untouched; serveSave conflict detection uses canonicalShortName for case/dash-insensitive matching. URL routing prefixes /.detail/ and /.delete/ remain via strings.TrimPrefix with no changes to + redirect or XSRF scoping code.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Matching and tolerance behavior is unchanged: case-insensitive lookup, stripping of surrounding whitespace and the fixed trailing-punctuation set, and shadow/conflict detection for names differing only by case or dashes behave as before; the URL routing prefixes, the + redirect behavior, and XSRF scoping on save and delete are untouched.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0.5,
+    "core_resolution": 0.6666666666666666
+  },
+  "valid_count": 9,
+  "pass_count": 7,
+  "must_have_pass": false,
+  "macro_score": 0.7916666666666666
+}

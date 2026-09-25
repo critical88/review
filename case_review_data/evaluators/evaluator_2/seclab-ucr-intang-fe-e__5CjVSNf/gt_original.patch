@@ -1,0 +1,473 @@
+diff --git a/src/cache.c b/src/cache.c
+index b4cc979..20e7539 100644
+--- a/src/cache.c
++++ b/src/cache.c
+@@ -618,11 +618,8 @@ void _process_incoming_RST(struct tcpinfo *info)
+             set_int_ex(key, 1, RESP_CACHE_TIMEOUT);
+             set_aflag1(info->daddr, info->saddr);
+ 
+-            struct conn_ledger *ledger = ledger_ref(&f);
+-            if (ledger) {
+-                // journal the type-1 reset attack evidence of this cycle
+-                ledger->events |= LEDGER_EV_TYPE1RST;
+-            }
++            // journal the type-1 reset attack evidence of this cycle
++            ledger_note_reset_type1(ledger_ref(&f));
+         }
+         free(info);
+         return;
+@@ -687,12 +684,8 @@ void _process_incoming_RST(struct tcpinfo *info)
+                         set_int_ex(key, 1, RESP_CACHE_TIMEOUT);
+                     }
+ 
+-                    struct conn_ledger *ledger = ledger_ref(&f);
+-                    if (ledger) {
+-                        // journal the type-2 reset attack evidence of this cycle
+-                        ledger->events |= LEDGER_EV_TYPE2RST;
+-                        ledger->last_mark = info->ttl;
+-                    }
++                    // journal the type-2 reset attack evidence of this cycle
++                    ledger_note_reset_type2(ledger_ref(&f), info->ttl);
+ 
+                     set_aflag2(info->daddr, info->saddr);
+                 }
+@@ -901,29 +894,8 @@ static void process_timeout(struct pending_request *pr) {
+                 }
+             }
+ 
+-            struct conn_ledger *ledger = ledger_ref(&f);
+-            if (ledger) {
+-                // close this cycle in the activity ledger: classify it from the
+-                // evidence collected, adapt the TTL hint, and summarize.
+-                unsigned short ev = ledger->events;
+-                if (ev & (LEDGER_EV_TYPE1RST | LEDGER_EV_TYPE2RST)) {
+-                    ledger->verdict = 3;
+-                    if (ledger->ttl_hint < 255)
+-                        ledger->ttl_hint++;
+-                }
+-                else if (ev & LEDGER_EV_RESP) {
+-                    ledger->verdict = 1;
+-                }
+-                else {
+-                    ledger->verdict = 2;
+-                    if (ledger->ttl_hint > 3)
+-                        ledger->ttl_hint--;
+-                }
+-                ledger->events |= LEDGER_EV_VERIFIED;
+-                log_info("[LEDGER] Cycle closed. %u_%hu_%u_%hu verdict=%d events=%04x ttl_hint=%u.",
+-                        ledger->fourtp.saddr, ledger->fourtp.sport, ledger->fourtp.daddr, ledger->fourtp.dport,
+-                        ledger->verdict, ledger->events, ledger->ttl_hint);
+-            }
++            // close this cycle in the activity ledger
++            ledger_close_cycle(ledger_ref(&f));
+ 
+             clear_vflag(saddr, sport, daddr, dport);
+             set_verified(saddr, sport, daddr, dport);
+@@ -976,29 +948,8 @@ static void process_timeout(struct pending_request *pr) {
+                 }
+             }
+ 
+-            struct conn_ledger *ledger = ledger_ref(&f);
+-            if (ledger) {
+-                // close this cycle in the activity ledger: classify it from the
+-                // evidence collected, adapt the TTL hint, and summarize.
+-                unsigned short ev = ledger->events;
+-                if (ev & (LEDGER_EV_TYPE1RST | LEDGER_EV_TYPE2RST)) {
+-                    ledger->verdict = 3;
+-                    if (ledger->ttl_hint < 255)
+-                        ledger->ttl_hint++;
+-                }
+-                else if (ev & LEDGER_EV_RESP) {
+-                    ledger->verdict = 1;
+-                }
+-                else {
+-                    ledger->verdict = 2;
+-                    if (ledger->ttl_hint > 3)
+-                        ledger->ttl_hint--;
+-                }
+-                ledger->events |= LEDGER_EV_VERIFIED;
+-                log_info("[LEDGER] Cycle closed. %u_%hu_%u_%hu verdict=%d events=%04x ttl_hint=%u.",
+-                        ledger->fourtp.saddr, ledger->fourtp.sport, ledger->fourtp.daddr, ledger->fourtp.dport,
+-                        ledger->verdict, ledger->events, ledger->ttl_hint);
+-            }
++            // close this cycle in the activity ledger
++            ledger_close_cycle(ledger_ref(&f));
+ 
+             clear_vflag(saddr, sport, daddr, dport);
+             set_verified(saddr, sport, daddr, dport);
+diff --git a/src/discrepancy.c b/src/discrepancy.c
+index e4ef980..f553b9a 100644
+--- a/src/discrepancy.c
++++ b/src/discrepancy.c
+@@ -21,11 +21,7 @@ void send_insertion_packet(struct send_tcp_vars *vars, unsigned int flags)
+     f.daddr = str2ip(vars->dst_ip);
+     f.sport = htons(vars->src_port);
+     f.dport = htons(vars->dst_port);
+-    struct conn_ledger *ledger = ledger_open(&f);
+-    if (ledger) {
+-        ledger->events |= LEDGER_EV_INJECTED;
+-        ledger->discreps |= (unsigned char)(flags & 0xFF);
+-    }
++    ledger_note_discrepancy(ledger_open(&f), flags);
+ 
+     if (flags & INS_DISC_SMALL_TTL) {
+         unsigned char ttl = get_ttl(str2ip(vars->dst_ip));
+diff --git a/src/main.c b/src/main.c
+index 3660e7d..8f19fee 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -710,12 +710,8 @@ int process_udp_packet(struct mypacket *packet, char inout)
+                     // transaction ID alone may cause collision
+                     cache_dns_udp_request(txn_id, qname, &fourtp);
+ 
+-                    struct conn_ledger *ledger = ledger_open(&fourtp);
+-                    if (ledger) {
+-                        // journal the redirected DNS request
+-                        ledger->events |= LEDGER_EV_REQ;
+-                        ledger->last_mark = txn_id;
+-                    }
++                    // journal the redirected DNS request
++                    ledger_note_request(ledger_open(&fourtp), txn_id);
+ 
+                     // send the request over TCP
+                     ret = send_dns_req(packet->payload, packet->payload_len);
+@@ -743,12 +739,8 @@ int process_udp_packet(struct mypacket *packet, char inout)
+                 log_debugv("[EVAL] DNS UDP response %d", txn_id);
+ 
+                 // Tell the caching thread to process the dns udp response
+-                struct conn_ledger *ledger = ledger_ref(&fourtp);
+-                if (ledger) {
+-                    // journal the response that completed this resolution
+-                    ledger->events |= LEDGER_EV_RESP;
+-                    ledger->last_mark = txn_id;
+-                }
++                // and journal the response that completed this resolution
++                ledger_note_result(ledger_ref(&fourtp), txn_id);
+                 process_dns_udp_response(txn_id, qname, &fourtp, iphdr->ttl);
+             }
+ 
+@@ -820,20 +812,9 @@ int process_tcp_packet(struct mypacket *packet, char inout)
+             set_sid(&fourtp, sid);
+             //cache_strategy(&fourtp, sid);
+ 
+-            struct conn_ledger *ledger = ledger_open(&fourtp);
+-            if (ledger) {
+-                // a strategy has been dispatched to this connection. start a
+-                // new treatment cycle in the activity ledger.
+-                ledger->sid = sid;
+-                ledger->attempts++;
+-                ledger->ttl_hint = get_ttl(iphdr->daddr);
+-                ledger->events = LEDGER_EV_SEEN;
+-                if (ledger->attempts >= 3) {
+-                    // this connection has already consumed several strategies.
+-                    log_info("[LEDGER] Strategy %d has been tried %d times for %u_%hu_%u_%hu.",
+-                            sid, ledger->attempts, fourtp.saddr, fourtp.sport, fourtp.daddr, fourtp.dport);
+-                }
+-            }
++            // a strategy has been dispatched to this connection.
++            // start a new treatment cycle in the activity ledger.
++            ledger_provision(ledger_open(&fourtp), sid, get_ttl(iphdr->daddr));
+ 
+             if (g_strats[sid].process_syn) {
+                 ret = g_strats[sid].process_syn(packet);
+@@ -922,13 +903,9 @@ int process_tcp_packet(struct mypacket *packet, char inout)
+                     }
+ #endif
+ 
+-                    struct conn_ledger *ledger = ledger_ref(&fourtp);
+-                    if (ledger) {
+-                        // journal the request that triggered the strategy,
+-                        // so the ledger knows what the cycle was about.
+-                        ledger->events |= LEDGER_EV_REQ;
+-                        ledger->last_mark = tcphdr->th_seq;
+-                    }
++                    // journal the request that triggered the strategy,
++                    // so the ledger knows what the cycle was about.
++                    ledger_note_request(ledger_ref(&fourtp), tcphdr->th_seq);
+ 
+                     cache_http_request(&fourtp, req_line2);
+                 }
+@@ -963,12 +940,8 @@ int process_tcp_packet(struct mypacket *packet, char inout)
+ #endif
+                 }
+ 
+-                struct conn_ledger *ledger = ledger_ref(&fourtp);
+-                if (ledger) {
+-                    // journal the redirected request
+-                    ledger->events |= LEDGER_EV_REQ;
+-                    ledger->last_mark = tcphdr->th_seq;
+-                }
++                // journal the redirected request
++                ledger_note_request(ledger_ref(&fourtp), tcphdr->th_seq);
+ 
+                 cache_dns_tcp_request(&fourtp);
+             }
+@@ -1029,16 +1002,12 @@ int process_tcp_packet(struct mypacket *packet, char inout)
+             reverse_fourtp.dport = tcphdr->th_sport;
+ 
+             int sid = get_sid(&reverse_fourtp);
+-            struct conn_ledger *ledger = ledger_ref(&fourtp);
+-            if (ledger) {
+-                // the connection is alive. note the response and, on the first
+-                // response of this cycle, adopt the server-side initial TTL
+-                // as the hint for the insertion packets.
+-                ledger->events |= LEDGER_EV_RESP;
+-                if (ledger->ttl_hint == 0) {
+-                    ledger->ttl_hint = choose_appropriate_ttl(iphdr->ttl);
+-                }
+-            }
++
++            // the connection is alive. note the response and, on the first
++            // response of this cycle, adopt the server-side initial TTL
++            // as the hint for the insertion packets.
++            ledger_note_response(ledger_ref(&fourtp), choose_appropriate_ttl(iphdr->ttl));
++
+             if (sid >= 0) {
+                 if (get_ttl(iphdr->saddr) == 0) {
+                     // if TTL hasn't been initialized 
+@@ -1071,12 +1040,8 @@ int process_tcp_packet(struct mypacket *packet, char inout)
+                     log_debug("[TCP] Got a HTTP response from %s:%d to %s:%d.", sip, sport, dip, dport);
+                     process_http_response(&fourtp, tcphdr->th_seq, iphdr->ttl);
+ 
+-                    struct conn_ledger *ledger = ledger_ref(&fourtp);
+-                    if (ledger) {
+-                        // journal the server response seen during this cycle
+-                        ledger->events |= LEDGER_EV_RESP;
+-                        ledger->last_mark = tcphdr->th_seq;
+-                    }
++                    // journal the server response seen during this cycle
++                    ledger_note_result(ledger_ref(&fourtp), tcphdr->th_seq);
+                 }
+             }
+             else if (sport == 53) {
+diff --git a/src/memcache.c b/src/memcache.c
+index 1f15fe1..ee4f96b 100644
+--- a/src/memcache.c
++++ b/src/memcache.c
+@@ -1037,3 +1037,145 @@ void conn_ledger_cache_summary()
+     printf("Ledger list size: %d\n", ledger_list_len);
+     printf("Ledger list max size: %d\n", MAX_CACHE_SIZE);
+ }
++
++
++/*
++ * The ledger's rules.
++ *
++ * These functions define how the activity ledger is maintained. Callers hand
++ * over the raw observation (strategy id, sequence number, attack evidence,
++ * confirmed TTL, discrepancy flags) and the ledger decides how it is recorded,
++ * classified and summarized.
++ */
++
++// A strategy has been dispatched to the connection: start a new cycle.
++void ledger_provision(struct conn_ledger *ledger, int sid, unsigned char host_ttl)
++{
++    if (!ledger)
++        return;
++    ledger->sid = sid;
++    ledger->attempts++;
++    ledger->ttl_hint = host_ttl;
++    ledger->events = LEDGER_EV_SEEN;
++    if (ledger->attempts >= 3) {
++        // this connection has already consumed several strategies.
++        log_info("[LEDGER] Strategy %d has been tried %d times for %u_%hu_%u_%hu.",
++                sid, ledger->attempts, ledger->fourtp.saddr, ledger->fourtp.sport,
++                ledger->fourtp.daddr, ledger->fourtp.dport);
++    }
++}
++
++// An outgoing request triggered the strategy of this cycle.
++void ledger_note_request(struct conn_ledger *ledger, unsigned int mark)
++{
++    if (!ledger)
++        return;
++    ledger->events |= LEDGER_EV_REQ;
++    ledger->last_mark = mark;
++}
++
++// A server response was seen during this cycle.
++void ledger_note_result(struct conn_ledger *ledger, unsigned int mark)
++{
++    if (!ledger)
++        return;
++    ledger->events |= LEDGER_EV_RESP;
++    ledger->last_mark = mark;
++}
++
++// The connection is alive. On the first response of the cycle, adopt the
++// server-side initial TTL as the hint for the insertion packets.
++void ledger_note_response(struct conn_ledger *ledger, unsigned char observed_ttl)
++{
++    if (!ledger)
++        return;
++    ledger->events |= LEDGER_EV_RESP;
++    if (ledger->ttl_hint == 0) {
++        ledger->ttl_hint = observed_ttl;
++    }
++}
++
++// Evidence that a type-1 reset attack hit this cycle.
++void ledger_note_reset_type1(struct conn_ledger *ledger)
++{
++    if (!ledger)
++        return;
++    ledger->events |= LEDGER_EV_TYPE1RST;
++}
++
++// Evidence that a type-2 (TTL-based) reset attack hit this cycle.
++void ledger_note_reset_type2(struct conn_ledger *ledger, unsigned char attack_ttl)
++{
++    if (!ledger)
++        return;
++    ledger->events |= LEDGER_EV_TYPE2RST;
++    ledger->last_mark = attack_ttl;
++}
++
++// Close the treatment cycle: classify it from the collected evidence,
++// adapt the TTL hint, and summarize.
++void ledger_close_cycle(struct conn_ledger *ledger)
++{
++    if (!ledger)
++        return;
++    unsigned short ev = ledger->events;
++    if (ev & (LEDGER_EV_TYPE1RST | LEDGER_EV_TYPE2RST)) {
++        ledger->verdict = 3;
++        if (ledger->ttl_hint < 255)
++            ledger->ttl_hint++;
++    }
++    else if (ev & LEDGER_EV_RESP) {
++        ledger->verdict = 1;
++    }
++    else {
++        ledger->verdict = 2;
++        if (ledger->ttl_hint > 3)
++            ledger->ttl_hint--;
++    }
++    ledger->events |= LEDGER_EV_VERIFIED;
++    log_info("[LEDGER] Cycle closed. %u_%hu_%u_%hu verdict=%d events=%04x ttl_hint=%u.",
++            ledger->fourtp.saddr, ledger->fourtp.sport, ledger->fourtp.daddr, ledger->fourtp.dport,
++            ledger->verdict, ledger->events, ledger->ttl_hint);
++}
++
++// The insertion packets sent to this connection applied these discrepancies.
++void ledger_note_discrepancy(struct conn_ledger *ledger, unsigned int flags)
++{
++    if (!ledger)
++        return;
++    ledger->events |= LEDGER_EV_INJECTED;
++    ledger->discreps |= (unsigned char)(flags & 0xFF);
++}
++
++// A probing response confirmed the server-side TTL of this connection.
++void ledger_refine_ttl_hint(struct conn_ledger *ledger, unsigned char ttl)
++{
++    if (!ledger)
++        return;
++    if (ledger->ttl_hint == 0 || ttl < ledger->ttl_hint) {
++        ledger->ttl_hint = ttl;
++    }
++}
++
++// A strategy fired a treatment on this connection by itself.
++void ledger_note_dispatch(struct conn_ledger *ledger, unsigned int mark)
++{
++    if (!ledger)
++        return;
++    ledger->events |= LEDGER_EV_INJECTED;
++    ledger->last_mark = mark;
++}
++
++// A strategy re-sent a treatment on a connection whose server response
++// has already been seen.
++void ledger_note_retransmission(struct conn_ledger *ledger, unsigned int mark)
++{
++    if (!ledger)
++        return;
++    if (ledger->events & LEDGER_EV_RESP) {
++        log_debug("[LEDGER] Junk data resent to %u_%hu after a response was seen.",
++                ledger->fourtp.saddr, ledger->fourtp.sport, ledger->fourtp.daddr, ledger->fourtp.dport);
++    }
++    ledger->events |= LEDGER_EV_INJECTED;
++    ledger->last_mark = mark;
++}
+diff --git a/src/memcache.h b/src/memcache.h
+index fc1f4a2..7519b25 100644
+--- a/src/memcache.h
++++ b/src/memcache.h
+@@ -85,6 +85,20 @@ int ledger_sid(struct conn_ledger *ledger);
+ unsigned short ledger_events(struct conn_ledger *ledger);
+ unsigned char ledger_ttl_hint(struct conn_ledger *ledger);
+ 
++// The ledger's rules. Callers hand over the raw observation; the ledger
++// decides how it is recorded, classified and summarized.
++void ledger_provision(struct conn_ledger *ledger, int sid, unsigned char host_ttl);
++void ledger_note_request(struct conn_ledger *ledger, unsigned int mark);
++void ledger_note_result(struct conn_ledger *ledger, unsigned int mark);
++void ledger_note_response(struct conn_ledger *ledger, unsigned char observed_ttl);
++void ledger_note_reset_type1(struct conn_ledger *ledger);
++void ledger_note_reset_type2(struct conn_ledger *ledger, unsigned char attack_ttl);
++void ledger_close_cycle(struct conn_ledger *ledger);
++void ledger_note_discrepancy(struct conn_ledger *ledger, unsigned int flags);
++void ledger_refine_ttl_hint(struct conn_ledger *ledger, unsigned char ttl);
++void ledger_note_dispatch(struct conn_ledger *ledger, unsigned int mark);
++void ledger_note_retransmission(struct conn_ledger *ledger, unsigned int mark);
++
+ // debug
+ void conn_info_cache_summary();
+ void conn_info_cache_dump();
+diff --git a/src/strategies/do_organic.c b/src/strategies/do_organic.c
+index ff62daa..8d36bdd 100644
+--- a/src/strategies/do_organic.c
++++ b/src/strategies/do_organic.c
+@@ -108,15 +108,7 @@ int x20_process_request(struct mypacket *packet)
+     f.daddr = packet->iphdr->daddr;
+     f.sport = packet->tcphdr->th_sport;
+     f.dport = packet->tcphdr->th_dport;
+-    struct conn_ledger *ledger = ledger_open(&f);
+-    if (ledger) {
+-        if (ledger->events & LEDGER_EV_RESP) {
+-            log_debug("[LEDGER] Junk data resent to %u_%hu after a response was seen.",
+-                    f.saddr, f.sport, f.daddr, f.dport);
+-        }
+-        ledger->events |= LEDGER_EV_INJECTED;
+-        ledger->last_mark = packet->tcphdr->th_seq;
+-    }
++    ledger_note_retransmission(ledger_open(&f), packet->tcphdr->th_seq);
+ 
+     return 0;
+ }
+diff --git a/src/strategies/rst_super.c b/src/strategies/rst_super.c
+index 7e7c897..b2353ed 100644
+--- a/src/strategies/rst_super.c
++++ b/src/strategies/rst_super.c
+@@ -87,11 +87,7 @@ int x6_process_request(struct mypacket *packet)
+     f.daddr = packet->iphdr->daddr;
+     f.sport = packet->tcphdr->th_sport;
+     f.dport = packet->tcphdr->th_dport;
+-    struct conn_ledger *ledger = ledger_ref(&f);
+-    if (ledger) {
+-        ledger->events |= LEDGER_EV_INJECTED;
+-        ledger->last_mark = packet->tcphdr->th_seq;
+-    }
++    ledger_note_dispatch(ledger_ref(&f), packet->tcphdr->th_seq);
+ 
+     return 1;
+ }
+diff --git a/src/ttl_probing.c b/src/ttl_probing.c
+index a2e2076..a16d4f4 100644
+--- a/src/ttl_probing.c
++++ b/src/ttl_probing.c
+@@ -74,12 +74,7 @@ int process_synack_for_ttl_probing(struct mypacket *packet)
+             f.daddr = str2ip(sip);
+             f.sport = htons(dport);
+             f.dport = htons(sport);
+-            struct conn_ledger *ledger = ledger_ref(&f);
+-            if (ledger) {
+-                if (ledger->ttl_hint == 0 || ttl < ledger->ttl_hint) {
+-                    ledger->ttl_hint = ttl;
+-                }
+-            }
++            ledger_refine_ttl_hint(ledger_ref(&f), ttl);
+         }
+         return -1;
+     }

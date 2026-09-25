@@ -1,0 +1,193 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "In agent.patch, `tlv_add_tlv_value` no longer inlines serialization or record appending: it calls `tlv_flatten(value, &flat_size)` for the serialization pass and `tlv_list_append(values, flat_tlv)` for the append step. The smell.diff inline loops for computing flat_size, writing 255-byte fragments, and tail-appending are removed. These helpers are shared single-purpose steps also used by `tlv_format`, `tlv_parse`, `tlv_get_tlv_value`, `tlv_add_value_`, and `tlv_stream_add_tlv_value`.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In src/tlv.c, the entry point that flattens nested TLV values into a stored flat record (tlv_add_tlv_value) performs record serialization and record appending again through the module's shared single-purpose steps (the module's formatting pass and its record-append routine, or consolidated equivalents) instead of carrying its own inline implementations of those steps.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In src/tlv.c, tlv_get_tlv_value now delegates the chunk-grouping parse to the shared helper `tlv_record_read(buffer, length, &i, &record_type, &value_data, &total_size)` and the record append to `tlv_list_append(value, item)`, removing the inline lookahead/chunk-gathering loop and tail-walk append from the smell. `tlv_record_read` is the same consolidated parse step used by `tlv_parse`, and `tlv_list_append` is shared by `tlv_add_value_`, `tlv_add_tlv_value`, and `tlv_parse`, so the parse and append steps have a single implementation rather than a self-contained inline parse at this entry point.",
+      "valid": true,
+      "attempts": 4,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In src/tlv.c, the entry point that parses a flat nested-TLV record back into values (tlv_get_tlv_value) performs lookup, destination-list construction and chunk-grouping parsing again through the module's shared steps (its parse routine and record-append routine, or consolidated equivalents) instead of its own inline implementations.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In src/tlv.c, the patched tlv_stream_add_tlv_value no longer contains inline serialization or guarded per-byte sink writes. It calls the shared flattening helper `byte *flat_data = tlv_flatten(value, &flat_size);` and then delegates the stream write to the shared sink writer: `int rc = tlv_stream_add_value(tlv, type, flat_data, flat_size); free(flat_data); return rc;`. The previous inlined `tlv->buffer[tlv->pos++] = ...; if (tlv->pos >= tlv->size) { ... on_flush ... }` blocks were removed.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In src/tlv.c, the entry point that writes a nested TLV tree into the flushing byte-stream sink (tlv_stream_add_tlv_value) delegates again to the module's shared step that writes a value into the sink (including its put/flush helpers or consolidated equivalents) rather than open-coding serialization plus guarded per-byte sink writes inline.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In src/accessories.c, homekit_value_clone now delegates entirely to homekit_value_copy: 'homekit_value_t *copy = malloc(sizeof(homekit_value_t)); homekit_value_copy(copy, value); return copy;'. homekit_characteristic_clone no longer carries its own independent dispatch-and-copy switch; the entire inline switch over ch->value.format (removed lines spanning homekit_format_bool through default) was replaced with a single call: 'homekit_value_copy(&clone->value, &ch->value);'. The per-format copying logic exists once in homekit_value_copy (which delegates to homekit_value_copy_payload), and both clone sites invoke that shared implementation.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In src/accessories.c, per-format value copying exists again as one shared implementation that the clone path invokes: homekit_value_clone delegates its copying to the module's value-copy routine (or a single consolidated equivalent), and homekit_characteristic_clone no longer carries its own independent dispatch-and-copy implementation of the same operation.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch extracts characteristic_clone_required_size and delegates value copying, but it does not restore or use a shared alignment helper for the packed clone layout. No align_pointer is reintroduced, and the open-coded modulo/rounding formulas from smell.diff (e.g. `if (x % sizeof(void*)) x += sizeof(void*) - x % sizeof(void*)`) remain unchanged at the size-computation and pointer-advance sites. The prompt explicitly asked for this offset-alignment arithmetic to live in one shared place again.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The destination-offset alignment arithmetic used by homekit_characteristic_clone's packed layout (rounding up to sizeof(void*)) is expressed through one shared definition applied at the size-computation and pointer-advance sites (for example a restored helper equivalent to the module's alignment routine), instead of open-coded modulo/rounding formulas repeated inline at every packing offset.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "smell.diff shows open-coded alignment at packing sites in homekit_characteristic_clone (e.g. `if ((size_t)p % sizeof(void*)) p += sizeof(void*) - (size_t)p % sizeof(void*)` and the `valid_values_bytes % sizeof(void*)`/`ranges_bytes % sizeof(void*)`/`callback_bytes % sizeof(void*)` advances). agent.patch's accessories.c hunks only extract `characteristic_clone_required_size` and replace the inline value copy with `homekit_value_copy`; they never restore `align_size`/`align_pointer` calls or alter those packing-site alignment blocks. Thus the entry point still embeds duplicate alignment math, so the negative failure is present.",
+      "valid": true,
+      "attempts": 6,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No function in src/tlv.c or src/accessories.c retains an absorbed implementation: after the patch there is no monolith-profile function that contains a body-duplicate of a still-defined same-module routine it never calls (specifically none of the five maintained entry-point functions still embeds a re-implementation of the module's formatting pass, record append, chunk-grouping parse, sink put/flush, value copy, or alignment math).",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The refactor edits are confined to src/tlv.c and src/accessories.c; no headers, server, or existing characteristics wiring are modified. Public APIs retain their names/signatures (e.g., homekit_value_copy, homekit_value_clone, homekit_characteristic_clone, tlv_add_tlv_value, tlv_get_tlv_value, tlv_stream_add_tlv_value), and the bodies delegate to new file-local helpers such as tlv_flatten, tlv_record_read, tlv_list_append, homekit_value_copy_payload, and characteristic_clone_required_size. The only other file is a new test-only host_tests/harness.c, not a ripple edit to existing outside consumers.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The repair is contained to internal structure of the two modules: code outside src/tlv.c and src/accessories.c (server, characteristics wiring, headers consumed elsewhere) requires no change for the tree to build and behave as before, and none of the shared steps' other consumers (for example the code paths that copy or marshal accessory values elsewhere) is broken by the re-delegation.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "All newly introduced helpers in both modules are declared `static` (file-local): in tlv.c, `tlv_item_serialized_size`, `tlv_item_serialize`, `tlv_list_append`, `tlv_flatten`, `tlv_record_read`; in accessories.c, `homekit_values_dup`, `homekit_value_copy_payload`, `characteristic_clone_required_size`. No exported function signature is altered: `tlv_format`, `tlv_parse`, `tlv_add_tlv_value`, `tlv_get_tlv_value`, `tlv_stream_add_tlv_value`, `tlv_add_value_`, `homekit_value_copy`, `homekit_value_clone`, and `homekit_characteristic_clone` all retain their original names, parameter lists, and return types. The new `host_tests/harness.c` is a separate test file outside the two modules and does not export new symbols from them. No new non-static symbols are added to either module.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The exported API of the two modules is frozen exactly: every exported function keeps its name, signature, return type, and value-ownership contract (in particular the five maintained entry points, the format/parse/stream/append/value-copy routines, and the accessory/characteristic/value clone functions; adding static-internal helpers is allowed, exporting new symbols or changing existing ones is not).",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "In agent.patch, src/accessories.c still keeps `static size_t align_size(size_t size)` (shown in the hunk header/context), but the refactored `characteristic_clone_required_size`/`homekit_characteristic_clone` do not call it; the smell's open-coded alignment arithmetic remains (e.g. `if (size % sizeof(void*)) size += sizeof(void*) - size % sizeof(void*)` and analogous valid_values/ranges/callback blocks), and the patch neither restores `align_size(...)` calls nor deletes the now-unused `align_size` helper. Thus an alignment helper is left defined yet unreachable.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The patch does not leave formerly-absorbed shared routines defined yet unreachable: every shared step of the two modules (formatting pass, record append, chunk-grouping parse, sink value writer, value-copy routine, alignment helpers) is either genuinely back in use by the re-delegated paths or has been superseded by a consolidated equivalent (in which case the superseded definition is removed), so no live sub-method is left with only the inlined copies as its ghost callers.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch leaves static `align_size` defined in src/accessories.c (its definition appears as unchanged context in the @@ hunk) but restores no call site for it: the extracted `characteristic_clone_required_size` still carries the smell's open-coded alignment arithmetic (unchanged body) instead of calling `align_size`, and no other call is added. This leaves a static function unreferenced, exactly the dead-code residue the rubric forbids.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No dead code is left behind by the rework: every static function defined in src/tlv.c and src/accessories.c after the patch has an actual call site (no unused restored helper, no newly extracted helper that nothing calls).",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch deletes the duplicated inline implementations rather than commenting them out or guarding them with #if 0. In src/accessories.c, the large inline value-copy switch blocks in homekit_value_clone and homekit_characteristic_clone are removed (all lines marked '-' in the diff) and replaced with calls to homekit_value_copy; no commented-out remnants remain. In src/tlv.c, the inline serialization loops in tlv_add_tlv_value, tlv_format, tlv_stream_add_tlv_value, the inline chunk-coalescing in tlv_get_tlv_value and tlv_parse, and the inline list-append blocks are all deleted and replaced with calls to tlv_flatten, tlv_item_serialize, tlv_record_read, and tlv_list_append. No '#if 0' regions, commented-out code blocks, or unreachable duplicate fragments of the absorbed steps are present in the patch.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The duplicated inline implementations are actually deleted from the code, not parked: no leftover commented-out blocks, '#if 0' regions, or unreachable duplicate fragments of the absorbed steps remain inside the two modules' functions.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The problem requires a zero-length value to \"parse back as no value.\" In the patch, tlv_record_read computes total_size=0 for a [type,0] header and then sets `*pos = i;` without advancing past the 2-byte header. tlv_parse and tlv_get_tlv_value then call tlv_add_value_ with size=0 and re-enter `while (i < length)` at the same i, so a zero-length record produces a size-0 node and loops instead of producing no value and advancing.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Parsing of chunked nested records does not regress: continuation-record merging stays bound by the lookahead-derived total size (no copying a following record's payload as extra chunk data), a record declaring length zero still produces no value node and does not cause the scan to mis-advance or loop, and a missing record still yields no value.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch restores delegation: tlv_item_serialize writes a zero-size item as `out[0]=item->type; out[1]=0; return out+2`, and tlv_flatten uses it, preserving the bare-header/no-payload flatten behavior. tlv_stream_add_tlv_value now calls `tlv_flatten(value,&flat_size)` then `tlv_stream_add_value(tlv,type,flat_data,flat_size)`, removing the inlined per-byte flush/empty-header logic and routing through the unchanged shared stream sink; tlv_stream_add_value is not modified in the patch, so its buffer-fill callback/reset and empty-value header-pair emission remain.",
+      "valid": true,
+      "attempts": 5,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Stream-sink observable behavior is unchanged: the write callback still fires when the sink buffer fills then the position resets; serializing an empty nested value into the stream still emits the bare type/zero-length header pair; and the flatten path still serializes a zero-length item as a bare header pair followed by no payload bytes.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "homekit_value_clone now delegates to homekit_value_copy, which preserves format/is_null/is_static flags and calls homekit_value_copy_payload for per-format copying: string uses strdup for non-static, data uses malloc+memcpy, TLV uses homekit_values_dup (tlv_new + tlv_add_value per record). homekit_characteristic_clone replaces its inline value duplication with homekit_value_copy(&clone->value, &ch->value). The characteristic_clone_required_size extraction preserves the same inlined alignment arithmetic and field-size accounting. The valid-values-range memcpy/pointer-advance site is not touched by the patch, so the idiosyncratic sizeof(homekit_valid_values_range_t*) at the copy/advance site (vs sizeof(homekit_valid_values_range_t) at the size site) is preserved. The packed field order and pointer-alignment after description remain unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Value and characteristic cloning stay byte-faithful: cloned values preserve format tag, is_null/is_static flags, string duplication, raw data copy, and nested TLV duplication; the packed characteristic destination layout is unchanged, including reproducing the existing element-size accounting at the valid-values-range memcpy/pointer-advance site rather than normalizing the historical sizeof choice.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch tlv.c, tlv_add_tlv_value still returns TLV_ERROR_MEMORY when tlv_flatten returns NULL and when the flat_tlv node malloc fails; tlv_get_tlv_value calls tlv_record_read and on TLV_ERROR_MEMORY does tlv_free(value); return NULL, while a failed item malloc is still handled with `if (!item) continue;`; tlv_parse returns TLV_ERROR_MEMORY when tlv_record_read reports allocation failure and ignores the tlv_add_value_ return for node failures; tlv_record_read returns TLV_ERROR_MEMORY only on its payload malloc failure. These preserve the smell.diff allocation-failure semantics.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Allocation-failure behavior of the reworked paths is preserved exactly: the TLV add path still fails with TLV_ERROR_MEMORY when its allocations fail; the parse path still releases the partially built value and returns NULL when an allocation fails; a record-node allocation failure in the parse path is still tolerated silently rather than propagated.",
+      "passes": true
+    },
+    {
+      "id": "R16",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The re-delegation does not introduce repeated-copy or cleanup regressions in the previously absorbed error paths: no new double-free of record values, no leaking of the flat buffer on the early-error paths (relative to the module's documented original ownership behavior), and no stacked ownership change caused by calling a shared step that already manages its own memory.",
+      "rationale": "When a copy of inline logic is replaced by a call to a shared routine that allocates or owns data, ownership coupling is the instance-specific risk: the swallowed code and the shared step must not both manage the same memory.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 0.75,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 0.6666666666666666
+  },
+  "valid_count": 15,
+  "pass_count": 10,
+  "must_have_pass": false,
+  "macro_score": 0.6458333333333333
+}

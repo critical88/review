@@ -1,0 +1,277 @@
+diff --git a/modiscript/api.py b/modiscript/api.py
+index 8c1eeb8..d68e4c2 100644
+--- a/modiscript/api.py
++++ b/modiscript/api.py
+@@ -1,5 +1,6 @@
+ from .lexer import Lexer
+ from .parser import Parser
++from .debug import DebugReporter
+ 
+ 
+ class ModiScript:
+@@ -7,11 +8,12 @@ class ModiScript:
+         self.debug = debug
+ 
+     def _compile_file(self, value, value_type="filename"):
+-        source = Lexer(value, value_type, self.debug)
++        reporter = DebugReporter(value, value_type, self.debug)
++        source = Lexer(value, value_type)
+         lex_out = source.analyze()
+-        source.record_lexemes(lex_out)
++        reporter.record_lexemes(lex_out)
+         parse_out = Parser(lex_out).parse()
+-        source.record_parse_tree(parse_out)
++        reporter.record_parse_tree(parse_out)
+         return compile(parse_out, "<ast>", "exec")
+ 
+     def execute(self, value, value_type="filename"):
+diff --git a/modiscript/corrector.py b/modiscript/corrector.py
+new file mode 100644
+index 0000000..9f065c4
+--- /dev/null
++++ b/modiscript/corrector.py
+@@ -0,0 +1,44 @@
++from .utils import WORDS
++import re
++
++mitrooon = re.compile(r'^mith?roo?o?n?$')
++acche = re.compile(r'^ac[ch]?hee?$')
++barabar = re.compile(r'^bara+bar$')
++sach = re.compile(r'^sac[ch]?h$')
++jhoot = re.compile(r'^jh?(oo|u)t$')
++
++
++class WordCorrector:
++    """The ModiScript word-correction policy, separated from the front end.
++
++    Accepted spellings are kept as a per-instance copy of WORDS, so a driver can
++    teach the language new word corrections through ``fixes`` without touching
++    globals. Spelling variants that aren't a fixed entry are folded onto a
++    canonical token by ``normalize``.
++    """
++
++    def __init__(self, fixes=None):
++        self._fixes = dict(WORDS)
++        if fixes:
++            self._fixes.update(fixes)
++
++    @staticmethod
++    def normalize(word):
++        if word in WORDS:
++            word = WORDS[word]
++        elif mitrooon.search(word):
++            word = 'mitrooon'
++        elif acche.search(word):
++            word = 'acche'
++        elif barabar.search(word):
++            word = 'barabar'
++        elif sach.search(word):
++            word = 'sach'
++        elif jhoot.search(word):
++            word = 'jhoot'
++        return word
++
++    def correct(self, word):
++        if word in self._fixes:
++            return self._fixes[word]
++        return self.normalize(word)
+diff --git a/modiscript/debug.py b/modiscript/debug.py
+new file mode 100644
+index 0000000..1bd06f6
+--- /dev/null
++++ b/modiscript/debug.py
+@@ -0,0 +1,26 @@
++class DebugReporter:
++    """Writes command-line debug reports for a run.
++
++    Deciding *when* (only in debug mode and only for file-backed programs) and
++    *where* (beside the analyzed source) these reports are written is a
++    diagnostic concern; it is kept out of the front end. ``record_lexemes``
++    dumps the lexeme stream and ``record_parse_tree`` dumps the parsed AST.
++    """
++
++    def __init__(self, value, value_type="filename", debug=False):
++        self.debug = debug
++        self._dump_ready = value_type == "filename"
++        self._trace_stem = value.split('.', 1)[0] if value_type == "filename" else ''
++
++    def record_lexemes(self, lex_out):
++        if not (self.debug and self._dump_ready):
++            return
++        with open(self._trace_stem + '.txt', 'w') as f:
++            print(*lex_out, sep='\n', file=f)
++
++    def record_parse_tree(self, parse_out):
++        if not (self.debug and self._dump_ready):
++            return
++        import ast
++        with open(self._trace_stem + '.py', 'w') as f:
++            print(ast.dump(parse_out), file=f)
+diff --git a/modiscript/lexer.py b/modiscript/lexer.py
+index 0bd6ac9..199da91 100644
+--- a/modiscript/lexer.py
++++ b/modiscript/lexer.py
+@@ -1,25 +1,16 @@
+-from .utils import LEX, ErrorHandler, ERROR, CONGRESS_RULE, STARTING_TROUBLE, MISQUOTE, WORDS
+-import re
++from .utils import LEX, ErrorHandler, ERROR, MISQUOTE
++from .corrector import WordCorrector
++from .program import ProgramEnvelope
+ import sys
+ 
+-mitrooon = re.compile(r'^mith?roo?o?n?$')
+-acche = re.compile(r'^ac[ch]?hee?$')
+-barabar = re.compile(r'^bara+bar$')
+-sach = re.compile(r'^sac[ch]?h$')
+-jhoot = re.compile(r'^jh?(oo|u)t$')
+-
+ 
+ class Lexer:
+-    def __init__(self, value, value_type="filename", debug=False):
++    def __init__(self, value, value_type="filename", corrector=None, envelope=None):
+         self.stack = []
+         self.clear = False
+         self.contents = []
+-        self.debug = debug
+-        self._dump_ready = value_type == "filename"
+-        self._trace_stem = value.split('.', 1)[0] if value_type == "filename" else ''
+-        self._word_fixes = {}
+-        self._collect_word_fixes()
+-        self._program_protocol = ('mitrooon', 'acche din aa gaye'.split())
++        self._corrector = corrector if corrector is not None else WordCorrector()
++        self._envelope = envelope if envelope is not None else ProgramEnvelope()
+         self._source_path = None
+         self._source_lines = []
+         if value_type == "filename":
+@@ -32,45 +23,6 @@ class Lexer:
+     def lexeme(lex, value=None, line=0, offset=0):
+         return locals()
+ 
+-    @staticmethod
+-    def normalize(word):
+-        if word in WORDS:
+-            word = WORDS[word]
+-        elif mitrooon.search(word):
+-            word = 'mitrooon'
+-        elif acche.search(word):
+-            word = 'acche'
+-        elif barabar.search(word):
+-            word = 'barabar'
+-        elif sach.search(word):
+-            word = 'sach'
+-        elif jhoot.search(word):
+-            word = 'jhoot'
+-        return word
+-
+-    def _collect_word_fixes(self):
+-        # Keep a per-program copy of the accepted spellings so a driver can
+-        # teach the front-end new word corrections without touching globals.
+-        self._word_fixes = dict(WORDS)
+-
+-    def _correction_for(self, word):
+-        if word in self._word_fixes:
+-            return self._word_fixes[word]
+-        return Lexer.normalize(word)
+-
+-    def _expect_opening(self, lexeme):
+-        if not Lexer._is_var(lexeme, self._program_protocol[0]):
+-            raise ErrorHandler(STARTING_TROUBLE)
+-
+-    def _expect_closing(self, lexemes):
+-        ending = list(self._program_protocol[1])
+-        try:
+-            while ending:
+-                if not Lexer._is_var(lexemes.pop(), ending.pop()):
+-                    raise ErrorHandler(CONGRESS_RULE)
+-        except IndexError:
+-            raise ErrorHandler(CONGRESS_RULE)
+-
+     def _read_source(self, path):
+         self._source_path = path
+         self._source_lines = []
+@@ -81,21 +33,6 @@ class Lexer:
+     def _inline_source(self, value):
+         self._source_lines = value.lower().split("\n")
+ 
+-    def record_lexemes(self, lex_out):
+-        # The report files are written next to the analyzed source, so the
+-        # trace stem is captured once when the front-end is set up.
+-        if not (self.debug and self._dump_ready):
+-            return
+-        with open(self._trace_stem + '.txt', 'w') as f:
+-            print(*lex_out, sep='\n', file=f)
+-
+-    def record_parse_tree(self, parse_out):
+-        if not (self.debug and self._dump_ready):
+-            return
+-        import ast
+-        with open(self._trace_stem + '.py', 'w') as f:
+-            print(ast.dump(parse_out), file=f)
+-
+     def _push(self, *lex):
+         self.stack.append(lex)
+         self.clear = True
+@@ -113,16 +50,12 @@ class Lexer:
+             return self.stack.pop()
+         raise ErrorHandler(ERROR, 'Empty pop')
+ 
+-    @staticmethod
+-    def _is_var(lex, value):
+-        return lex['lex'] == LEX['var'] and lex['value'] == value
+-
+     def analyze(self):
+         lexer = self._analyze_lexemes()
+         lex = next(lexer)
+-        self._expect_opening(lex)
++        self._envelope.expect_opening(lex)
+         lexemes = list(lexer)
+-        self._expect_closing(lexemes)
++        self._envelope.expect_closing(lexemes)
+         return lexemes
+ 
+     def _analyze_lexemes(self):
+@@ -165,7 +98,7 @@ class Lexer:
+                     while o < length and line[o].isalpha():
+                         w += line[o]
+                         o += 1
+-                    w = self._correction_for(w)
++                    w = self._corrector.correct(w)
+                     if w == 'agar':
+                         self._push(LEX['if'], None, num, offset)
+                     elif w == 'toh' and self.on_top((LEX['var'], 'nahi')):
+diff --git a/modiscript/program.py b/modiscript/program.py
+new file mode 100644
+index 0000000..81b4fda
+--- /dev/null
++++ b/modiscript/program.py
+@@ -0,0 +1,30 @@
++from .utils import LEX, ErrorHandler, STARTING_TROUBLE, CONGRESS_RULE
++
++
++class ProgramEnvelope:
++    """The required packaging of every Modi program.
++
++    A program must open with ``mitrooon`` and close with ``acche din aa gaye``.
++    Verifying (and stripping) that envelope is a packaging concern, not a
++    token-grammar one, so it lives here instead of in the front end.
++    """
++
++    opening = 'mitrooon'
++    closing = 'acche din aa gaye'.split()
++
++    @staticmethod
++    def is_var(lex, value):
++        return lex['lex'] == LEX['var'] and lex['value'] == value
++
++    def expect_opening(self, lexeme):
++        if not self.is_var(lexeme, self.opening):
++            raise ErrorHandler(STARTING_TROUBLE)
++
++    def expect_closing(self, lexemes):
++        ending = list(self.closing)
++        try:
++            while ending:
++                if not self.is_var(lexemes.pop(), ending.pop()):
++                    raise ErrorHandler(CONGRESS_RULE)
++        except IndexError:
++            raise ErrorHandler(CONGRESS_RULE)

@@ -1,0 +1,414 @@
+diff --git a/lychee-lib/src/checker/mail.rs b/lychee-lib/src/checker/mail.rs
+deleted file mode 100644
+index 3264331..0000000
+--- a/lychee-lib/src/checker/mail.rs
++++ /dev/null
+@@ -1,72 +0,0 @@
+-use crate::{Status, Uri};
+-use std::time::Duration;
+-
+-#[cfg(feature = "email-check")]
+-use mailify_lib::{Client, Config};
+-
+-/// A utility for checking the validity of email addresses.
+-///
+-/// `EmailChecker` is responsible for validating email addresses,
+-/// optionally performing reachability checks when the appropriate
+-/// features are enabled.
+-#[derive(Debug, Clone)]
+-pub(crate) struct MailChecker {
+-    #[cfg(feature = "email-check")]
+-    client: Client,
+-}
+-
+-#[cfg(not(feature = "email-check"))]
+-impl MailChecker {
+-    /// Creates a new `EmailChecker`.
+-    pub(crate) const fn new(_timeout: Option<Duration>) -> Self {
+-        Self {}
+-    }
+-
+-    /// Ignore the mail check if the `email-check` feature is not enabled.
+-    #[allow(
+-        clippy::unused_async,
+-        reason = "Match the signature of the function with the email-check feature"
+-    )]
+-    pub(crate) async fn check_mail(&self, _uri: &Uri) -> Status {
+-        Status::Excluded
+-    }
+-}
+-
+-#[cfg(feature = "email-check")]
+-impl MailChecker {
+-    /// Creates a new `EmailChecker`.
+-    pub(crate) fn new(timeout: Option<Duration>) -> Self {
+-        Self {
+-            client: Client::new(Config {
+-                timeout,
+-                ..Default::default()
+-            }),
+-        }
+-    }
+-
+-    /// Check a mail address, or equivalently a `mailto` URI.
+-    ///
+-    /// URIs may contain query parameters (e.g. `contact@example.com?subject="Hello"`),
+-    /// which are ignored by this check. They are not part of the mail address
+-    /// and instead passed to a mail client.
+-    pub(crate) async fn check_mail(&self, uri: &Uri) -> Status {
+-        self.perform_email_check(uri).await
+-    }
+-
+-    async fn perform_email_check(&self, uri: &Uri) -> Status {
+-        use crate::ErrorKind;
+-        use http::StatusCode;
+-        use mailify_lib::CheckResult;
+-
+-        let address = uri.url.path().to_string();
+-        let result = self.client.check(&address).await;
+-
+-        match result {
+-            CheckResult::Success => Status::Ok(StatusCode::OK),
+-            CheckResult::Uncertain(reason) => Status::UnknownMailStatus(reason.to_string()),
+-            CheckResult::Failure(reason) => {
+-                ErrorKind::UnreachableEmailAddress(uri.clone(), reason.to_string()).into()
+-            }
+-        }
+-    }
+-}
+diff --git a/lychee-lib/src/checker/mod.rs b/lychee-lib/src/checker/mod.rs
+index 803b1aa..501bb31 100644
+--- a/lychee-lib/src/checker/mod.rs
++++ b/lychee-lib/src/checker/mod.rs
+@@ -3,6 +3,5 @@
+ //! This module contains all checkers, which are responsible for checking the status of a URL.
+ 
+ pub(crate) mod file;
+-pub(crate) mod mail;
+ pub(crate) mod website;
+ pub(crate) mod wikilink;
+diff --git a/lychee-lib/src/client.rs b/lychee-lib/src/client.rs
+index a5795a4..8bf8a8e 100644
+--- a/lychee-lib/src/client.rs
++++ b/lychee-lib/src/client.rs
+@@ -31,12 +31,16 @@ use typed_builder::TypedBuilder;
+ use crate::{
+     BaseInfo, ErrorKind, Methods, Request, Response, Result, Status, Uri,
+     chain::RequestChain,
+-    checker::{file::FileChecker, mail::MailChecker, website::WebsiteChecker},
++    checker::{file::FileChecker, website::WebsiteChecker},
+     filter::Filter,
+     ratelimit::{ClientMap, HostConfigs, HostKey, HostPool, RateLimitConfig},
+     remap::Remaps,
+     types::{DEFAULT_ACCEPTED_STATUS_CODES, Redirects, redirect_history::RedirectHistory},
+ };
++use crate::filter::{is_example_domain, is_false_positive, is_unsupported_domain};
++#[cfg(feature = "email-check")]
++use mailify_lib::Client as MailClient;
++use url::Url;
+ 
+ /// Default number of redirects that are followed.
+ pub const DEFAULT_MAX_REDIRECTS: usize = 10;
+@@ -420,7 +424,11 @@ impl ClientBuilder {
+         Ok(Client {
+             remaps: self.remaps,
+             filter,
+-            email_checker: MailChecker::new(self.timeout),
++            #[cfg(feature = "email-check")]
++            email_verifier: Some(MailClient::new(mailify_lib::Config {
++                timeout: self.timeout,
++                ..mailify_lib::Config::default()
++            })),
+             website_checker,
+             file_checker: FileChecker::new(
+                 &self.base,
+@@ -522,14 +530,20 @@ pub struct Client {
+     /// Rules to decide whether a given link should be checked or ignored.
+     filter: Filter,
+ 
++    /// The optional mail verification engine used for `mailto` URIs.
++    ///
++    /// Mail verification started out as its own checker object, but as the
++    /// client began to own the whole request life cycle it also took over the
++    /// verifier itself. Clients built without the `email-check` feature carry
++    /// no verifier at all.
++    #[cfg(feature = "email-check")]
++    email_verifier: Option<MailClient>,
++
+     /// A checker for website URLs.
+     website_checker: WebsiteChecker,
+ 
+     /// A checker for file URLs.
+     file_checker: FileChecker,
+-
+-    /// A checker for email URLs.
+-    email_checker: MailChecker,
+ }
+ 
+ impl Client {
+@@ -564,7 +578,11 @@ impl Client {
+         } = request.try_into()?;
+ 
+         let start = std::time::Instant::now(); // Measure check time
+-        let remap = self.remap(&mut uri)?.inspect(|r| debug!("Remapping {r}"));
++        let remap = if self.has_remap_rules() {
++            self.remap(&mut uri)?.inspect(|r| debug!("Remapping {r}"))
++        } else {
++            None
++        };
+ 
+         let (status, redirects) = match uri.scheme() {
+             _ if self.is_excluded(&uri) => (Status::Excluded, None),
+@@ -597,23 +615,158 @@ impl Client {
+     ///
+     /// Returns an `Err` if the remapped `uri` is not a valid URI.
+     pub fn remap(&self, uri: &mut Uri) -> Result<Option<Remap>> {
+-        match self.remaps {
+-            Some(ref remaps) => {
+-                let remapped = remaps.remap(uri)?;
+-                if let Some(remapped) = &remapped {
+-                    *uri = remapped.new.clone();
+-                }
+-
+-                Ok(remapped)
++        if self.remaps.is_none() {
++            return Ok(None);
++        }
++
++        let remapped = self.resolve_remap_target(uri)?;
++        if let Some(remapped) = &remapped {
++            *uri = remapped.new.clone();
++        }
++
++        Ok(remapped)
++    }
++
++    /// Whether at least one remap rule is configured.
++    fn has_remap_rules(&self) -> bool {
++        self.remaps.as_ref().is_some_and(|remaps| !remaps.is_empty())
++    }
++
++    /// Find the remap rule that applies to `original`, if any, and build the
++    /// resulting [`Remap`].
++    ///
++    /// The rules are evaluated sequentially and the first match wins, so a
++    /// later rule never overrides an earlier one.
++    ///
++    /// # Errors
++    ///
++    /// Returns an `Err` if the remap rule produces an invalid URL.
++    fn resolve_remap_target(&self, original: &Uri) -> Result<Option<Remap>> {
++        let Some(remaps) = self.remaps.as_ref() else {
++            return Ok(None);
++        };
++
++        for (pattern, replacement) in &remaps.patterns {
++            if pattern.is_match(original.as_str()) {
++                let new = pattern.replace_all(original.as_str(), replacement);
++                let new = Url::parse(&new).map_err(|_| {
++                    ErrorKind::InvalidUrlRemap(format!("the result `{new}` is not a valid URL"))
++                })?;
++
++                let remap = Remap {
++                    original: original.clone(),
++                    new: Uri { url: new },
++                };
++                return Ok(Some(remap));
+             }
+-            None => Ok(None),
+         }
++
++        Ok(None)
+     }
+ 
+     /// Returns whether the given `uri` should be ignored from checking.
++    ///
++    /// The client evaluates the exclusion policy itself: the scheme and host
++    /// rules, the IP classifications, the mail inclusions, the built-in
++    /// exclusions for reserved and unsupported domains, and finally the
++    /// include/exclude regular expressions.
+     #[must_use]
+     pub fn is_excluded(&self, uri: &Uri) -> bool {
+-        self.filter.is_excluded(uri)
++        // Skip mail address, specific IP, specific host, scheme, and built-in
++        // exclusion categories.
++        if self.is_scheme_excluded(uri)
++            || self.is_host_excluded(uri)
++            || self.is_ip_excluded(uri)
++            || self.is_mail_excluded(uri)
++            || uri.is_tel()
++            || self.is_builtin_excluded(uri)
++        {
++            return true;
++        }
++
++        let input = uri.as_str();
++
++        if self.is_includes_empty() {
++            if self.is_excludes_empty() {
++                // Both excludes and includes rules are empty:
++                // *Presumably included* unless it's a false positive
++                return is_false_positive(input);
++            }
++        } else if self.is_includes_match(input) {
++            // *Explicitly included* (Includes take precedence over excludes)
++            return false;
++        }
++
++        // Exclude well-known false-positives
++        // Performed after checking includes to allow user-overwrites
++        if is_false_positive(input)
++            // Previous checks imply input is not explicitly included.
++            // If exclude rules are empty, then *presumably excluded*
++            || self.is_excludes_empty()
++            // If exclude rules match input, then *explicitly excluded*
++            || self.is_excludes_match(input)
++        {
++            return true;
++        }
++
++        false
++    }
++
++    /// Whether the URI belongs to the built-in exclusion categories: reserved
++    /// example domains and known unsupported domains.
++    fn is_builtin_excluded(&self, uri: &Uri) -> bool {
++        is_example_domain(uri) || is_unsupported_domain(uri)
++    }
++
++    /// Whether the scheme of the given URI is excluded
++    fn is_scheme_excluded(&self, uri: &Uri) -> bool {
++        if self.filter.schemes.is_empty() {
++            return false;
++        }
++        !self.filter.schemes.contains(uri.scheme())
++    }
++
++    /// Whether the host is excluded from checking
++    fn is_host_excluded(&self, uri: &Uri) -> bool {
++        // If loopback IPs are excluded, exclude localhost as well, which usually maps to a loopback IP
++        self.filter.exclude_loopback_ips && uri.domain() == Some("localhost")
++    }
++
++    /// Whether the IP address is excluded from checking
++    fn is_ip_excluded(&self, uri: &Uri) -> bool {
++        if (self.filter.exclude_loopback_ips && uri.is_loopback())
++            || (self.filter.exclude_private_ips && uri.is_private())
++            || (self.filter.exclude_link_local_ips && uri.is_link_local())
++        {
++            return true;
++        }
++
++        false
++    }
++
++    /// Whether e-mails aren't checked (which is the default)
++    fn is_mail_excluded(&self, uri: &Uri) -> bool {
++        uri.is_mail() && !self.filter.include_mail
++    }
++
++    /// Whether no include rules are configured
++    fn is_includes_empty(&self) -> bool {
++        !matches!(self.filter.includes, Some(ref includes) if !includes.is_empty())
++    }
++
++    /// Whether no exclude rules are configured
++    fn is_excludes_empty(&self) -> bool {
++        !matches!(self.filter.excludes, Some(ref excludes) if !excludes.is_empty())
++    }
++
++    /// Whether the include rules match the given input
++    fn is_includes_match(&self, input: &str) -> bool {
++        matches!(self.filter.includes, Some(ref includes) if includes.is_match(input))
++    }
++
++    /// Whether the exclude rules match the given input
++    fn is_excludes_match(&self, input: &str) -> bool {
++        matches!(self.filter.excludes, Some(ref excludes) if excludes.is_match(input))
+     }
+ 
+     /// Checks the given URI of a website.
+@@ -630,8 +783,68 @@ impl Client {
+     }
+ 
+     /// Checks a `mailto` URI.
++    ///
++    /// Without the `email-check` feature no mail verifier is compiled in and
++    /// mail URIs are ignored, matching the behavior of the old mail checker.
++    #[cfg(feature = "email-check")]
+     pub async fn check_mail(&self, uri: &Uri) -> Status {
+-        self.email_checker.check_mail(uri).await
++        self.perform_email_check(uri).await
++    }
++
++    /// Checks a `mailto` URI.
++    #[cfg(not(feature = "email-check"))]
++    #[allow(
++        clippy::unused_async,
++        reason = "Match the signature of the function with the email-check feature"
++    )]
++    pub async fn check_mail(&self, _uri: &Uri) -> Status {
++        Status::Excluded
++    }
++
++    /// Verifies the mail address of the given `mailto` URI with the configured
++    /// mail verifier.
++    ///
++    /// URIs may contain query parameters (e.g. `contact@example.com?subject="Hello"`),
++    /// which are ignored by this check. They are not part of the mail address
++    /// and instead passed to a mail client.
++    #[cfg(feature = "email-check")]
++    async fn perform_email_check(&self, uri: &Uri) -> Status {
++        use crate::ErrorKind;
++        use http::StatusCode;
++        use mailify_lib::CheckResult;
++
++        if !self.has_mail_verifier() {
++            return Status::Excluded;
++        }
++        if let Some(verifier) = self.mail_verifier() {
++            debug!("Checking mail address with {verifier:?}");
++        }
++        let Some(verifier) = self.email_verifier.as_ref() else {
++            return Status::Excluded;
++        };
++
++        let address = uri.url.path().to_string();
++        let result = verifier.check(&address).await;
++
++        match result {
++            CheckResult::Success => Status::Ok(StatusCode::OK),
++            CheckResult::Uncertain(reason) => Status::UnknownMailStatus(reason.to_string()),
++            CheckResult::Failure(reason) => {
++                ErrorKind::UnreachableEmailAddress(uri.clone(), reason.to_string()).into()
++            }
++        }
++    }
++
++    /// Whether the client carries a mail verifier.
++    #[cfg(feature = "email-check")]
++    fn has_mail_verifier(&self) -> bool {
++        self.email_verifier.is_some()
++    }
++
++    /// The configured mail verifier, if any.
++    #[cfg(feature = "email-check")]
++    fn mail_verifier(&self) -> Option<&MailClient> {
++        self.email_verifier.as_ref()
+     }
+ }
+ 
+diff --git a/lychee-lib/src/remap.rs b/lychee-lib/src/remap.rs
+index f70b2fd..eddfd19 100644
+--- a/lychee-lib/src/remap.rs
++++ b/lychee-lib/src/remap.rs
+@@ -52,7 +52,8 @@ impl Display for Remap {
+ /// See module level documentation of usage notes.
+ #[derive(Debug, Clone)]
+ pub struct Remaps {
+-    patterns: Vec<(Regex, String)>,
++    /// The remap rules, in evaluation order.
++    pub(crate) patterns: Vec<(Regex, String)>,
+ }
+ 
+ impl Remaps {

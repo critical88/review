@@ -1,0 +1,147 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The problem statement says the read method \"used to delegate the directory-chain traversal and the per-key merge-strategy resolution to two helpers\" that were then inlined. The agent patch re-extracts only the merge helper: it adds `_get_merge_with_strategies` and calls it for both `layer_merge` and `base_merge`, but the directory-chain traversal remains inlined as the `while`/`for` loop over `inherited_directories` inside the read method, and no extracted traversal helper is added. Since the rubric requires both responsibilities to be delegated to helpers, only one of the two is satisfied.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The configuration read method delegates the directory-chain layer traversal and the per-key merge-strategy resolution to extracted helpers, instead of performing the whole read-and-inherit computation in one inlined body.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's stack.py patch restores three extracted helpers and delegates to them from the constructor: self.disable_rollback = self._ensure_boolean(\"disable_rollback\", disable_rollback); self.ignore/self.obsolete = self._ensure_boolean(...); four self._set_field_with_deprecated_alias(...) calls for sceptre_role_session_duration, sceptre_role, cloudformation_service_role, and template_handler_config; and self.parameters = self._cast_parameters(parameters or {}). The helper methods _ensure_boolean, _set_field_with_deprecated_alias, and _cast_parameters are defined separately, so boolean coercion, deprecated-alias resolution, and parameter casting are no longer inlined in one body.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The Stack constructor delegates boolean coercion, deprecated-alias field resolution, and CloudFormation parameter casting to extracted helpers, instead of performing the whole validation-and-normalization in one inlined body.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent extracted merging (_get_merge_with_strategies), boolean coercion (_ensure_boolean), alias resolution (_set_field_with_deprecated_alias), and parameter casting (_cast_parameters) as distinct helpers, but the directory-chain traversal remains inline in the read method — the 'while True' loop building inherited_directories and the 'for current_directory in inherited_directories' walk are not delegated to a distinct traversal helper (the original _recursive_read was not reconstructed). The rubric explicitly requires traversal to be extracted as one of the per-responsibility helpers.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Each absorbed responsibility is extracted as a distinct single-responsibility helper (traversal, merging, boolean coercion, alias resolution, parameter casting), so the repaired methods orchestrate named steps rather than wrapping the inlined block in one catch-all helper.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The extracted `_set_field_with_deprecated_alias` method in sceptre/stack.py uses `setattr(self, deprecated_attribute_name, deprecated_value)` for the deprecated-alias branch, preserving the property-setter redirection. The constructor calls pass the deprecated attribute names ('iam_role', 'role_arn', 'iam_role_session_duration', 'template_path') as the `deprecated_attribute_name` argument, so e.g. setting iam_role triggers the iam_role property setter which redirects to sceptre_role, and setting template_path triggers the template_path setter which builds template_handler_config = {'type':'file','path':value}.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The extracted deprecated-alias resolver still assigns to the deprecated attribute name via setattr (or otherwise reaches the deprecated property setters), so iam_role resolves to sceptre_role, role_arn to cloudformation_service_role, iam_role_session_duration to sceptre_role_session_duration, and template_path to a template_handler_config of {\"type\":\"file\",\"path\":value}.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch restores the `_set_field_with_deprecated_alias` helper, which contains the branch `elif required: raise InvalidConfigFileError(f\"{preferred_config_name} is a required Stack Config.\")`. The template handler config is resolved by calling this helper with `required=True` and `preferred_config_name=\"template\"`, so when neither `template_handler_config` nor `template_path` is supplied, the `elif required:` branch raises `InvalidConfigFileError(\"template is a required Stack Config.\")`, preserving the mandatory-template behavior.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The required template config-key resolution still raises when neither the preferred nor the deprecated template value is supplied.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch replaces the inlined per-layer merge loop with `layer_merge = self._get_merge_with_strategies(accumulated_config, rendered_layer)` and the inlined base-config merge loop with `base_merge = self._get_merge_with_strategies(config, this_config)`, and defines a single `_get_merge_with_strategies(self, inherited_config, layer_config)` method containing the per-key merge logic once, so both merge points route through the one extracted helper.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Both merge points in the configuration read path (per-layer and against the base config) route through the single extracted merge helper, so the per-key merge logic lives in one place rather than being duplicated twice.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch consolidates the duplicated inline blocks behind shared helpers: in reader.py both inlined merge loops are replaced with `self._get_merge_with_strategies(accumulated_config, rendered_layer)` and `self._get_merge_with_strategies(config, this_config)`, and the helper is restored; in stack.py inlined boolean checks are replaced with `self._ensure_boolean(...)`, inlined alias resolution blocks with `self._set_field_with_deprecated_alias(...)`, and inlined parameter casting with `self._cast_parameters(...)`, with those helpers restored. No duplicate inline bodies remain in production source.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Duplicated inlined copies of the merge resolution or of the alias/boolean/parameter helpers are left in the production source after repair instead of being consolidated behind a single shared helper.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The patch extracts only the merge helper but leaves the smell-introduced explicit chain walk (`boundary_directory`/`inherited_directories` while loop) and the per-layer `self.logger.debug(\"Layer '%s' merged %d keys into the inherited configuration\", current_directory, len(layer_merge))` call in the now-delegating ConfigReader method, and does not restore `_recursive_read`; these locals/comments/debug calls are leftover scaffolding from the inlined form.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Intermediate variables, comments, or scaffolding introduced solely to support the inlined form remain in the now-delegating methods after repair.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "Problem statement requires the read path to preserve per-key merge strategy overrides. The agent patch reintroduces a _get_merge_with_strategies helper that iterates CONFIG_MERGE_STRATEGIES, resolves {merge_key}_inheritance overrides from inherited_config and layer_config, raises SceptreException when resolved_name is not in CONFIG_MERGE_STRATEGY_OVERRIDES[merge_key], and otherwise applies CONFIG_MERGE_STRATEGY_OVERRIDES[merge_key][resolved_name]; the read path calls it for both the per-layer merge (accumulated_config, rendered_layer) and the final base merge (config, this_config), preserving the override resolution and invalid-strategy raise.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The configuration read path still applies the per-key merge strategy overrides (the *_inheritance override resolution, including its invalid-strategy raise) identically after repair.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch restores helpers but preserves every validation path and message: `_ensure_boolean` raises the same `f\"{self.name}: Value for {config_name} must be a boolean, not a {type(value).__name__}\"` for disable_rollback/ignore/obsolete; `_set_field_with_deprecated_alias` reproduces the exact 'Both ... are set ... is deprecated.' messages for all four alias pairs and `f\"{preferred_config_name} is a required Stack Config.\"` for the missing template; `_cast_parameters` keeps the same non-dict (`got {parameters}` with `parameters or {}` matching the smell's `resolved_parameters`) and invalid-shape messages; and `_get_merge_with_strategies` keeps the same `f\"{resolved_name} is not a valid inheritance strategy for {merge_key}\"` SceptreException. No validation error or message is altered.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair changes which validation errors are raised or their messages for non-boolean flags, mutually-set deprecated pairs, non-dict parameters, invalid parameter expression shapes, or the missing required template configuration.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In the agent's patch, the restored `_cast_parameters` method contains a `cast_value` function that preserves all required cast semantics: `if isinstance(value, bool): return \"true\" if value else \"false\"` maps booleans to the strings \"true\"/\"false\"; `elif isinstance(value, (int, float)): return str(value)` maps numbers to their string forms; `elif isinstance(value, list): return [cast_value(item) for item in value]` recursively casts nested lists; and `elif isinstance(value, Resolver): return value` leaves Resolver instances unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "CloudFormation parameter casting still maps booleans to the strings \"true\"/\"false\" (not a bare bool), numbers to their string forms, nested lists recursively, and leaves Resolver instances unchanged.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch preserves the explicit StackGroup chain walk unchanged (the inherited_directories construction with the empty-string config-root append is outside the diff context and untouched), so the config-root layer is still rendered. It only extracts the per-layer merge computation into _get_merge_with_strategies(accumulated_config, rendered_layer) and the final base merge into _get_merge_with_strategies(config, this_config), keeping the same top-down iteration order and the same accumulated_config.update(rendered_layer) / this_config.update(base_merge) / config.update(this_config) sequencing. The rendered layer set and merge order are not altered.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair changes the rendered layer set or merge order for nested StackGroups (for example by dropping the config-root layer), altering the inherited configuration.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 1,
+    "core_resolution": 0.3333333333333333
+  },
+  "valid_count": 12,
+  "pass_count": 9,
+  "must_have_pass": false,
+  "macro_score": 0.7083333333333334
+}

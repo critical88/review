@@ -1,0 +1,471 @@
+diff --git a/handler.go b/handler.go
+index 4c99840..0816cc7 100644
+--- a/handler.go
++++ b/handler.go
+@@ -3,14 +3,9 @@
+ package nosurf
+ 
+ import (
+-	"crypto/rand"
+-	"crypto/subtle"
+-	"encoding/base64"
+ 	"errors"
+-	"io"
+ 	"net/http"
+ 	"net/url"
+-	pathModule "path"
+ 	"regexp"
+ )
+ 
+@@ -74,6 +69,29 @@ func defaultFailureHandler(w http.ResponseWriter, r *http.Request) {
+ 	http.Error(w, http.StatusText(FailureCode), FailureCode)
+ }
+ 
++// Extracts the "sent" token from the request
++// and returns an unmasked version of it
++func extractToken(r *http.Request) []byte {
++	// Prefer the header over form value
++	sentToken := r.Header.Get(HeaderName)
++
++	// Then POST values
++	if len(sentToken) == 0 {
++		sentToken = r.PostFormValue(FormFieldName)
++	}
++
++	// If all else fails, try a multipart value.
++	// PostFormValue() will already have called ParseMultipartForm()
++	if len(sentToken) == 0 && r.MultipartForm != nil {
++		vals := r.MultipartForm.Value[FormFieldName]
++		if len(vals) != 0 {
++			sentToken = vals[0]
++		}
++	}
++
++	return b64decode(sentToken)
++}
++
+ // Constructs a new CSRFHandler that calls
+ // the specified handler if the CSRF check succeeds.
+ func New(handler http.Handler) *CSRFHandler {
+@@ -102,113 +120,83 @@ func (h CSRFHandler) getCookieName() string {
+ 	return CookieName
+ }
+ 
+-// ServeHTTP steers a request through the whole check in one pass:
+-// cookie intake, token minting, admission routing, origin adjudication
+-// and credential comparison. The phases are laid out back to back on
+-// purpose, so that a single request never bounces between call layers.
++// ServeHTTP walks a request through the CSRF check in well-defined
++// phases: the bearer cookie is read and the per-request token is
++// (re)issued as needed; safe methods and exempt paths short-circuit
++// to success; the request origin is then adjudicated; finally the
++// submitted token is compared against the real one. Each phase is
++// delegated to a dedicated helper so that this method only coordinates
++// the flow.
+ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+-	// attach the per-request token/reason container
+ 	r = addNosurfContext(r)
+ 	defer ctxClear(r)
+ 	w.Header().Add("Vary", "Cookie")
+ 
+-	// -- intake: find the bearer cookie and its raw payload ------
+-	cookieName := CookieName
+-	if h.baseCookie.Name != "" {
+-		cookieName = h.baseCookie.Name
+-	}
+-
+ 	var realToken []byte
+-	tokenCookie, cookieErr := r.Cookie(cookieName)
+-	if cookieErr == nil {
+-		if raw, rawErr := base64.StdEncoding.DecodeString(tokenCookie.Value); rawErr == nil {
+-			realToken = raw
+-		}
++
++	tokenCookie, err := r.Cookie(h.getCookieName())
++	if err == nil {
++		realToken = b64decode(tokenCookie.Value)
+ 	}
+ 
+-	// -- mint/bootstrap phase ------------------------------------
+-	// A real token of unexpected length is either tampered with,
+-	// left over from another generation scheme, or has never been
+-	// issued to this client. In all of those cases a fresh one is
+-	// handed out right away; the upcoming comparison still uses the
+-	// previous payload and fails on its own, no need to short-circuit.
++	// If the length of the real token isn't what it should be,
++	// it has either been tampered with,
++	// or we're migrating onto a new algorithm for generating tokens,
++	// or it hasn't ever been set so far.
++	// In any case of those, we should regenerate it.
++	//
++	// As a consequence, CSRF check will fail when comparing the tokens later on,
++	// so we don't have to fail it just yet.
+ 	if len(realToken) != tokenLength {
+-		// 32 fresh bytes out of the system entropy pool
+-		fresh := make([]byte, tokenLength)
+-		if _, mintErr := io.ReadFull(rand.Reader, fresh); mintErr != nil {
+-			panic(mintErr)
+-		}
+-
+-		// publication of the presentation form for the wrapped handler
+-		ctxSetToken(r, fresh)
+-
+-		// and distribution of the raw form to the client, in a cookie
+-		// shaped after the configured base
+-		outCookie := h.baseCookie
+-		if h.baseCookie.Name != "" {
+-			outCookie.Name = h.baseCookie.Name
+-		} else {
+-			outCookie.Name = CookieName
+-		}
+-		outCookie.Value = base64.StdEncoding.EncodeToString(fresh)
+-		http.SetCookie(w, &outCookie)
++		h.RegenerateToken(w, r)
+ 	} else {
+-		// trusted payload: publish it for the wrapped handler
+ 		ctxSetToken(r, realToken)
+ 	}
+ 
+-	// -- admission routing: safe verbs and exemptions ------------
+-	// repeated requests to the same resource, cache validators,
+-	// OPTIONS probes and the like never reach the credential
+-	// machinery. Neither do the paths opted out of the check.
+-	safeVerb := false
+-	for _, known := range safeMethods {
+-		if known == r.Method {
+-			safeVerb = true
+-			break
+-		}
++	if sContains(safeMethods, r.Method) || h.IsExempt(r) {
++		// short-circuit with a success for safe methods
++		h.handleSuccess(w, r)
++		return
+ 	}
+ 
+-	exempt := false
+-	if !safeVerb {
+-		path := r.URL.Path
+-		// custom func matcher
+-		if h.exemptFunc != nil && h.exemptFunc(r) {
+-			exempt = true
+-		}
+-		if !exempt {
+-			for _, candidate := range h.exemptPaths {
+-				if candidate == path {
+-					exempt = true
+-					break
+-				}
+-			}
+-		}
+-		if !exempt {
+-			for _, glob := range h.exemptGlobs {
+-				if matched, globErr := pathModule.Match(glob, path); matched && globErr == nil {
+-					exempt = true
+-					break
+-				}
+-			}
+-		}
+-		if !exempt {
+-			for _, pattern := range h.exemptRegexps {
+-				if pattern.MatchString(path) {
+-					exempt = true
+-					break
+-				}
+-			}
+-		}
++	if err := h.ensureSameOrigin(r); err != nil {
++		ctxSetReason(r, err)
++		h.handleFailure(w, r)
++		return
+ 	}
+ 
+-	if safeVerb || exempt {
+-		h.handleSuccess(w, r)
++	// Finally, we check the token itself.
++	sentToken := extractToken(r)
++
++	if !verifyToken(realToken, sentToken) {
++		ctxSetReason(r, ErrBadToken)
++		h.handleFailure(w, r)
+ 		return
+ 	}
+ 
+-	// -- origin adjudication -------------------------------------
+-	// The request's own origin, as this host sees it.
++	// Everything else passed, handle the success.
++	h.handleSuccess(w, r)
++}
++
++// handleSuccess simply calls the successHandler.
++// Everything else, like setting a token in the context
++// is taken care of by h.ServeHTTP()
++func (h *CSRFHandler) handleSuccess(w http.ResponseWriter, r *http.Request) {
++	h.successHandler.ServeHTTP(w, r)
++}
++
++// Same applies here: h.ServeHTTP() sets the failure reason, the token,
++// and only then calls handleFailure()
++func (h *CSRFHandler) handleFailure(w http.ResponseWriter, r *http.Request) {
++	h.failureHandler.ServeHTTP(w, r)
++}
++
++// ensureSameOrigin verifies that the request originates from the same
++// origin as this host. The Sec-Fetch-Site header is consulted first;
++// it then falls back to the Origin header and, when that is absent,
++// to the Referer header, taking any configured trusted origins into
++// account.
++func (h *CSRFHandler) ensureSameOrigin(r *http.Request) error {
+ 	selfOrigin := &url.URL{
+ 		Scheme: "http",
+ 		Host:   r.Host,
+@@ -217,132 +205,88 @@ func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+ 		selfOrigin.Scheme = "https"
+ 	}
+ 
+-	if r.Header.Get("Sec-Fetch-Site") != "same-origin" {
+-		// First opinion: the Origin header.
+-		originFailure := error(nil)
+-		site := r.Header.Get("Origin")
+-		if site == "" || site == "null" {
+-			originFailure = errNoOrigin
+-		} else if originSite, siteErr := url.Parse(site); siteErr != nil {
+-			originFailure = siteErr
+-		} else if originSite.Scheme == selfOrigin.Scheme && originSite.Host == selfOrigin.Host {
+-			originFailure = nil
+-		} else if h.isAllowedOrigin != nil && h.isAllowedOrigin(originSite) {
+-			originFailure = nil
+-		} else {
+-			originFailure = ErrBadOrigin
+-		}
++	// A Sec-Fetch-Site: same-origin value is a strong signal that the
++	// request was issued from our own origin and skips further scrutiny.
++	if r.Header.Get("Sec-Fetch-Site") == "same-origin" {
++		return nil
++	}
+ 
+-		// Any definite Origin verdict ends the adjudication;
+-		// only a missing Origin falls through to the Referer.
+-		if originFailure != nil && originFailure != errNoOrigin {
+-			ctxSetReason(r, originFailure)
+-			h.handleFailure(w, r)
+-			return
+-		}
++	// Without that signal, defer to the Origin header and, when it is
++	// absent, to the Referer header — considering trusted origins.
++	if err := h.checkOrigin(selfOrigin, r); err == nil {
++		return nil
++	} else if !errors.Is(err, errNoOrigin) {
++		return err
++	}
+ 
+-		if originFailure == errNoOrigin {
+-			referer, refererErr := url.Parse(r.Referer())
+-			if refererErr != nil || referer.String() == "" {
+-				ctxSetReason(r, ErrNoReferer)
+-				h.handleFailure(w, r)
+-				return
+-			}
++	// The Origin header was not present; give the Referer a chance,
++	// which is needed for both secure and insecure requests.
++	return h.checkReferer(selfOrigin, r)
++}
+ 
+-			if referer.Scheme == selfOrigin.Scheme && referer.Host == selfOrigin.Host {
+-				// points back at us: accepted
+-			} else if h.isAllowedOrigin != nil && h.isAllowedOrigin(referer) {
+-				// explicitly allowed: accepted
+-			} else {
+-				ctxSetReason(r, ErrBadReferer)
+-				h.handleFailure(w, r)
+-				return
+-			}
+-		}
++// checkReferer validates the request against the Referer header.
++func (h *CSRFHandler) checkReferer(selfOrigin *url.URL, r *http.Request) error {
++	referer, err := url.Parse(r.Referer())
++	if err != nil || referer.String() == "" {
++		return ErrNoReferer
+ 	}
+ 
+-	// -- credential comparison -----------------------------------
+-	// Pull the submitted credential: the header wins, then the
+-	// parsed form, then whichever multipart part carries the name.
+-	sentToken := r.Header.Get(HeaderName)
+-	if len(sentToken) == 0 {
+-		sentToken = r.PostFormValue(FormFieldName)
+-	}
+-	if len(sentToken) == 0 && r.MultipartForm != nil {
+-		vals := r.MultipartForm.Value[FormFieldName]
+-		if len(vals) != 0 {
+-			sentToken = vals[0]
+-		}
++	if sameOrigin(selfOrigin, referer) {
++		return nil
+ 	}
+ 
+-	var sent []byte
+-	if raw, rawErr := base64.StdEncoding.DecodeString(sentToken); rawErr == nil {
+-		sent = raw
++	if h.isAllowedOrigin != nil && h.isAllowedOrigin(referer) {
++		return nil
+ 	}
+ 
+-	// un-submit the client pad: the first half is the one-time key,
+-	// the second half is the payload it hid
+-	credentialValid := false
+-	if len(realToken) == tokenLength && len(sent) == 2*tokenLength {
+-		pad, hidden := sent[:tokenLength], sent[tokenLength:]
+-		for i := range hidden {
+-			hidden[i] ^= pad[i]
+-		}
++	return ErrBadReferer
++}
+ 
+-		if len(realToken) == tokenLength && len(hidden) == tokenLength &&
+-			subtle.ConstantTimeCompare(realToken, hidden) == 1 {
+-			credentialValid = true
+-		}
++// checkOrigin validates the request against the Origin header. It
++// returns errNoOrigin when no Origin header is present so the caller
++// can fall back to the Referer check.
++func (h *CSRFHandler) checkOrigin(selfOrigin *url.URL, r *http.Request) error {
++	originStr := r.Header.Get("Origin")
++	if originStr == "" || originStr == "null" {
++		return errNoOrigin
+ 	}
+ 
+-	if !credentialValid {
+-		ctxSetReason(r, ErrBadToken)
+-		h.handleFailure(w, r)
+-		return
++	origin, err := url.Parse(originStr)
++	if err != nil {
++		return err
+ 	}
+ 
+-	h.handleSuccess(w, r)
+-}
++	if sameOrigin(selfOrigin, origin) {
++		return nil
++	}
+ 
+-// handleSuccess simply calls the successHandler.
+-// Everything else, like setting a token in the context
+-// is taken care of by h.ServeHTTP()
+-func (h *CSRFHandler) handleSuccess(w http.ResponseWriter, r *http.Request) {
+-	h.successHandler.ServeHTTP(w, r)
+-}
++	if h.isAllowedOrigin != nil && h.isAllowedOrigin(origin) {
++		return nil
++	}
+ 
+-// Same applies here: h.ServeHTTP() sets the failure reason, the token,
+-// and only then calls handleFailure()
+-func (h *CSRFHandler) handleFailure(w http.ResponseWriter, r *http.Request) {
+-	h.failureHandler.ServeHTTP(w, r)
++	return ErrBadOrigin
+ }
+ 
+-// Generates a new token, sets it on the given request and returns it.
+-// The whole issuance is performed inline: the mint, the publication
+-// for the wrapped handler and the cookie distribution.
++// Generates a new token, sets it on the given request and returns it
+ func (h *CSRFHandler) RegenerateToken(w http.ResponseWriter, r *http.Request) string {
+-	// mint phase: 32 bytes from the system entropy pool
+-	seed := make([]byte, tokenLength)
+-	if _, seedErr := io.ReadFull(rand.Reader, seed); seedErr != nil {
+-		panic(seedErr)
+-	}
++	token := generateToken()
++	h.setTokenCookie(w, r, token)
++
++	return Token(r)
++}
+ 
+-	// publication phase: the wrapped handler reads the presentation
+-	// form out of the request container
+-	ctxSetToken(r, seed)
++// setTokenCookie publishes the given (unmasked) token in the request
++// context via ctxSetToken() (which masks it) and distributes the raw
++// token to the client in a cookie derived from the configured base.
++func (h *CSRFHandler) setTokenCookie(w http.ResponseWriter, r *http.Request, token []byte) {
++	// ctxSetToken() does the masking for us
++	ctxSetToken(r, token)
+ 
+-	// distribution phase: the raw seed goes to the client in a
+-	// clone-of-base cookie
+ 	cookie := h.baseCookie
+-	if h.baseCookie.Name != "" {
+-		cookie.Name = h.baseCookie.Name
+-	} else {
+-		cookie.Name = CookieName
+-	}
+-	cookie.Value = base64.StdEncoding.EncodeToString(seed)
+-	http.SetCookie(w, &cookie)
++	cookie.Name = h.getCookieName()
++	cookie.Value = b64encode(token)
+ 
+-	return Token(r)
++	http.SetCookie(w, &cookie)
+ }
+ 
+ // Sets the handler to call in case the CSRF check
+diff --git a/token.go b/token.go
+index bd81874..e105bb1 100644
+--- a/token.go
++++ b/token.go
+@@ -57,42 +57,26 @@ func b64decode(data string) []byte {
+ // and returns a bool value indicating if tokens are equal.
+ // Supports masked tokens. realToken comes from Token(r) and
+ // sentToken is token sent unusual way.
+-//
+-// The whole verdict is reached in one stretch: decode both
+-// operands, fold a masked operand back to its raw shape and
+-// compare the raw forms in constant time.
+ func VerifyToken(realToken, sentToken string) bool {
+-	// decode both operands; a malformed one aborts the check
+-	prospective, prospectiveErr := base64.StdEncoding.DecodeString(realToken)
+-	if prospectiveErr != nil {
++	real, err := base64.StdEncoding.DecodeString(realToken)
++	if err != nil {
+ 		return false
+ 	}
+-	submitted, submittedErr := base64.StdEncoding.DecodeString(sentToken)
+-	if submittedErr != nil {
+-		return false
++	// unmask the real token if it is masked
++	if len(real) == 2*tokenLength {
++		real = unmaskToken(real)
+ 	}
+ 
+-	// fold a masked operand back to raw shape: the first half is
+-	// the one-time pad, the second half are the bytes it hid
+-	if len(prospective) == 2*tokenLength {
+-		pad, hidden := prospective[:tokenLength], prospective[tokenLength:]
+-		for i := range hidden {
+-			hidden[i] ^= pad[i]
+-		}
+-		prospective = hidden
++	sent, err := base64.StdEncoding.DecodeString(sentToken)
++	if err != nil {
++		return false
+ 	}
+-	if len(submitted) == 2*tokenLength {
+-		pad, hidden := submitted[:tokenLength], submitted[tokenLength:]
+-		for i := range hidden {
+-			hidden[i] ^= pad[i]
+-		}
+-		submitted = hidden
++	// unmask the sent token if it is masked
++	if len(sent) == 2*tokenLength {
++		sent = unmaskToken(sent)
+ 	}
+ 
+-	// constant-time equality of the raw forms
+-	return len(prospective) == tokenLength &&
+-		len(submitted) == tokenLength &&
+-		subtle.ConstantTimeCompare(prospective, submitted) == 1
++	return tokensEqual(real, sent)
+ }
+ 
+ // verifyToken expects the realToken to be unmasked and the sentToken to be masked

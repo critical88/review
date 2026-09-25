@@ -1,0 +1,182 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "In zones/muxmanager.go, reload now only opens/stats/JSON-decodes the file and then calls `zone.Load(objmap)`; the previously inlined record-construction block (recordTypes map, per-type switch over A/AAAA/PTR/MX/SRV/CNAME/MF/NS/TXT/SPF, weight parsing, sub-label wiring, SOA synthesis, targeting checks) is removed. In zones/reader.go, the agent adds well-scoped methods: `Zone.Load` delegates to `zone.loadRecordData(data)`, `zone.finalizeLabels()`, `zone.AddSOA()`, and `zone.validateTargeting()`; `loadRecordData` performs the per-record-type label/record construction including weight parsing and TXT/SPF string handling, and `finalizeLabels` synthesizes missing sub-domain labels and applies TTL/weight finalization.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The zone-loading work embedded in the reload routine is delegated again: the per-record-type label and record construction (A/AAAA/PTR/MX/SRV/CNAME/MF/NS/TXT/SPF handling, per-record weight parsing, TXT/SPF string handling, and sub-label wiring for the alias convention) is performed by a well-scoped function or method that the reload routine calls, and the inline copy of that construction work inside the reload routine is gone.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In zones/muxmanager.go, the agent deletes the inline targeting flag switch and inline SOA record construction from reload() and replaces them with `if err := zone.Load(objmap); err != nil { return err }`. In zones/reader.go, the new `Zone.Load` delegates targeting parsing to `targeting.ParseTargets(v.(string))` and delegates SOA assembly to `zone.AddSOA()`, so neither construction responsibility remains inline in the reload routine.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The reload routine also delegates SOA assembly for zones and the assembly of targeting options from their string form: neither the SOA record construction nor the eight-way targeting flag parsing is performed inline in the reload routine anymore.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes the entire inline target-computation block from server/serve.go (the ~80 lines handling TargetIP bracketed prefixes, ASN/country/continent/region/regionGroup geo targets, and the '@' global fallback) and restores delegation with `targets, netmask, location := z.Options.Targeting.GetTargets(ip, z.HasClosest)`. The accompanying imports `targeting` and `targeting/geo` are also removed from serve.go, confirming the inline copy is gone and the logic lives once in the targeting package.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The DNS request handler delegates client-target computation to a well-scoped unit: the bracketed IP-prefix targets, the geographic (ASN, country, continent, region) targets, and the global suffix are computed by a delegated function or method, and the handler's inline copy of that logic is removed.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the entire inline label-walk block from server/serve.go — the `for _, target := range targets` loop that resolved targets to label names, probed `qts`, followed MF aliases via `slices.DeleteFunc` to exclude NS/SOA, and the empty-label NOERROR-vs-NXDOMAIN fallback — and replaces it with `labelMatches := z.FindLabels(qlabel, targets, qts)`, adding the comment 'The lookup logic lives once on the zone.' This moves the label walk back into a delegated zone method rather than keeping it inline in the handler.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The DNS request handler delegates the label walk: resolving targets to label names, probing the requested record type, following MF alias chains while excluding NS/SOA from alias follow-ups, and the empty-label fallback distinguishing NOERROR-with-SOA from NXDOMAIN live in a delegated unit, not inline in the handler.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes the entire inlined picker from serve.go (the `for getPicked := true; getPicked; getPicked = false` block containing health filtering via health.GetStatus, the geo-proximity distance loop, the weighted random draw with rand.Intn, and the health weight-sum recomputation) and replaces it with a single delegated call: `servers := z.Picker(label, labelQtype, label.MaxHosts, location)`. The `math/rand` and `health` imports are also removed from serve.go, confirming the inline copy of the picker (including its embedded health filtering) is gone and record selection is delegated to the canonical Zone.Picker method.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The DNS request handler delegates record selection: health filtering of records under test, the pass-through of unweighted groups, the geo-proximity pass, the weighted random draw bounded by the per-type answer cap, and the health weight-sum recomputation all live behind a well-scoped delegated unit, and the handler's inline copy of the picker (including its embedded health filtering) is removed.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent deletes the inlined copies from both entry points and restores single-home delegation. In serve.go, the inline target computation is replaced with `z.Options.Targeting.GetTargets(ip, z.HasClosest)`, the inline label-walk is replaced with `z.FindLabels(qlabel, targets, qts)`, the inline picker (health filtering, closest-match, weighted randomization) is replaced with `z.Picker(label, labelQtype, label.MaxHosts, location)`, and the inline OPT scan is replaced with `edns.FindOPT(req)`. In muxmanager.go, the ~600-line inlined zone-reading body is removed and replaced with `zone.Load(objmap)`, with reload retaining only file discovery, change detection, open/stat/JSON-decode. The re-extracted responsibilities in reader.go are decomposed into separate single-purpose methods: `Load` (options parse + orchestration), `loadRecordData` (record construction), `finalizeLabels` (TTL/weight pass), `AddSOA` (SOA synthesis), and `validateTargeting` (geo-provider checks) — not a single undifferentiated monolith. Targeting string parsing delegates to `targeting.ParseTargets` rather than being re-inlined. No new location lumps multiple absorbed responsibilities into one body.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, each re-extracted responsibility has exactly one authoritative implementation: the prior copies inside the reload routine and the request handler are deleted rather than renamed, and no new location keeps multiple absorbed responsibilities lumped together in one body.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the inlined picker from server/serve.go (which had `health.GetStatus(servers[i].Test) == health.StatusHealthy` and weight arithmetic like `rand.Intn(sum + 1)` and `sum -= servers[i].Weight`), replacing it with `servers := z.Picker(label, labelQtype, label.MaxHosts, location)`. It also removes the inlined target computation and FindLabels logic, replacing them with `z.Options.Targeting.GetTargets(...)` and `z.FindLabels(...)`. Correspondingly, serve.go drops imports `math/rand`, `slices`, `health`, `targeting`, and `targeting/geo` — all only needed by the inlined copies. In zones/muxmanager.go, the ~600-line inline JSON-decoding/record-construction block is replaced with `zone.Load(objmap)`, and the reload routine now only opens, stats, and raw-JSON-decodes the file. muxmanager.go drops imports `net/netip`, `sort`, `strconv`, `targeting`, `typeutil`, and `rdata`, keeping only those its remaining file-discovery and decode-delegation orchestration needs (`encoding/json`, `io`, `runtime/debug`, `errorutil`, etc.).",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The repair also cleans up the low-level reach that only the embedded copies justified: the request handler no longer performs direct health-status testing or record-weight arithmetic, and the reload routine no longer carries JSON-decoding detail inline; the imports and references the two entry points keep are the ones their remaining orchestration actually needs.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch routes responsibilities back through the surviving canonical helpers that the smell had inlined: it restores `edns.FindOPT(req)` (replacing the inline Pseudo-record scan), `z.Options.Targeting.GetTargets(ip, z.HasClosest)` (replacing ~80 lines of inline target assembly), `z.FindLabels(qlabel, targets, qts)` (replacing the inline label-match loop), and `z.Picker(label, labelQtype, label.MaxHosts, location)` (replacing the inlined health/distance/weighted-random picker). In the zone-loading path, the new `Zone.Load` calls `targeting.ParseTargets` instead of the smell's inline string-split parser, `loadRecordData` uses `zone.AddLabel(dk)` instead of direct `zone.Labels[dkLower]` map writes, `Load` calls `zone.AddSOA()` instead of the inlined SOA synthesis, and `validateTargeting` calls `zone.SetLocations()`. No near-duplicate parallel helpers are left alongside these originals.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Responsibilities that already have canonical surviving helpers are routed back through those helpers (possibly reshaped for a cleaner interface), so that the existing functions are in productive use after the repair instead of being orphaned alongside new near-duplicate ones.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch restores delegation on all three secondary paths cited by the rubric. (1) SOA-label fallback: muxmanager.reload now calls zone.Load(objmap), and Load delegates SOA synthesis to zone.AddSOA() instead of the inlined soaLabel/soaRR block from the smell. (2) ANY-qtype routing: serve.go replaces the inlined label-walk and inlined picker (which contained the TypeANY short-circuit and per-rtype Picker loop) with z.FindLabels(qlabel, targets, qts) and z.Picker(label, labelQtype, label.MaxHosts, location). (3) Real-IP target fallback: the inlined target assembly (IP-prefix, ASN, country/continent/region, global) is replaced by z.Options.Targeting.GetTargets(ip, z.HasClosest), and the ECS->realIP fallback comment confirms serve only handles the fallback while target computation lives once in the targeting package. No local re-implementations remain for these paths.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "All affected paths wire through the delegated units consistently: the reload routine's remaining construction callers (such as the SOA-label fallback path for zones being published), the request handler's ANY-qtype routing, and the real-IP target fallback all use the same authoritative implementations rather than keeping local re-implementations for those secondary paths.",
+      "passes": true
+    },
+    {
+      "id": "R10",
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The control-flow scaffolding that existed only to make absorbed code fit — the single-use immediately-invoked per-file closure standing in for the zone parse function and the one-shot picker loop standing in for early returns — is removed once the responsibilities are delegated again.",
+      "rationale": "These constructs are packaging artifacts specific to this injected case; leaving them behind after delegation keeps the entry point artificially shaped around bodies it no longer contains.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes all comments that rationalized re-inlining. In serve.go: the comment 'Pulling the qname apart right here instead of in a helper keeps the request setup in one place' is replaced with a purely descriptive comment about lower-casing; 'Scan the request's pseudo records for an OPT record here rather than calling edns.FindOPT; the extra indirection doesn't pay for itself on the hot path' is removed entirely (inline scan replaced with edns.FindOPT call); 'The target computation is done inline (it used to be two helper calls deep): this is the DNS hot path' is replaced with a comment describing delegation to the targeting package; 'walking the targeting chain inline (this used to be a helper method on the zone)' is replaced with a delegation comment; 'The picker is inlined: the records to answer with are picked straight from the label here' is replaced with a comment describing delegation to Zone.Picker. In muxmanager.go: 'the zone reading, setup and bookkeeping all happens in this one function so file reloads are as quick as they can be' is replaced with a comment describing delegation to Zone.Load; 'The targeting options are parsed right here instead of calling into the targeting package's parser: it's trivial string parsing and zone reading is a hot loop' is removed (code calls targeting.ParseTargets); 'The label bookkeeping is done here directly so we don't spend time hopping through the label helpers' is removed (code moved to loadRecordData); 'also done here so the zone is ready in one pass' (SOA) is removed (code calls AddSOA). No remaining comment in the patch argues for re-inlining.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Comments that rationalized doing the work in place (such as claims that delegation does not pay for itself on the hot path) are removed together with the copies they justified, so no comment left in the code argues for re-inlining these responsibilities.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch restores `servers := z.Picker(label, labelQtype, label.MaxHosts, location)` in server/serve.go, removing the inlined health-filter/weight-draw block; Zone.Picker is not modified, so unhealthy-record exclusion and weight-sum recomputation remain. The loader still wires health via `zone.addHealthReference(label, rdata_)` in zones/reader.go. Thus health-aware selection is preserved.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Health-aware selection behavior is preserved: records whose configured checks report unhealthy are excluded from answers and from the weight draw, and a group whose every checked record is unhealthy yields no answer records rather than returning unhealthy ones or crashing.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch restores the original delegation: `targets, netmask, location := z.Options.Targeting.GetTargets(ip, z.HasClosest)` replaces the entire inline targeting block from the smell, preserving target precedence, the ASN-only-on-geo-failure behavior, and netmask propagation by relying on the unchanged `GetTargets` implementation. The ECS-to-realIP retry is explicitly preserved: the comment `// if the ECS IP didn't get targets, try the real IP instead` and the condition `if l := len(targets); (l == 0 || l == 1 && targets[0] == \"@\") && ip != realIP {` remain in serve.go. EDNS OPT lookup is restored to `option := edns.FindOPT(req)` (replacing the inline `req.Pseudo` scan), and the subsequent SUBNET/scope handling code is left untouched, so EDNS scope/netmask propagation is unchanged. No modifications to the targeting package's `GetTargets` function are present in the patch.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Targeting behavior is preserved: same target precedence for a given client address, a failed location lookup still yields at most the ASN target with a nil location, the retry against the real IP address when the ECS address produced no targets still happens, and EDNS scope/netmask propagation is unchanged.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In zones/muxmanager.go the per-file closure still wraps zone.Load in the existing panic-recover guard (runtime/debug stays imported; the unchanged recover block logs and converts panics to zerr), and after the closure the code still does `if zone == nil || zoneErr != nil { parseErr = ...; log.Println(...); continue }`, so a bad file is logged and skipped while other zones proceed. The closure still stats the file and sets `zone.Options.Serial = int(zoneFileInfo.ModTime().Unix())` before Load, and the sha256 hash-skip block is left untouched. Record reconstruction moved to Zone.loadRecordData still panics on bad data (e.g. `panic(fmt.Errorf(\"bad A record ...\"))`) inside that recover guard.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Zone reload resilience is preserved: a zone file that fails to parse is logged and skipped without stopping other zones from being published or served, the panic-recovery guard around record reconstruction still contains constructor panics, zone serials still derive from file modification times, and unchanged files are still skipped by hash.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch restores delegation to the original helpers instead of keeping the smell's inlined logic, avoiding all four behavioral regressions listed in R15. (1) CNAME/MF capping: the inline picker (with `max = 1` for CNAME/MF) is removed and replaced by `servers := z.Picker(label, labelQtype, label.MaxHosts, location)`, delegating the cap back to the original Picker. (2) Unweighted groups: the inline `if label.Weight[labelQtype] == 0 { break }` early-return-all path is removed; Picker handles it. (3) Weighted draw bound: the inline `n := rand.Intn(sum + 1)` loop is removed; Picker's original draw logic is used. (4) NOERROR-vs-NXDOMAIN: the inline label-walk fallback (`if len(labelMatches) == 0 { if label, ok := z.Labels[qlabel]; ok { ... } }`) is removed and replaced by `labelMatches := z.FindLabels(qlabel, targets, qts)`, restoring the original FindLabels behavior. The zone-loading path (Load/loadRecordData/finalizeLabels/AddSOA/validateTargeting) preserves the same record-construction, weight, TTL, and SOA logic as the pre-smell code, using `zone.AddLabel` and `targeting.ParseTargets` rather than the smell's inline equivalents.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not subtly change answer content: no newly returned multiple CNAME/MF answers (they remain capped to one), no application of the max-hosts cap to unweighted groups that previously returned every record, no off-by-one in the weighted random draw bound, and no change to which names answer NOERROR-with-SOA versus NXDOMAIN.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 1
+  },
+  "valid_count": 14,
+  "pass_count": 14,
+  "must_have_pass": false,
+  "macro_score": 1
+}

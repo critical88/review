@@ -1,0 +1,416 @@
+diff --git a/ngx_cache_purge_module.c b/ngx_cache_purge_module.c
+index 65070f8..f957909 100644
+--- a/ngx_cache_purge_module.c
++++ b/ngx_cache_purge_module.c
+@@ -104,16 +104,6 @@ ngx_int_t   ngx_http_cache_purge_init(ngx_http_request_t *r,
+     ngx_http_file_cache_t *cache, ngx_http_complex_value_t *cache_key);
+ void        ngx_http_cache_purge_handler(ngx_http_request_t *r);
+ 
+-static ngx_int_t   ngx_http_cache_purge_wildcard_compile(ngx_conf_t *cf,
+-    ngx_str_t *pattern, ngx_str_t *prefix);
+-static ngx_int_t   ngx_http_cache_purge_wildcard_match(ngx_str_t *key,
+-    ngx_str_t *prefix);
+-static ngx_int_t   ngx_http_cache_purge_pattern_respond(ngx_http_request_t *r,
+-    ngx_int_t matched);
+-static void        ngx_http_cache_purge_pattern_note(ngx_http_request_t *r,
+-    ngx_int_t matched);
+-static ngx_int_t   ngx_http_cache_purge_pattern_unlink(ngx_http_cache_t *c);
+-
+ ngx_int_t   ngx_http_file_cache_purge(ngx_http_request_t *r);
+ 
+ char       *ngx_http_cache_purge_conf(ngx_conf_t *cf,
+@@ -207,48 +197,6 @@ CRLF "</center>" CRLF
+ "</html>" CRLF
+ ;
+ 
+-/*
+- * Experimental support for wildcard purges.
+- */
+-static const u_char ngx_http_cache_purge_wildcard_hint[] =
+-"<br>Hint: wildcard purges match every key starting"
+-" with a given prefix" CRLF;
+-
+-static const u_char ngx_http_cache_purge_wildcard_tokens[] = "*?";
+-
+-static ngx_int_t
+-ngx_http_cache_purge_wildcard_compile(ngx_conf_t *cf, ngx_str_t *pattern,
+-    ngx_str_t *prefix)
+-{
+-    if (pattern->len < 2 || pattern->data[pattern->len - 1] != '*') {
+-        return NGX_DECLINED;
+-    }
+-
+-    prefix->len = pattern->len - 1;
+-    prefix->data = ngx_pnalloc(cf->pool, prefix->len);
+-    if (prefix->data == NULL) {
+-        return NGX_ERROR;
+-    }
+-
+-    ngx_memcpy(prefix->data, pattern->data, prefix->len);
+-
+-    return NGX_OK;
+-}
+-
+-static ngx_int_t
+-ngx_http_cache_purge_wildcard_match(ngx_str_t *key, ngx_str_t *prefix)
+-{
+-    if (prefix->len == 0 || key->len < prefix->len) {
+-        return NGX_DECLINED;
+-    }
+-
+-    if (ngx_memcmp(key->data, prefix->data, prefix->len) == 0) {
+-        return NGX_OK;
+-    }
+-
+-    return NGX_DECLINED;
+-}
+-
+ # if (NGX_HTTP_FASTCGI)
+ extern ngx_module_t  ngx_http_fastcgi_module;
+ 
+@@ -435,7 +383,6 @@ ngx_http_fastcgi_cache_purge_handler(ngx_http_request_t *r)
+     ngx_http_fastcgi_loc_conf_t   *flcf;
+ #  if (nginx_version >= 1007009)
+     ngx_http_fastcgi_main_conf_t  *fmcf;
+-    ngx_array_t                   *searched;
+     ngx_int_t                      rc;
+ #  endif /* nginx_version >= 1007009 */
+ 
+@@ -458,8 +405,6 @@ ngx_http_fastcgi_cache_purge_handler(ngx_http_request_t *r)
+         return rc;
+     }
+ 
+-    searched = r->upstream->caches;
+-
+ #  else
+ 
+     cache = flcf->upstream.cache->data;
+@@ -1204,13 +1149,9 @@ ngx_int_t
+ ngx_http_cache_purge_access_handler(ngx_http_request_t *r)
+ {
+     ngx_http_cache_purge_loc_conf_t   *cplcf;
+-    u_char                           *token;
+ 
+     cplcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+ 
+-    token = ngx_strlchr(r->method_name.data, r->method_name.data
+-                        + r->method_name.len, '*');
+-
+     if (r->method_name.len != cplcf->conf->method.len
+         || (ngx_strncmp(r->method_name.data, cplcf->conf->method.data,
+                         r->method_name.len)))
+@@ -1316,7 +1257,6 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r)
+     ngx_str_t    *key;
+     ngx_int_t     rc;
+     size_t        len;
+-    size_t        suffix_len;
+ 
+     key = r->cache->keys.elts;
+ 
+@@ -1325,9 +1265,6 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r)
+           + sizeof("<br>Key : ") - 1 + sizeof(CRLF "<br>Path: ") - 1
+           + key[0].len + r->cache->file.name.len;
+ 
+-    suffix_len = sizeof(ngx_http_cache_purge_success_page_tail) - 1
+-                 + sizeof(CRLF "<br>Matched: ") - 1;
+-
+     r->headers_out.content_type.len = sizeof("text/html") - 1;
+     r->headers_out.content_type.data = (u_char *) "text/html";
+     r->headers_out.status = NGX_HTTP_OK;
+@@ -1368,93 +1305,6 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r)
+     return ngx_http_output_filter(r, &out);
+ }
+ 
+-/*
+- * Helpers that were meant to serve the pattern purge response path.
+- */
+-static ngx_int_t
+-ngx_http_cache_purge_pattern_respond(ngx_http_request_t *r, ngx_int_t matched)
+-{
+-    ngx_chain_t   out;
+-    ngx_buf_t    *b;
+-    size_t        len;
+-
+-    len = sizeof("<br>Matched: ") - 1 + NGX_OFF_T_LEN
+-          + sizeof(CRLF "<br>Path: ") - 1
+-          + r->cache->file.name.len;
+-
+-    r->headers_out.content_type.len = sizeof("text/plain") - 1;
+-    r->headers_out.content_type.data = (u_char *) "text/plain";
+-    r->headers_out.status = NGX_HTTP_OK;
+-    r->headers_out.content_length_n = len;
+-
+-    b = ngx_create_temp_buf(r->pool, len);
+-    if (b == NULL) {
+-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+-    }
+-
+-    out.buf = b;
+-    out.next = NULL;
+-
+-    b->last = ngx_cpymem(b->last, "<br>Matched: ",
+-                         sizeof("<br>Matched: ") - 1);
+-    b->last = ngx_sprintf(b->last, "%i", matched);
+-    b->last = ngx_cpymem(b->last, CRLF "<br>Path: ",
+-                         sizeof(CRLF "<br>Path: ") - 1);
+-    b->last = ngx_cpymem(b->last, r->cache->file.name.data,
+-                         r->cache->file.name.len);
+-    b->last_buf = 1;
+-
+-    return ngx_http_output_filter(r, &out);
+-}
+-
+-static void
+-ngx_http_cache_purge_pattern_note(ngx_http_request_t *r, ngx_int_t matched)
+-{
+-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+-                   "http file cache purge pattern: matched %i entries, \"%s\"",
+-                   matched, r->cache->file.name.data);
+-}
+-
+-static ngx_int_t
+-ngx_http_cache_purge_pattern_unlink(ngx_http_cache_t *c)
+-{
+-    ngx_http_file_cache_t  *cache;
+-
+-    cache = c->file_cache;
+-
+-    /*
+-     * remove the pattern-matched entry from disk and from the
+-     * shared memory accounting.
+-     */
+-
+-    ngx_shmtx_lock(&cache->shpool->mutex);
+-
+-    if (!c->node->exists) {
+-        ngx_shmtx_unlock(&cache->shpool->mutex);
+-        return NGX_DECLINED;
+-    }
+-
+-    cache->sh->size -= c->node->fs_size;
+-
+-    c->node->exists = 0;
+-#  if (nginx_version >= 8001) \
+-       || ((nginx_version < 8000) && (nginx_version >= 7060))
+-    c->node->updating = 0;
+-#  endif
+-
+-    ngx_shmtx_unlock(&cache->shpool->mutex);
+-
+-    if (ngx_delete_file(c->file.name.data) == NGX_FILE_ERROR) {
+-        /* entry in error log is enough, don't notice client */
+-        ngx_log_error(NGX_LOG_CRIT, c->file.log, ngx_errno,
+-                      ngx_delete_file_n " \"%s\" failed", c->file.name.data);
+-
+-        return NGX_ERROR;
+-    }
+-
+-    return NGX_OK;
+-}
+-
+ # if (nginx_version >= 1007009)
+ 
+ /*
+@@ -1467,7 +1317,7 @@ ngx_http_cache_purge_cache_get(ngx_http_request_t *r, ngx_http_upstream_t *u,
+     ngx_http_file_cache_t **cache)
+ {
+     ngx_str_t               *name, val;
+-    ngx_uint_t               i, zones;
++    ngx_uint_t               i;
+     ngx_http_file_cache_t  **caches;
+ 
+     if (u->conf->cache_zone) {
+@@ -1486,7 +1336,6 @@ ngx_http_cache_purge_cache_get(ngx_http_request_t *r, ngx_http_upstream_t *u,
+     }
+ 
+     caches = u->caches->elts;
+-    zones = u->caches->nelts;
+ 
+     for (i = 0; i < u->caches->nelts; i++) {
+         name = &caches[i]->shm_zone->shm.name;
+@@ -1514,7 +1363,6 @@ ngx_http_cache_purge_init(ngx_http_request_t *r, ngx_http_file_cache_t *cache,
+     ngx_http_cache_t  *c;
+     ngx_str_t         *key;
+     ngx_int_t          rc;
+-    size_t             prefix_len;
+ 
+     rc = ngx_http_discard_request_body(r);
+     if (rc != NGX_OK) {
+@@ -1541,8 +1389,6 @@ ngx_http_cache_purge_init(ngx_http_request_t *r, ngx_http_file_cache_t *cache,
+         return NGX_ERROR;
+     }
+ 
+-    prefix_len = key->len;
+-
+     r->cache = c;
+     c->body_start = ngx_pagesize;
+     c->file_cache = cache;
+@@ -1557,7 +1403,6 @@ void
+ ngx_http_cache_purge_handler(ngx_http_request_t *r)
+ {
+     ngx_int_t  rc;
+-    ngx_int_t  matched;
+ 
+ #  if (NGX_HAVE_FILE_AIO)
+     if (r->aio) {
+@@ -1567,8 +1412,6 @@ ngx_http_cache_purge_handler(ngx_http_request_t *r)
+ 
+     rc = ngx_http_file_cache_purge(r);
+ 
+-    matched = (rc == NGX_OK);
+-
+     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "http file cache purge: %i, \"%s\"",
+                    rc, r->cache->file.name.data);
+@@ -1596,7 +1439,6 @@ ngx_http_file_cache_purge(ngx_http_request_t *r)
+ {
+     ngx_http_file_cache_t  *cache;
+     ngx_http_cache_t       *c;
+-    off_t                   reclaimed;
+ 
+     switch (ngx_http_file_cache_open(r)) {
+     case NGX_OK:
+@@ -1634,7 +1476,6 @@ ngx_http_file_cache_purge(ngx_http_request_t *r)
+ 
+ #  if (nginx_version >= 1000001)
+     cache->sh->size -= c->node->fs_size;
+-    reclaimed = c->node->fs_size;
+     c->node->fs_size = 0;
+ #  else
+     cache->sh->size -= (c->node->length + cache->bsize - 1) / cache->bsize;
+@@ -1670,7 +1511,6 @@ ngx_http_cache_purge_conf(ngx_conf_t *cf, ngx_http_cache_purge_conf_t *cpcf)
+     ngx_str_t       *value;
+     ngx_int_t        rc;
+     ngx_uint_t       i;
+-    u_char          *marker;
+ 
+     value = cf->args->elts;
+ 
+@@ -1685,12 +1525,6 @@ ngx_http_cache_purge_conf(ngx_conf_t *cf, ngx_http_cache_purge_conf_t *cpcf)
+         cpcf->method = value[1];
+     }
+ 
+-    /* check for embedded wildcard */
+-    if (cpcf->method.len > 1) {
+-        marker = ngx_strlchr(cpcf->method.data, cpcf->method.data
+-                            + cpcf->method.len, '*');
+-    }
+-
+     if (cf->args->nelts < 4) {
+         cpcf->enable = 1;
+         return NGX_CONF_OK;
+diff --git a/t/servroot/conf/nginx.conf b/t/servroot/conf/nginx.conf
+new file mode 100644
+index 0000000..a57b6b5
+--- /dev/null
++++ b/t/servroot/conf/nginx.conf
+@@ -0,0 +1,80 @@
++worker_processes  1;
++daemon on;
++master_process off;
++error_log /workspace/repo/t/servroot/logs/error.log debug;
++pid       /workspace/repo/t/servroot/logs/nginx.pid;
++env MOCKEAGAIN_VERBOSE;
++env MOCKEAGAIN;
++env MOCKEAGAIN_WRITE_TIMEOUT_PATTERN;
++env LD_PRELOAD;
++env LD_LIBRARY_PATH;
++env DYLD_INSERT_LIBRARIES;
++env DYLD_FORCE_FLAT_NAMESPACE;
++#env LUA_PATH;
++#env LUA_CPATH;
++
++
++
++http {
++    access_log /workspace/repo/t/servroot/logs/access.log; client_body_temp_path /workspace/repo/t/servroot/client_body_temp;  fastcgi_temp_path /workspace/repo/t/servroot/fastcgi_temp; scgi_temp_path /workspace/repo/t/servroot/scgi_temp; uwsgi_temp_path /workspace/repo/t/servroot/uwsgi_temp;
++    #access_log off;
++
++    default_type text/plain;
++    keepalive_timeout  68000ms;
++
++    proxy_cache_path  /tmp/ngx_cache_purge_cache keys_zone=test_cache:10m;
++    proxy_temp_path   /tmp/ngx_cache_purge_temp 1 2;
++
++    server {
++        listen          1984;
++        #placeholder
++        server_name     'localhost';
++        
++        client_max_body_size 30M;
++        #client_body_buffer_size 4k;
++
++        # Begin preamble config...
++
++        # End preamble config...
++
++        # Begin test case config...
++    fastcgi_cache_purge  on;
++    proxy_cache_purge    on;
++    set $cache           test_cache;
++
++    location /proxy {
++        proxy_pass         $scheme://127.0.0.1:$server_port/etc/passwd;
++        proxy_cache        $cache;
++        proxy_cache_key    $uri$is_args$args;
++        proxy_cache_valid  3m;
++        add_header         X-Cache-Status $upstream_cache_status;
++
++        if ($uri)          { }
++    }
++
++    location = /etc/passwd {
++        root               /;
++    }
++
++        # End test case config.
++
++        location / {
++            root /workspace/repo/t/servroot/html;
++            index index.html index.htm;
++        }
++    }
++}
++
++
++
++#timer_resolution 100ms;
++
++events {
++    accept_mutex off;
++
++    worker_connections  128;
++}
++env ASAN_OPTIONS;
++env MOCKNOEAGAIN_VERBOSE;
++env MOCKNOEAGAIN;
++user root;
+diff --git a/t/servroot/html/index.html b/t/servroot/html/index.html
+new file mode 100644
+index 0000000..d99c1a6
+--- /dev/null
++++ b/t/servroot/html/index.html
+@@ -0,0 +1 @@
++<html><head><title>It works!</title></head><body>It works!</body></html>
+\ No newline at end of file
+diff --git a/t/servroot/logs/access.log b/t/servroot/logs/access.log
+new file mode 100644
+index 0000000..9f6d3c5
+--- /dev/null
++++ b/t/servroot/logs/access.log
+@@ -0,0 +1 @@
++127.0.0.1 - - [25/Sep/2026:05:54:39 +0000] "PURGE /proxy/passwd HTTP/1.1" 200 273 "-" "-"
+diff --git a/t/servroot/logs/error.log b/t/servroot/logs/error.log
+new file mode 100644
+index 0000000..b50ffdc
+--- /dev/null
++++ b/t/servroot/logs/error.log
+@@ -0,0 +1,8 @@
++2026/09/25 05:54:39 [notice] 781#0: using the "epoll" event method
++2026/09/25 05:54:39 [notice] 781#0: nginx/1.20.2
++2026/09/25 05:54:39 [notice] 781#0: built by gcc 13.3.0 (Ubuntu 13.3.0-6ubuntu2~24.04.1) 
++2026/09/25 05:54:39 [notice] 781#0: OS: Linux 5.10.134-19.1.al8.x86_64
++2026/09/25 05:54:39 [notice] 781#0: getrlimit(RLIMIT_NOFILE): 1048576:1048576
++2026/09/25 05:54:39 [notice] 782#0: signal 3 (SIGQUIT) received from 699, shutting down
++2026/09/25 05:54:39 [info] 782#0: epoll_wait() failed (4: Interrupted system call)
++2026/09/25 05:54:39 [notice] 782#0: exit

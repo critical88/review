@@ -1,0 +1,156 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The patch moves much of the stage off the Session: it adds an `augmenter` struct for `augmentOverlayFile`, `augmentOriginalFile`, and `checkOverrides`, and makes `parseOriginalFiles`, `augmentOriginalImports`, `isOnlyImports`, `pruneImports`, and `finalizeRemovals` free functions, while removing `Session.augOverrides`/`augFound`. However, overlay parsing and the stage entry point remain methods on the build-driver Session: `func (s *Session) parseAndAugment(...)` and `func (s *Session) parseOverlayFiles(...)` are still present in build/augment.go, and LoadPackages still calls `s.parseAndAugment`. Since the rubric requires the source-rewriting stage, including overlay parsing, to be owned by a dedicated non-driver collaborator rather than Session methods, this is not fully satisfied.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The per-package source-rewriting stage for browser compatibility -- overlay and original-source parsing, override-directive application, imports-only detection, unused-import pruning, and deferred declaration-removal finalization -- is owned by a dedicated non-driver collaborator that the build flow invokes, instead of being implemented as methods on the build-driver Session type (the injected callables in build/augment.go).",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch introduces a dedicated `augmenter` struct in build/augment.go with `overrides map[string]overrideInfo` and `found map[string]struct{}` fields, and `parseAndAugment` now creates a fresh `augmenter` per package sweep via `newAugmenter()`. All augmentation methods (`augmentOverlayFile`, `augmentOriginalFile`, `checkOverrides`) are moved from `*Session` receivers to `*augmenter` receivers, with all `s.augOverrides`/`s.augFound` references changed to `a.overrides`/`a.found`. The `augOverrides` and `augFound` fields are removed from the `Session` struct in build/build.go. Tests in build/build_test.go are updated to construct `&augmenter{...}` instead of `&Session{augOverrides:...}`.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The per-package overlay augmentation state -- the pending override descriptors keyed by identifier and the record of which names the overrides actually matched -- is kept with the augmentation owner and scoped to a single package sweep, with the Session type no longer holding these as instance fields (the injected augOverrides and augFound fields are removed from the struct).",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch modifies only build/augment.go, build/build.go, and build/build_test.go; it never touches build/pkgmeta.go. As injected in smell.diff, TestPackage, XTestPackage, FileModTime, InstallPath, and newAdHocPackage remain `func (s *Session)` methods, and the patch leaves callers routing package-fact questions through the Session (e.g., build_test.go still uses `s.TestPackage(pkg)`/`s.XTestPackage(pkg)` and tool.go still calls `s.InstallPath(pkg)`). These package facts are therefore not callable without receiving the Session, and ad-hoc package fabrication is still a Session method, so R3 is not satisfied.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Package facts are owned and answered outside the build driver: the in-package test-variant construction, the external test-variant construction, the source-modification-time lookup, and the installed-archive path resolution (the injected build/pkgmeta.go Session methods TestPackage, XTestPackage, FileModTime, InstallPath) are callable without receiving the Session -- for example restored onto the package descriptor they describe -- and the ad-hoc ephemeral package fabrication is likewise no longer a Session method.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch does not modify build/embed.go and leaves the smell-injected `func (s *Session) embedFiles(pkg *PackageData, fset *token.FileSet, files []*ast.File)` as a Session method; the call site in build.go still uses `s.embedFiles(pkg, fileSet, files)`, so the embedded-asset synthesis remains owned by and invoked through the build driver, not a package-level callable parameterized by the descriptor and file set.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Embedded-asset initialization synthesis (the goembed-driven generation of the initializer source for packages with go:embed, injected as the Session method embedFiles in build/embed.go) is executed by a callable that does not take the build driver as its owner or leading operand -- for instance a package-level function parameterized by the package descriptor and file set.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch only re-homes augmentation internals to an `augmenter` and updates tests. It leaves production routing on the Session: `func (s *Session) parseAndAugment` and `func (s *Session) parseOverlayFiles` remain in build/augment.go, and build.go is touched only to delete the `augOverrides`/`augFound` fields; LoadPackages still calls `s.parseAndAugment` and `s.embedFiles`. There is no diff for build/embed.go (`embedFiles` stays a Session method), build/pkgmeta.go (`TestPackage`, `XTestPackage`, `FileModTime`, `InstallPath`, `newAdHocPackage` stay Session methods), or tool.go (still `s.InstallPath(pkg)`). Thus the rewired production call sites still detour through the Session.",
+      "valid": true,
+      "attempts": 5,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every production call site that the injection rewired through the driver now goes to the re-homed owner directly: the per-package flow's sweep and embedded-asset invocations, the test-package loading flow's variant construction, the ad-hoc package fabrication, and tool.go's installed-archive lookup all reach package facts or stage behavior without detouring through the Session object.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch re-homes TestOverlayAugmentation and TestOriginalAugmentation to &augmenter (s.augmentOverlayFile, s.overrides, s.augmentOriginalFile, s.checkOverrides; package-level pruneImports/augmentOriginalImports) and preserves their assertions. However, it contains no hunk for TestNativesDontImportExtraPackages, which smell.diff rewired to construct &Session{xctx: stdOnly} and call s.TestPackage(pkg), s.XTestPackage(pkg), and s.parseAndAugment(...); that augmentation-sweep/variant walkthrough still exercises behavior through the whole driver rather than a re-homed owner.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The affected build-package tests that the injection rewired to drive stage and variant behavior through a constructed Session (the augmentation-sweep loops, overlay-directive scenarios, and per-package variant walkthroughs in build/build_test.go) now exercise those concerns through the re-homed owners, keeping every scenario and assertion's checked behavior intact rather than weakening or deleting coverage.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the injected `augOverrides` and `augFound` fields from the Session struct in build.go (deleting the `augOverrides map[string]overrideInfo` / `augFound map[string]struct{}` block and its comment). The per-package override bookkeeping is relocated to a new `augmenter` struct in augment.go (`overrides`, `found`), and the moved callables are taken off Session: `augmentOverlayFile`, `augmentOriginalFile`, and `checkOverrides` become `*augmenter` methods, while `parseOriginalFiles`, `augmentOriginalImports`, `isOnlyImports`, `pruneImports`, and `finalizeRemovals` become package-level functions with no receiver. No dead Session forwarding thunks remain for these callables (parseAndAugment/parseOverlayFiles retain real Session logic rather than delegating). The `overrideInfo` type stays in augment.go, is updated to reference the augmenter, and is actively used by it rather than being stranded unused in build.go.",
+      "valid": true,
+      "attempts": 3,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No stage-specific residue survives in the build driver's definition: the injected augmentation state fields are removed from the Session struct (not left unused or repurposed), no dead forwarding methods remain on Session for the moved callables, and the override bookkeeping type (overrideInfo) is not stranded unused in the driver's source file.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "R8 requires the Session doc comment in build/build.go to be updated away from end-to-end ownership. The smell injected that comment: \"Beyond driving the overall build, the session owns the package assembly pipeline end to end...\". agent.patch's only build/build.go hunk deletes the augOverrides/augFound fields but does not modify the Session doc comment, so the overstated ownership prose remains unchanged.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The build-driver type's documentation no longer claims end-to-end ownership of the per-package assembly or of the overlay augmentation state it carries: the Session doc comment in build/build.go is updated to describe a coordinating role, and new or moved owners carry documentation matching what they actually own.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the Session-carried augmentation state from build.go (`augOverrides`/`augFound` fields are deleted) and introduces a single `augmenter` owner with `overrides`/`found` fields. `parseAndAugment` constructs `newAugmenter()` and delegates to `aug.augmentOverlayFile`, `aug.augmentOriginalFile`, and `aug.checkOverrides`; `parseOriginalFiles`, `augmentOriginalImports`, `pruneImports`, and `finalizeRemovals` become package functions. Tests are updated to use `&augmenter{}` instead of `Session` for stage behavior. No duplicate Session-owned and augmenter-owned copies of the overlay state remain, and the patch does not re-add the old package-level implementations alongside the new owner.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not leave the same knowledge in two homes: no duplicate or shadow implementations of the absorbed steps remain (for example a Session-carried copy and a re-homed copy of the same overlay, variant, or embed logic coexisting in the tree), and no file keeps exports or dead code that exist only to serve the removed arrangement.",
+      "passes": true
+    },
+    {
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair is not a syntactic re-spelling: the absorbed callables were not merely converted into package-level functions that still take the build driver (*Session) as their leading argument, nor left as Session methods that forward to the moved implementation, so the stage and package-fact knowledge no longer threads through the driver in either form.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "In build/augment.go the agent only changes ownership, not semantics: augmentOverlayFile, augmentOriginalFile, and checkOverrides move from *Session to *augmenter with s.augOverrides→a.overrides and s.augFound→a.found, while the gopherjs:new/replace/keepOriginal/purgeMethods/overrideSignature branches and the purge/override-signature removal logic remain identical. augmentOriginalImports still switches on the same import-path set and rewrites sync→nosync unchanged; isOnlyImports, pruneImports, and finalizeRemovals are de-methoded but their logic is unchanged. parseAndAugment still deletes the \"init\" override, lazily allocates found only when len(overrides)>0, and calls checkOverrides in the same order. Tests are updated to construct an augmenter with the same maps. No directive semantics were altered.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Overlay override directive semantics did not regress: gopherjs:new enforcement (only-new identifier guarantee), gopherjs:purge dropping both the original and override declaration, gopherjs:override-signature mismatch reporting, arch-tagged import augmentation for ordinary imports, imports-only file handling, and deferred removal finalization all behave exactly as before.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes the shared Session fields `augOverrides` and `augFound` entirely and introduces a dedicated `augmenter` struct that owns `overrides` and `found` maps. In `parseAndAugment`, a fresh `augmenter` is constructed per package via `aug := newAugmenter()`, which allocates an empty `overrides` map and leaves `found` nil until lazy allocation. Because the augmenter is a local variable scoped to each `parseAndAugment` call, per-package state cannot leak across packages or carry over stale entries. The `checkOverrides` validation is still invoked when `len(aug.overrides) > 0`, so unmatched expected overrides are still detected. The Session struct no longer carries any augmentation bookkeeping fields, eliminating the possibility of scope drift.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The augmentation state did not lose its per-package lifetime: the pending override and matched-name bookkeeping is still confined to one package's sweep (no cross-package leakage, no stale carry-over between packages, no skipped validation when an expected override is unmatched), regardless of which owner now holds it.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch only modifies build/augment.go, build/build.go, and build/build_test.go. It does not touch embed.go, pkgmeta.go, tool.go, or any PackageData methods; TestPackage/XTestPackage, FileModTime, InstallPath, newAdHocPackage, and embedFiles remain unchanged. The changes are confined to moving unexported augmentation state from Session to a local augmenter and updating tests, preserving the augmentation logic and all observable build products and cross-package interfaces.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Observable build products and cross-package interfaces did not change: test-variant tags and build contexts, the ad-hoc package's forced build attributes and pinned future timestamp, the generated embedded-asset initializer content for all four embed forms, installed-archive path resolution, and the descriptor internals consumed by internal packages (notably what internal/testmain builds against) all remain exactly as before the repair.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 0.75,
+    "artifact_cleanup": 0.6666666666666666,
+    "associated_changes": 0,
+    "core_resolution": 0.25
+  },
+  "valid_count": 13,
+  "pass_count": 6,
+  "must_have_pass": false,
+  "macro_score": 0.41666666666666663
+}

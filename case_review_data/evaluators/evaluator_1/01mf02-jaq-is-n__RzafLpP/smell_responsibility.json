@@ -1,0 +1,86 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "task_id": "01mf02-jaq-is-n",
+  "repo_id": "smellgen-01mf02-jaq-interface-se__hrrLapk",
+  "checker_backend": "Dylint",
+  "smell_type": "interface_segregation",
+  "rule": {
+    "id": "fat_interface",
+    "description": "A trait violates interface segregation when it forces required methods onto every implementor that no client in the defining crate can exercise. One rule, two bands of the same required-and-unused measurement: (1) a fat interface with at least 8 required methods of which at least 3 are never called by any client outside the trait's own definition and implementations in the defining crate; (2) a small capability trait of at most 4 required methods whose entire interface is unused in the defining crate while that crate implements the trait, forcing the capability onto implementors.",
+    "implementation": "Dylint lint library (rustc late-lint pass, late_lint_mod via check_crate) driven through a vendored dylint_driver as RUSTC_WRAPPER over `cargo check --workspace --all-features`; usage is measured with HIR def-ids resolved through typeck results, and calls made inside the trait's own definition or own trait impls do not count as client usage."
+  },
+  "detection_procedure": [
+    "Discover the repository root (SMELL_CHECK_REPO, or walk up from the working directory to a Cargo workspace, or /workspace/repo).",
+    "Ensure the rustc-dev component is present so rustc_private is linkable; rustup installs it when missing.",
+    "Build the vendored Dylint driver and the fat_interface lint library into a machine-local cache, then run cargo check --workspace --all-features with the driver as RUSTC_WRAPPER, DYLINT_LIBS pointing at the built library, and DYLINT_NO_DEPS=1 so only workspace crates are linted.",
+    "Parse every `warning: fat_interface` block: report its location, trait name, and the structural evidence message. Zero matches exits 0, one or more matches exit 1 with the evidence printed, and an incomplete analysis (unbuildable tree, missing workspace, missing components) exits 2 without verdict."
+  ],
+  "entry_notes": {
+    "fat-valt-core-contract": {
+      "description": "The core value trait is turned into a fat interface: the string/sequence/number capability methods (into_seq, is_int, as_isize, as_f64, is_utf8_str, as_bytes, as_sub_str, from_utf8_bytes) are hoisted from jaq_std::ValT into jaq_core::ValT as required methods. Every value type in the ecosystem must now implement them, while clients of the defining crate jaq-core still exercise none of the 8 hoisted methods there.",
+      "expected_repair": "Split the merged trait back along the capability boundary its clients rely on: keep the small core contract in jaq-core and move the JSON-oriented capability surface into a separate trait that only value types with those capabilities implement."
+    },
+    "hasinputs-capability-payload": {
+      "description": "The optional input-stream capability is turned into mandatory payload: trait HasInputs moves to the core crate, becomes a bound on the associated Data type of the core DataT contract, and the core crate itself implements it only via a leak-stub that yields an empty stream. Nothing in the defining crate ever calls inputs(); the capability is dead weight that every data kind must now carry.",
+      "expected_repair": "Make the capability opt-in again: keep HasInputs as a separate interface a data kind can implement, and let the inputs filters demand it only through a where clause on the data type instead of a mandatory associated-type bound."
+    }
+  },
+  "smell_entries": [
+    {
+      "id": "fat-valt-core-contract",
+      "file_path": "jaq-core/src/val.rs",
+      "class_name": "ValT",
+      "function_name": null
+    },
+    {
+      "id": "hasinputs-capability-payload",
+      "file_path": "jaq-core/src/input.rs",
+      "class_name": "HasInputs",
+      "function_name": null
+    }
+  ],
+  "checks": [
+    {
+      "check_id": "fat-interface-required-method-dead-weight",
+      "description": "Band 1 of rule fat_interface: a trait with >= 8 required methods of which >= 3 are never called by any client in the defining crate.",
+      "entry_ids": [
+        "fat-valt-core-contract"
+      ],
+      "matches": [
+        {
+          "entry_ids": [
+            "fat-valt-core-contract"
+          ],
+          "file": "jaq-core/src/val.rs",
+          "symbol": "ValT",
+          "line": 63,
+          "evidence": "trait `ValT` forces 19 required methods onto every implementor, but 8 of them are never used by any client in the defining crate (into_seq, is_int, as_isize, as_f64, is_utf8_str, as_bytes, as_sub_str, from_utf8_bytes); split the interface along the capability boundaries its clients actually rely on"
+        }
+      ]
+    },
+    {
+      "check_id": "capability-payload-forced-onto-implementors",
+      "description": "Band 2 of rule fat_interface: a trait of 1..=4 required methods whose entire interface is unused in the defining crate while that crate implements it.",
+      "entry_ids": [
+        "hasinputs-capability-payload"
+      ],
+      "matches": [
+        {
+          "entry_ids": [
+            "hasinputs-capability-payload"
+          ],
+          "file": "jaq-core/src/input.rs",
+          "symbol": "HasInputs",
+          "line": 28,
+          "evidence": "capability trait `HasInputs` is implemented in the defining crate, yet its entire interface (inputs) is never called there; keep the interface opt-in so implementors are not forced to carry unused capability"
+        }
+      ]
+    }
+  ],
+  "injected_match_count": 2,
+  "polarity": {
+    "clean": "exit 0 (0 matches)",
+    "injected": "exit 1 (2 matches, one per smell entry)",
+    "repaired_by_gt_patch": "exit 0 (0 matches)"
+  }
+}

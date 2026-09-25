@@ -1,0 +1,169 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The patch moves the ledger's interpretation rules into memcache.c (the module that defines conn_ledger, its event vocabulary, hashed storage, and lookup/open API). Specifically, memcache.c adds ledger_mark_type1rst(), ledger_mark_type2rst(), and ledger_close_cycle(): ledger_close_cycle() now owns the verdict classification (reset attacks→verdict 3 with ttl_hint++, response→verdict 1, else→verdict 2 with ttl_hint--), the LEDGER_EV_VERIFIED marking, and the [LEDGER] Cycle closed log_info summary — logic that was previously duplicated inline at two process_timeout sites in cache.c. cache.c now calls ledger_mark_type1rst(ledger) and ledger_mark_type2rst(ledger, info->ttl) in _process_incoming_RST instead of doing ledger->events |= LEDGER_EV_TYPE1RST / LEDGER_EV_TYPE2RST inline, and both process_timeout sites now call ledger_close_cycle(ledger) instead of assembling the classification/TTL-hint/summary rules themselves. The header memcache.h declares these new rule functions alongside the existing accessors, so the owning module both declares the record and decides how raw observations are classified and summarized.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The module that owns the per-connection activity ledger record (the module defining the record type, its evidence vocabulary, its hashed storage and its lookup/open API) now also implements the rules that interpret raw observations into ledger updates, so the accounting rules are decided by that module rather than assembled at consumer sites.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only refactored 4 of the required sites: both reset-attack classification legs in cache.c (ledger_mark_type1rst/ledger_mark_type2rst) and both evaluation-timeout verification branches in cache.c (ledger_close_cycle). The patch contains NO changes to main.c (TCP processing function and UDP DNS processing function, which still directly set ledger->sid, ledger->attempts, ledger->ttl_hint, ledger->events, ledger->last_mark), NO changes to discrepancy.c (insertion send path still directly sets ledger->events and ledger->discreps), NO changes to ttl_probing.c (TTL probing path still directly sets ledger->ttl_hint), and NO changes to do_organic.c or rst_super.c (strategy implementations still directly set ledger->events and ledger->last_mark). The rubric requires every listed site to convey its raw observation to the owning module, but the majority of sites remain unrefactored.",
+      "valid": true,
+      "attempts": 5,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every site that previously maintained ledger state inline — in the TCP processing function, the UDP DNS processing function, both reset-attack classification legs, both evaluation-timeout verification branches, the insertion send path, the TTL probing path, and the two strategy implementations that fire treatments — now conveys its raw observation to the owning module instead of manipulating the record's fields where it stands.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only moves the cache.c direct-field manipulations into the owning module (replacing ledger->events |= LEDGER_EV_TYPE1RST with ledger_mark_type1rst, etc., and the verdict/TTL-hint close-cycle logic with ledger_close_cycle in memcache.c). It does not touch discrepancy.c, main.c, strategies/do_organic.c, strategies/rst_super.c, or ttl_probing.c, which still directly manipulate ledger fields outside the owning module: e.g., discrepancy.c still does 'ledger->events |= LEDGER_EV_INJECTED; ledger->discreps |= (unsigned char)(flags & 0xFF);', main.c still does 'ledger->sid = sid; ledger->attempts++; ledger->ttl_hint = get_ttl(iphdr->daddr); ledger->events = LEDGER_EV_SEEN;', and ttl_probing.c still does 'ledger->ttl_hint = ttl;'. Since multiple consumer functions still directly manipulate the record's fields, the rubric's requirement that no function outside the owning module does so is not satisfied.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No function outside the owning module directly manipulates the ledger record's fields anymore; a consumer may obtain or open the record and pass it (or its key) to the owning module's API, but the interpretation of observations happens with the owner.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch adds a single owning-module function `ledger_close_cycle` in src/memcache.c that contains the full close-out rule: it derives the verdict from the same evidence (reset evidence -> verdict 3 with ttl_hint++ when <255; response -> verdict 1; silence -> verdict 2 with ttl_hint-- when >3), sets LEDGER_EV_VERIFIED, and emits the identical `[LEDGER] Cycle closed. ...` log_info line. Both mirrored consumer-side rule blocks in src/cache.c's process_timeout (the two verification branches) are replaced with `ledger_close_cycle(ledger);` calls, consolidating the duplicated logic into one owning-module rule rather than two consumer-side blocks.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The cycle close-out is a single owning-module rule that derives the same verdict from the same evidence (reset evidence beats a response, which beats silence), applies the same conditional TTL-hint adjustments, marks the cycle verified, and produces the same summary line — rather than two mirrored consumer-side rule blocks.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch declares the three new rule functions in the owning module's header (memcache.h): `void ledger_mark_type1rst(struct conn_ledger *ledger);`, `void ledger_mark_type2rst(struct conn_ledger *ledger, unsigned int mark);`, and `void ledger_close_cycle(struct conn_ledger *ledger);`. Their implementations are added to memcache.c (e.g., `ledger_close_cycle` contains the verdict classification, TTL-hint adjustment, and `[LEDGER]` log emission that was previously inlined in cache.c). The consumer cache.c now calls these functions (e.g., `ledger_mark_type1rst(ledger);`, `ledger_mark_type2rst(ledger, info->ttl);`, `ledger_close_cycle(ledger);`) instead of reaching into record fields directly, so all consumer TUs compile against the header declaration surface and the rule logic lives in the owning module.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The owning module's header exposes whatever new rule functions the repair introduced, so all consumer translation units (including the strategy implementations) compile against one declaration surface, and their implementation lives in the module that owns the record.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch does not modify src/strategies/do_organic.c or src/strategies/rst_super.c. Both strategy files still reach directly into the conn_ledger record fields instead of going through the owning module's API: do_organic.c uses `ledger->events |= LEDGER_EV_INJECTED;`, `ledger->last_mark = packet->tcphdr->th_seq;`, and `if (ledger->events & LEDGER_EV_RESP)`, while rst_super.c uses `ledger->events |= LEDGER_EV_INJECTED;` and `ledger->last_mark = packet->tcphdr->th_seq;`. Although the agent added API functions (ledger_mark_type1rst, ledger_mark_type2rst, ledger_close_cycle) to memcache.c/h, these are only consumed by cache.c; no API function for marking injected evidence was added, and the two strategy sites were not converted to use the owner's API.",
+      "valid": true,
+      "attempts": 5,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The strategy implementation files keep including the owning module's header and reference its API for their treatment journaling, i.e. their bookkeeping goes through the relocated rules rather than a private shortcut back into the record.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not modify src/discrepancy.c or src/ttl_probing.c. The smell.diff shows those two key-reconstruction sites already build the fourtuple with byte-order conversion before delegating to the ledger module: send_insertion_packet uses f.sport = htons(vars->src_port); f.dport = htons(vars->dst_port); before ledger_open(&f), and process_synack_for_ttl_probing uses f.sport = htons(dport); f.dport = htons(sport); before ledger_ref(&f). Since the patch leaves these sites untouched, the existing htons conversions are preserved and the records still match the pipeline paths.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The consumer sites that reconstruct the ledger key from a non-packet representation — the insertion send path building it from send-variable addresses and ports, and the probing path building it from probed port numbers — preserve the existing byte-order conversion when delegating, so they address the same record the pipeline paths do.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent only relocated the type-1/type-2 RST marking and cycle-closing logic from cache.c (replacing them with ledger_mark_type1rst/ledger_mark_type2rst/ledger_close_cycle calls). Inline bookkeeping blocks remain in many other consumer sites: discrepancy.c still does `ledger->events |= LEDGER_EV_INJECTED; ledger->discreps |= (unsigned char)(flags & 0xFF)`; main.c still directly sets `ledger->sid = sid; ledger->attempts++; ledger->ttl_hint = get_ttl(...); ledger->events = LEDGER_EV_SEEN` and `ledger->events |= LEDGER_EV_REQ; ledger->last_mark = ...` at multiple sites; strategies/do_organic.c and rst_super.c still do `ledger->events |= LEDGER_EV_INJECTED; ledger->last_mark = ...`; ttl_probing.c still directly mutates `ledger->ttl_hint`. These consumer sites retain local `struct conn_ledger *ledger` pointers and `if (ledger)` guard scaffolding wrapping inline field mutations, so the inline bookkeeping blocks are not gone from all consumer sites.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The inline bookkeeping blocks are gone from all consumer sites, including their local record pointers and the guard scaffolding that existed only to wrap the inline updates; no consumer keeps a leftover fragment or a commented-out copy of the old rule.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The smell injected two identical inline copies of the verdict-classification/TTL-hint-adjustment/summary rule in cache.c's process_timeout (and inline type1/type2 reset marking in _process_incoming_RST). The agent's patch removes both inline process_timeout blocks and replaces them with `ledger_close_cycle(ledger);`, defining that rule once in memcache.c (`ledger_close_cycle`), and replaces the inline reset-event assignments with `ledger_mark_type1rst(ledger)` / `ledger_mark_type2rst(ledger, info->ttl)` defined once in memcache.c. No retained inline copy of the verdict/TTL/close-cycle interpretation logic remains at the consumer sites, so each moved accounting semantic has exactly one implementation.",
+      "valid": true,
+      "attempts": 4,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "No rule that interprets ledger observations remains duplicated in more than one place (e.g. an owning-module rule plus a retained inline copy of the same evidence/verdict/TTL logic at a consumer), so each accounting semantic has exactly one implementation.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The reporting helper `show_ledger_of` in helper.c (called from main.c's \"all other protocols\" branch) was introduced in the smell as a getter-only consumer using `ledger_ref` plus `ledger_sid`/`ledger_events`/`ledger_ttl_hint`. The agent patch contains no changes to helper.c or main.c; its textual edits are confined to cache.c (replacing inline `ledger->events`/`verdict`/`ttl_hint` writes with `ledger_mark_type1rst`/`ledger_mark_type2rst`/`ledger_close_cycle`) and to memcache.c/.h (adding those rule functions). Thus the pre-existing read-only consumer was not converted to field access and still reports through the owner's getter API.",
+      "valid": true,
+      "attempts": 5,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The pre-existing read-only consumer of the ledger (the reporting helper that prints a connection's ledger status for other incoming protocols) is not converted into a field-accessing consumer and keeps reporting through the owner's getter API.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The cycle-closure summary is moved into ledger_close_cycle() in src/memcache.c with the identical log_info call: same level (log_info), same format string \"[LEDGER] Cycle closed. %u_%hu_%u_%hu verdict=%d events=%04x ttl_hint=%u.\", same argument values (ledger->fourtp fields, verdict, events, ttl_hint), and same emission condition (called only inside the existing if(ledger) blocks in cache.c). The strategy retry notice in main.c and the junk-data retransmission notice in do_organic.c are not touched by agent.patch, so their level, format, arguments, and conditions are unchanged.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No `[LEDGER]` log line changes level, format string, argument values, or emission condition: the cycle-closure summary, the strategy retry notice, and the junk-data retransmission notice must be produced exactly as before.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The consolidated ledger rules are NULL-safe: ledger_mark_type1rst, ledger_mark_type2rst, and ledger_close_cycle each begin with `if (!ledger) return;` in memcache.c, and their callers in cache.c retain the existing `if (ledger)` guards before calling them (e.g. `ledger_ref(&f); if (ledger) { ledger_close_cycle(ledger); }`). ledger_open is unchanged, so the full-store warning and NULL return behavior remain. Other injected sites not touched by the patch (discrepancy.c, main.c, do_organic.c, rst_super.c, ttl_probing.c) still guard on ledger_open/ledger_ref returning non-NULL, so no unconditional writes or NULL dereferences are introduced.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair introduces no crash and no dropped guard when the bounded ledger store refuses to create a record (or when a key has none): every delegation is safe without a record, paths that previously skipped their update still perform no update in that situation, and the store's full warning behavior is unchanged.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch relocates the cycle-close logic to ledger_close_cycle in memcache.c while preserving the exact bounds: `if (ledger->ttl_hint < 255) ledger->ttl_hint++;` for reset evidence and `if (ledger->ttl_hint > 3) ledger->ttl_hint--;` for no-response. It does not modify the first-response adoption (`if (ledger->ttl_hint == 0) ledger->ttl_hint = choose_appropriate_ttl(iphdr->ttl);` in main.c) or the probing replacement (`if (ledger->ttl_hint == 0 || ttl < ledger->ttl_hint)` in ttl_probing.c), so all four TTL-hint conditions remain intact.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "TTL-hint semantics are preserved: the server-side initial TTL is adopted only when no hint exists yet on the first response, a confirmed probing value replaces the hint only when unset or smaller, the reset-evidence increment stays bounded at 255, and the no-response decrement still applies only above 3.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent.patch modifies only src/cache.c, src/memcache.c, and src/memcache.h (plus binaries); it does not touch src/strategies/do_organic.c or src/main.c. Consequently the junk-data retransmission notice in do_organic.c still checks `ledger->events & LEDGER_EV_RESP` before setting `LEDGER_EV_INJECTED`, and the strategy retry notice in main.c still increments `ledger->attempts` and logs when `ledger->attempts >= 3`. The new ledger_mark_type1rst/type2rst and ledger_close_cycle helpers only replace the reset/close logic in cache.c, leaving these two state-reading sites and their ordering/threshold intact.",
+      "valid": true,
+      "attempts": 4,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The junk-data retransmission notice still fires only for connections whose response evidence was already set at the time the treatment was re-sent (the response check is not reordered after the injection mark or inverted), and the strategy retry notice still appears from the third dispatched strategy onward.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.6666666666666666,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 0.5
+  },
+  "valid_count": 14,
+  "pass_count": 10,
+  "must_have_pass": false,
+  "macro_score": 0.7083333333333333
+}

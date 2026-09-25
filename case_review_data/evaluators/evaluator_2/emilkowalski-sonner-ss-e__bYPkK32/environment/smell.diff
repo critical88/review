@@ -1,0 +1,198 @@
+diff --git a/src/appearance.ts b/src/appearance.ts
+new file mode 100644
+index 0000000..0e2e093
+--- /dev/null
++++ b/src/appearance.ts
+@@ -0,0 +1,24 @@
++import type { ToastT } from './types';
++
++// How a toast resolves the visual skin it renders with. Values can come from
++// the toast itself or from the toaster rendering it, and the pieces below spell
++// out which one wins for every part of the skin.
++
++// A toast renders inverted when the toast itself or the toaster it belongs to
++// asks for it. `invert` is tri-state: unset on the toast means "do what the
++// toaster does".
++export const getToastInvert = (toast: ToastT, toasterInvert: boolean | undefined) => {
++  return toast.invert || toasterInvert;
++};
++
++// Rich colors are the colored variant of a type: green success, red error and so
++// on. The toast opts in itself or, when it doesn't care, the toaster decides.
++export const getToastRichColors = (toast: ToastT, defaultRichColors: boolean | undefined) => {
++  return toast.richColors ?? defaultRichColors;
++};
++
++// Only toasts that don't bring their own JSX and are not opted out of the
++// built-in styling are rendered with it. Everything else is on its own.
++export const getToastStyled = (toast: ToastT, toasterUnstyled: boolean | undefined) => {
++  return !Boolean(toast.jsx || toast.unstyled || toasterUnstyled);
++};
+diff --git a/src/assets.tsx b/src/assets.tsx
+index f10b9fd..3c3dec1 100644
+--- a/src/assets.tsx
++++ b/src/assets.tsx
+@@ -1,6 +1,6 @@
+ 'use client';
+ import React from 'react';
+-import type { ToastTypes } from './types';
++import type { ToastIcons, ToastT, ToastTypes } from './types';
+ 
+ export const getAsset = (type: ToastTypes): JSX.Element | null => {
+   switch (type) {
+@@ -21,6 +21,13 @@ export const getAsset = (type: ToastTypes): JSX.Element | null => {
+   }
+ };
+ 
++// Which icon a toast renders with is decided in steps: an icon the toast carries
++// itself wins, then the icons the toaster was configured with, and only then the
++// built-in asset for the type of the toast.
++export const getToastIcon = (toast: ToastT, toastType: ToastTypes | undefined, icons?: ToastIcons) => {
++  return toast.icon || icons?.[toastType] || getAsset(toastType);
++};
++
+ const bars = Array(12).fill(0);
+ 
+ export const Loader = ({ visible, className }: { visible: boolean; className?: string }) => {
+diff --git a/src/index.tsx b/src/index.tsx
+index b87db01..1bb8064 100644
+--- a/src/index.tsx
++++ b/src/index.tsx
+@@ -3,11 +3,13 @@
+ import React from 'react';
+ import ReactDOM from 'react-dom';
+ 
+-import { CloseIcon, getAsset, Loader } from './assets';
++import { CloseIcon, getToastIcon, Loader } from './assets';
++import { getToastInvert, getToastRichColors, getToastStyled } from './appearance';
+ import { useIsDocumentHidden } from './hooks';
+ import { toast, ToastState } from './state';
+ import './styles.css';
+ import {
++  getWiredToastOptions,
+   isAction,
+   SwipeDirection,
+   type ExternalToast,
+@@ -143,7 +145,7 @@ const Toast = (props: ToastProps) => {
+     [props.swipeDirections, position],
+   );
+ 
+-  const invert = toast.invert || ToasterInvert;
++  const invert = getToastInvert(toast, ToasterInvert);
+   const disabled = toastType === 'loading';
+ 
+   offset.current = React.useMemo(() => heightIndex * gap + toastsHeightBefore, [heightIndex, toastsHeightBefore]);
+@@ -262,7 +264,7 @@ const Toast = (props: ToastProps) => {
+     return <Loader className={cn(classNames?.loader, toast?.classNames?.loader)} visible={toastType === 'loading'} />;
+   }
+ 
+-  const icon = toast.icon || icons?.[toastType] || getAsset(toastType);
++  const icon = getToastIcon(toast, toastType, icons);
+ 
+   return (
+     <li
+@@ -277,8 +279,8 @@ const Toast = (props: ToastProps) => {
+         toast?.classNames?.[toastTypeKey],
+       )}
+       data-sonner-toast=""
+-      data-rich-colors={toast.richColors ?? defaultRichColors}
+-      data-styled={!Boolean(toast.jsx || toast.unstyled || unstyled)}
++      data-rich-colors={getToastRichColors(toast, defaultRichColors)}
++      data-styled={getToastStyled(toast, unstyled)}
+       data-mounted={mounted}
+       data-promise={Boolean(toast.promise)}
+       data-swiped={isSwiped}
+@@ -625,6 +627,9 @@ const Toaster = React.forwardRef<HTMLElement, ToasterProps>(function Toaster(pro
+     containerAriaLabel = 'Notifications',
+   } = props;
+   const [toasts, setToasts] = React.useState<ToastT[]>([]);
++  // How the Toaster's own props and its `toastOptions` stack up for every toast
++  // it renders. `toastOptions` are the more specific layer of the two.
++  const wiredToastOptions = getWiredToastOptions(toastOptions, duration, closeButton);
+   const filteredToasts = React.useMemo(() => {
+     if (id) {
+       return toasts.filter((toast) => toast.toasterId === id);
+@@ -865,12 +870,12 @@ const Toaster = React.forwardRef<HTMLElement, ToasterProps>(function Toaster(pro
+                   index={index}
+                   toast={toast}
+                   defaultRichColors={richColors}
+-                  duration={toastOptions?.duration ?? duration}
++                  duration={wiredToastOptions.duration}
+                   className={toastOptions?.className}
+                   descriptionClassName={toastOptions?.descriptionClassName}
+                   invert={invert}
+                   visibleToasts={visibleToasts}
+-                  closeButton={toastOptions?.closeButton ?? closeButton}
++                  closeButton={wiredToastOptions.closeButton}
+                   interacting={interacting}
+                   position={position}
+                   style={toastOptions?.style}
+diff --git a/src/state.ts b/src/state.ts
+index 29d70b8..e3309b9 100644
+--- a/src/state.ts
++++ b/src/state.ts
+@@ -24,6 +24,23 @@ const getToastId = (data?: { id?: number | string }) => {
+   return typeof data?.id === 'number' || data?.id?.length > 0 ? data.id : toastsCounter++;
+ };
+ 
++// The presentation options a toast record carries with it. An update doesn't
++// restate them: it keeps what the toast was created with unless the update sets
++// its own value, so subscribers and `getHistory()` keep seeing the same toast
++// and not a stripped down copy of it.
++const getStoredPresentation = (stored: ToastT, update: ExternalToast) => {
++  return {
++    richColors: update.richColors ?? stored.richColors,
++    invert: update.invert ?? stored.invert,
++    unstyled: update.unstyled ?? stored.unstyled,
++    closeButton: update.closeButton ?? stored.closeButton,
++    classNames: update.classNames ?? stored.classNames,
++    // `icon: null` removes the icon of a toast, so a value that is set on the
++    // update always wins here instead of falling back to the stored one.
++    icon: update.icon !== undefined ? update.icon : stored.icon,
++  };
++};
++
+ class Observer {
+   subscribers: Array<(toast: ExternalToast | ToastToDismiss) => void>;
+   toasts: Array<ToastT | ToastToDismiss>;
+@@ -118,12 +135,14 @@ class Observer {
+         });
+ 
+     if (alreadyExists) {
++      const storedPresentation = getStoredPresentation(alreadyExists, data);
+       this.toasts = this.toasts.map((toast) => {
+         if (toast.id === id) {
+-          this.publish({ ...toast, ...data, id, title: message });
++          this.publish({ ...toast, ...data, ...storedPresentation, id, title: message });
+           return {
+             ...toast,
+             ...data,
++            ...storedPresentation,
+             id,
+             dismissible,
+             title: message,
+diff --git a/src/types.ts b/src/types.ts
+index e74740d..f2d4956 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -115,6 +115,20 @@ interface ToastOptions {
+   toasterId?: string;
+ }
+ 
++// The <Toaster> wires its own props into every toast it renders, and its
++// `toastOptions` are the more specific layer for the toasts of that toaster:
++// they win whenever they carry a value.
++export const getWiredToastOptions = (
++  toastOptions: ToastOptions | undefined,
++  duration: ToasterProps['duration'],
++  closeButton: ToasterProps['closeButton'],
++) => {
++  return {
++    duration: toastOptions?.duration ?? duration,
++    closeButton: toastOptions?.closeButton ?? closeButton,
++  };
++};
++
+ type Offset =
+   | {
+       top?: string | number;

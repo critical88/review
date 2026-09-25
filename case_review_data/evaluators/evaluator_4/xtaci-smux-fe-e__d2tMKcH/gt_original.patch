@@ -1,0 +1,321 @@
+diff --git a/session.go b/session.go
+index a11861f..085547d 100644
+--- a/session.go
++++ b/session.go
+@@ -380,53 +380,6 @@ func (s *Session) returnTokens(n int) {
+ 	}
+ }
+ 
+-// streamConsumed records receive-side bookkeeping for a stream after n bytes
+-// have been consumed by the reader, and returns the number of consumed bytes
+-// that should be announced to the peer in a window update, or 0 when no
+-// window update is due.
+-//
+-// The caller must hold the stream's bufferLock, so the per-stream counters stay
+-// consistent with the buffer it mirrors.
+-func (s *Session) streamConsumed(st *stream, n int) uint32 {
+-	st.numRead += uint32(n)
+-	st.incr += uint32(n)
+-
+-	// send window update if the increased bytes exceed half of the buffer size
+-	// or this is the initial read.
+-	if st.incr >= st.windowUpdateThreshold || st.numRead == uint32(n) {
+-		notifyConsumed := st.numRead
+-		st.incr = 0
+-		return notifyConsumed
+-	}
+-	return 0
+-}
+-
+-// streamWindow computes the current send window for a stream. ok is false if
+-// the peer claims to have consumed more than it received, which indicates
+-// malformed remote data.
+-//
+-// All window state lives on the stream, so the session simply mediates the
+-// arithmetic the write path needs.
+-func (s *Session) streamWindow(st *stream) (win int32, windowOk bool) {
+-	// per stream sliding window control
+-	// [.... [consumed... numWritten] ... win... ]
+-	// [.... [consumed...................+rmtwnd]]
+-	// note:
+-	// even if uint32 overflow, this math still works:
+-	// eg1: uint32(0) - uint32(math.MaxUint32) = 1
+-	// eg2: int32(uint32(0) - uint32(1)) = -1
+-	//
+-	// basically, you can take it as a MODULAR ARITHMETIC
+-	inflight := int32(atomic.LoadUint32(&st.numWritten) - atomic.LoadUint32(&st.peerConsumed))
+-	if inflight < 0 { // security check for malformed data
+-		return 0, false
+-	}
+-
+-	// make sure you understand 'win' is calculated in modular arithmetic(2^32(4GB))
+-	win = int32(atomic.LoadUint32(&st.peerWindow)) - inflight
+-	return win, true
+-}
+-
+ // recvLoop keeps on reading from underlying connection if tokens are available
+ func (s *Session) recvLoop() {
+ 	var hdr rawHeader
+diff --git a/shaper.go b/shaper.go
+index 168ed1b..e901395 100644
+--- a/shaper.go
++++ b/shaper.go
+@@ -180,3 +180,26 @@ func (sq *shaperQueue) IsEmpty() bool {
+ func (sq *shaperQueue) Len() int {
+ 	return int(atomic.LoadInt64(&sq.count))
+ }
++
++// pendingBacklog reports how many write requests and payload bytes are
++// currently queued, walking the round-robin list and summing the payload
++// bytes waiting in every stream's heap.
++func (sq *shaperQueue) pendingBacklog() (queuedFrames uint64, queuedBytes uint64) {
++	sq.mu.Lock()
++	defer sq.mu.Unlock()
++
++	// total number of queued write requests
++	queuedFrames = uint64(atomic.LoadInt64(&sq.count))
++
++	for elem := sq.rrList.Front(); elem != nil; elem = elem.Next() {
++		sid, _ := elem.Value.(uint32)
++		h := sq.streams[sid]
++		if h == nil {
++			continue
++		}
++		for i := 0; i < h.Len(); i++ {
++			queuedBytes += uint64(len((*h)[i].frame.data))
++		}
++	}
++	return queuedFrames, queuedBytes
++}
+diff --git a/stats.go b/stats.go
+index fbb3b76..09f8c59 100644
+--- a/stats.go
++++ b/stats.go
+@@ -22,10 +22,6 @@
+ 
+ package smux
+ 
+-import (
+-	"sync/atomic"
+-)
+-
+ // StreamAccounting is a point-in-time accounting view of a single stream,
+ // aimed at diagnosing stalled or unbalanced multiplexed connections.
+ type StreamAccounting struct {
+@@ -62,9 +58,6 @@ type StreamAccounting struct {
+ // StreamStats returns a point-in-time accounting view of the stream with the
+ // given stream id. The second return value is false if the session does not
+ // know a stream with this id, for example after it has been closed.
+-//
+-// Values are sampled without stopping the session, so they describe an
+-// approximation of the state at some recent instant.
+ func (s *Session) StreamStats(sid uint32) (StreamAccounting, bool) {
+ 	s.streamLock.Lock()
+ 	st := s.streams[sid]
+@@ -73,61 +66,11 @@ func (s *Session) StreamStats(sid uint32) (StreamAccounting, bool) {
+ 	if st == nil {
+ 		return StreamAccounting{}, false
+ 	}
+-
+-	var acc StreamAccounting
+-	acc.ID = st.id
+-	acc.BytesRead = uint64(st.numRead)
+-	acc.BytesWritten = uint64(st.numWritten)
+-	acc.Inflight = st.numWritten - st.peerConsumed
+-	acc.PeerWindow = st.peerWindow
+-	acc.BytesBuffered = st.bufferedBytes()
+-
+-	select {
+-	case <-st.chFinEvent:
+-		acc.ReadClosed = true
+-	default:
+-	}
+-
+-	select {
+-	case <-st.chWriteClosed:
+-		acc.WriteClosed = true
+-	default:
+-	}
+-
+-	select {
+-	case <-st.die:
+-		acc.Closed = true
+-	default:
+-	}
+-
+-	return acc, true
++	return st.stats(), true
+ }
+ 
+ // ShaperBacklog reports how many write requests and payload bytes are currently
+ // queued by the traffic shaper across all streams.
+-//
+-// The shaper state is sampled without taking the shaper's lock, so a queue that
+-// is being drained concurrently may report fewer bytes than were queued at the
+-// start of the call. This keeps the sender and shaper loops from blocking on
+-// diagnostics. The walk tolerates the transient inconsistency between the
+-// scheduler's round-robin list and its per-stream heaps.
+ func (s *Session) ShaperBacklog() (queuedFrames uint64, queuedBytes uint64) {
+-	sq := s.sq
+-
+-	// total number of queued write requests
+-	queuedFrames = uint64(atomic.LoadInt64(&sq.count))
+-
+-	// walk the scheduler's round-robin list and sum the payload bytes
+-	// waiting in every stream's heap.
+-	for elem := sq.rrList.Front(); elem != nil; elem = elem.Next() {
+-		sid, _ := elem.Value.(uint32)
+-		h := sq.streams[sid]
+-		if h == nil {
+-			continue
+-		}
+-		for i := 0; i < h.Len(); i++ {
+-			queuedBytes += uint64(len((*h)[i].frame.data))
+-		}
+-	}
+-	return queuedFrames, queuedBytes
++	return s.sq.pendingBacklog()
+ }
+diff --git a/stream.go b/stream.go
+index 19c72ba..5737653 100644
+--- a/stream.go
++++ b/stream.go
+@@ -107,6 +107,17 @@ func (r *bufferRing) len() int {
+ 	return r.size
+ }
+ 
++// bufferedBytes returns the number of payload bytes currently held in the
++// ring, scanned over the live cells of the ring.
++func (r *bufferRing) bufferedBytes() int {
++	var total int
++	for i := 0; i < r.size; i++ {
++		idx := (r.head + i) & r.mask
++		total += len(r.bufs[idx])
++	}
++	return total
++}
++
+ func (r *bufferRing) grow() {
+ 	newCap := len(r.bufs) * 2
+ 	if newCap < 1 {
+@@ -274,7 +285,7 @@ func (s *stream) tryReadV2(b []byte) (n int, err error) {
+ 	// continues reading data.
+ 	//
+ 	// s.numRead == n indicates that this is the initial read.
+-	notifyConsumed = s.sess.streamConsumed(s, n)
++	notifyConsumed = s.recordConsumed(n)
+ 	s.bufferLock.Unlock()
+ 
+ 	if recycled != nil {
+@@ -364,7 +375,7 @@ func (s *stream) writeToV2(w io.Writer) (n int64, err error) {
+ 		if buf != nil {
+ 			bufLen = uint32(len(buf))
+ 		}
+-		notifyConsumed = s.sess.streamConsumed(s, int(bufLen))
++		notifyConsumed = s.recordConsumed(int(bufLen))
+ 		s.bufferLock.Unlock()
+ 
+ 		// same as v1, write the buffer to w
+@@ -554,10 +565,8 @@ func (s *stream) writeV2(b []byte) (n int, err error) {
+ 			deadlineTimer = nil
+ 		}
+ 
+-		// per stream sliding window control:
+-		// the session owns the window arithmetic for every stream,
+-		// see the notes on Session.streamWindow() for the modular arithmetic.
+-		win, windowOk := s.sess.streamWindow(s)
++		// per stream sliding window control
++		win, windowOk := s.sendWindow()
+ 		if !windowOk { // security check for malformed data
+ 			return 0, ErrConsumed
+ 		}
+@@ -751,17 +760,79 @@ func (s *stream) recycleTokens() (n int) {
+ 	return
+ }
+ 
+-// bufferedBytes returns the number of payload bytes currently held in the
+-// ring. It takes an unshared snapshot of the ring descriptor and scans the
+-// live slots, so the result is an approximation on a busy stream.
+-func (s *stream) bufferedBytes() int {
+-	r := s.bufferRing
+-	var total int
+-	for i := 0; i < r.size; i++ {
+-		idx := (r.head + i) & r.mask
+-		total += len(r.bufs[idx])
++// recordConsumed records receive-side bookkeeping after n bytes have been
++// consumed by the reader, and returns the number of consumed bytes that should
++// be announced to the peer in a window update, or 0 when no window update
++// is due.
++//
++// The caller must hold the stream's bufferLock, so the per-stream counters
++// stay consistent with the buffer they mirror.
++func (s *stream) recordConsumed(n int) uint32 {
++	s.numRead += uint32(n)
++	s.incr += uint32(n)
++
++	// send window update if the increased bytes exceed half of the buffer size
++	// or this is the initial read.
++	if s.incr >= s.windowUpdateThreshold || s.numRead == uint32(n) {
++		notifyConsumed := s.numRead
++		s.incr = 0
++		return notifyConsumed
+ 	}
+-	return total
++	return 0
++}
++
++// sendWindow computes the current send window for this stream. ok is false if
++// the peer claims to have consumed more than it received, which indicates
++// malformed remote data.
++//
++// note:
++// even if uint32 overflow, this math still works:
++// eg1: uint32(0) - uint32(math.MaxUint32) = 1
++// eg2: int32(uint32(0) - uint32(1)) = -1
++//
++// basically, you can take it as a MODULAR ARITHMETIC
++func (s *stream) sendWindow() (win int32, windowOk bool) {
++	inflight := int32(atomic.LoadUint32(&s.numWritten) - atomic.LoadUint32(&s.peerConsumed))
++	if inflight < 0 { // security check for malformed data
++		return 0, false
++	}
++
++	// make sure you understand 'win' is calculated in modular arithmetic(2^32(4GB))
++	win = int32(atomic.LoadUint32(&s.peerWindow)) - inflight
++	return win, true
++}
++
++// stats returns a point-in-time accounting view of the stream. Values are
++// sampled without taking the stream's lock, so they describe an approximation
++// of the state at some recent instant.
++func (s *stream) stats() StreamAccounting {
++	var acc StreamAccounting
++	acc.ID = s.id
++	acc.BytesRead = uint64(s.numRead)
++	acc.BytesWritten = uint64(s.numWritten)
++	acc.Inflight = s.numWritten - s.peerConsumed
++	acc.PeerWindow = s.peerWindow
++	acc.BytesBuffered = s.bufferRing.bufferedBytes()
++
++	select {
++	case <-s.chFinEvent:
++		acc.ReadClosed = true
++	default:
++	}
++
++	select {
++	case <-s.chWriteClosed:
++		acc.WriteClosed = true
++	default:
++	}
++
++	select {
++	case <-s.die:
++		acc.Closed = true
++	default:
++	}
++
++	return acc
+ }
+ 
+ // wakeupReader notifies read process

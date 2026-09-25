@@ -1,0 +1,169 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "agent.patch only modifies create-diff-object.c, restoring helpers and calls such as kpatch_correlate_section(), kpatch_find_static_twin(), kpatch_compare_correlated_elements(), kpatch_compare_symbols(), and kpatch_rebuild_rela_section_data(). It contains no changes to lookup.c, create-klp-module.c, or create-kpatch-module.c, which smell.diff left with inlined stage implementations (lookup_symbol embedding local/global/exported lookups; create-klp-module main inlining klp rela/sym/arch/removal logic; create-kpatch-module main inlining dynrela creation and rela rebuild). Thus not all five pipeline drivers delegate to named helpers.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "All five pipeline drivers — the correlation driver and the comparison/output driver of create-diff-object.c, the parent-object symbol lookup routine of lookup.c, and the main routines of create-klp-module.c and create-kpatch-module.c — delegate their stage steps to named, single-purpose helper functions instead of embedding re-implementations of those steps inside their loops.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch restores helper calls in create-diff-object.c (e.g., `kpatch_correlate_section(sec_orig, sec_patched)`, `kpatch_find_static_twin(relasec, sym)`, `kpatch_compare_correlated_elements(kelf_patched)`, `kpatch_rebuild_rela_section_data(relasec)`), but create-kpatch-module.c still carries inlined copies of `create_section_pair` (manual `ALLOC_LINK(sec, &kelf->sections); sec->name = name; ...`) and `kpatch_rebuild_rela_section_data` (manual `relas[index].r_offset = ...` loop), and create-klp-module.c still inlines section removal (`list_for_each_entry_safe` + `list_del`/`free` instead of `kpatch_remove_and_free_section`). Those helpers remain defined, so several unit steps still exist twice.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "For every step helper that is still defined in the shared component files or in the same translation unit (item-section/symbol correlation pair handling, single-section allocation, section removal and freeing, rela section data rebuild, exported-symbol lookup), the drivers now call it rather than carrying a pasted copy of its body: a reader looking for 'how does the tree remove/free one section' or 'how does it rebuild one rela section buffer' finds exactly one implementation.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch re-introduces the comparison ladder as standalone functions in create-diff-object.c: rela_equal(), kpatch_compare_correlated_rela_section(), kpatch_compare_correlated_nonrela_section(), kpatch_compare_correlated_section(), kpatch_compare_correlated_elements(), kpatch_compare_correlated_symbol(), and kpatch_compare_symbols(). In main(), the large inline 'unrolled kpatch_compare_correlated_elements()'/'unrolled kpatch_compare_symbols()' block is deleted and replaced with kpatch_compare_correlated_elements(kelf_patched); kpatch_compare_symbols(kelf_patched);. kpatch_compare_correlated_section() delegates to the rela/non-rela branch functions, kpatch_compare_correlated_rela_section() calls rela_equal(), and kpatch_compare_symbols() calls kpatch_compare_correlated_symbol(), so the comparison chain is no longer inlined in the driver.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The change-comparison ladder is re-extracted: comparing one correlated section (with its rela-section and non-rela-section branches), comparing two individual relas, comparing the symbol list, and the per-symbol comparison all exist again as functions called by the diff-object driver, so no single driver function contains the comparison chain inline.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only modifies create-diff-object.c; it contains no changes to lookup.c. The smell.diff merged lookup_local_symbol, lookup_global_symbol, and lookup_exported_symbol into a single inline lookup_symbol function in lookup.c, deleting all three separate stage functions. Since the agent did not touch lookup.c, those three binding-scope stages remain absorbed into the monolithic lookup_symbol and are not restored as three separate callable functions.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The symbol lookup routine's three binding-scope stages (object-local symbols, then global/weak symbols, then exported symbols) are three separate functions again, callable with the table, the lookup key, and a result buffer, and the lookup routine sequences them and honors their early-binding precedence.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only modifies create-diff-object.c and contains no changes to create-klp-module.c. The smell inlined the KLP expansion stage's two find-or-add steps (find_or_add_ksym_to_symbols and find_or_add_klp_relasec) into main as nested blocks manipulating driver-local variables; since the agent patch does not restore or introduce helper functions for these steps, they remain inlined and are not delegated with explicit parameters/returns.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The KLP expansion stage delegates its two find-or-add steps — creating-or-finding the per-object klp symbol, and creating-or-finding the matching .klp.rela section for a relocation destination — to helper functions that receive the loop state as explicit parameters/returns instead of manipulating driver-local variables in place.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only modifies create-diff-object.c; it does not touch create-kpatch-module.c at all. The smell.diff inlined the .kpatch.dynrelas section-pair allocation (ALLOC_LINK(sec, &kelf->sections), sec->data = malloc(...), sec->sh.sh_type = SHT_PROGBITS, the .rela partner allocation, etc.) directly into create-kpatch-module.c's main, replacing the removed create_dynamic_rela_sections helper. Since the agent's patch leaves create-kpatch-module.c unchanged, those inline section/header/data allocation bodies for .kpatch.dynrelas remain, and the shared section-creation helpers of kpatch-elf.c (e.g., create_section_pair) are not wired back in for this driver.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The .kpatch.dynrelas table is built through the shared section-creation helpers of kpatch-elf.c (a single section plus its rela section partner), with the patch-module driver no longer containing inline section/header/data allocation bodies for it.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch only modifies create-diff-object.c, where it restores helpers and removes inlined seams (e.g., kpatch_correlate_section(sec_orig, sec_patched), kpatch_find_static_twin(relasec, sym), kpatch_compare_correlated_elements(kelf_patched), kpatch_rebuild_rela_section_data(relasec), eliminating cs_orig/fst_res/rela_same). It has no hunks for lookup.c or create-kpatch-module.c, so the smell.diff alias seams still remain in those drivers: lookup_symbol's renamed exported-table cursors lsym/esym/ei and create-kpatch-module.c's dynrela element-count locals entsize/nr_pair/name. R7 requires all such alias seams to be gone from driver bodies.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "should_have",
+      "criterion": "Re-created helpers exchange everything they need through their own parameters and return values, and the inlining seams are gone from the drivers: the renamed per-copy loop counters and alias variables (the cloned section-pair locals, the per-scope renamed exported-table cursors, the renamed dynrela element-count local) no longer appear in driver bodies.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only modifies create-diff-object.c. It does restore predicate-style helpers there (e.g., `rela_equal()` returns bool, `kpatch_find_static_twin()` returns a symbol, and main calls `kpatch_compare_correlated_elements`/`kpatch_compare_symbols`/`kpatch_rebuild_rela_section_data` instead of the inlined flag/label block). However, R8 also requires the scope-lookup stages to return outcomes to callers, and the patch contains no changes to lookup.c. As left by smell.diff, `lookup_symbol()` is still inlined with `bool found = false;` and stage comments, and `lookup_local_symbol()`/`lookup_global_symbol()` remain removed, so those stages do not return to callers.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "should_have",
+      "criterion": "Predicate-like steps report results the C way again: the per-rela equality test and the scope-lookup stages return their outcome to callers, and the drivers no longer replace helper returns with flag variables plus jump labels in the middle of loops.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch re-extracts the sibling-finding step into a helper `kpatch_find_static_twin(struct section *relasec, struct symbol *sym)` in create-diff-object.c. The helper preserves the parent-section fallback for a .part. symbol (`kpatch_get_correlated_parent(relasec2->base->sym)` then `relasec2 = parent->sec->rela`) and matching by referencing rela (`kpatch_find_uncorrelated_rela(relasec2->twin, sym)` plus the `kpatch_find_static_twin_in_children` fallback). The correlation driver `kpatch_correlate_elfs` now calls it via `patched_sym = kpatch_find_static_twin(relasec, sym);` instead of the inlined block from smell.diff, and the surrounding bundled-symbol handling (`bundled`/`patched_bundled`) in the caller is left intact.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "should_have",
+      "criterion": "The static-local correlation pass keeps its sibling-finding step — including the parent-section fallback (a .part. symbol that kept the reference in the patched object) and matching by referencing rela — as a helper the correlation driver calls, covering the bundled-symbol case too.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only refactors create-diff-object.c, restoring helpers (rela_equal, kpatch_compare_correlated_section, kpatch_compare_correlated_elements, kpatch_compare_symbols, kpatch_find_static_twin) and replacing inlined blocks with calls. It does not touch create-kpatch-module.c, which still contains comments describing unrolled sub-steps ('The .kpatch.dynrelas section pair allocation ... are unrolled here so the freshly allocated section can be filled in a single pass' and 'unrolled kpatch_rebuild_rela_section_data()') plus a duplicate kpatch_rebuild_rela_section_data body inlined in main while the helper still exists in kpatch-elf.c. create-klp-module.c still has inlined section-removal logic duplicating kpatch_remove_and_free_section (helper still exists). lookup.c still has inlined lookup_local_symbol/lookup_global_symbol bodies embedded in lookup_symbol. The refactored tree retains leftover inlining scaffolding across multiple files.",
+      "valid": true,
+      "attempts": 3,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The refactored tree contains no leftover inlining scaffolding: no comments inside drivers describing an expanded/unrolled or pasted sub-step, no duplicate allocation, removal, comparison, or enumeration bodies between a driver and its helper, and no driver-local intermediate variables that existed only to bind an embedded copy to its loop.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "In create-diff-object.c every helper the agent re-creates or re-connects has a real caller: kpatch_find_static_twin is re-created and called as `patched_sym = kpatch_find_static_twin(relasec, sym)` inside kpatch_correlate_elfs; rela_equal is called by kpatch_compare_correlated_rela_section, which is called by kpatch_compare_correlated_section, called by kpatch_compare_correlated_elements, called from main; kpatch_compare_correlated_nonrela_section, kpatch_compare_correlated_symbol, and kpatch_compare_symbols are likewise wired into the compare chain (kpatch_compare_symbols called from main). The previously-inlined kpatch_correlate_section is re-connected via `kpatch_correlate_section(sec_orig, sec_patched)` and kpatch_rebuild_rela_section_data via `kpatch_rebuild_rela_section_data(relasec)`. No re-created static helper is left without a caller, so no dead helper is introduced.",
+      "valid": true,
+      "attempts": 4,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "should_have",
+      "criterion": "No re-created or re-connected helper is left dead: every step function extracted by the change has at least one real caller (for example, both cleanup passes go through the shared removal helper rather than leaving it bypassed), and no helper exists solely to satisfy the build or the refactor.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch restores kpatch_find_static_twin as a helper and preserves the bundled branch: it keeps `if (!relasec2->twin && relasec2->base->sym)` with the `kpatch_get_correlated_parent` reassignment to `parent->sec->rela`, then the `if (relasec2->twin)` search via `kpatch_find_uncorrelated_rela` and `kpatch_find_static_twin_in_children`. Stage 3 calls it with `patched_sym = kpatch_find_static_twin(relasec, sym);`, and the subsequent bundled-correlation logic (associating section twins) is left as untouched context. The fragile bundled seam is not dropped or made to exit early.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Bundled static-local correlation is preserved: when a static local is bundled with its section and its reference moved between sibling functions, the correlation driver still associates the section twins of the patched symbol (dropping this step corrupts change detection so that changed bundled sections are missed or falsely re-linked).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch modifies only create-diff-object.c (re-extracting correlation/comparison helpers and kpatch_rebuild_rela_section_data); it does not touch create-klp-module.c or create-kpatch-module.c. Consequently the KLP and patch-module section-cleanup passes remain unchanged from the functionally-equivalent smell: create-klp-module.c still drops .kpatch.{symbols,relocations,arch} and their rela sections (including secsym removal) with the arch pass removing only .parainstructions/.altinstructions and their relas, and create-kpatch-module.c still creates .kpatch.dynrelas with its .rela section and drops the same intermediates via kpatch_remove_and_free_section. No section-removal or dynrela-construction logic was altered, so the intended output section set is preserved.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Built module outputs still contain exactly the intended sections: the KLP output drops the tool-internal .kpatch.{symbols,relocations,arch} sections and their rela sections (including the section symbols recorded for them), and the arch pass removes only its own name-prefixed sections; the patch-module output drops the same intermediates and keeps .kpatch.dynrelas with its rela section intact and correctly ordered.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not modify lookup.c, and the merged lookup_symbol preserves per-scope semantics: stage 1 (local) sets objname/addr/size from the STT_FILE block and computes sympos with `if (found) ERROR(\"duplicate local symbol...\")`; stage 2 (global/weak) sets `result->addr = lsym->addr`, `result->sympos = 0`, `result->exported = is_exported(table, sym->name)`, with `if (result->objname) ERROR(\"duplicate global symbol...\")`; stage 3 (exported) sets addr=0/size=0/sympos=0 and tolerates a NULL result via `if (!result) return true;` before any dereference, returning `result && result->objname`. These match the original lookup_local_symbol/lookup_global_symbol/lookup_exported_symbol behaviors, and lookup_exported_symbol is retained for is_exported's NULL-probe call site.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "should_have",
+      "criterion": "Per-scope lookup semantics are unchanged: objname/addr/size/sympos fields keep their per-scope meanings (globals report the parent symbol address and sympos 0; a same-name duplicate in one scope is the error path; an exported hit tolerates a NULL result buffer as an existence probe and returns success without dereferencing it).",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 0.3333333333333333,
+    "core_resolution": 0.16666666666666666
+  },
+  "valid_count": 14,
+  "pass_count": 6,
+  "must_have_pass": false,
+  "macro_score": 0.5
+}

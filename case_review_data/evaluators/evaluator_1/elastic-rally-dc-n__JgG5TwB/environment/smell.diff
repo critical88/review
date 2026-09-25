@@ -1,0 +1,328 @@
+diff --git a/esrally/driver/driver.py b/esrally/driver/driver.py
+index 735faec..6c408dd 100644
+--- a/esrally/driver/driver.py
++++ b/esrally/driver/driver.py
+@@ -213,6 +213,37 @@ class BenchmarkComplete:
+         self.metrics = metrics
+ 
+ 
++def remember_target_cluster(
++    driver_actor, cluster_details, distribution_flavor, distribution_version, revision, target_id, target_platform, target_auth_type
++):
++    """
++    Stores the identity facts of the cluster that we are benchmarking on the main driver actor.
++
++    ``Driver.prepare_benchmark`` derives these values while the benchmark candidate is
++    still reachable. This keeps the raw cluster info - needed by the actor's child
++    helpers - next to the resolved identity facts that are forwarded to race control
++    once track preparation has completed (see ``DriverActor._after_track_prepared``).
++    The parameter list matches the one used by the other paths that pass these facts
++    around (e.g. ``PreparationComplete``), so it stays easy to keep them in sync.
++
++    :param driver_actor: The main driver actor that remembers the target cluster's facts.
++    :param cluster_details: The raw cluster info response (may be empty if the REST API check was skipped).
++    :param distribution_flavor: The target cluster's distribution flavor (defaults to ``oss`` for unknown builds).
++    :param distribution_version: The target cluster's version number.
++    :param revision: The target cluster's build revision.
++    :param target_id: Identifies the benchmark target (project ID for serverless, cluster ID for ECH, cluster name for on-prem) if known.
++    :param target_platform: The platform the target cluster runs on (one of ``serverless``, ``hosted`` or ``on-prem``).
++    :param target_auth_type: The authentication type Rally used to connect (``api_key`` or ``basic``) if recorded.
++    """
++    driver_actor.cluster_details = cluster_details
++    driver_actor.distribution_flavor = distribution_flavor
++    driver_actor.distribution_version = distribution_version
++    driver_actor.revision = revision
++    driver_actor.target_id = target_id
++    driver_actor.target_platform = target_platform
++    driver_actor.target_auth_type = target_auth_type
++
++
+ class TaskFinished:
+     def __init__(self, metrics, next_task_scheduled_in):
+         self.metrics = metrics
+@@ -238,6 +269,10 @@ class DriverActor(actor.RallyActor):
+         self.status = "init"
+         self.post_process_timer = 0
+         self.cluster_details = {}
++        self.distribution_flavor = None
++        self.distribution_version = None
++        self.revision = None
++        self.target_id = None
+         self.target_platform = None
+         self.target_auth_type = None
+ 
+@@ -357,26 +392,16 @@ class DriverActor(actor.RallyActor):
+         return self.createActor(TrackPreparationActor, targetActorRequirements=self._requirements(host))
+ 
+     def _after_track_prepared(self):
+-        cluster_version = self.cluster_details["version"] if self.cluster_details else {}
+-        # manually compiled versions don't expose build_flavor but Rally expects a value in telemetry devices
+-        # we should default to trial/basic, but let's default to oss for now to avoid breaking the charts
+-        build_flavor = cluster_version.get("build_flavor", "oss")
+-        build_version = cluster_version.get("number", build_flavor)
+-        build_hash = cluster_version.get("build_hash", build_flavor)
+-
+-        # Determine target_id (cluster_name from GET /)
+-        target_id = self.cluster_details.get("cluster_name") if self.cluster_details else None
+-
+         for child in self.children:
+             self.send(child, thespian.actors.ActorExitRequest())
+         self.children = []
+         self.send(
+             self.benchmark_actor,
+             PreparationComplete(
+-                build_flavor,
+-                build_version,
+-                build_hash,
+-                target_id=target_id,
++                self.distribution_flavor,
++                self.distribution_version,
++                self.revision,
++                target_id=self.target_id,
+                 target_platform=self.target_platform,
+                 target_auth_type=self.target_auth_type,
+             ),
+@@ -752,6 +777,16 @@ class Driver:
+         serverless_mode = convert.to_bool(self.config.opts("driver", "serverless.mode", mandatory=False, default_value=False))
+         serverless_operator = convert.to_bool(self.config.opts("driver", "serverless.operator", mandatory=False, default_value=False))
+         build_hash = None
++        # Identity facts of the cluster that we are benchmarking. If we cannot reach the
++        # cluster (REST API check skipped or static responses in use) we fall back to
++        # "oss", mirroring the fallback that unknown builds use.
++        cluster_details = {}
++        distribution_flavor = "oss"
++        distribution_version = "oss"
++        revision = "oss"
++        target_id = None
++        target_platform = None
++        target_auth_type = None
+         if skip_rest_api_check:
+             self.logger.info("Skipping REST API check as requested explicitly.")
+         elif uses_static_responses:
+@@ -761,36 +796,55 @@ class Driver:
+                 self.logger.info("Skipping REST API check while targetting serverless cluster with a public user.")
+             else:
+                 self.wait_for_rest_api(es_clients)
+-            self.driver_actor.cluster_details = self.retrieve_cluster_info(es_clients)
++            cluster_details = self.retrieve_cluster_info(es_clients)
+             if serverless_mode:
+                 # overwrite static serverless version number
+-                self.driver_actor.cluster_details["version"]["number"] = "serverless"
++                cluster_details["version"]["number"] = "serverless"
+                 if serverless_operator:
+                     # overwrite build hash if running as operator
+                     build_hash = self.retrieve_build_hash_from_nodes_info(es_clients)
+                     self.logger.info("Retrieved actual build hash [%s] from serverless cluster.", build_hash)
+-                    self.driver_actor.cluster_details["version"]["build_hash"] = build_hash
++                    cluster_details["version"]["build_hash"] = build_hash
++
++            # manually compiled versions don't expose build_flavor but Rally expects a value in telemetry devices
++            # we should default to trial/basic, but let's default to oss for now to avoid breaking the charts
++            cluster_version = cluster_details.get("version", {}) if cluster_details else {}
++            distribution_flavor = cluster_version.get("build_flavor", "oss")
++            distribution_version = cluster_version.get("number", distribution_flavor)
++            revision = cluster_version.get("build_hash", distribution_flavor)
++
++            # Determine target_id (cluster_name from GET /)
++            target_id = cluster_details.get("cluster_name") if cluster_details else None
+ 
+             # Determine target_platform while we still have the API response object (with response headers)
+             if serverless_mode:
+-                self.driver_actor.target_platform = "serverless"
++                target_platform = "serverless"
+             else:
+                 target_platform = "on-prem"
+                 try:
+-                    cluster_details = self.driver_actor.cluster_details
+                     meta = getattr(cluster_details, "meta", None)
+                     if meta is not None and "x-found-handling-cluster" in getattr(meta, "headers", {}):
+                         target_platform = "hosted"
+                 except Exception:
+                     pass
+-                self.driver_actor.target_platform = target_platform
+ 
+             # Determine target_auth_type from default client options
+             default_client_options = self.config.opts("client", "options").default_or_first
+             if default_client_options.get("api_key"):
+-                self.driver_actor.target_auth_type = "api_key"
++                target_auth_type = "api_key"
+             elif default_client_options.get("basic_auth_user") or default_client_options.get("basic_auth"):
+-                self.driver_actor.target_auth_type = "basic"
++                target_auth_type = "basic"
++
++        remember_target_cluster(
++            self.driver_actor,
++            cluster_details,
++            distribution_flavor,
++            distribution_version,
++            revision,
++            target_id,
++            target_platform,
++            target_auth_type,
++        )
+ 
+         # Avoid issuing any requests to the target cluster when static responses are enabled. The results
+         # are not useful and attempts to connect to a non-existing cluster just lead to exception traces in logs.
+diff --git a/esrally/metrics.py b/esrally/metrics.py
+index 3e7212c..bfe71db 100644
+--- a/esrally/metrics.py
++++ b/esrally/metrics.py
+@@ -1992,6 +1992,35 @@ class Race:
+         self.target_platform = target_platform
+         self.target_auth_type = target_auth_type
+ 
++    def record_target_cluster(
++        self, distribution_flavor, distribution_version, revision, target_id=None, target_platform=None, target_auth_type=None
++    ):
++        """
++        Records the identity facts of the cluster that this race has benchmarked.
++
++        The values arrive via the driver, once track preparation has completed. They are
++        passed through in the same shape in which they travel through the preparation
++        path (see ``esrally.driver.driver.DriverActor``), i.e. distribution flavor and
++        version, build revision, the cluster's id, the platform it runs on and the
++        authentication type that Rally used to talk to it.
++
++        :param distribution_flavor: The target cluster's distribution flavor.
++        :param distribution_version: The target cluster's version number.
++        :param revision: The target cluster's build revision.
++        :param target_id: Identifies the benchmark target if known. ``None`` keeps the current value.
++        :param target_platform: The platform the target cluster runs on. ``None`` keeps the current value.
++        :param target_auth_type: The authentication type Rally used to connect. ``None`` keeps the current value.
++        """
++        self.distribution_flavor = distribution_flavor
++        self.distribution_version = distribution_version
++        self.revision = revision
++        if target_id is not None:
++            self.target_id = target_id
++        if target_platform is not None:
++            self.target_platform = target_platform
++        if target_auth_type is not None:
++            self.target_auth_type = target_auth_type
++
+     @property
+     def track_name(self):
+         return str(self.track)
+diff --git a/esrally/racecontrol.py b/esrally/racecontrol.py
+index 642488a..c448afc 100644
+--- a/esrally/racecontrol.py
++++ b/esrally/racecontrol.py
+@@ -260,15 +260,14 @@ class BenchmarkCoordinator:
+     def on_preparation_complete(
+         self, distribution_flavor, distribution_version, revision, target_id=None, target_platform=None, target_auth_type=None
+     ):
+-        self.race.distribution_flavor = distribution_flavor
+-        self.race.distribution_version = distribution_version
+-        self.race.revision = revision
+-        if target_id is not None:
+-            self.race.target_id = target_id
+-        if target_platform is not None:
+-            self.race.target_platform = target_platform
+-        if target_auth_type is not None:
+-            self.race.target_auth_type = target_auth_type
++        self.race.record_target_cluster(
++            distribution_flavor=distribution_flavor,
++            distribution_version=distribution_version,
++            revision=revision,
++            target_id=target_id,
++            target_platform=target_platform,
++            target_auth_type=target_auth_type,
++        )
+         # store race initially (without any results) so other components can retrieve full metadata
+         self.race_store.store_race(self.race)
+         if self.race.challenge.auto_generated:
+diff --git a/esrally/telemetry.py b/esrally/telemetry.py
+index 7dc0ace..00ee451 100644
+--- a/esrally/telemetry.py
++++ b/esrally/telemetry.py
+@@ -1802,6 +1802,44 @@ def flatten_stats_fields(prefix=None, stats=None):
+         return {}
+ 
+ 
++def store_cluster_environment_info(
++    metrics_store,
++    distribution_flavor,
++    distribution_version,
++    revision,
++    target_id,
++    target_platform,
++    target_auth_type,
++):
++    """
++    Publishes the target cluster's identity facts as cluster-scoped meta-info.
++
++    The exact same facts are also forwarded by the driver once track preparation
++    has completed (see ``PreparationComplete`` in ``esrally.driver.driver``), so
++    this helper's parameter list deliberately mirrors the values that travel
++    through that path: distribution flavor and version, build revision, the
++    cluster's id, the platform it runs on and the authentication type Rally
++    used to talk to it.
++
++    :param metrics_store: The metrics store that records cluster-scoped meta-info.
++    :param distribution_flavor: The target cluster's distribution flavor (e.g. ``default``, ``oss`` or ``serverless``).
++    :param distribution_version: The target cluster's version number.
++    :param revision: The target cluster's build revision.
++    :param target_id: Identifies the benchmark target (project ID for serverless, cluster ID for ECH, cluster name for on-prem) if known.
++    :param target_platform: The platform the target cluster runs on (one of ``serverless``, ``hosted`` or ``on-prem``).
++    :param target_auth_type: The authentication type Rally used to connect (``api_key`` or ``basic``) if recorded.
++    """
++    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "source_revision", revision)
++    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "distribution_version", distribution_version)
++    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "distribution_flavor", distribution_flavor)
++    # Store target ID (project ID for serverless, cluster ID for ECH, cluster name for on-prem)
++    if target_id:
++        metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_id", target_id)
++    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_platform", target_platform)
++    if target_auth_type:
++        metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_auth_type", target_auth_type)
++
++
+ class ClusterEnvironmentInfo(InternalTelemetryDevice):
+     """
+     Gathers static environment information on a cluster level (e.g. version numbers).
+@@ -1833,16 +1871,11 @@ class ClusterEnvironmentInfo(InternalTelemetryDevice):
+         # overwrite static serverless version number
+         if versions.is_serverless(distribution_flavor):
+             distribution_version = "serverless"
+-        self.metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "source_revision", revision)
+-        self.metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "distribution_version", distribution_version)
+-        self.metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "distribution_flavor", distribution_flavor)
+ 
+         # Store target ID (project ID for serverless, cluster ID for ECH, cluster name for on-prem)
+         target_id = client_info.get("cluster_name")
+-        if target_id:
+-            self.metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_id", target_id)
+ 
+-        # Determine and store target platform
++        # Determine target platform
+         if versions.is_serverless(distribution_flavor):
+             target_platform = "serverless"
+         else:
+@@ -1856,13 +1889,23 @@ class ClusterEnvironmentInfo(InternalTelemetryDevice):
+                         target_platform = "hosted"
+             except Exception:
+                 pass
+-        self.metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_platform", target_platform)
+ 
+-        # Determine and store auth type from client options
++        # Determine auth type from client options
++        target_auth_type = None
+         if self.client_options.get("api_key"):
+-            self.metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_auth_type", "api_key")
++            target_auth_type = "api_key"
+         elif self.client_options.get("basic_auth_user") or self.client_options.get("basic_auth"):
+-            self.metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_auth_type", "basic")
++            target_auth_type = "basic"
++
++        store_cluster_environment_info(
++            self.metrics_store,
++            distribution_flavor,
++            distribution_version,
++            revision,
++            target_id,
++            target_platform,
++            target_auth_type,
++        )
+ 
+ 
+ def add_metadata_for_node(metrics_store, node_name, host_name):

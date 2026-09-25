@@ -1,0 +1,539 @@
+diff --git a/server/dbdata/group.go b/server/dbdata/group.go
+index 641b039..07433cc 100644
+--- a/server/dbdata/group.go
++++ b/server/dbdata/group.go
+@@ -341,7 +341,7 @@ func GroupAuthLogin(name, pwd string, authData map[string]interface{}) error {
+ 		return err
+ 	}
+ 	// 配置检测登录, 无客户端上下文信息
+-	err = auth.checkUser(name, pwd, g, "", "", "")
++	err = auth.checkUser(&UserAuthReq{Name: name, Pwd: pwd}, g)
+ 	return err
+ }
+ 
+diff --git a/server/dbdata/user.go b/server/dbdata/user.go
+index 82eec37..f425640 100644
+--- a/server/dbdata/user.go
++++ b/server/dbdata/user.go
+@@ -68,14 +68,14 @@ func SetUser(v *User) error {
+ }
+ 
+ // 验证用户登录信息
+-func CheckUser(name, pwd, group, remoteAddr, userAgent, macAddr string) error {
+-	base.Trace("CheckUser", name, pwd, group, remoteAddr)
++func CheckUser(ar *UserAuthReq) error {
++	base.Trace("CheckUser", ar.Name, ar.Pwd, ar.Group, ar.RemoteAddr)
+ 
+ 	// 获取登入的group数据
+ 	groupData := &Group{}
+-	err := One("Name", group, groupData)
++	err := One("Name", ar.Group, groupData)
+ 	if err != nil || groupData.Status != 1 {
+-		return fmt.Errorf("%s - %s", name, "用户组错误")
++		return fmt.Errorf("%s - %s", ar.Name, "用户组错误")
+ 	}
+ 	// 初始化Auth
+ 	if len(groupData.Auth) == 0 {
+@@ -84,7 +84,7 @@ func CheckUser(name, pwd, group, remoteAddr, userAgent, macAddr string) error {
+ 	authType := groupData.Auth["type"].(string)
+ 	// 本地认证方式
+ 	if authType == "local" {
+-		return checkLocalUser(name, pwd, group, remoteAddr, userAgent, macAddr)
++		return checkLocalUser(ar)
+ 	}
+ 	// 其它认证方式, 支持自定义
+ 	_, ok := authRegistry[authType]
+@@ -92,12 +92,14 @@ func CheckUser(name, pwd, group, remoteAddr, userAgent, macAddr string) error {
+ 		return fmt.Errorf("%s %s", "未知的认证方式: ", authType)
+ 	}
+ 	auth := makeInstance(authType).(IUserAuth)
+-	return auth.checkUser(name, pwd, groupData, remoteAddr, userAgent, macAddr)
++	return auth.checkUser(ar, groupData)
+ }
+ 
+ // 验证本地用户登录信息
+-func checkLocalUser(name, pwd, group, remoteAddr, userAgent, macAddr string) error {
+-	// 本地认证方式不使用来源地址、客户端信息和mac地址
++func checkLocalUser(ar *UserAuthReq) error {
++	name := ar.Name
++	pwd := ar.Pwd
++	group := ar.Group
+ 
+ 	// TODO 严重问题
+ 	// return nil
+diff --git a/server/dbdata/user_test.go b/server/dbdata/user_test.go
+index ee5c46b..4892b4d 100644
+--- a/server/dbdata/user_test.go
++++ b/server/dbdata/user_test.go
+@@ -40,7 +40,7 @@ func TestCheckUser(t *testing.T) {
+ 	// 单独验证密码
+ 	u.DisableOtp = true
+ 	_ = SetUser(&u)
+-	err = CheckUser("aaa", pincode, group, "192.168.30.1:10443", "ut_agent", "")
++	err = CheckUser(&UserAuthReq{Name: "aaa", Pwd: pincode, Group: group})
+ 	ast.Nil(err)
+ 
+ 	// 添加一个radius组
+@@ -55,7 +55,7 @@ func TestCheckUser(t *testing.T) {
+ 	g2 := Group{Name: group2, Status: 1, ClientDns: dns, RouteInclude: route, Auth: authData}
+ 	err = SetGroup(&g2)
+ 	ast.Nil(err)
+-	err = CheckUser("aaa", "bbbbbbb", group2, "192.168.30.1:10443", "ut_agent", "")
++	err = CheckUser(&UserAuthReq{Name: "aaa", Pwd: "bbbbbbb", Group: group2})
+ 	if ast.NotNil(err) {
+ 		ast.Contains(err.Error(), "aaa Radius服务器连接异常")
+ 	}
+@@ -65,7 +65,7 @@ func TestCheckUser(t *testing.T) {
+ 	p1 := Policy{Username: "aaa", Status: 1, ClientDns: dns2, RouteInclude: route2}
+ 	err = SetPolicy(&p1)
+ 	ast.Nil(err)
+-	err = CheckUser("aaa", pincode, group, "192.168.30.1:10443", "ut_agent", "")
++	err = CheckUser(&UserAuthReq{Name: "aaa", Pwd: pincode, Group: group})
+ 	ast.Nil(err)
+ 	// 添加一个ldap组
+ 	group3 := "group3"
+@@ -85,7 +85,7 @@ func TestCheckUser(t *testing.T) {
+ 	g3 := Group{Name: group3, Status: 1, ClientDns: dns, RouteInclude: route, Auth: authData}
+ 	err = SetGroup(&g3)
+ 	ast.Nil(err)
+-	err = CheckUser("aaa", "bbbbbbb", group3, "192.168.30.1:10443", "ut_agent", "")
++	err = CheckUser(&UserAuthReq{Name: "aaa", Pwd: "bbbbbbb", Group: group3})
+ 	if ast.NotNil(err) {
+ 		ast.Equal("aaa LDAP服务器连接异常, 请检测服务器和端口", err.Error())
+ 	}
+diff --git a/server/dbdata/userauth.go b/server/dbdata/userauth.go
+index 5c84820..13a80b3 100644
+--- a/server/dbdata/userauth.go
++++ b/server/dbdata/userauth.go
+@@ -7,9 +7,19 @@ import (
+ 
+ var authRegistry = make(map[string]reflect.Type)
+ 
++// 用户认证请求信息
++type UserAuthReq struct {
++	Name       string // 用户名
++	Pwd        string // 密码
++	Group      string // 登入组
++	RemoteAddr string // 来源地址
++	UserAgent  string // 客户端信息
++	MacAddr    string // 客户端mac地址
++}
++
+ type IUserAuth interface {
+ 	checkData(authData map[string]interface{}) error
+-	checkUser(name, pwd string, g *Group, remoteAddr, userAgent, macAddr string) error
++	checkUser(ar *UserAuthReq, g *Group) error
+ }
+ 
+ func makeInstance(name string) interface{} {
+diff --git a/server/dbdata/userauth_ldap.go b/server/dbdata/userauth_ldap.go
+index e47015a..5ee00cb 100644
+--- a/server/dbdata/userauth_ldap.go
++++ b/server/dbdata/userauth_ldap.go
+@@ -62,8 +62,10 @@ func (auth AuthLdap) checkData(authData map[string]interface{}) error {
+ 	return nil
+ }
+ 
+-func (auth AuthLdap) checkUser(name, pwd string, g *Group, remoteAddr, userAgent, macAddr string) error {
+-	base.Trace("AuthLdap checkUser", name, remoteAddr, userAgent)
++func (auth AuthLdap) checkUser(ar *UserAuthReq, g *Group) error {
++	base.Trace("AuthLdap checkUser", ar.Name, ar.RemoteAddr, ar.UserAgent)
++	name := ar.Name
++	pwd := ar.Pwd
+ 	pl := len(pwd)
+ 	if name == "" || pl < 1 {
+ 		return fmt.Errorf("%s %s", name, "密码错误")
+diff --git a/server/dbdata/userauth_radius.go b/server/dbdata/userauth_radius.go
+index 1594934..f4376f8 100644
+--- a/server/dbdata/userauth_radius.go
++++ b/server/dbdata/userauth_radius.go
+@@ -41,7 +41,9 @@ func (auth AuthRadius) checkData(authData map[string]interface{}) error {
+ 	return nil
+ }
+ 
+-func (auth AuthRadius) checkUser(name, pwd string, g *Group, remoteAddr, userAgent, macAddr string) error {
++func (auth AuthRadius) checkUser(ar *UserAuthReq, g *Group) error {
++	name := ar.Name
++	pwd := ar.Pwd
+ 	pl := len(pwd)
+ 	if name == "" || pl < 1 {
+ 		return fmt.Errorf("%s %s", name, "密码错误")
+@@ -75,9 +77,9 @@ func (auth AuthRadius) checkUser(name, pwd string, g *Group, remoteAddr, userAge
+ 			return fmt.Errorf("%s %s", name, "Radius set nasip 出现错误")
+ 		}
+ 	}
+-	if macAddr != "" {
+-		base.Trace("AuthRadius", name, remoteAddr, userAgent, macAddr)
+-		err = rfc2865.CallingStationID_AddString(packet, macAddr)
++	if ar.MacAddr != "" {
++		base.Trace("AuthRadius", name, ar.RemoteAddr, ar.UserAgent, ar.MacAddr)
++		err = rfc2865.CallingStationID_AddString(packet, ar.MacAddr)
+ 		if err != nil {
+ 			return fmt.Errorf("%s %s", name, "Radius set CallingStationID 出现错误")
+ 		}
+diff --git a/server/handler/link_auth.go b/server/handler/link_auth.go
+index 3e93149..2de3321 100644
+--- a/server/handler/link_auth.go
++++ b/server/handler/link_auth.go
+@@ -99,8 +99,14 @@ func LinkAuth(w http.ResponseWriter, r *http.Request) {
+ 		UserActLog:    ua,
+ 	}
+ 	// TODO 用户密码校验
+-	// 认证请求上下文: 用户名、密码、组、来源地址、客户端信息、mac地址
+-	err = dbdata.CheckUser(cr.Auth.Username, cr.Auth.Password, cr.GroupSelect, cr.RemoteAddr, userAgent, cr.MacAddressList.MacAddress)
++	err = dbdata.CheckUser(&dbdata.UserAuthReq{
++		Name:       cr.Auth.Username,
++		Pwd:        cr.Auth.Password,
++		Group:      cr.GroupSelect,
++		RemoteAddr: cr.RemoteAddr,
++		UserAgent:  userAgent,
++		MacAddr:    cr.MacAddressList.MacAddress,
++	})
+ 	if err != nil {
+ 		lockManager.UpdateLoginStatus(cr.Auth.Username, r.RemoteAddr, false) // 记录登录失败状态
+ 
+diff --git a/server/sessdata/ip_pool.go b/server/sessdata/ip_pool.go
+index 3ae6ef0..87a1684 100644
+--- a/server/sessdata/ip_pool.go
++++ b/server/sessdata/ip_pool.go
+@@ -92,15 +92,24 @@ func ipInPool(ip net.IP) bool {
+ 	return false
+ }
+ 
++// 上线客户端信息
++type ClientInfo struct {
++	Username   string // 用户名
++	MacAddr    string // 客户端mac地址
++	UniqueMac  bool   // 客户端获取到真实设备mac
++	RemoteAddr string // 来源地址
++	UserAgent  string // 客户端信息
++}
++
+ // AcquireIp 获取动态ip
+ // 分配动态ip时记录客户端来源信息, 便于排查ip分配问题
+-func AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent string) (newIp net.IP) {
+-	base.Trace("AcquireIp start:", username, macAddr, uniqueMac, remoteAddr)
++func AcquireIp(cc *ClientInfo) (newIp net.IP) {
++	base.Trace("AcquireIp start:", cc.Username, cc.MacAddr, cc.UniqueMac, cc.RemoteAddr)
+ 	ipPoolMux.Lock()
+ 	defer func() {
+ 		ipPoolMux.Unlock()
+-		base.Trace("AcquireIp end:", username, macAddr, uniqueMac, newIp)
+-		base.Info("AcquireIp ip:", username, remoteAddr, userAgent, newIp)
++		base.Trace("AcquireIp end:", cc.Username, cc.MacAddr, cc.UniqueMac, newIp)
++		base.Info("AcquireIp ip:", cc.Username, cc.RemoteAddr, cc.UserAgent, newIp)
+ 	}()
+ 
+ 	var (
+@@ -109,14 +118,14 @@ func AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent s
+ 	)
+ 
+ 	// 获取到客户端 macAddr 的情况
+-	if uniqueMac {
++	if cc.UniqueMac {
+ 		// 判断是否已经分配过
+ 		mi := &dbdata.IpMap{}
+-		err = dbdata.One("mac_addr", macAddr, mi)
++		err = dbdata.One("mac_addr", cc.MacAddr, mi)
+ 		if err != nil {
+ 			// 没有查询到数据
+ 			if dbdata.CheckErrNotFound(err) {
+-				return loopIp(username, macAddr, uniqueMac, remoteAddr, userAgent)
++				return loopIp(cc)
+ 			}
+ 			// 查询报错
+ 			base.Error(err)
+@@ -124,7 +133,7 @@ func AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent s
+ 		}
+ 
+ 		// 存在ip记录
+-		base.Trace("uniqueMac:", username, mi)
++		base.Trace("uniqueMac:", cc.Username, mi)
+ 		ipStr := mi.IpAddr
+ 		ip := net.ParseIP(ipStr)
+ 		// 跳过活跃连接
+@@ -134,9 +143,9 @@ func AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent s
+ 		// ip符合规范
+ 		// 检测原有ip是否在新的ip池内
+ 		if !ok && ipInPool(ip) {
+-			mi.Username = username
++			mi.Username = cc.Username
+ 			mi.LastLogin = tNow
+-			mi.UniqueMac = uniqueMac
++			mi.UniqueMac = cc.UniqueMac
+ 			// 回写db数据
+ 			_ = dbdata.Set(mi)
+ 			ipActive[ipStr] = true
+@@ -145,23 +154,23 @@ func AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent s
+ 
+ 		// ip保留
+ 		if mi.Keep {
+-			base.Error(username, macAddr, ipStr, "保留ip不匹配CIDR")
++			base.Error(cc.Username, cc.MacAddr, ipStr, "保留ip不匹配CIDR")
+ 			return nil
+ 		}
+ 
+ 		// 删除当前macAddr
+-		mi = &dbdata.IpMap{MacAddr: macAddr}
++		mi = &dbdata.IpMap{MacAddr: cc.MacAddr}
+ 		_ = dbdata.Del(mi)
+-		return loopIp(username, macAddr, uniqueMac, remoteAddr, userAgent)
++		return loopIp(cc)
+ 	}
+ 
+ 	// 没有获取到mac的情况
+ 	ipMaps := []dbdata.IpMap{}
+-	err = dbdata.FindWhere(&ipMaps, 30, 1, "username=?", username)
++	err = dbdata.FindWhere(&ipMaps, 30, 1, "username=?", cc.Username)
+ 	if err != nil {
+ 		// 没有查询到数据
+ 		if dbdata.CheckErrNotFound(err) {
+-			return loopIp(username, macAddr, uniqueMac, remoteAddr, userAgent)
++			return loopIp(cc)
+ 		}
+ 		// 查询报错
+ 		base.Error(err)
+@@ -188,10 +197,10 @@ func AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent s
+ 		// 没有mac的 不需要验证租期
+ 		// mi.LastLogin.Before(leaseTime) &&
+ 		if ipInPool(ip) {
+-			mi.Username = username
++			mi.Username = cc.Username
+ 			mi.LastLogin = tNow
+-			mi.MacAddr = macAddr
+-			mi.UniqueMac = uniqueMac
++			mi.MacAddr = cc.MacAddr
++			mi.UniqueMac = cc.UniqueMac
+ 			// 回写db数据
+ 			_ = dbdata.Set(mi)
+ 			ipActive[ipStr] = true
+@@ -199,7 +208,7 @@ func AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent s
+ 		}
+ 	}
+ 
+-	return loopIp(username, macAddr, uniqueMac, remoteAddr, userAgent)
++	return loopIp(cc)
+ }
+ 
+ var (
+@@ -208,7 +217,7 @@ var (
+ 	loopFarIp *dbdata.IpMap
+ )
+ 
+-func loopIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent string) net.IP {
++func loopIp(cc *ClientInfo) net.IP {
+ 	var (
+ 		i  uint32
+ 		ip net.IP
+@@ -217,13 +226,13 @@ func loopIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent stri
+ 	// 重新赋值
+ 	loopFarIp = &dbdata.IpMap{LastLogin: time.Now()}
+ 
+-	i, ip = loopLong(loopCurIp, IpPool.IpLongMax, username, macAddr, uniqueMac, remoteAddr, userAgent)
++	i, ip = loopLong(loopCurIp, IpPool.IpLongMax, cc)
+ 	if ip != nil {
+ 		loopCurIp = i
+ 		return ip
+ 	}
+ 
+-	i, ip = loopLong(IpPool.IpLongMin, loopCurIp, username, macAddr, uniqueMac, remoteAddr, userAgent)
++	i, ip = loopLong(IpPool.IpLongMin, loopCurIp, cc)
+ 	if ip != nil {
+ 		loopCurIp = i
+ 		return ip
+@@ -236,7 +245,7 @@ func loopIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent stri
+ 		// 使用最早登陆的 ip
+ 		ipStr := loopFarIp.IpAddr
+ 		ip = net.ParseIP(ipStr)
+-		mi := &dbdata.IpMap{IpAddr: ipStr, MacAddr: macAddr, UniqueMac: uniqueMac, Username: username, LastLogin: time.Now()}
++		mi := &dbdata.IpMap{IpAddr: ipStr, MacAddr: cc.MacAddr, UniqueMac: cc.UniqueMac, Username: cc.Username, LastLogin: time.Now()}
+ 		// 回写db数据
+ 		_ = dbdata.Set(mi)
+ 		ipActive[ipStr] = true
+@@ -245,11 +254,11 @@ func loopIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent stri
+ 	}
+ 
+ 	// 全都在线，没有数据可用
+-	base.Warn("no ip available, please see ip_map table row", username, macAddr, remoteAddr, userAgent)
++	base.Warn("no ip available, please see ip_map table row", cc.Username, cc.MacAddr, cc.RemoteAddr, cc.UserAgent)
+ 	return nil
+ }
+ 
+-func loopLong(start, end uint32, username, macAddr string, uniqueMac bool, remoteAddr, userAgent string) (uint32, net.IP) {
++func loopLong(start, end uint32, cc *ClientInfo) (uint32, net.IP) {
+ 	var (
+ 		err       error
+ 		tNow      = time.Now()
+@@ -272,7 +281,7 @@ func loopLong(start, end uint32, username, macAddr string, uniqueMac bool, remot
+ 			// 没有查询到数据
+ 			if dbdata.CheckErrNotFound(err) {
+ 				// 该ip没有被使用
+-				mi = &dbdata.IpMap{IpAddr: ipStr, MacAddr: macAddr, UniqueMac: uniqueMac, Username: username, LastLogin: tNow}
++				mi = &dbdata.IpMap{IpAddr: ipStr, MacAddr: cc.MacAddr, UniqueMac: cc.UniqueMac, Username: cc.Username, LastLogin: tNow}
+ 				_ = dbdata.Add(mi)
+ 				ipActive[ipStr] = true
+ 				return i, ip
+@@ -290,10 +299,10 @@ func loopLong(start, end uint32, username, macAddr string, uniqueMac bool, remot
+ 		// 判断租期
+ 		if mi.LastLogin.Before(leaseTime) {
+ 			// 存在记录，说明已经超过租期，可以直接使用
+-			mi.Username = username
++			mi.Username = cc.Username
+ 			mi.LastLogin = tNow
+-			mi.MacAddr = macAddr
+-			mi.UniqueMac = uniqueMac
++			mi.MacAddr = cc.MacAddr
++			mi.UniqueMac = cc.UniqueMac
+ 			// 回写db数据
+ 			_ = dbdata.Set(mi)
+ 			ipActive[ipStr] = true
+diff --git a/server/sessdata/ip_pool_test.go b/server/sessdata/ip_pool_test.go
+index 796caef..890f975 100644
+--- a/server/sessdata/ip_pool_test.go
++++ b/server/sessdata/ip_pool_test.go
+@@ -50,7 +50,7 @@ func TestIpPool(t *testing.T) {
+ 	var ip net.IP
+ 
+ 	for i := 100; i <= 150; i++ {
+-		_ = AcquireIp(getTestUser(i), getTestMacAddr(i), true, "192.168.30.1:44443", "ut_user_agent")
++		_ = AcquireIp(&ClientInfo{Username: getTestUser(i), MacAddr: getTestMacAddr(i), UniqueMac: true, RemoteAddr: "192.168.30.1:44443", UserAgent: "ut_user_agent"})
+ 	}
+ 
+ 	// 回收
+@@ -60,7 +60,7 @@ func TestIpPool(t *testing.T) {
+ 	// 从头循环获取可用ip
+ 	user_new := getTestUser(210)
+ 	mac_new := getTestMacAddr(210)
+-	ip = AcquireIp(user_new, mac_new, true, "192.168.30.1:44443", "ut_user_agent")
++	ip = AcquireIp(&ClientInfo{Username: user_new, MacAddr: mac_new, UniqueMac: true, RemoteAddr: "192.168.30.1:44443", UserAgent: "ut_user_agent"})
+ 	t.Log("mac_new", ip)
+ 	assert.NotNil(ip)
+ 	assert.True(net.IPv4(192, 168, 3, 140).Equal(ip))
+diff --git a/server/sessdata/session.go b/server/sessdata/session.go
+index 9d2da58..ea22011 100644
+--- a/server/sessdata/session.go
++++ b/server/sessdata/session.go
+@@ -161,16 +161,16 @@ func NewSession(token string) *Session {
+ }
+ 
+ // 封装客户端上线流程
+-func connAdmission(username, macAddr string, uniqueMac bool, remoteAddr, userAgent string) net.IP {
++func connAdmission(cc *ClientInfo) net.IP {
+ 	// 判断用户在线数量
+-	limit := LimitClient(username, false)
++	limit := LimitClient(cc.Username, false)
+ 	if !limit {
+-		base.Warn("limit is full", username, remoteAddr)
++		base.Warn("limit is full", cc.Username, cc.RemoteAddr)
+ 		return nil
+ 	}
+-	ip := AcquireIp(username, macAddr, uniqueMac, remoteAddr, userAgent)
++	ip := AcquireIp(cc)
+ 	if ip == nil {
+-		LimitClient(username, true)
++		LimitClient(cc.Username, true)
+ 		return nil
+ 	}
+ 	return ip
+@@ -190,7 +190,13 @@ func (s *Session) NewConn() *ConnSession {
+ 		s.CSess.Close()
+ 	}
+ 
+-	ip := connAdmission(username, macAddr, uniqueMac, remoteAddr, userAgent)
++	ip := connAdmission(&ClientInfo{
++		Username:   username,
++		MacAddr:    macAddr,
++		UniqueMac:  uniqueMac,
++		RemoteAddr: remoteAddr,
++		UserAgent:  userAgent,
++	})
+ 	if ip == nil {
+ 		return nil
+ 	}
+@@ -256,7 +262,15 @@ func (cs *ConnSession) Close() {
+ 
+ 		ReleaseIp(cs.IpAddr, cs.Sess.MacAddr)
+ 		LimitClient(cs.Username, true)
+-		AddUserActLog(cs.Sess.Username, cs.Sess.Group, cs.IpAddr.String(), cs.RemoteAddr, cs.Sess.DeviceType, cs.Sess.PlatformVersion, cs.UserAgent, cs.UserLogoutCode)
++		AddUserActLog(&UserEvent{
++			Username:        cs.Sess.Username,
++			Group:           cs.Sess.Group,
++			IpAddr:          cs.IpAddr.String(),
++			RemoteAddr:      cs.RemoteAddr,
++			DeviceType:      cs.Sess.DeviceType,
++			PlatformVersion: cs.Sess.PlatformVersion,
++			UserAgent:       cs.UserAgent,
++		}, cs.UserLogoutCode)
+ 	})
+ }
+ 
+@@ -459,7 +473,14 @@ func CloseSess(token string, code ...uint8) {
+ 		sess.CSess.Close()
+ 		return
+ 	}
+-	AddUserActLogBySess(sess.Username, sess.Group, sess.RemoteAddr, sess.DeviceType, sess.PlatformVersion, sess.UserAgent, code...)
++	AddUserActLogBySess(&UserEvent{
++		Username:        sess.Username,
++		Group:           sess.Group,
++		RemoteAddr:      sess.RemoteAddr,
++		DeviceType:      sess.DeviceType,
++		PlatformVersion: sess.PlatformVersion,
++		UserAgent:       sess.UserAgent,
++	}, code...)
+ }
+ 
+ func CloseCSess(token string) {
+@@ -482,30 +503,40 @@ func DelSessByStoken(stoken string) {
+ 	CloseSess(token, dbdata.UserLogoutBanner)
+ }
+ 
+-func AddUserActLog(username, group, ipAddr string, remoteAddr, deviceType, platformVersion, userAgent string, logoutCode uint8) {
++// 用户上下线事件信息
++type UserEvent struct {
++	Username        string // 用户名
++	Group           string // 登入组
++	IpAddr          string // 连接ip信息
++	RemoteAddr      string // 来源地址
++	DeviceType      string // 设备类型
++	PlatformVersion string // 设备系统版本
++	UserAgent       string // 客户端信息
++}
++
++func AddUserActLog(ev *UserEvent, logoutCode uint8) {
+ 	info := dbdata.UserActLogIns.GetInfoOpsById(logoutCode)
+-	addUserActLog(username, group, ipAddr, remoteAddr, deviceType, platformVersion, userAgent, info)
++	addUserActLog(ev, info)
+ }
+ 
+-func AddUserActLogBySess(username, group, remoteAddr, deviceType, platformVersion, userAgent string, code ...uint8) {
++func AddUserActLogBySess(ev *UserEvent, code ...uint8) {
+ 	info := dbdata.UserActLogIns.GetInfoOpsById(dbdata.UserLogoutBanner)
+ 	if len(code) > 0 {
+ 		info = dbdata.UserActLogIns.GetInfoOpsById(code[0])
+ 	}
+-	// 无连接ip信息
+-	addUserActLog(username, group, "", remoteAddr, deviceType, platformVersion, userAgent, info)
++	addUserActLog(ev, info)
+ }
+ 
+-func addUserActLog(username, group, ipAddr string, remoteAddr, deviceType, platformVersion, userAgent, info string) {
++func addUserActLog(ev *UserEvent, info string) {
+ 	ua := dbdata.UserActLog{
+-		Username:        username,
+-		GroupName:       group,
+-		IpAddr:          ipAddr,
+-		RemoteAddr:      remoteAddr,
+-		DeviceType:      deviceType,
+-		PlatformVersion: platformVersion,
++		Username:        ev.Username,
++		GroupName:       ev.Group,
++		IpAddr:          ev.IpAddr,
++		RemoteAddr:      ev.RemoteAddr,
++		DeviceType:      ev.DeviceType,
++		PlatformVersion: ev.PlatformVersion,
+ 		Status:          dbdata.UserLogout,
+ 	}
+ 	ua.Info = info
+-	dbdata.UserActLogIns.Add(ua, userAgent)
++	dbdata.UserActLogIns.Add(ua, ev.UserAgent)
+ }

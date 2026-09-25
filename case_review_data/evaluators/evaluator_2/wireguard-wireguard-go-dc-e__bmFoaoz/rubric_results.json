@@ -1,0 +1,136 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The agent.patch only modifies device/noise-protocol.go (introducing transcriptState for the Noise hash/chainKey) and contains no changes to device/uapi.go. As shown in smell.diff, the UAPI set operation still threads the peer-selection state as separate consecutive parameters: device.handlePostConfig(&peer, &dummy, &created, &pkaOn), device.handlePublicKeyLine(&peer, &dummy, &created, value), and device.handlePeerLine(&peer, &dummy, &created, &pkaOn, key, value). Since these values are not held by one cohesive data type owned by the set operation, the rubric is not satisfied.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The peer-selection state that a UAPI set operation threads through its parsing stages -- which peer the remaining lines apply to, whether it is a placeholder for this device's own public key, and whether it was created during this operation -- is held by one cohesive data type owned by the set operation, and no stage of that parsing still receives those values as separate consecutive parameters.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch only groups the Noise transcript hash/chainKey into transcriptState in device/noise-protocol.go. It does not touch the inbound handshake datagram path in device/receive.go or device/send.go; methods there still take the packet and endpoint as separate consecutive parameters, e.g. handleHandshakeMsg(msgType uint32, packet []byte, endpoint conn.Endpoint), authenticateHandshake(packet []byte, endpoint conn.Endpoint), processHandshakeInitiation(packet []byte, endpoint conn.Endpoint), processHandshakeResponse(packet []byte, endpoint conn.Endpoint), and SendHandshakeCookie(packet []byte, endpoint conn.Endpoint). No cohesive datagram context object is introduced for packet bytes plus remote endpoint.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The inbound handshake datagram context -- the verbatim packet bytes together with the remote endpoint they arrived from -- is carried as one cohesive value through the whole inbound handling path: per-type dispatch, the received cookie-reply branch, MAC and rate-limit validation, initiation and response consumption, and the construction of a denial reply; no method on that path still takes the payload and the endpoint as separate consecutive parameters.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch introduces a `transcriptState` holder containing `hash` and `chainKey`, and changes every Noise staging method to take `state *transcriptState` instead of separate hash/chainKey parameters: `mixInitiationTranscript(msg, state)`, `decryptInitiationStatic(msg, state)`, `verifyInitiationTimestamp(handshake, msg, state)`, and `consumeResponseTranscript(handshake, msg, state)`. Callers declare one `var state transcriptState` and pass `&state` through all stages, then assign `handshake.hash = state.hash` and `handshake.chainKey = state.chainKey`, so all stages operate on the same transcript backings.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The transcript working state consumed while authenticating a handshake -- the mix hash and chain key backings, together with the per-stage message and handshake views -- is moved through every initiation and response staging stage via one holder, no staging method still takes hash and chain key as separate consecutive parameters, and all stages keep operating on the same transcript backings.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch introduces transcriptState{hash, chainKey} with mixHash/mixKey/zero methods and passes *transcriptState across Noise stage boundaries (mixInitiationTranscript, decryptInitiationStatic, verifyInitiationTimestamp, consumeResponseTranscript). ConsumeMessageInitiation/Response declare a single state and pass &state; callees read/mutate state.hash and state.chainKey or call state.mixHash/mixKey rather than unpacking into bare local hash/chainKey variables.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The values introduced to replace the regrouped parameters are used as real abstractions: call sites and stage boundaries exchange each holder itself, and stage logic reads or mutates through it, instead of unpacking it back into bare locals that mirror the old parameter group at every callee.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch only modifies device/noise-protocol.go, introducing transcriptState and updating Noise transcript call sites. It contains no hunks for device/uapi.go, device/receive.go, or device/send.go. As shown in smell.diff, those files still spread the old value groups argument-by-argument: uapi.go calls handlePostConfig(&peer, &dummy, &created, &pkaOn), handlePublicKeyLine(&peer, &dummy, &created, value), and handlePeerLine(&peer, &dummy, &created, &pkaOn, key, value); receive.go calls handleHandshakeMsg(elem.msgType, elem.packet, elem.endpoint), processCookieReply(packet, endpoint), authenticateHandshake(packet, endpoint), processHandshakeInitiation(packet, endpoint), and processHandshakeResponse(packet, endpoint); send.go defines SendHandshakeCookie(packet []byte, endpoint conn.Endpoint). No cohesive holder is introduced or used for these control planes, so call sites remain inconsistent.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "All call sites are consistent with the new holders across the whole device package: the UAPI set traversal invoking its stages, the handshake queue handling loop, and the outbound denial-reply construction all pass the cohesive values, and no call site anywhere still spreads any of the old value groups argument-by-argument.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only introduces transcriptState in noise-protocol.go for the hash/chainKey pair. It does not modify receive.go, send.go, or uapi.go, so the inbound handshake path still passes packet []byte and endpoint conn.Endpoint as separate parameters (e.g., authenticateHandshake, processHandshakeInitiation, processHandshakeResponse, SendHandshakeCookie in smell.diff). Consequently MAC validation inputs, per-source-address rate-limit allowance, endpoint learning, timer events, and received-byte accounting are not served from a cohesive datagram/operation context object; they continue to derive from separate values rather than obtaining one consistent view through new shapes.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Dependencies interlocked with the regrouped values keep receiving what they require through the new shapes: MAC validation inputs, per-source-address rate-limit allowance, endpoint learning, index and handshake table access, timer events, and received-byte accounting each obtain one consistent view of the datagram or operation without re-deriving or duplicating the grouped values.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch only encapsulates the Noise transcript hash/chainKey pair into transcriptState in noise-protocol.go. It leaves the other threaded groups from the smell with bare consecutive parameters: uapi.go still declares handlePostConfig(peer **Peer, dummy *bool, created *bool, pkaOn *bool) and handlePeerLine(peer **Peer, dummy *bool, created *bool, pkaOn *bool, key, value string), and receive.go still declares handleHandshakeMsg(msgType uint32, packet []byte, endpoint conn.Endpoint) and processHandshakeInitiation/Response(packet []byte, endpoint conn.Endpoint), so vestiges of the old value threading survive.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Vestiges of the old value threading survive: some method still declares the old bare consecutive parameters, or a forwarding parameter or local copies that merely re-spread the old group are kept after no call site needs the expanded form.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch replaces the separate hash/chainKey parameters with a transcriptState type whose hash, chainKey, mixHash, mixKey, and zero members are all read or called by the updated stages (mixInitiationTranscript, decryptInitiationStatic, verifyInitiationTimestamp, consumeResponseTranscript, ConsumeMessageInitiation, ConsumeMessageResponse). No commented-out pre-refactor signatures, unused holder fields, or meaningless parameters remain in the touched noise-protocol.go code.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Dead scaffolding is left behind: holder types or fields that no stage reads, parameters that no caller supplies meaningfully, or commented-out copies of the pre-refactor signatures remain in the touched planes.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch only modifies device/noise-protocol.go, introducing transcriptState and threading it through ConsumeMessageInitiation/ConsumeMessageResponse. It contains no hunks for device/uapi.go or the IPC set path (IpcSetOperation, handlePostConfig, handlePublicKeyLine, handlePeerLine), so configuration parsing, malformed-key/value errno responses, update_only/remove placeholder handling, allowed-ip and keepalive effects, and deferred peer start/keepalive/roaming suppression remain unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Configuration behavior is unchanged: a set operation produces the same accepted configuration and the same errno responses for malformed keys and values, the same update_only and remove semantics including placeholder handling for the device's own public key, the same allowed-ip and keepalive effects, and the same deferred actions (peer start with staged packets, immediate keepalive when persistent keepalive is switched on, endpoint-roaming suppression exactly as before).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch only introduces transcriptState in device/noise-protocol.go and threads &state through the Noise transcript steps; the KDF/AEAD/mixHash/mixKey operations, replay/flood verdicts (`replay = !timestamp.After(handshake.lastTimestamp)`, `flood = time.Since(handshake.lastInitiationConsumption) <= HandshakeInitationRate`), handshake.hash/chainKey assignment, and zeroing are preserved. It contains no edits to receive.go/send.go/uapi.go, so MAC1 gating, MAC2 cookie reply construction/source, rate limiter, endpoint learning, timer firings, rxBytes accounting, and BeginSymmetricSession decisions remain unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Inbound handshake behavior is unchanged: MAC1 validation still gates everything; under load a failing MAC2 still produces exactly one denial cookie reply built from the denied datagram and answered to its source; the per-source-address limiter still gates consumption identically; initiation and response consumption keep the same endpoint learning, timer firings, received-byte accounting, replay and flood verdicts, and session derivation decisions.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch groups hash/chainKey into a pointer-passed transcriptState and preserves clearing at the same commit points: in ConsumeMessageInitiation it assigns handshake.hash = state.hash and handshake.chainKey = state.chainKey, then calls state.zero(); in ConsumeMessageResponse it does the same assignment then state.zero(). Shared secrets in consumeResponseTranscript remain local and are still cleared with setZero(ss[:]) after each use. No hash or chainKey values are logged, and transcriptState is passed by pointer rather than copied.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Noise transcript integrity is unchanged: hash and chain key working material is still cleared at the same points where the handshake state is committed or consumed, secret material is not copied beyond what the transcript requires, and no transcript state is logged.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 0,
+    "core_resolution": 0.5
+  },
+  "valid_count": 11,
+  "pass_count": 6,
+  "must_have_pass": false,
+  "macro_score": 0.5
+}

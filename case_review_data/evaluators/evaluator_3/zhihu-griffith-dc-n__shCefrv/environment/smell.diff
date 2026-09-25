@@ -1,0 +1,572 @@
+diff --git a/packages/griffith-hls/src/VideoComponent.tsx b/packages/griffith-hls/src/VideoComponent.tsx
+index 7758744..21a5572 100644
+--- a/packages/griffith-hls/src/VideoComponent.tsx
++++ b/packages/griffith-hls/src/VideoComponent.tsx
+@@ -1,15 +1,19 @@
+ import React, {Component} from 'react'
+ // TODO: 升级有类型的新版
+ import Hls from 'hls.js/dist/hls.light.min'
+-import {Source} from './types'
+ import {getMasterM3U8Blob} from './utils'
+ 
+ type NativeVideoProps = React.HTMLProps<HTMLVideoElement>
++// 各列按 sourceQualities 的顺序索引，一一对应
+ type VideoProps = NativeVideoProps & {
+   paused: boolean
+   currentQuality: string
+   useAutoQuality: boolean
+-  sources: Source[]
++  sourceQualities: string[]
++  playUrls: string[]
++  sourceWidths: number[]
++  sourceHeights: number[]
++  sourceBitrates: number[]
+   onRef(el: HTMLVideoElement | null): void
+ }
+ 
+@@ -21,17 +25,28 @@ export default class VideoComponent extends Component<VideoProps> {
+   hasLoadStarted = false
+ 
+   componentDidMount() {
+-    const {src, sources, useAutoQuality} = this.props
++    const {
++      src,
++      useAutoQuality,
++      playUrls,
++      sourceQualities,
++      sourceWidths,
++      sourceHeights,
++      sourceBitrates,
++    } = this.props
+     this.hls = new Hls({autoStartLoad: false})
+     this.hls.attachMedia(this.video!)
+ 
+-    const isAutoQualitySourceProvided = Boolean(
+-      sources.find((s) => s.quality === 'auto')
+-    )
++    const isAutoQualitySourceProvided = sourceQualities.indexOf('auto') >= 0
+ 
+     // 启用自动质量但是又没有提供 auto 规格的 source，那么就尝试本地手动生成
+     if (useAutoQuality && !isAutoQualitySourceProvided) {
+-      const master = getMasterM3U8Blob(sources)
++      const master = getMasterM3U8Blob(
++        playUrls,
++        sourceBitrates,
++        sourceWidths,
++        sourceHeights
++      )
+       this.src = URL.createObjectURL(master)
+       this.manuallyBuildAdaptiveM3U8Blob = true
+     } else {
+@@ -42,7 +57,7 @@ export default class VideoComponent extends Component<VideoProps> {
+   }
+ 
+   componentDidUpdate(prevProps: VideoProps) {
+-    const {currentQuality, sources, paused, src} = this.props
++    const {currentQuality, playUrls, sourceQualities, paused, src} = this.props
+ 
+     if (!this.hls) {
+       return
+@@ -50,12 +65,13 @@ export default class VideoComponent extends Component<VideoProps> {
+ 
+     if (currentQuality !== prevProps.currentQuality || prevProps.src !== src) {
+       // 切换清晰度
+-      const source = sources.find((s) => s.quality === currentQuality)
+-      if (source) {
++      const qualityIndex = sourceQualities.indexOf(currentQuality)
++      const playUrl = qualityIndex >= 0 ? playUrls[qualityIndex] : undefined
++      if (playUrl !== undefined) {
+         if (this.manuallyBuildAdaptiveM3U8Blob) {
+           const levels = this.hls.levels
+           const level = levels.findIndex((l) =>
+-            l.url.includes(source.source as any)
++            l.url.includes(playUrl as any)
+           )
+           this.hls.nextLevel = level
+         } else {
+@@ -65,7 +81,7 @@ export default class VideoComponent extends Component<VideoProps> {
+           this.hls.destroy()
+           this.hls = new Hls({autoStartLoad: false})
+           this.hls.attachMedia(this.video!)
+-          this.hls.loadSource(source.source)
++          this.hls.loadSource(playUrl)
+           this.video!.currentTime = currentTime
+           this.hls.startLoad()
+           if (!paused) {
+@@ -99,7 +115,11 @@ export default class VideoComponent extends Component<VideoProps> {
+       currentQuality,
+       useAutoQuality,
+       src,
+-      sources,
++      sourceQualities,
++      playUrls,
++      sourceWidths,
++      sourceHeights,
++      sourceBitrates,
+       paused,
+       /* eslint-enable @typescript-eslint/no-unused-vars */
+       ...props
+diff --git a/packages/griffith-hls/src/types.ts b/packages/griffith-hls/src/types.ts
+deleted file mode 100644
+index 9750ec1..0000000
+--- a/packages/griffith-hls/src/types.ts
++++ /dev/null
+@@ -1,7 +0,0 @@
+-export type Source = {
+-  source: string
+-  quality: string
+-  bitrate: number
+-  height: number
+-  width: number
+-}
+diff --git a/packages/griffith-hls/src/utils/getMasterM3U8Blob.ts b/packages/griffith-hls/src/utils/getMasterM3U8Blob.ts
+index 5b90b58..edb8ec1 100644
+--- a/packages/griffith-hls/src/utils/getMasterM3U8Blob.ts
++++ b/packages/griffith-hls/src/utils/getMasterM3U8Blob.ts
+@@ -1,14 +1,18 @@
+-import {Source} from '../types'
+ import createMasterM3U8 from './createMasterM3U8'
+ 
+-export default (sources: Source[]): Blob => {
+-  const list = sources.map((item) => ({
+-    source: item.source,
+-    bandwidth: item.bitrate * 1024,
++export default function getMasterM3U8Blob(
++  playUrls: string[],
++  sourceBitrates: number[] = [],
++  sourceWidths: number[] = [],
++  sourceHeights: number[] = []
++): Blob {
++  const list = playUrls.map((source, index) => ({
++    source,
++    bandwidth: sourceBitrates[index] * 1024,
+ 
+     resolution: {
+-      width: item.width,
+-      height: item.height,
++      width: sourceWidths[index],
++      height: sourceHeights[index],
+     },
+   }))
+ 
+diff --git a/packages/griffith-mp4/src/VideoComponent.tsx b/packages/griffith-mp4/src/VideoComponent.tsx
+index 836d076..05d373b 100644
+--- a/packages/griffith-mp4/src/VideoComponent.tsx
++++ b/packages/griffith-mp4/src/VideoComponent.tsx
+@@ -5,11 +5,16 @@ import MSE from './mse'
+ const {isSafari} = ua
+ 
+ type NativeVideoProps = React.HTMLProps<HTMLVideoElement>
++// 各列按 sourceQualities 的顺序索引，一一对应
+ type VideoProps = NativeVideoProps & {
+   paused: boolean
+   currentQuality: string
+   useAutoQuality: boolean
+-  sources: {quality: string; source: string}[]
++  sourceQualities: string[]
++  playUrls: string[]
++  sourceWidths: number[]
++  sourceHeights: number[]
++  sourceBitrates: number[]
+   onRef(el: HTMLVideoElement | null): void
+ }
+ 
+diff --git a/packages/griffith/src/components/NormalVideo.tsx b/packages/griffith/src/components/NormalVideo.tsx
+index 0982423..12e8092 100644
+--- a/packages/griffith/src/components/NormalVideo.tsx
++++ b/packages/griffith/src/components/NormalVideo.tsx
+@@ -1,12 +1,15 @@
+ import React from 'react'
+-import {PlaySource} from '../types'
+ 
+ type NativeVideoProps = React.HTMLProps<HTMLVideoElement>
+ type VideoProps = NativeVideoProps & {
+   paused: boolean
+   currentQuality: string
+   useAutoQuality: boolean
+-  sources: PlaySource[]
++  sourceQualities: string[]
++  playUrls: string[]
++  sourceWidths: number[]
++  sourceHeights: number[]
++  sourceBitrates: number[]
+   onRef: (el: HTMLVideoElement | null) => void
+ }
+ 
+@@ -17,7 +20,11 @@ const NormalVideo: React.FC<VideoProps> = (props) => {
+     paused,
+     currentQuality,
+     useAutoQuality,
+-    sources,
++    sourceQualities,
++    playUrls,
++    sourceWidths,
++    sourceHeights,
++    sourceBitrates,
+     /* eslint-disable @typescript-eslint/no-unused-vars */
+     ...restProps
+   } = props
+diff --git a/packages/griffith/src/components/Player.tsx b/packages/griffith/src/components/Player.tsx
+index 1916bf5..4c5af8a 100644
+--- a/packages/griffith/src/components/Player.tsx
++++ b/packages/griffith/src/components/Player.tsx
+@@ -153,7 +153,7 @@ const InnerPlayer: React.FC<InnerPlayerProps> = ({
+   customPlayer,
+ }) => {
+   const {emitEvent, subscribeAction} = useContext(InternalMessageContext)
+-  const {currentSrc, sources} = useContext(VideoSourceContext)
++  const {currentSrc, sourceQualities} = useContext(VideoSourceContext)
+   const [root, setRoot] = useState<HTMLDivElement | null>(null)
+   const videoRef = useRef<{
+     root: HTMLVideoElement
+@@ -506,16 +506,16 @@ const InnerPlayer: React.FC<InnerPlayerProps> = ({
+     onSeek: handleSeek,
+   })
+ 
+-  const prevSources = usePrevious(sources)
++  const prevSources = usePrevious(sourceQualities)
+   useEffect(() => {
+-    if (prevSources && prevSources !== sources) {
++    if (prevSources && prevSources !== sourceQualities) {
+       handleSeek(0) //TODO: Event
+       handlePause()
+       if (autoplay) {
+         handlePlay()
+       }
+     }
+-  }, [autoplay, handlePlay, handleSeek, handlePause, prevSources, sources])
++  }, [autoplay, handlePlay, handleSeek, handlePause, prevSources, sourceQualities])
+ 
+   const isPip = Boolean(pipRef.current?.pictureInPictureElement)
+ 
+diff --git a/packages/griffith/src/components/Video.tsx b/packages/griffith/src/components/Video.tsx
+index d7f6c69..5fcc2ce 100644
+--- a/packages/griffith/src/components/Video.tsx
++++ b/packages/griffith/src/components/Video.tsx
+@@ -2,13 +2,7 @@ import React, {Component} from 'react'
+ import {css} from 'aphrodite/no-important'
+ import {EVENTS} from 'griffith-message'
+ import {logger, ua} from 'griffith-utils'
+-import {
+-  PlaybackRate,
+-  Quality,
+-  PlaySource,
+-  ProgressValue,
+-  VideoPlugin,
+-} from '../types'
++import {PlaybackRate, Quality, ProgressValue, VideoPlugin} from '../types'
+ import VideoSourceContext from '../contexts/VideoSourceContext'
+ import VideoWithMessage, {VideoComponentType} from './VideoWithMessage'
+ import selectVideo from './selectVideo'
+@@ -25,13 +19,18 @@ const isNotAllowedError = (error: MediaError) =>
+ 
+ type NativeVideoProps = Omit<React.HTMLProps<HTMLVideoElement>, 'ref'>
+ 
++// 各列按 sourceQualities 的顺序索引，一一对应
+ type VideoProps = NativeVideoProps & {
+   format: string
+   paused?: boolean
+   useMSE?: boolean
+   volume: number
+   currentQuality?: Quality
+-  sources?: PlaySource[]
++  sourceQualities: Quality[]
++  playUrls: string[]
++  sourceWidths: number[]
++  sourceHeights: number[]
++  sourceBitrates: number[]
+   // 自定义事件（注意与原生不同，附加了自定义参数）
+   onLoadingChange?: (isLoading: boolean) => void
+   onDurationUpdate: (duration: number) => void
+@@ -349,7 +348,11 @@ class Video extends Component<VideoProps> {
+       onSeeked,
+       format,
+       useMSE,
+-      sources,
++      sourceQualities,
++      playUrls,
++      sourceWidths,
++      sourceHeights,
++      sourceBitrates,
+       currentQuality,
+       crossOrigin,
+       customHeaders,
+@@ -389,8 +392,12 @@ class Video extends Component<VideoProps> {
+         onProgress={this.handleProgress}
+         onNativeEvent={this.handleNativeEvent}
+         paused={paused}
+-        sources={sources}
+         currentQuality={currentQuality}
++        sourceQualities={sourceQualities}
++        playUrls={playUrls}
++        sourceWidths={sourceWidths}
++        sourceHeights={sourceHeights}
++        sourceBitrates={sourceBitrates}
+         Video={VideoComponent as VideoComponentType}
+       />
+     )
+@@ -400,24 +407,50 @@ class Video extends Component<VideoProps> {
+ type InjectedProps =
+   | 'src'
+   | 'format'
+-  | 'sources'
++  | 'playUrls'
++  | 'sourceQualities'
++  | 'sourceWidths'
++  | 'sourceHeights'
++  | 'sourceBitrates'
+   | 'currentQuality'
+   | 'currentPlaybackRate'
+ 
+-export default React.forwardRef<any, Omit<VideoProps, InjectedProps>>(
+-  (props, ref) => (
++// 从 context 中取出各列并传给 Video
++function VideoWithContext(
++  props: Omit<VideoProps, InjectedProps>,
++  ref: React.ForwardedRef<any>
++) {
++  return (
+     <VideoSourceContext.Consumer>
+-      {({currentSrc, sources, currentQuality, format, currentPlaybackRate}) => (
++      {({
++        currentSrc,
++        playUrls,
++        sourceQualities,
++        sourceWidths,
++        sourceHeights,
++        sourceBitrates,
++        currentQuality,
++        format,
++        currentPlaybackRate,
++      }) => (
+         <Video
+           ref={ref}
+           {...props}
+           src={currentSrc}
+           format={format}
+-          sources={sources}
++          playUrls={playUrls}
++          sourceQualities={sourceQualities}
++          sourceWidths={sourceWidths}
++          sourceHeights={sourceHeights}
++          sourceBitrates={sourceBitrates}
+           currentQuality={currentQuality}
+           currentPlaybackRate={currentPlaybackRate}
+         />
+       )}
+     </VideoSourceContext.Consumer>
+   )
++}
++
++export default React.forwardRef<any, Omit<VideoProps, InjectedProps>>(
++  VideoWithContext
+ )
+diff --git a/packages/griffith/src/contexts/VideoSourceContext.ts b/packages/griffith/src/contexts/VideoSourceContext.ts
+index f6c915c..691a5dc 100644
+--- a/packages/griffith/src/contexts/VideoSourceContext.ts
++++ b/packages/griffith/src/contexts/VideoSourceContext.ts
+@@ -1,14 +1,22 @@
+ import React from 'react'
+-import {PlaySource, Quality, PlaybackRate} from '../types'
++import {Quality, PlaybackRate} from '../types'
+ 
+ export type VideoSourceContextValue = {
+   currentSrc: string
+   format: string
+-  sources: PlaySource[]
+   // 视频质量
+   qualities: Quality[]
+   setCurrentQuality: (x: Quality) => void
+   currentQuality: Quality
++  /**
++   * 以下各列按 sourceQualities 的顺序索引，一一对应。
++   * 注意 sourceQualities 不包含手动插入的 auto 项，与 qualities 不同。
++   */
++  sourceQualities: Quality[]
++  playUrls: string[]
++  sourceWidths: number[]
++  sourceHeights: number[]
++  sourceBitrates: number[]
+   // 播放速度
+   playbackRates: PlaybackRate[]
+   setCurrentPlaybackRate: (x: PlaybackRate) => void
+diff --git a/packages/griffith/src/contexts/VideoSourceProvider.tsx b/packages/griffith/src/contexts/VideoSourceProvider.tsx
+index f871dc5..08e48f1 100644
+--- a/packages/griffith/src/contexts/VideoSourceProvider.tsx
++++ b/packages/griffith/src/contexts/VideoSourceProvider.tsx
+@@ -7,7 +7,13 @@ import {
+   QualityOrder,
+ } from '../types'
+ import VideoSourceContext from './VideoSourceContext'
+-import {getQualities, getSources} from './parsePlaylist'
++import {
++  getQualities,
++  getPlayUrls,
++  getSourceBitrates,
++  getSourceHeights,
++  getSourceWidths,
++} from './parsePlaylist'
+ import {EVENTS} from 'griffith-message'
+ import {ua} from 'griffith-utils'
+ import reverseArray from '../utils/reverseArray'
+@@ -38,15 +44,36 @@ const VideoSourceProvider: React.FC<VideoSourceProviderProps> = ({
+ }) => {
+   const {emitEvent} = useContext(InternalMessageContext)
+   const lastSourceMap = useChanged(sourceMap)
+-  const {qualities, sources, format, isDescOrder} = useMemo(() => {
++  const {
++    qualities,
++    sourceQualities,
++    playUrls,
++    sourceWidths,
++    sourceHeights,
++    sourceBitrates,
++    format,
++    isDescOrder,
++  } = useMemo(() => {
+     // 其实视频源应当是必需参数
+     if (!lastSourceMap) {
+-      return {qualities: [], sources: []}
++      return {
++        qualities: [] as Quality[],
++        sourceQualities: [] as Quality[],
++        playUrls: [] as string[],
++        sourceWidths: [] as number[],
++        sourceHeights: [] as number[],
++        sourceBitrates: [] as number[],
++      }
+     }
+     const {format} = Object.values(lastSourceMap)[0]!
+     const isDescOrder = defaultQualityOrder === 'desc'
+     const qualities = getQualities(lastSourceMap, isMobile, isDescOrder)
+-    const sources = getSources(qualities, lastSourceMap)
++    // 列必须与 sourceQualities 对齐：不包含下面手动插入的 auto 项
++    const sourceQualities = [...qualities]
++    const playUrls = getPlayUrls(sourceQualities, lastSourceMap)
++    const sourceWidths = getSourceWidths(sourceQualities, lastSourceMap)
++    const sourceHeights = getSourceHeights(sourceQualities, lastSourceMap)
++    const sourceBitrates = getSourceBitrates(sourceQualities, lastSourceMap)
+ 
+     // 目前只有直播流实现了手动拼接 auto 清晰度的功能
+     if (
+@@ -58,7 +85,16 @@ const VideoSourceProvider: React.FC<VideoSourceProviderProps> = ({
+       qualities.unshift('auto')
+     }
+ 
+-    return {qualities, sources, format, isDescOrder}
++    return {
++      qualities,
++      sourceQualities,
++      playUrls,
++      sourceWidths,
++      sourceHeights,
++      sourceBitrates,
++      format,
++      isDescOrder,
++    }
+   }, [useAutoQuality, lastSourceMap, defaultQualityOrder])
+ 
+   const [currentQuality, setCurrentQualityRaw] = useState(
+@@ -98,21 +134,24 @@ const VideoSourceProvider: React.FC<VideoSourceProviderProps> = ({
+ 
+   // 根据当前清晰度返回对应的 src
+   const currentSrc = useMemo(() => {
+-    if (sources.length === 0) {
++    if (playUrls.length === 0) {
+       return
+     }
+ 
+-    const source =
+-      sources.find((item) => item.quality === currentQuality) || sources[0]
+-    return source.source
+-  }, [currentQuality, sources])
++    const index = sourceQualities.indexOf(currentQuality)
++    return playUrls[index >= 0 ? index : 0]
++  }, [currentQuality, playUrls, sourceQualities])
+ 
+   const contextValue = useMemo(
+     () => ({
+       qualities: isDescOrder ? qualities : reverseArray(qualities),
+       playbackRates,
+       format: format!,
+-      sources,
++      sourceQualities,
++      playUrls,
++      sourceWidths,
++      sourceHeights,
++      sourceBitrates,
+       currentQuality,
+       currentPlaybackRate: playbackRate!,
+       currentSrc: currentSrc!,
+@@ -127,9 +166,13 @@ const VideoSourceProvider: React.FC<VideoSourceProviderProps> = ({
+       playbackRates,
+       qualities,
+       isDescOrder,
+-      setCurrentPlaybackRate,
++      sourceQualities,
++      playUrls,
++      sourceWidths,
++      sourceHeights,
++      sourceBitrates,
+       setCurrentQuality,
+-      sources,
++      setCurrentPlaybackRate,
+     ]
+   )
+ 
+diff --git a/packages/griffith/src/contexts/parsePlaylist.ts b/packages/griffith/src/contexts/parsePlaylist.ts
+index 210fc38..390fbfd 100644
+--- a/packages/griffith/src/contexts/parsePlaylist.ts
++++ b/packages/griffith/src/contexts/parsePlaylist.ts
+@@ -1,4 +1,4 @@
+-import {Quality, FormattedPlaySource, PlaySourceMap} from '../types'
++import {Quality, PlaySourceMap} from '../types'
+ const QUALITY_ORDER: Quality[] = ['auto', 'ld', 'sd', 'hd', 'fhd']
+ 
+ export const getQualities = (
+@@ -25,16 +25,34 @@ export const getQualities = (
+   return qualities
+ }
+ 
+-export const getSources = (
++// 以下 getter 均按 qualities 的顺序返回各列，避免为整个播放列表构建中间对象
++
++export const getPlayUrls = (qualities: Quality[], sources: PlaySourceMap) =>
++  qualities.map((quality) =>
++    // @ts-expect-error Property 'auto' does not exist on type 'PlaySourceMap'，应当是 QUALITY_ORDER 定义错了
++    sources[quality].play_url
++  ) as string[]
++
++export const getSourceHeights = (qualities: Quality[], sources: PlaySourceMap) =>
++  qualities.map(
++    (quality) =>
++      // @ts-expect-error Property 'auto' does not exist on type 'PlaySourceMap'，应当是 QUALITY_ORDER 定义错了
++      sources[quality].height
++  ) as number[]
++
++export const getSourceWidths = (qualities: Quality[], sources: PlaySourceMap) =>
++  qualities.map(
++    (quality) =>
++      // @ts-expect-error Property 'auto' does not exist on type 'PlaySourceMap'，应当是 QUALITY_ORDER 定义错了
++      sources[quality].width
++  ) as number[]
++
++export const getSourceBitrates = (
+   qualities: Quality[],
+   sources: PlaySourceMap
+-): FormattedPlaySource[] =>
+-  qualities.map((quality) => {
+-    // @ts-expect-error Property 'auto' does not exist on type 'PlaySourceMap'，应当是 QUALITY_ORDER 定义错了
+-    const {play_url, ...rest} = sources[quality]
+-    return {
+-      ...rest,
+-      source: play_url,
+-      quality,
+-    } as FormattedPlaySource
+-  })
++) =>
++  qualities.map(
++    (quality) =>
++      // @ts-expect-error Property 'auto' does not exist on type 'PlaySourceMap'，应当是 QUALITY_ORDER 定义错了
++      sources[quality].bitrate
++  ) as number[]

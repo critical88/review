@@ -1,0 +1,136 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The patch deletes BufCursor's std::io::Read, std::io::BufRead, std::io::Write, and Iterator impls and removes BufCursor::single. Reader, Writer, and IntoIter now hold the wrapped value directly and implement io::Read/BufRead, io::Write, and Iterator themselves. cursor.rs doc now says Reader/Writer/IntoIter 'sit beside the cursor' and own their own io/iterator implementations, so the io bridges and iteration are no longer owned by the same type as the read/write cursor mechanics.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, no single type in the buffer adapter module owns the adapter family's cursor responsibilities all at once: the read-side windowed walk, the write-side windowed walk, the two-region drain in both directions, the io::Read/io::BufRead bridge, the io::Write bridge and byte iteration are distributed across dedicated one-concern owners (the existing adapter types or a cohesive repartition of them).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch leaves take.rs untouched and removes only BufCursor::single plus the io/Iterator impls from cursor.rs, leaving the Buf impl unchanged. The retained single-region cursor clamps remaining via cmp::min(self.front.remaining(), self.limit), clamps chunk via &bytes[..cmp::min(bytes.len(), self.limit)], asserts cnt <= self.limit in advance and decrements self.limit -= cnt, and copy_to_bytes asserts len <= self.remaining() and does self.limit -= len. Paired cursors are still built with limit: usize::MAX and their remaining/chunk paths do not clamp, so windowless cursors show no window. Reader and IntoIter are restored to plain buf fields with no window.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Wherever the read-side windowed walk lands, it keeps its exact edge-case behavior: remaining and the chunk views clamp to the window, advancing past the window still fails the existing assertion, the window decreases by exactly the bytes moved through it, and cursors that never had a window still show none.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch leaves the paired-region traversal in cursor.rs unchanged: `advance` still drains front before back (`if a_rem >= cnt { self.front.advance(cnt); ... }` else `self.front.advance(a_rem); ... back.advance(cnt)`); `copy_to_bytes` still assembles spanning copies (`ret.put(&mut self.front); ret.put((&mut *back).take(len - a_rem))`); and `chunks_vectored` still vectors front then back (`n = self.front.chunks_vectored(dst); n += back.chunks_vectored(&mut dst[n..])`). chain.rs is untouched and still delegates to `BufCursor::paired`; the patch only removes the io/Iterator impls and `single`, not the two-region read/write drain order.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The two-region traversal keeps its exact drain order on both the read and write paths - the front region is fully consumed before the rear region - including the spanning copies that assemble exactly the requested bytes across both regions and the std-only vectored chunk behavior.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent removes the io bridges from BufCursor (cursor.rs deletes its std::io::Read, BufRead, Write impls) and re-homes them in their owners. Reader::read clamps with `let n = cmp::min(self.buf.remaining(), dst.len())` then copies `dst[..n]`; `fill_buf` returns `Ok(Buf::chunk(&self.buf))` without advancing; `consume` calls `self.buf.advance(amt)`. Writer::write clamps with `let n = cmp::min(self.buf.remaining_mut(), src.len())` then `put_slice(&src[..n])`; `flush` returns `Ok(())`.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Each io bridge is owned by its bridge owner and preserves its semantics: read and write lengths clamp to the currently usable capacity, the buffered view exposes the current chunk without consuming, consume advances by the given amount, and flush reports success without doing work.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The patch only re-points the protocol adapters back to direct owned state (Reader/Writer/IntoIter now use `buf: B`/`buf: T` and accessors return `&self.buf`/`self.buf`), but Take, Limit, and Chain are left unchanged from the smell: they still store `cursor: BufCursor<T>` and their accessors delegate to the shared internal type (e.g. `self.cursor.first_ref()`, `self.cursor.into_front()`, `self.cursor.limit()`, `self.cursor.set_limit(lim)`, `self.cursor.into_regions()`). Since the rubric requires every adapter's constructor and accessor surface to work against its owning adapter's own state, the three windowing/pairing adapters fail this requirement.",
+      "valid": true,
+      "attempts": 4,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every adapter's constructor and accessor surface works against its owning adapter's own state after the repair: references and mutable-reference accessors, into/get accessors, the two-region adapter's per-region accessors, and the window limit getters and setters all keep their names, signatures and visibility, with the crate's public API neither gaining nor losing any item.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, src/buf/iter.rs no longer uses BufCursor: IntoIter now owns `buf: T`, and `Iterator` is implemented directly on the owning type. `next` checks `self.buf.has_remaining()`, reads `self.buf.chunk()[0]`, then `self.buf.advance(1)`, yielding one byte per step; `size_hint` returns `(rem, Some(rem))` from `self.buf.remaining()`. The corresponding `Iterator for BufCursor` and `BufCursor::single` are removed in cursor.rs, so iteration computes from its owner's own bounds instead of forwarding into the shared cursor path.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Byte iteration is fully self-contained in its owning type after the repair: it yields each remaining byte exactly once, reports exact size hints, and computes from its owner's own bounds rather than by forwarding into another responsibility's runtime path.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch removes the io::Read/io::BufRead/io::Write/Iterator impls and the `single` constructor from BufCursor, but does NOT remove the `consumed: usize` field from the `BufCursor` struct, nor the `self.consumed += requested`/`self.consumed += len` increments in `advance`, `copy_to_bytes`, and `advance_mut`. No adapter in the new layout reports this counter — Take, Limit, and Chain only delegate cursor calls and never read `consumed` — so it is scaffolding left without a purpose that the rubric explicitly requires to be gone.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Scaffolding that the chosen repair leaves without a purpose is actually removed: the internal multi-responsibility engine type and its module registration, the per-cursor byte-traffic counter that no adapter reports, and the placeholder Buf/BufMut implementations that existed only to back the engine's default region bound are all gone from the crate when the new layout no longer needs them.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch only removes BufCursor from Reader/Writer/IntoIter. It leaves chain.rs, limit.rs, and take.rs unchanged from the smell: they still hold `cursor: BufCursor<...>` and forward every method to it (e.g. `Take::remaining` -> `self.cursor.remaining()`, `Limit::chunk_mut` -> `self.cursor.chunk_mut()`, `Chain::advance` -> `self.cursor.advance(cnt)`), so the adapter family still contains cosmetic forwarding shells around the internal coordinator. `BufCursor.consumed` also remains a write-only bookkeeping field.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair does not leave the adapter family as cosmetic forwarding shells: no module wiring, import, type declaration or accessor remains whose only job is to forward to a retired internal coordinator, and no unreachable bookkeeping field or dead sweeping helper is kept alongside the new owners.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch deletes BufCursor's fused io/iterator mode rules (impl Read, BufRead, Write, and Iterator) and the single constructor, then restores Reader, Writer, and IntoIter to direct buf fields with their own read/write/next logic. The retained BufCursor still separates modes by tail: the None/single path clamps remaining/chunk by limit and does limit -= cnt once; the Some/paired path does two-region drain without decrementing limit, so single-region adapters do not inherit paired drain and Chain does not gain an active window budget.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not fuse mode rules that apply to different adapters: single-region cursors (the window adapters, the io bridges, iteration) must not inherit two-region drain behavior, the two-region adapter must not gain window clamps or budget decrements it never had, and no remaining/chunk clamp or per-transfer budget decrement may be dropped or applied twice.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "smell.diff shows reader/writer modules stay behind `#[cfg(feature = \"std\")]` in mod.rs, and agent.patch does not alter mod.rs. In agent.patch, `cursor.rs` retains `#[cfg(feature = \"std\")] use std::io::IoSlice;` and `#[cfg(feature = \"std\")] fn chunks_vectored`, while removing the internal `Read`/`BufRead`/`Write`/`Iterator` impls from `BufCursor`. `reader.rs` and `writer.rs` regain direct `io::Read`/`io::BufRead` and `io::Write` impls in the std-gated modules, and `iter.rs` regains a direct core `Iterator` impl. Public adapter capabilities remain unchanged: Take/Limit/Chain still forward to `BufCursor`, Reader/Writer/IntoIter still expose the same io/iterator behavior.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not narrow or widen the runtime surface under feature gates: the io bridges and the vectored chunk path remain available exactly when std is enabled and remain absent from no-std builds, and no adapter type gains or loses observable capability relative to the pre-consolidation crate.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch only modifies src/buf/cursor.rs, src/buf/iter.rs, src/buf/reader.rs, and src/buf/writer.rs; no test files, assertions, expectations, or test cases are modified, relaxed, deleted, or skipped.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The crate's tests are not modified, weakened or deleted in the process: no assertion is relaxed, no expectation updated, and no test removed or skipped to make the repaired crate pass.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0,
+    "associated_changes": 0.5,
+    "core_resolution": 1
+  },
+  "valid_count": 11,
+  "pass_count": 8,
+  "must_have_pass": false,
+  "macro_score": 0.625
+}

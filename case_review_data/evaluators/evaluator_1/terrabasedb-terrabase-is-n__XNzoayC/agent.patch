@@ -1,0 +1,567 @@
+diff --git a/server/src/engine/storage/common/interface/fs.rs b/server/src/engine/storage/common/interface/fs.rs
+index c813929..47c1342 100644
+--- a/server/src/engine/storage/common/interface/fs.rs
++++ b/server/src/engine/storage/common/interface/fs.rs
+@@ -232,26 +232,26 @@ impl FileSystem {
+ 
+ /*
+     file traits
++
++    The file capability surface is split across several narrow traits, one per
++    direction a disk-backed handle can meaningfully support. A handle implements
++    only the traits it can honor; there is no umbrella trait that a read-only or
++    write-only handle has to stub out with a runtime refusal. Composite readers
++    and writers then declare exactly the capabilities they consume, as a
++    combination of these traits.
+ */
+ 
+-/// The single file capability interface of the storage engine.
+-///
+-/// This bundles every low-level file capability the engine needs into one
+-/// interface: sequential reads and writes, durability (fsync/truncate) and
+-/// position/length access. Handles that cannot honor one of these directions
+-/// are expected to reject it at runtime.
+-pub trait FileIo {
+-    /*
+-        sequential reads
+-    */
++/// Sequential reads from a file handle.
++pub trait FileRead {
+     fn fread_exact(&mut self, buf: &mut [u8]) -> IoResult<()>;
+     fn fread_exact_block<const N: usize>(&mut self) -> IoResult<[u8; N]> {
+         let mut blk = [0; N];
+         self.fread_exact(&mut blk).map(|_| blk)
+     }
+-    /*
+-        sequential writes
+-    */
++}
++
++/// Sequential writes to a file handle.
++pub trait FileWrite {
+     fn fwrite(&mut self, buf: &[u8]) -> IoResult<u64>;
+     fn fwrite_all(&mut self, buf: &[u8]) -> IoResult<()> {
+         self.fwrite_all_count(buf).1
+@@ -278,31 +278,44 @@ pub trait FileIo {
+         }
+         (written, Ok(()))
+     }
+-    /*
+-        durability
+-    */
++}
++
++/// Durability for a writable file handle: flushing pending data (and metadata)
++/// and truncating the underlying storage to a requested size.
++pub trait FileSync {
+     fn fsync_all(&mut self) -> IoResult<()>;
+     fn fsync_data(&mut self) -> IoResult<()>;
+     fn f_truncate(&mut self, new_size: u64) -> IoResult<()>;
+-    /*
+-        position/length access
+-    */
+-    fn f_len(&self) -> IoResult<u64>;
++}
++
++/// Moving the read/write cursor of a file handle.
++pub trait FileSeek {
+     fn f_cursor(&mut self) -> IoResult<u64>;
+     fn f_seek_start(&mut self, offset: u64) -> IoResult<()>;
+ }
+ 
++/// Reporting the length of a file handle.
++pub trait FileLength {
++    fn f_len(&self) -> IoResult<u64>;
++}
++
+ /*
+     file impls
+ */
+ 
+-impl FileIo for File {
++// a `File` is opened read+write, so it honors every capability by delegating to
++// its inner handle (a real file, or a virtual file under tests)
++impl FileRead for File {
+     fn fread_exact(&mut self, buf: &mut [u8]) -> IoResult<()> {
+         self.f.fread_exact(buf)
+     }
++}
++impl FileWrite for File {
+     fn fwrite(&mut self, buf: &[u8]) -> IoResult<u64> {
+         self.f.fwrite(buf)
+     }
++}
++impl FileSync for File {
+     fn fsync_all(&mut self) -> IoResult<()> {
+         self.f.fsync_all()
+     }
+@@ -312,9 +325,13 @@ impl FileIo for File {
+     fn f_truncate(&mut self, new_size: u64) -> IoResult<()> {
+         self.f.f_truncate(new_size)
+     }
++}
++impl FileLength for File {
+     fn f_len(&self) -> IoResult<u64> {
+         self.f.f_len()
+     }
++}
++impl FileSeek for File {
+     fn f_cursor(&mut self) -> IoResult<u64> {
+         self.f.f_cursor()
+     }
+@@ -360,16 +377,23 @@ impl LocalFile for BufWriter<std_fs::File> {
+ }
+ 
+ /*
+-    impls for FileIo
++    impls for capability traits
+ */
+ 
+-impl<Lf: LocalFile> FileIo for Lf {
++// a backed, locally-resident `std::fs::File` (plain, buffered-read or
++// buffered-write) can honor every capability: the open flags, not the wrapper,
++// gate which directions are actually exercised
++impl<Lf: LocalFile> FileRead for Lf {
+     fn fread_exact(&mut self, buf: &mut [u8]) -> IoResult<()> {
+         self._mut().read_exact(buf)
+     }
++}
++impl<Lf: LocalFile> FileWrite for Lf {
+     fn fwrite(&mut self, buf: &[u8]) -> IoResult<u64> {
+         self._mut().write(buf).map(|x| x as u64)
+     }
++}
++impl<Lf: LocalFile> FileSync for Lf {
+     fn fsync_all(&mut self) -> IoResult<()> {
+         self._mut().sync_all()
+     }
+@@ -379,9 +403,13 @@ impl<Lf: LocalFile> FileIo for Lf {
+     fn f_truncate(&mut self, new_size: u64) -> IoResult<()> {
+         self._mut().set_len(new_size)
+     }
++}
++impl<Lf: LocalFile> FileLength for Lf {
+     fn f_len(&self) -> IoResult<u64> {
+         self._ref().metadata().map(|md| md.len())
+     }
++}
++impl<Lf: LocalFile> FileSeek for Lf {
+     fn f_cursor(&mut self) -> IoResult<u64> {
+         self._mut().stream_position()
+     }
+@@ -390,20 +418,15 @@ impl<Lf: LocalFile> FileIo for Lf {
+     }
+ }
+ 
+-// in-memory buffer handle (used for the metadata block tests): the merged file
+-// interface obligates the buffer to take a position on every direction; the
+-// read and cursor directions are refused, while writes append as usual
+-impl FileIo for Vec<u8> {
+-    fn fread_exact(&mut self, _buf: &mut [u8]) -> IoResult<()> {
+-        Err(Error::new(
+-            ErrorKind::Unsupported,
+-            "in-memory buffer is write-only",
+-        )
+-        .into())
+-    }
++// in-memory buffer handle (used for the metadata block tests): the buffer only
++// appends writes and knows its own length, so it implements just those
++// capabilities — read and cursor access are absent rather than refused
++impl FileWrite for Vec<u8> {
+     fn fwrite(&mut self, buf: &[u8]) -> IoResult<u64> {
+         Write::write(self, buf).map(|x| x as u64)
+     }
++}
++impl FileSync for Vec<u8> {
+     fn fsync_all(&mut self) -> IoResult<()> {
+         Ok(())
+     }
+@@ -423,23 +446,11 @@ impl FileIo for Vec<u8> {
+             .into()),
+         }
+     }
++}
++impl FileLength for Vec<u8> {
+     fn f_len(&self) -> IoResult<u64> {
+         Ok(self.len() as u64)
+     }
+-    fn f_cursor(&mut self) -> IoResult<u64> {
+-        Err(Error::new(
+-            ErrorKind::Unsupported,
+-            "in-memory buffer has no cursor",
+-        )
+-        .into())
+-    }
+-    fn f_seek_start(&mut self, _offset: u64) -> IoResult<()> {
+-        Err(Error::new(
+-            ErrorKind::Unsupported,
+-            "in-memory buffer has no cursor",
+-        )
+-        .into())
+-    }
+ }
+ 
+ /*
+@@ -447,7 +458,7 @@ impl FileIo for Vec<u8> {
+ */
+ 
+ #[cfg(test)]
+-impl<Lf: FileIo> FileIo for AnyFile<Lf> {
++impl<Lf: FileRead> FileRead for AnyFile<Lf> {
+     fn fread_exact(&mut self, buf: &mut [u8]) -> IoResult<()> {
+         match self {
+             Self::Local(lf) => lf.fread_exact(buf),
+@@ -456,6 +467,9 @@ impl<Lf: FileIo> FileIo for AnyFile<Lf> {
+                 .with_file_mut(&vf.0, |f| f.fread_exact(buf)),
+         }
+     }
++}
++#[cfg(test)]
++impl<Lf: FileWrite> FileWrite for AnyFile<Lf> {
+     fn fwrite(&mut self, buf: &[u8]) -> IoResult<u64> {
+         match self {
+             Self::Local(lf) => lf.fwrite(buf),
+@@ -464,6 +478,9 @@ impl<Lf: FileIo> FileIo for AnyFile<Lf> {
+                 .with_file_mut(&vf.0, |f| f.fwrite(buf)),
+         }
+     }
++}
++#[cfg(test)]
++impl<Lf: FileSync> FileSync for AnyFile<Lf> {
+     fn fsync_all(&mut self) -> IoResult<()> {
+         match self {
+             Self::Local(lf) => lf.fsync_all(),
+@@ -484,6 +501,9 @@ impl<Lf: FileIo> FileIo for AnyFile<Lf> {
+                 .with_file_mut(&vf.0, |f| f.truncate(new_size)),
+         }
+     }
++}
++#[cfg(test)]
++impl<Lf: FileLength> FileLength for AnyFile<Lf> {
+     fn f_len(&self) -> IoResult<u64> {
+         match self {
+             Self::Local(lf) => lf.f_len(),
+@@ -492,6 +512,9 @@ impl<Lf: FileIo> FileIo for AnyFile<Lf> {
+                 .with_file(&vf.0, |f| f.length()),
+         }
+     }
++}
++#[cfg(test)]
++impl<Lf: FileSeek> FileSeek for AnyFile<Lf> {
+     fn f_cursor(&mut self) -> IoResult<u64> {
+         match self {
+             Self::Local(lf) => lf.f_cursor(),
+@@ -627,35 +650,14 @@ impl BufferedReader {
+     }
+ }
+ 
+-// buffered read-side handle: the write and durability directions of the merged
+-// file interface are refused, since this handle is opened for reading
+-impl FileIo for BufferedReader {
++// buffered read-side handle: opened for reading, so it surfaces only the read,
++// seek and length capabilities — there is no write or durability surface
++impl FileRead for BufferedReader {
+     fn fread_exact(&mut self, buf: &mut [u8]) -> IoResult<()> {
+         self.f.fread_exact(buf)
+     }
+-    fn fwrite(&mut self, _buf: &[u8]) -> IoResult<u64> {
+-        Err(Error::new(ErrorKind::Unsupported, "buffered reader is read-only").into())
+-    }
+-    fn fsync_all(&mut self) -> IoResult<()> {
+-        Err(Error::new(
+-            ErrorKind::Unsupported,
+-            "buffered reader does not manage durability",
+-        )
+-        .into())
+-    }
+-    fn fsync_data(&mut self) -> IoResult<()> {
+-        Err(Error::new(
+-            ErrorKind::Unsupported,
+-            "buffered reader does not manage durability",
+-        )
+-        .into())
+-    }
+-    fn f_truncate(&mut self, _new_size: u64) -> IoResult<()> {
+-        Err(Error::new(ErrorKind::Unsupported, "buffered reader is read-only").into())
+-    }
+-    fn f_len(&self) -> IoResult<u64> {
+-        self.f.f_len()
+-    }
++}
++impl FileSeek for BufferedReader {
+     fn f_cursor(&mut self) -> IoResult<u64> {
+         self.f.f_cursor()
+     }
+@@ -663,6 +665,11 @@ impl FileIo for BufferedReader {
+         self.f.f_seek_start(offset)
+     }
+ }
++impl FileLength for BufferedReader {
++    fn f_len(&self) -> IoResult<u64> {
++        self.f.f_len()
++    }
++}
+ 
+ pub struct BufferedWriter {
+     #[cfg(test)]
+@@ -726,15 +733,14 @@ impl BufferedWriter {
+     }
+ }
+ 
+-// buffered write-side handle: the read and position/length directions of the
+-// merged file interface are refused, since this handle is opened for writing
+-impl FileIo for BufferedWriter {
+-    fn fread_exact(&mut self, _buf: &mut [u8]) -> IoResult<()> {
+-        Err(Error::new(ErrorKind::Unsupported, "buffered writer is write-only").into())
+-    }
++// buffered write-side handle: opened for writing, so it surfaces only the write
++// and durability capabilities — there is no read, seek or length surface
++impl FileWrite for BufferedWriter {
+     fn fwrite(&mut self, buf: &[u8]) -> IoResult<u64> {
+         self.f.fwrite(buf)
+     }
++}
++impl FileSync for BufferedWriter {
+     fn fsync_all(&mut self) -> IoResult<()> {
+         self.f.fsync_all()
+     }
+@@ -744,13 +750,4 @@ impl FileIo for BufferedWriter {
+     fn f_truncate(&mut self, new_size: u64) -> IoResult<()> {
+         self.f.f_truncate(new_size)
+     }
+-    fn f_len(&self) -> IoResult<u64> {
+-        Err(Error::new(ErrorKind::Unsupported, "buffered writer is write-only").into())
+-    }
+-    fn f_cursor(&mut self) -> IoResult<u64> {
+-        Err(Error::new(ErrorKind::Unsupported, "buffered writer is write-only").into())
+-    }
+-    fn f_seek_start(&mut self, _offset: u64) -> IoResult<()> {
+-        Err(Error::new(ErrorKind::Unsupported, "buffered writer is write-only").into())
+-    }
+ }
+diff --git a/server/src/engine/storage/common/interface/vfs.rs b/server/src/engine/storage/common/interface/vfs.rs
+index 4618828..7617067 100644
+--- a/server/src/engine/storage/common/interface/vfs.rs
++++ b/server/src/engine/storage/common/interface/vfs.rs
+@@ -54,7 +54,7 @@ pub mod vfs_utils {
+     );
+     /// WARNING: A random write crash automatically degrades to a [`WriteCrashKind::Zero`] as soon as it completes
+     /// to prevent any further data writes (due to retries in
+-    /// [`fs::FileIo::fwrite_all_count`](super::super::fs::FileIo::fwrite_all_count))
++    /// [`fs::FileWrite::fwrite_all_count`](super::super::fs::FileWrite::fwrite_all_count))
+     pub fn debug_enable_random_write_crash() {
+         local_mut!(RANDOM_WRITE_CRASH, |crash| *crash = WriteCrashKind::Random)
+     }
+diff --git a/server/src/engine/storage/common/sdss/impls/sdss_r1/mod.rs b/server/src/engine/storage/common/sdss/impls/sdss_r1/mod.rs
+index 96eafa3..2ae3b37 100644
+--- a/server/src/engine/storage/common/sdss/impls/sdss_r1/mod.rs
++++ b/server/src/engine/storage/common/sdss/impls/sdss_r1/mod.rs
+@@ -42,7 +42,7 @@ use {
+         engine::{
+             error::StorageError,
+             mem::unsafe_apis::memcpy,
+-            storage::common::interface::fs::{File, FileIo},
++            storage::common::interface::fs::{File, FileRead, FileWrite},
+             RuntimeResult,
+         },
+         util::{compiler::TaggedEnum, os},
+@@ -437,7 +437,7 @@ pub trait FileSpecV1: Sized {
+         Ok((f, md))
+     }
+     /// write metadata
+-    fn _write_metadata(f: &mut impl FileIo, args: Self::EncodeArgs) -> IoResult<Self::Metadata>;
++    fn _write_metadata(f: &mut impl FileWrite, args: Self::EncodeArgs) -> IoResult<Self::Metadata>;
+     /// upgrade this file
+     fn upgrade_file(
+         orig_path: impl AsRef<Path>,
+@@ -504,7 +504,7 @@ impl<Sfs: SimpleFileSpecV1> FileSpecV1 for Sfs {
+             Err(md)
+         }
+     }
+-    fn _write_metadata(f: &mut impl FileIo, _: Self::EncodeArgs) -> IoResult<Self::Metadata> {
++    fn _write_metadata(f: &mut impl FileWrite, _: Self::EncodeArgs) -> IoResult<Self::Metadata> {
+         let (md, block) = HeaderV1::<Self::HeaderSpec>::encode_return(
+             Self::FILE_CLASS,
+             Self::FILE_SPECIFIER,
+diff --git a/server/src/engine/storage/common/sdss/impls/sdss_r1/rw.rs b/server/src/engine/storage/common/sdss/impls/sdss_r1/rw.rs
+index 5e1fc0d..0530f9e 100644
+--- a/server/src/engine/storage/common/sdss/impls/sdss_r1/rw.rs
++++ b/server/src/engine/storage/common/sdss/impls/sdss_r1/rw.rs
+@@ -32,7 +32,9 @@ use {
+             mem::fixed_vec::FixedVec,
+             storage::common::{
+                 checksum::SCrc64,
+-                interface::fs::{BufferedReader, File, FileIo},
++                interface::fs::{
++                    BufferedReader, File, FileLength, FileRead, FileSeek, FileSync, FileWrite,
++                },
+                 sdss::sdss_r1::FileSpecV1,
+             },
+             RuntimeResult,
+@@ -102,47 +104,59 @@ impl<S: FileSpecV1> SdssFile<S> {
+     }
+ }
+ 
+-impl<S: FileSpecV1, F: FileIo> SdssFile<S, F> {
++impl<S: FileSpecV1, F: FileRead> SdssFile<S, F> {
+     /// Attempt to fill the entire buffer from the file
+     pub fn read_buffer(&mut self, buffer: &mut [u8]) -> IoResult<()> {
+         self.file.fread_exact(buffer)
+     }
+-    /// Read the entire part of the remaining file into memory
+-    pub fn read_full(&mut self) -> IoResult<Vec<u8>> {
+-        let len = self.file_length()? - self.file_cursor()?;
+-        let mut buf = vec![0; len as usize];
+-        self.read_buffer(&mut buf)?;
+-        Ok(buf)
+-    }
++}
++impl<S: FileSpecV1, F: FileSeek> SdssFile<S, F> {
+     /// Get the current position of the file
+     pub fn file_cursor(&mut self) -> IoResult<u64> {
+         self.file.f_cursor()
+     }
++    /// Move the cursor `n` bytes from the start
++    pub fn seek_from_start(&mut self, n: u64) -> IoResult<()> {
++        self.file.f_seek_start(n)
++    }
++}
++impl<S: FileSpecV1, F: FileLength> SdssFile<S, F> {
+     /// Get the length of the file
+     pub fn file_length(&self) -> IoResult<u64> {
+         self.file.f_len()
+     }
+-    /// Move the cursor `n` bytes from the start
+-    pub fn seek_from_start(&mut self, n: u64) -> IoResult<()> {
+-        self.file.f_seek_start(n)
++}
++impl<S: FileSpecV1, F: FileRead + FileSeek + FileLength> SdssFile<S, F> {
++    /// Read the entire part of the remaining file into memory
++    pub fn read_full(&mut self) -> IoResult<Vec<u8>> {
++        let len = self.file_length()? - self.file_cursor()?;
++        let mut buf = vec![0; len as usize];
++        self.read_buffer(&mut buf)?;
++        Ok(buf)
+     }
++}
++impl<S: FileSpecV1, F: FileWrite> SdssFile<S, F> {
+     /// Attempt to write the entire buffer into the file
+     pub fn write_buffer(&mut self, data: &[u8]) -> IoResult<()> {
+         self.file.fwrite_all(data)
+     }
++}
++impl<S: FileSpecV1, F: FileSync> SdssFile<S, F> {
+     /// Sync all data and metadata permanently
+     pub fn fsync_all(&mut self) -> IoResult<()> {
+         self.file.fsync_all()?;
+         Ok(())
+     }
++    pub fn truncate(&mut self, new_size: u64) -> IoResult<()> {
++        self.file.f_truncate(new_size)
++    }
++}
++impl<S: FileSpecV1, F: FileWrite + FileSync> SdssFile<S, F> {
+     /// Write a block followed by an explicit fsync call
+     pub fn fsynced_write(&mut self, data: &[u8]) -> IoResult<()> {
+         self.file.fwrite_all(data)?;
+         self.file.fsync_all()
+     }
+-    pub fn truncate(&mut self, new_size: u64) -> IoResult<()> {
+-        self.file.f_truncate(new_size)
+-    }
+ }
+ 
+ /*
+diff --git a/server/src/engine/storage/common/sdss/impls/sdss_r1/upgrades.rs b/server/src/engine/storage/common/sdss/impls/sdss_r1/upgrades.rs
+index 138360c..1e15e79 100644
+--- a/server/src/engine/storage/common/sdss/impls/sdss_r1/upgrades.rs
++++ b/server/src/engine/storage/common/sdss/impls/sdss_r1/upgrades.rs
+@@ -28,7 +28,7 @@ use {
+     crate::{
+         engine::{
+             fractal::context,
+-            storage::common::interface::fs::{File, FileSystem, FileIo},
++            storage::common::interface::fs::{File, FileSystem, FileSeek, FileWrite},
+             RuntimeResult,
+         },
+         util::os,
+diff --git a/server/src/engine/storage/v1/raw/rw.rs b/server/src/engine/storage/v1/raw/rw.rs
+index ae1a725..0fa04d7 100644
+--- a/server/src/engine/storage/v1/raw/rw.rs
++++ b/server/src/engine/storage/v1/raw/rw.rs
+@@ -28,7 +28,10 @@ use crate::{
+     engine::{
+         storage::common::{
+             checksum::SCrc64,
+-            interface::fs::{BufferedReader, BufferedWriter, File, FileIo},
++            interface::fs::{
++                BufferedReader, BufferedWriter, File, FileLength, FileRead, FileSeek, FileSync,
++                FileWrite,
++            },
+             sdss,
+         },
+         RuntimeResult,
+@@ -169,25 +172,33 @@ impl<F> SDSSFileIO<F> {
+     }
+ }
+ 
+-impl<F: FileIo> SDSSFileIO<F> {
++impl<F: FileRead> SDSSFileIO<F> {
+     pub fn read_buffer(&mut self, buffer: &mut [u8]) -> IoResult<()> {
+         self.f.fread_exact(buffer)
+     }
++}
++impl<F: FileSeek> SDSSFileIO<F> {
+     pub fn file_cursor(&mut self) -> IoResult<u64> {
+         self.f.f_cursor()
+     }
+-    pub fn file_length(&self) -> IoResult<u64> {
+-        self.f.f_len()
+-    }
+     pub fn seek_from_start(&mut self, by: u64) -> IoResult<()> {
+         self.f.f_seek_start(by)
+     }
++}
++impl<F: FileLength> SDSSFileIO<F> {
++    pub fn file_length(&self) -> IoResult<u64> {
++        self.f.f_len()
++    }
++}
++impl<F: FileRead + FileSeek + FileLength> SDSSFileIO<F> {
+     pub fn read_full(&mut self) -> IoResult<Vec<u8>> {
+         let len = self.file_length()? - self.file_cursor()?;
+         let mut buf = vec![0; len as usize];
+         self.read_buffer(&mut buf)?;
+         Ok(buf)
+     }
++}
++impl<F: FileWrite + FileSync> SDSSFileIO<F> {
+     pub fn fsynced_write(&mut self, data: &[u8]) -> IoResult<()> {
+         self.f.fwrite_all(data)?;
+         self.f.fsync_all()
+diff --git a/server/src/engine/storage/v2/raw/journal/raw/mod.rs b/server/src/engine/storage/v2/raw/journal/raw/mod.rs
+index 71d9887..1198516 100644
+--- a/server/src/engine/storage/v2/raw/journal/raw/mod.rs
++++ b/server/src/engine/storage/v2/raw/journal/raw/mod.rs
+@@ -35,7 +35,7 @@ use {
+             mem::unsafe_apis::memcpy,
+             storage::common::{
+                 checksum::SCrc64,
+-                interface::fs::{File, FileSystem, FileIo},
++                interface::fs::{File, FileSystem, FileSeek, FileSync},
+                 sdss::sdss_r1::{
+                     rw::{SdssFile, TrackedReader, TrackedWriter},
+                     FileSpecV1,
+diff --git a/server/src/engine/storage/v2/raw/journal/raw/tests/recovery.rs b/server/src/engine/storage/v2/raw/journal/raw/tests/recovery.rs
+index bfb4e06..c206718 100644
+--- a/server/src/engine/storage/v2/raw/journal/raw/tests/recovery.rs
++++ b/server/src/engine/storage/v2/raw/journal/raw/tests/recovery.rs
+@@ -33,7 +33,7 @@ use {
+             storage::{
+                 common::{
+                     interface::{
+-                        fs::{File, FileSystem, FileIo},
++                        fs::{File, FileSystem, FileLength, FileSync, FileWrite},
+                         vfs_utils,
+                     },
+                     sdss::sdss_r1::FileSpecV1,

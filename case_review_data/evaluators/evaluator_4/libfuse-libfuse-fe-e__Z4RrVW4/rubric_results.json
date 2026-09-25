@@ -1,0 +1,180 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The agent's patch does not modify fuse_signals.c at all. The smell's session_exit_from_signal() in fuse_signals.c still directly performs the session-exit transition as surgery on the session record: atomic_store_explicit(&se->mt_exited, 1, memory_order_relaxed), sem_post(&se->mt_finish), and se->error = sig. The rubric requires this transition be moved behind a session-module interface while the signal module retains only signal concerns; the agent instead only refactored the loop wind-down (fuse_session_end for io_uring cleanup and error fold) and left the signal teardown path untouched.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The signal teardown path no longer performs the session-exit transition (storing the exit flag, posting the wakeup semaphore, recording the error) as direct surgery on the session record: the transition is requested through an interface of the session module or performed inside the session implementation, while the signal module retains only signal concerns (its registration guard, its debug log line, and the negative-signal backtrace-and-abort policy).",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The rubric requires the single-threaded loop to consult the session through session interfaces for both exit polling and exit result. smell.diff introduced a raw atomic loop head in lib/fuse_loop.c: while (!atomic_load_explicit(&se->mt_exited, memory_order_relaxed)). agent.patch modifies only the tail of fuse_session_loop_30(), replacing direct se->error/se->uring.pool handling with fuse_session_end(se, res), but includes no hunk changing the loop head. The raw atomic access to se->mt_exited remains, so exit polling is still not going through the session module interface.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The single-threaded request loop consults the session through the session module's interfaces for both its exit polling and its exit result: no raw atomic access to the session's exit flag in the loop head, and no direct reads of the session's recorded error or its io_uring pool to derive what the loop returns (a session-side loop-result function, or equivalent session-owned exit-status and result interfaces, both count).",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch does not touch `session_mt_begin_shutdown()` in lib/fuse_loop_mt.c; that loop-module helper still performs the shutdown wait via `while (!atomic_load_explicit(&se->mt_exited, memory_order_relaxed)) sem_wait(&se->mt_finish);`, logs under `se->debug`, and takes `se->mt_lock` by direct member surgery. The agent only moved io_uring teardown/error folding into `fuse_session_end()`, leaving the wait-until-exited and shutdown debug message in the loop module rather than requesting them from the session.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The multi-thread loop's shutdown sequencing is session-side for the parts that are session business: waiting until the session is exited and the accompanying shutdown debug message are requested from (or performed by) the session module rather than by direct member surgery from the loop module. Taking the worker-list lock directly around the loop module's own worker-cancel walk is acceptable.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch does not touch the mount-related session-state writes at all. In the smell.diff, fuse_session_mount_publish() and fuse_session_mount_unwind() are implemented in lib/mount.c and directly write session fields (se->fd, se->mountpoint, se->auto_unmount_fd, se->error, se->is_sync_init). The agent.patch modifies only fuse_i.h, fuse_loop.c, fuse_loop_mt.c, and fuse_lowlevel.c (adding fuse_session_end for io_uring/error wind-down), plus an unrelated .pyc file. It does not move fuse_session_mount_publish or fuse_session_mount_unwind out of mount.c into the session implementation, nor does it alter the mount code in fuse_lowlevel.c that calls them. Therefore the mount module still decides the session's channel state by writing the session record directly.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The mount module no longer decides the session's channel state by writing the session record: adopting the auto-unmount fd into the session, publishing the channel fd and mountpoint after a successful mount, and the failure-path channel invalidation (fd, recorded error, sync-init flag) all happen inside the session implementation or behind session-owned interfaces, so the mount code keeps only mount mechanics.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch adds a new internal session operation `fuse_session_end` in fuse_lowlevel.c and declares it in the private fuse_i.h. Both fuse_loop.c and fuse_loop_mt.c replace their open-coded `se->uring.pool`/`se->error` teardown with calls to this session-owned function, relocating the post-loop wind-down to the session module rather than merely renaming or re-wrapping a consumer-local helper.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No resolution-by-cosmetics: the teardown, loop and mount code does not merely rename or reshape its local helpers while keeping the same direct member surgery on session fields inside the consumer modules (e.g., the same flag store, semaphore post and error write re-wrapped in another local helper of the same module, or the loop simply inlining what its helper did).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The request requires preserving signal behavior, loop return values, and io_uring cleanup. agent.patch keeps io_uring teardown and session-error folding in fuse_session_end() (fuse_lowlevel.c: if se->uring.pool fuse_uring_stop; if se->error != 0 res = se->error) and routes both fuse_session_loop_30 and fuse_session_loop_mt_312 through it. fuse_loop.c still zeroes positive res before calling fuse_session_end, so a last-read length is not returned; fuse_loop_mt.c still folds mt.error via fuse_session_end. The patch does not modify fuse_signals.c, so the smell's sem_post wake on exit and the sig<0 log/abort path remain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No behavior was deleted to make the refactor easier: waking the parked loops on session exit is preserved, the negative-signal backtrace-and-abort path is preserved, io_uring teardown on loop exit is preserved, and the loop result discipline is not weakened (the length of the last read request is still never returned as the loop result).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch adds the new cross-TU session lifecycle helper `int fuse_session_end(struct fuse_session *se, int res);` to the private header `lib/fuse_i.h` and defines it in `fuse_lowlevel.c`, then calls it from both `fuse_loop.c` and `fuse_loop_mt.c`. It is not placed in a public header, and no single-file session helper is needlessly exported.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "New session-module interfaces that are used across translation units are declared in the library's private (library-internal) header, and functions added to the session implementation that only one file needs are kept file-local rather than needlessly exported into that shared header.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent.patch only modifies lib/fuse_i.h, lib/fuse_loop.c, lib/fuse_loop_mt.c, and lib/fuse_lowlevel.c (plus an added .pyc); it does not touch lib/mount_i_linux.h or lib/mount.c. Consequently, the smell.diff's mount-side session API remains exposed: the prototypes `fuse_session_mount_publish` and `fuse_session_mount_unwind`, the added `#include <sys/types.h>`, the `struct fuse_session;` forward declaration in mount_i_linux.h, and the transitional comments at the rewired mount call sites are all left in place. The rubric requires these unnecessary cross-module declarations and stale comments to be removed, but they are not.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Cross-module declarations the refactor made unnecessary are removed together with the code that used them: no prototypes, forward declarations or extra includes remain in the mount-internal header for mount-side session operations that no longer exist, and no stale transitional comments describe the hand-rolled arrangement at the rewired call sites.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only touches private files under lib/ (fuse_i.h, fuse_loop.c, fuse_loop_mt.c, fuse_lowlevel.c) and an unrelated .pyc; it does not edit any header under include/. The new fuse_session_end is declared in the private lib/fuse_i.h and defined in lib/fuse_lowlevel.c without a FUSE_SYMVER tag or version-script entry, so no new public symbol is exported. No version script file is modified, and the FUSE_SYMVER versioned entry points (fuse_session_loop_30, fuse_session_loop_mt_312) retain their version tags.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The public surface is untouched: no edits to headers under the library's public include directory, no new symbols exported from the shared library, and no changes to the symbol version script or the versioned compatibility entry points.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only touches fuse_i.h, fuse_loop.c, fuse_loop_mt.c, and fuse_lowlevel.c; it leaves the starting tree's auxiliaries in place. session_exit_from_signal() remains in fuse_signals.c directly writing se->mt_exited and sem_post(&se->mt_finish); session_mt_begin_shutdown() remains in fuse_loop_mt.c polling se->mt_exited and locking se->mt_lock; fuse_session_loop_30 still reads se->mt_exited via atomic_load_explicit; and fuse_session_mount_publish/fuse_session_mount_unwind remain implemented in mount.c rather than absorbed into the session module. These helpers survive live but are not reduced to session-interface calls, so the refactor leaves the transitional scaffolding behind.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The refactor leaves no dead scaffolding behind the transition: the auxiliaries the starting tree added to the signal, loop and mount modules are gone (absorbed into the session module or deleted outright) unless they remain live and reduced to session-interface calls, and every declaration that survives is still referenced.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch adds a new binary file scripts/__pycache__/release.cpython-312.pyc, a compiled Python bytecode artifact, which is a stray build/cache file left in the tree.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No editing-process artifacts are left in the tree: commented-out copies of the replaced code, backup or conflict files (.orig, .rej, .bak, *.patch.htm), stray debug printfs, or test/playground files added during the refactor.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The smell defines session_exit_from_signal() in lib/fuse_signals.c to log the teardown message when se->debug is set, store se->mt_exited=1, sem_post(&se->mt_finish), set se->error=sig, and for sig<0 print the assertion error, dump_stack(), and abort(). agent.patch contains no hunk modifying lib/fuse_signals.c; it only touches fuse_i.h, fuse_loop.c, fuse_loop_mt.c, fuse_lowlevel.c, and an unrelated .pyc file, so these teardown-signal semantics remain intact.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Teardown-signal semantics survive intact: receiving a teardown signal still marks the session exited, wakes loops parked on the session's semaphore, and records the signal value as the session error; with session debug set the teardown message is still logged; a negative signal value still prints the assertion error, dumps the backtrace, and aborts.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not modify mount.c, mount_i_linux.h, or the mount sections of fuse_lowlevel.c, so the mount-channel bookkeeping from the smell survives intact. fuse_session_mount_publish(se, fd, mountpoint) is still called in the out: path before fuse_daemonize_early_set_mounted(). fuse_session_mount_unwind still closes fd and sets se->fd=-1, se->error=err, se->is_sync_init=false on failure; still keeps sock_fd only when err==0 && se->mo->auto_unmount, otherwise closes it and reaps fusermount_pid via waitpid(); and still calls fuse_kern_umount_mountfd(mountfd) when setup_auto_unmount fails on the direct-mount path.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Mount-channel bookkeeping survives intact: success still publishes the channel fd and mountpoint to the session before the early-daemonize 'mounted' notification; failure still closes the channel fd before invalidating the session channel state, records the error, and clears the sync-init flag; the auto-unmount comm socket is still kept only when auto-unmount was requested and the mount succeeded, otherwise closed with the fusermount child reaped; helper-spawn failure on the direct-mount path still unmounts the mount fd.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In lib/fuse_loop_mt.c, the agent patch only removes the post-join `if (se->uring.pool) fuse_uring_stop(se);` and `if(se->error != 0) err = se->error;` lines, replacing them with `err = fuse_session_end(se, err);`. It does not modify the preceding shutdown sequence from smell.diff: `session_mt_begin_shutdown(se)` waits for exit and takes `se->mt_lock`, the loop cancels exactly `mt.main.next`-registered workers while the lock is held, then unlocks and joins them. No clone-fd, idle, or max thread config code is touched, so worker shutdown discipline and loop config semantics remain intact.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Worker shutdown discipline survives intact: the loop still waits for the session to be exited before cancelling exactly the registered workers with the worker-list lock held and then joining them, and the loop configuration semantics (clone-fd behavior, idle and max thread counts) are unchanged.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch does not modify fuse_signals.c or the session_mt_begin_shutdown helper in fuse_loop_mt.c; its fuse_loop_mt.c change only replaces the post-join io_uring_stop/error fold with err = fuse_session_end(se, err). Therefore the debug-gated teardown log in session_exit_from_signal and the FUSE_LOG_DEBUG \"fuse: session exited, terminating workers\" message emitted after mt_exited is observed remain unchanged from smell.diff.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Session debug logging still behaves the same in the repointed paths: the teardown log line is emitted under the same condition (session debug flag set), and the multi-thread shutdown message remains a debug-level message emitted when the session has been flagged exited.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 0.3333333333333333
+  },
+  "valid_count": 15,
+  "pass_count": 8,
+  "must_have_pass": false,
+  "macro_score": 0.49999999999999994
+}

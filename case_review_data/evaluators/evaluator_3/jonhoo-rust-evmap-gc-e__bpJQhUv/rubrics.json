@@ -1,0 +1,96 @@
+{
+  "schema_version": "smellbench.solve_rubrics.v3",
+  "execution_mode": "one_independent_call_per_rubric",
+  "aggregation": "macro_average_by_category",
+  "rubrics": [
+    {
+      "id": "R1",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the solver's patch, the writer-side handle type no longer has inherent impl blocks living in any module file other than the one that defines it (the crate root, the reader module, the guard module, and the factory module no longer contain impl blocks of that type).",
+      "rationale": "This is the structural heart of the centralized-coordinator problem in this crate: the injected case deliberately spread one type's implementation across five module files, so re-owning those impls is the resolution, whatever decomposition the solver chose to get there."
+    },
+    {
+      "id": "R2",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The writer-side handle no longer carries the total inherent-method load it had accumulated: counting all inherent methods defined on it across the crate, it ends within the range a cohesive type in this codebase plausibly owns (the read-side handle type is the natural yardstick), rather than retaining every absorbed responsibility under a new layout.",
+      "rationale": "Redistribution that keeps all responsibilities attached to the same type while merely relocating its impl blocks would leave the coordinator in place; this rubric catches that outcome."
+    },
+    {
+      "id": "R3",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Pair construction is again owned where the components are defined: construction of a writer together with its reader (both the value form and the empty/Default form) is implemented by crate-root or component-owned code, and any builder-style methods that remain on the writer handle are at most thin delegations to that code.",
+      "rationale": "Construction was the first responsibility the injected case moved onto the coordinator; the concrete case-specific facts are which capabilities (the free constructors new/new_from_empty and what they delegate to) must keep existing without becoming writer-type surface."
+    },
+    {
+      "id": "R4",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Reader-lifecycle responsibilities — registering additional readers against the shared epoch table and minting reader factories for other threads — are implemented by the reader side (the reader handle type, the reader's factory type, or helpers in the reader module), not as writer-handle methods that build read-side structs from writer-held fields.",
+      "rationale": "These are the responsibilities whose placement next to the epoch machinery and factory type made the crate’s modules impossible to read in isolation; re-homing them is instance-specific resolution, and equivalent shapes (free functions in the reader module, methods on the factory type, a registration helper) all satisfy it."
+    },
+    {
+      "id": "R5",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Entering the read side is again reader-owned machinery: the epoch-bump/fence/re-guarantee entry protocol (and the 'handle already dropped' parity restoration) is implemented on the read side, and any writer-side entry point that survives is a delegation to that machinery rather than a reimplementation that pokes reader-private epoch and enter counters directly.",
+      "rationale": "The injected case duplicated the memory-ordering-sensitive guard entry protocol onto the coordinator and widened a guard-internals helper to reach it; this rubric verifies that specific duplication was undone (delegating through the reader's existing entry path is an equally sound resolution)."
+    },
+    {
+      "id": "R6",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The intermediate visibility widenings that let foreign modules drive the writer's shared state are gone: the writer handle's epoch table, its held reader-side partner handle, and its last-known reader-progress fields are no longer reachable from other modules, and read-side internals (guard construction helper, reader struct fields, factory struct fields) are not left open for cross-module callers.",
+      "rationale": "Cross-module raw-field access is the mechanistic glue of this case’s coordinator; leaving the widenings in place would keep the coupling the task asks to remove even if the method count happens to drop."
+    },
+    {
+      "id": "R7",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The responsibilities were re-homed as complete chains rather than split across owners: both construction forms, reader registration and factory minting, snapshot tracking of reader epochs after swaps, and the writer's own pre-first-publish direct-read path each end up wholly owned (no half of a chain left on the coordinator while the other half moved).",
+      "rationale": "Partial extraction that leaves the coordinator mediating between two halves of the same responsibility keeps the worst maintenance property of the original drift while making it harder to see."
+    },
+    {
+      "id": "R8",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "should_have",
+      "criterion": "Comments and doc links across the touched modules describe the new ownership truthfully: no comment still documents cross-module reach-in arrangements (e.g., who else is allowed to call a read-side internals helper) as if they existed, and doc comments on the surviving public entry points match their actual implementation path.",
+      "rationale": "The injected case relied on shared-state reach-in being documented in the host modules; stale ownership prose is the residue a follow-up maintainer would trip over, so it belongs to the refactor's associated changes."
+    },
+    {
+      "id": "R9",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No re-homing scaffolding remains: no abandoned delegate-only impl blocks or forwarding families beyond the public API the crate already exposed, no unused imports or wildcard re-exports left behind by moved items, and no dead visibility widenings that the final layout no longer needs.",
+      "rationale": "Instance-specific because the injected case is built from delegating free constructors, widened fields, and cross-module imports — exactly the artifacts a rushed repair leaves dangling."
+    },
+    {
+      "id": "R10",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not weaken the concurrency argument: epoch bumping, fence placement, enter-counter parity restoration (including the dropped-handle cases), and post-swap snapshot ordering under the epoch-table lock carry over with equivalent memory-ordering reasoning, and no unsafe block gains obligations the read-side documentation cannot support.",
+      "rationale": "The case deliberately concentrates behavioral risk in the guard-entry cluster; a solver could pass structural checks while subtly re-sequencing the entry protocol, which this rubric catches."
+    },
+    {
+      "id": "R11",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not reduce the crate’s externally visible capability set to make the structure work: consumers can still construct pairs both ways, publish (blocking and opportunistic), wait, flush, apply write-side operations, enter and iterate through guards, spawn readers, mint and use factories from other threads, clone raw handles, and use the aliasing facade, with the same observable semantics as before the change.",
+      "rationale": "Deleting or degrading absorbed capabilities is the cheap way to make the coordinator disappear; this rubric pins the pre-existing capability envelope that any sound refactoring must preserve."
+    }
+  ]
+}
+ 

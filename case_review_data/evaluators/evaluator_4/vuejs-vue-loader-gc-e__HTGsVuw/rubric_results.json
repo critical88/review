@@ -1,0 +1,279 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The refactor request asks to separate cohesive pipeline parts into focused modules and leave the main loader coordinating. agent.patch only restores cssModules.ts and hotReload.ts and delegates those two calls from SFCLoader, but src/index.ts still contains the SFCLoader class with descriptor parsing/caching (loadSFC/cacheDescriptor/static descriptorCache/getDescriptor/setDescriptor/cleanQuery), language-block selection (selectBlock), script resolution (static resolveScript/canInlineTemplate), per-block proxy-module code generation (genScriptImport/genTemplateImport/genStyleImports/genCustomBlocksCode/finalizeComponentCode), and compiler-error formatting (static formatError). One class therefore still concentrates most SFC compilation responsibilities.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The main SFC entry (src/index.ts) no longer concentrates SFC compilation in one class-or-scope: the work is redistributed so that no remaining single class or single module still combines descriptor parsing/caching, language-block selection, script resolution, per-block proxy-module code generation, CSS-modules emission, hot-reload emission, and compiler-error formatting.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only extracts cssModules.ts and hotReload.ts back into separate modules. The descriptor cache and parsing remain as static members of the SFCLoader class inside index.ts (the entry): `static descriptorCache = new Map<string, SFCDescriptor>()`, `static setDescriptor(...)`, `static getDescriptor(...)`, and `private static cleanQuery(...)` are all still defined in index.ts. No dedicated descriptorCache.ts (or equivalent standalone owner module) is recreated. The plugins and template loader access descriptors via `SFCLoader.descriptorCache` / `SFCLoader.getDescriptor`, meaning the entry module itself remains the owner and holder of the cache, not a separate cohesive unit.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Descriptor parsing and its per-file descriptor cache now live in a dedicated cohesive owner (own module or equivalent unit), and that owner is the single addressable place for reading/writing descriptors from both the main request flow and other in-package consumers; the entry does not hold its own duplicate cache.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch extracts only CSS-modules and HMR codegen into src/cssModules.ts and src/hotReload.ts. It does not create a separate owner for script resolution: index.ts still keeps `static clientCache`, `static serverCache`, `static typeDepToSFCMap`, `static canInlineTemplate`, and `static resolveScript` inside the `SFCLoader` coordinator, and templateLoader.ts/pluginWebpack4.ts/pluginWebpack5.ts continue to call `SFCLoader.resolveScript`, `SFCLoader.clientCache`, and `SFCLoader.typeDepToSFCMap`. Thus compileScript invocation/option mapping, resolved-script caches, the inline-template decision, and imported-type dependency recording remain absorbed in the request-flow entry rather than in a dedicated cohesive module.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Script resolution — compileScript invocation and option mapping, the client/server resolved-script caches, the inline-template decision, and the imported-type dependency recording — has a dedicated cohesive owner separate from the request-flow entry, so template resolution and cache behavior can be changed without touching request code generation.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only extracts `genCSSModulesCode` and `genHotReloadCode` back into standalone modules (src/cssModules.ts, src/hotReload.ts), but does not touch the `selectBlock` method. In the smell.diff, the former src/select.ts was deleted and its logic was folded into `SFCLoader` as `private selectBlock()`. The agent.patch makes no changes to this method — it remains an embedded private member of the `SFCLoader` class (visible in the unchanged index.ts context around the `selectBlock()` method and the `// block selection` comment section), sitting alongside the generation code (`genScriptImport`, `genTemplateImport`, `genStyleImports`, `genCustomBlocksCode`). Block selection dispatch was not re-established as its own dedicated unit.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Language-block selection dispatch (?type=script|template|style|custom requests leaving through the block-loader callback) is implemented in a unit dedicated to block selection rather than as an embedded member of a general-purpose request class next to the generation code.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only extracts CSS-modules emission (genCSSModulesCode to cssModules.ts) and hot-reload emission (genHotReloadCode to hotReload.ts) from the SFCLoader class. The proxy-module import construction code — genScriptImport, genTemplateImport, genStyleImports, genCustomBlocksCode, finalizeComponentCode, attrsToQuery, and selectBlock — all remain as methods on the SFCLoader class (established in smell.diff and untouched by agent.patch), which also owns descriptor state (descriptorCache, getDescriptor, setDescriptor), script resolution caches (clientCache, serverCache, resolveScript), and typeDepToSFCMap. The import/request construction logic was not moved to codegen-oriented units separated from descriptor state ownership.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The code that constructs proxy-module imports and block requests (script/template/style/custom import statements, query stringification, attrs-to-query handling, inline-match-resource vs plain request routing) lives in codegen-oriented units separated from descriptor state ownership and from CSS-modules/hot-reload emission.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch recreates src/cssModules.ts as an exported genCSSModulesCode(opts) function containing the cssModules[\"name\"] = styleVar wiring and the module.hot.accept rerender branch, and src/index.ts imports it and delegates stylesCode += genCSSModulesCode({index, request, moduleName, id, needsHotReload}) in the style loop while removing the inlined private genCSSModulesCode method from SFCLoader.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "CSS-modules emission (the cssModules object wiring exported per style module attribute, with the hot-reload rerender branch) is owned by a dedicated codegen unit rather than being inlined in the same scope as request construction or descriptor caching.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch restores dedicated codegen modules: src/hotReload.ts exports genHotReloadCode (client HMR registration via api.createRecord/api.reload) and genTemplateHotReloadCode (template rerender module.hot.accept callback), and src/cssModules.ts exports genCSSModulesCode containing the style rerender module.hot.accept callback. In src/index.ts the SFCLoader class imports these ('import { genHotReloadCode } from ./hotReload', 'import { genCSSModulesCode } from ./cssModules') and delegates to them via genHotReloadCode({id, templateRequest}) and genCSSModulesCode({index, request, moduleName, id, needsHotReload}), while the previous private methods this.genHotReloadCode, this.genTemplateHotReloadCode and this.genCSSModulesCode are deleted from the class. Hot-reload emission is thus owned by standalone modules with their own seams rather than a private method cluster of the class that also owns parsing, caching and request construction.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Hot-reload code emission (client registration, template rerender acceptance callback, style rerender) is owned by a dedicated codegen unit with its own seams, not a private method cluster of a class that also owns parsing, caching and request construction.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent extracted cssModules and hotReload into their own modules (src/cssModules.ts, src/hotReload.ts) but did NOT extract formatError. In the agent.patch, formatError remains a static method of the SFCLoader coordinator class in src/index.ts (static formatError(...)), and templateLoader.ts still calls SFCLoader.formatError. No src/formatError.ts was recreated. The rubric's desired behavior — compiler-error code-frame formatting living in its own unit rather than as a static method of the coordinator class — is absent.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Compiler-error code-frame formatting lives in its own unit (used mutually by the main flow and template compilation), not as a static method of the coordinator class that everything else also lives in.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch only extracts two code-gen helpers: it re-adds src/cssModules.ts and src/hotReload.ts and replaces SFCLoader.genCSSModulesCode/genHotReloadCode with imports. The SFCLoader class in src/index.ts still owns static descriptorCache, clientCache, serverCache, and typeDepToSFCMap, and still implements most request-flow phases itself: loadSFC/cacheDescriptor, computeScopeId, selectBlock, genScriptImport, genTemplateImport, genStyleImports, genCustomBlocksCode, finalizeComponentCode, static resolveScript, getDescriptor/setDescriptor, formatError, canInlineTemplate, hash, and attrsToQuery. Peer modules still access shared state via SFCLoader.* (e.g. pluginWebpack4/5 and templateLoader use SFCLoader.typeDepToSFCMap/descriptorCache/clientCache/getDescriptor/resolveScript/formatError per smell.diff). This is the same coordinator class with only a couple of trivial helpers moved out.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The coordinator class was not merely reshuffled: a single class that still declares most of the phase methods for the whole request flow and still owns the shared caches (e.g., a renamed/re-capitalized version of the injected class with the same method inventory minus a couple of moved helpers, or a class that statically exposes the descriptor/script caches to peers) makes this item fail.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch does not modify src/templateLoader.ts and does not restore separate owner modules for descriptor/script/error formatting; those remain as static members of SFCLoader in src/index.ts (SFCLoader.getDescriptor, SFCLoader.resolveScript, SFCLoader.formatError). Thus templateLoader.ts still reaches the descriptor, resolved script, and error formatting through the main entry's class rather than from newly established owner units in normal imports.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "src/templateLoader.ts obtains the descriptor, the resolved script, and error formatting from the newly established owner units in normal imports — it no longer reaches them through the main entry's class, and its own compilation logic is unchanged.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not modify src/pluginWebpack4.ts or src/pluginWebpack5.ts, leaving their rule-rewriting and watch logic untouched. The shared invalidation state (typeDepToSFCMap, descriptorCache, clientCache) remains owned by the SFCLoader class in src/index.ts — the agent only extracted cssModules.ts and hotReload.ts as code-gen helpers, not the shared caches. The plugins (as rewired in the smell diff) continue to access this state through SFCLoader.typeDepToSFCMap, SFCLoader.descriptorCache, and SFCLoader.clientCache, satisfying the requirement that both plugin variants reach the shared invalidation state through its new owning unit.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Both webpack plugin variants (src/pluginWebpack4.ts and src/pluginWebpack5.ts) reach the shared invalidation state (imported-type dependency map, descriptor cache, resolved-script caches) through its new owning unit, and their rule-rewriting and watch logic is otherwise untouched.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch only touches src/index.ts and adds two standalone helper modules (src/cssModules.ts, src/hotReload.ts), rewiring the SFCLoader to delegate CSS-modules and HMR code generation to them. It does not modify pluginWebpack4.ts, pluginWebpack5.ts, the pitcher, or any style-loader internals; the plugin variants' rule-cloning/condition logic is left untouched, so no consumer restructuring beyond the ownership rewire occurred.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair does not rewrite consumers beyond the endpoint rewire the ownership move requires: the plugin variants' rule-cloning/condition logic and the pitcher or style loaders' internals are not restructured, merged into the entry, or re-authored around new abstractions.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes the duplicated CSS-modules and HMR methods from the SFCLoader class when it creates the new module owners. Specifically, the patch deletes the private `genCSSModulesCode`, `genHotReloadCode`, and `genTemplateHotReloadCode` methods from `src/index.ts` and replaces the call sites with calls to the newly imported `genCSSModulesCode` from `./cssModules` and `genHotReloadCode` from `./hotReload`. No leftover or shadowed copies of these methods remain inside the coordinator class alongside the new module owners. The other responsibilities (descriptor caching, script resolution, block selection, error formatting) remain solely in the class without new module owners, so there is no duplication alongside a new owner.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No responsibility is left duplicated: the removed pieces (descriptor caching, script resolution, block selection, CSS-modules/HMR emission, error formatting) do not still exist as unused or shadowed copies inside the coordinator class alongside the new owners (e.g., a private static method or cache field that nothing references, or an old path still reachable in dead branches).",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch retains the full SFCLoader class shell in src/index.ts. It only extracts two small helpers (genCSSModulesCode and genHotReloadCode) back to separate modules, but leaves the injected coordinator's per-request field block (loaderContext, source, options, sourceMap, rootContext, resourcePath, isWebpack5, incomingQuery, resourceQuery, enableInlineMatchResource, isServer, isProduction, filename, asCustomElement, descriptor, errors, rawShortFilePath, shortFilePath, id, hasScoped, needsHotReload, isTS, templateRequest, propsToAttach) and all static state fields (descriptorCache, clientCache, serverCache, typeDepToSFCMap, errorEmitted) in the class. Descriptor cache management (getDescriptor/setDescriptor/cleanQuery), script resolution (resolveScript/canInlineTemplate), error formatting (formatError), block selection (selectBlock), and attrsToQuery all remain as methods on the class, so the main entry still carries the injected coordinator structure the rubric says should not be retained.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The main entry does not retain a vestigial class shell: whatever remains in src/index.ts does not keep the injected coordinator's per-request field block, static state fields, or forwarding wrappers that only delegate to the new owners without adding request-flow meaning.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch only adds stateless codegen modules (src/cssModules.ts and src/hotReload.ts) and imports them into index.ts, removing the inline private methods; it does not reintroduce descriptorCache.ts/resolveScript.ts or declare any second descriptorCache/clientCache/serverCache/typeDepToSFCMap. The shared caches remain single static SFCLoader.* members, and consumers remain pointed at SFCLoader.* (smell.diff shows pluginWebpack4/5 and templateLoader already use SFCLoader.descriptorCache/clientCache/typeDepToSFCMap/getDescriptor/resolveScript), with no duplicate live copy introduced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The shared caches exist exactly once with their consumers correctly pointed at that single instance — no leftover second declaration of the descriptor cache/script caches in the entry class alongside the owning unit's version (a state copy that would break identity semantics even if emission still looks right).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch re-adds src/cssModules.ts and src/hotReload.ts with identical emitted strings: cssModules.ts still emits `import style${index} from ${request}`, `cssModules[\"${name}\"] = ${styleVar}`, and the `module.hot.accept`/`__VUE_HMR_RUNTIME__.rerender(\"${id}\")` block; hotReload.ts still emits `__exports__.__hmrId = \"${id}\"`, `api.createRecord('${id}', __exports__)`, and the optional `api.rerender('${id}', render)` template accept. index.ts delegates with the same values (`id: this.id`, `needsHotReload: this.needsHotReload`, `templateRequest: this.templateRequest`) and the patch does not alter template/script/style/custom-block query construction, import order, export-helper attachment, runtime props, or custom-element `_style_N` wiring.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The emitted proxy module is preserved: same import statements in the same order for template, script, styles and custom blocks, same ?vue&type=... query construction (id, index, scoped, ts, lang, src, external, blockType, issuerPath params), same export-helper attachment and runtime props (__scopeId, __file, __cssModules), and same custom-element mode output (per-block _style_N imports and XML wiring).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch only extracts `genCSSModulesCode` and `genHotReloadCode` into `src/cssModules.ts` and `src/hotReload.ts`, delegating to them as free functions. It does not touch the descriptor cache machinery: `SFCLoader.descriptorCache` (static Map), `SFCLoader.setDescriptor`, `SFCLoader.getDescriptor` (including the `fs.readFileSync` disk fallback for uncached/thread-loader scenarios), `cacheDescriptor()`, and `cleanQuery()` all remain unchanged static members of `SFCLoader`. The template loader still calls `SFCLoader.getDescriptor` and `SFCLoader.resolveScript`, and both webpack plugins still access `SFCLoader.descriptorCache`, `SFCLoader.clientCache`, and `SFCLoader.typeDepToSFCMap` for rebuild cache-busting, so the main request, block/template paths, and subsequent rebuilds continue to share the same parsed descriptor instance per file.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Descriptor identity semantics survive: the main request, block/template paths and subsequent rebuilds share the same parsed descriptor per file for a given compilerOptions (no double parsing to different instances), and the disk fallback for an uncached file (sub-loader/thread scenario) still works.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch only extracts CSS-modules and hot-reload code generation into separate modules and delegates to them from SFCLoader; it does not touch script resolution. The diff context shows SFCLoader.resolveScript, the static clientCache/serverCache WeakMaps keyed by descriptor identity, canInlineTemplate, and the resolveTemplateTSOptions call inside resolveScript remain unchanged, so per-descriptor caching, the client/server split, inlining decisions, and TS template handling are preserved.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Script resolution behavior is unchanged: compiled scripts are cached per descriptor identity (WeakMap semantics) with the existing client-vs-server split, canInlineTemplate makes the same inlining decision per mode, and resolveTemplateTSOptions handling for TS templates is preserved.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only extracts CSS-modules and HMR codegen into separate modules and delegates to them from SFCLoader; it does not alter the type-dependency/script-cache wiring. Shared state remains on SFCLoader (typeDepToSFCMap, clientCache, serverCache, descriptorCache), and SFCLoader.resolveScript still records resolved.deps into SFCLoader.typeDepToSFCMap and caches resolved scripts. Both plugin variants (unchanged by the patch) still enumerate SFCLoader.typeDepToSFCMap.keys(), look up affected SFCs, delete SFCLoader.clientCache entries, and read SFCLoader.descriptorCache for recompilation.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The plugins' invalidation pass still works end-to-end: during script resolution the imported-type dependencies are still recorded against affected component files, and on rebuild/watch the plugins can still enumerate affected components, drop their resolved scripts from cache, and collect the descriptors needing recompilation in both webpack 4 and webpack 5 variants.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch does not touch the missing-plugin guard. In the refactored code it remains a module-wide static flag (`static errorEmitted = false`) checked and set in `ensurePluginInstalled()` via `SFCLoader.errorEmitted`, with the `thread-loader` short-circuit still present, so it stays once-per-process rather than becoming per-request or per-object.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The missing-plugin error keeps its once-per-process semantics: it is still emitted on requests when VueLoaderPlugin is absent, thread-loader usage still short-circuits the check, and it does not become once-per-request (nor once-per-object) or move to first import.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch leaves the block-request early-return path untouched: it only adds imports for genHotReloadCode/genCSSModulesCode and delegates those calls in index.ts, without modifying the `if (this.incomingQuery.type) { this.selectBlock(); return undefined }` dispatch (present in smell.diff) or the `selectBlock()` method that calls `loaderContext.callback(null, ...)` for template/script/style/custom blocks. Thus ?type=... requests still return early via the loader callback and emit no proxy module.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Language-block requests still return early through the block-loader callback: a ?type=... request selects the block via the loader callback and produces no proxy module (no main-module emission, no hanging promise), exactly as before.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The id is still computed once per component in SFCLoader.computeScopeId() (unchanged by the agent), which sets this.id via SFCLoader.hash() with production source-dependent vs development path-only logic. The agent's patch delegates genCSSModulesCode and genHotReloadCode to separate modules but passes id: this.id as a parameter to both (genCSSModulesCode({..., id: this.id, ...}) and genHotReloadCode({id: this.id, ...})), so the helpers consume the shared id rather than re-deriving it. The template query (&id=${this.id}), scoped-style queries (&id=${this.id}), CSS-modules HMR rerender (\"${id}\"), and hot-reload registration (__hmrId = \"${id}\") all reference the same this.id computed once in computeScopeId().",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "One stable module id is used per component across all its block requests: the scope/id derivation (production source-dependent hashing vs development path-only id) runs once per component and is shared by the script import, the template query (?id=), scoped-style queries and the hot-reload registration, so blocks stay associated with their component (no re-derived per-block ids).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch only changes internal code generation: it re-adds src/cssModules.ts and src/hotReload.ts and delegates to them from SFCLoader. It does not modify `export { VueLoaderPlugin }`, the `export default function loader(this: LoaderContext<VueLoaderOptions>, source: string)` webpack-loader wrapper, or the `VueLoaderOptions` interface, and it leaves the webpack 4/5 plugin dispatch files untouched, so the entry public contract remains unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The main loader's public contract is untouched: default export still calls like a webpack loader with the same signature, VueLoaderPlugin is still exported from the entry (and still dispatched by webpack version as before), and the VueLoaderOptions surface is unchanged for the many downstream consumers and tests.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The re-introduced src/cssModules.ts and src/hotReload.ts are stateless pure functions taking an opts object (genCSSModulesCode({index, request, moduleName, id, needsHotReload}) and genHotReloadCode({id, templateRequest})) and declare no module-level mutable variables. Per-request values remain instance fields on SFCLoader (this.id, this.needsHotReload, this.templateRequest) and are passed into the helpers, while shared caches remain static class fields; the patch does not hoist loaderContext/filename or other per-request state into module scope in the extracted units.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair does not leak request-scoped state into the shared units: the new owners do not gain module-level mutable per-request state (e.g., caches or flags that capture one request's loaderContext/filename and get read by the next request), which would serialize requests and corrupt concurrent builds.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.6666666666666666,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 0.2222222222222222
+  },
+  "valid_count": 24,
+  "pass_count": 15,
+  "must_have_pass": false,
+  "macro_score": 0.6388888888888888
+}

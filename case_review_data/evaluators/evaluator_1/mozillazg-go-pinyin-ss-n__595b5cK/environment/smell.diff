@@ -1,0 +1,322 @@
+diff --git a/phonetic_symbol.go b/phonetic_symbol.go
+index 1632437..2eb028a 100644
+--- a/phonetic_symbol.go
++++ b/phonetic_symbol.go
+@@ -1,5 +1,9 @@
+ package pinyin
+ 
++import (
++	"regexp"
++)
++
+ // 带音标字符。
+ var phoneticSymbol = map[string]string{
+ 	"ā": "a1",
+@@ -31,3 +35,37 @@ var phoneticSymbol = map[string]string{
+ 	"ǹ": "n4",
+ 	"ḿ": "m2",
+ }
++
++// 所有带声调的字符
++var rePhoneticSymbolSource = func(m map[string]string) string {
++	s := ""
++	for k := range m {
++		s = s + k
++	}
++	return s
++}(phoneticSymbol)
++
++// 匹配带声调字符的正则表达式
++var rePhoneticSymbol = regexp.MustCompile("[" + rePhoneticSymbolSource + "]")
++
++// 匹配使用数字标识声调的字符的正则表达式
++var reTone2 = regexp.MustCompile("([aeoiuvnm])([1-4])$")
++
++// 按照目标风格替换拼音中的带声调字符
++func decodePhoneticSymbol(p string, a Args) string {
++	return rePhoneticSymbol.ReplaceAllStringFunc(p, func(m string) string {
++		symbol, _ := phoneticSymbol[m]
++		switch a.Style {
++		// 不包含声调
++		case Normal, FirstLetter, Finals:
++			// 去掉声调: a1 -> a
++			m = reTone2.ReplaceAllString(symbol, "$1")
++		case Tone2, FinalsTone2, Tone3, FinalsTone3:
++			// 返回使用数字标识声调的字符
++			m = symbol
++		default:
++			// 声调在头上
++		}
++		return m
++	})
++}
+diff --git a/pinyin.go b/pinyin.go
+index a5383a3..90d2b17 100644
+--- a/pinyin.go
++++ b/pinyin.go
+@@ -1,7 +1,6 @@
+ package pinyin
+ 
+ import (
+-	"regexp"
+ 	"strings"
+ )
+ 
+@@ -45,24 +44,6 @@ var initialArray = strings.Split(
+ 	",",
+ )
+ 
+-// 所有带声调的字符
+-var rePhoneticSymbolSource = func(m map[string]string) string {
+-	s := ""
+-	for k := range m {
+-		s = s + k
+-	}
+-	return s
+-}(phoneticSymbol)
+-
+-// 匹配带声调字符的正则表达式
+-var rePhoneticSymbol = regexp.MustCompile("[" + rePhoneticSymbolSource + "]")
+-
+-// 匹配使用数字标识声调的字符的正则表达式
+-var reTone2 = regexp.MustCompile("([aeoiuvnm])([1-4])$")
+-
+-// 匹配 Tone2 中标识韵母声调的正则表达式
+-var reTone3 = regexp.MustCompile("^([a-z]+)([1-4])([a-z]*)$")
+-
+ // Args 配置信息
+ type Args struct {
+ 	Style     int    // 拼音风格（默认： Normal)
+@@ -88,15 +69,6 @@ var Fallback = func(r rune, a Args) []string {
+ 	return []string{}
+ }
+ 
+-var finalExceptionsMap = map[string]string{
+-	"ū": "ǖ",
+-	"ú": "ǘ",
+-	"ǔ": "ǚ",
+-	"ù": "ǜ",
+-}
+-var reFinalExceptions = regexp.MustCompile("^(j|q|x)(ū|ú|ǔ|ù)$")
+-var reFinal2Exceptions = regexp.MustCompile("^(j|q|x)u(\\d?)$")
+-
+ // NewArgs 返回包含默认配置的 `Args`
+ func NewArgs() Args {
+ 	return Args{Style, Heteronym, Separator, Fallback}
+@@ -114,86 +86,18 @@ func initial(p string) string {
+ 	return s
+ }
+ 
+-// 获取单个拼音中的韵母
+-func final(p string) string {
+-	n := initial(p)
+-	if n == "" {
+-		return handleYW(p)
+-	}
+-
+-	// 特例 j/q/x
+-	matches := reFinalExceptions.FindStringSubmatch(p)
+-	// jū -> jǖ
+-	if len(matches) == 3 && matches[1] != "" && matches[2] != "" {
+-		v, _ := finalExceptionsMap[matches[2]]
+-		return v
+-	}
+-	// ju -> jv, ju1 -> jv1
+-	p = reFinal2Exceptions.ReplaceAllString(p, "${1}v$2")
+-	return strings.Join(strings.SplitN(p, n, 2), "")
+-}
+-
+-// 处理 y, w
+-func handleYW(p string) string {
+-	// 特例 y/w
+-	if strings.HasPrefix(p, "yu") {
+-		p = "v" + p[2:] // yu -> v
+-	} else if strings.HasPrefix(p, "yi") {
+-		p = p[1:] // yi -> i
+-	} else if strings.HasPrefix(p, "y") {
+-		p = "i" + p[1:] // y -> i
+-	} else if strings.HasPrefix(p, "wu") {
+-		p = p[1:] // wu -> u
+-	} else if strings.HasPrefix(p, "w") {
+-		p = "u" + p[1:] // w -> u
+-	}
+-	return p
+-}
+-
+ func toFixed(p string, a Args) string {
+-	if a.Style == Initials {
+-		return initial(p)
+-	}
+ 	origP := p
+ 
+ 	// 替换拼音中的带声调字符
+-	py := rePhoneticSymbol.ReplaceAllStringFunc(p, func(m string) string {
+-		symbol, _ := phoneticSymbol[m]
+-		switch a.Style {
+-		// 不包含声调
+-		case Normal, FirstLetter, Finals:
+-			// 去掉声调: a1 -> a
+-			m = reTone2.ReplaceAllString(symbol, "$1")
+-		case Tone2, FinalsTone2, Tone3, FinalsTone3:
+-			// 返回使用数字标识声调的字符
+-			m = symbol
+-		default:
+-			// 声调在头上
+-		}
+-		return m
+-	})
++	py := decodePhoneticSymbol(p, a)
++
++	// 调整数字声调所在的位置
++	py = repositionToneNumber(py, a)
++
++	// 提取韵母
++	py = extractFinals(origP, py, a)
+ 
+-	switch a.Style {
+-	// 将声调移动到最后
+-	case Tone3, FinalsTone3:
+-		py = reTone3.ReplaceAllString(py, "$1$3$2")
+-	}
+-	switch a.Style {
+-	// 首字母
+-	case FirstLetter:
+-		py = string([]rune(py)[0])
+-	// 韵母
+-	case Finals, FinalsTone, FinalsTone2, FinalsTone3:
+-		// 转换为 []rune unicode 编码用于获取第一个拼音字符
+-		// 因为 string 是 utf-8 编码不方便获取第一个拼音字符
+-		rs := []rune(origP)
+-		switch string(rs[0]) {
+-		// 因为鼻音没有声母所以不需要去掉声母部分
+-		case "ḿ", "ń", "ň", "ǹ":
+-		default:
+-			py = final(py)
+-		}
+-	}
+ 	return py
+ }
+ 
+@@ -202,6 +106,10 @@ func applyStyle(p []string, a Args) []string {
+ 	seen := make(map[string]struct{})
+ 	for _, v := range p {
+ 		v = toFixed(v, a)
++		// 首字母风格只保留拼音的第一个字符
++		if a.Style == FirstLetter {
++			v = string([]rune(v)[0])
++		}
+ 		if _, ok := seen[v]; !ok {
+ 			newP = append(newP, v)
+ 			seen[v] = struct{}{}
+@@ -222,6 +130,12 @@ func SinglePinyin(r rune, a Args) []string {
+ 	} else {
+ 		pys = a.Fallback(r, a)
+ 	}
++	// 声母风格只保留各个拼音的声母部分
++	if a.Style == Initials {
++		for i, v := range pys {
++			pys[i] = initial(v)
++		}
++	}
+ 	if len(pys) > 0 {
+ 		if !a.Heteronym {
+ 			pys = []string{pys[0]}
+diff --git a/pinyin_finals.go b/pinyin_finals.go
+new file mode 100644
+index 0000000..684db98
+--- /dev/null
++++ b/pinyin_finals.go
+@@ -0,0 +1,70 @@
++package pinyin
++
++import (
++	"regexp"
++	"strings"
++)
++
++var finalExceptionsMap = map[string]string{
++	"ū": "ǖ",
++	"ú": "ǘ",
++	"ǔ": "ǚ",
++	"ù": "ǜ",
++}
++var reFinalExceptions = regexp.MustCompile("^(j|q|x)(ū|ú|ǔ|ù)$")
++var reFinal2Exceptions = regexp.MustCompile("^(j|q|x)u(\\d?)$")
++
++// 获取单个拼音中的韵母
++func final(p string) string {
++	n := initial(p)
++	if n == "" {
++		return handleYW(p)
++	}
++
++	// 特例 j/q/x
++	matches := reFinalExceptions.FindStringSubmatch(p)
++	// jū -> jǖ
++	if len(matches) == 3 && matches[1] != "" && matches[2] != "" {
++		v, _ := finalExceptionsMap[matches[2]]
++		return v
++	}
++	// ju -> jv, ju1 -> jv1
++	p = reFinal2Exceptions.ReplaceAllString(p, "${1}v$2")
++	return strings.Join(strings.SplitN(p, n, 2), "")
++}
++
++// 处理 y, w
++func handleYW(p string) string {
++	// 特例 y/w
++	if strings.HasPrefix(p, "yu") {
++		p = "v" + p[2:] // yu -> v
++	} else if strings.HasPrefix(p, "yi") {
++		p = p[1:] // yi -> i
++	} else if strings.HasPrefix(p, "y") {
++		p = "i" + p[1:] // y -> i
++	} else if strings.HasPrefix(p, "wu") {
++		p = p[1:] // wu -> u
++	} else if strings.HasPrefix(p, "w") {
++		p = "u" + p[1:] // w -> u
++	}
++	return p
++}
++
++// 韵母风格(Finals / FinalsTone / FinalsTone2 / FinalsTone3)只返回
++// 各个拼音的韵母部分；鼻音字符(ḿ ń ň ǹ)没有声母所以不需要去掉声母部分
++func extractFinals(origP string, p string, a Args) string {
++	switch a.Style {
++	// 韵母
++	case Finals, FinalsTone, FinalsTone2, FinalsTone3:
++		// 转换为 []rune unicode 编码用于获取第一个拼音字符
++		// 因为 string 是 utf-8 编码不方便获取第一个拼音字符
++		rs := []rune(origP)
++		switch string(rs[0]) {
++		// 因为鼻音没有声母所以不需要去掉声母部分
++		case "ḿ", "ń", "ň", "ǹ":
++		default:
++			p = final(p)
++		}
++	}
++	return p
++}
+diff --git a/pinyin_tone.go b/pinyin_tone.go
+new file mode 100644
+index 0000000..9262d19
+--- /dev/null
++++ b/pinyin_tone.go
+@@ -0,0 +1,17 @@
++package pinyin
++
++import "regexp"
++
++// 匹配 Tone3 中标识韵母声调的正则表达式
++var reTone3 = regexp.MustCompile("^([a-z]+)([1-4])([a-z]*)$")
++
++// Tone3/FinalsTone3 风格下声调用数字标识在拼音的最后，
++// 需要把位于拼音中间的声调数字移动到最后
++func repositionToneNumber(p string, a Args) string {
++	switch a.Style {
++	// 将声调移动到最后
++	case Tone3, FinalsTone3:
++		p = reTone3.ReplaceAllString(p, "$1$3$2")
++	}
++	return p
++}

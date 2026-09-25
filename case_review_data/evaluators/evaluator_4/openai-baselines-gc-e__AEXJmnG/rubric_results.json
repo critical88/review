@@ -1,0 +1,127 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "In agent.patch, baselines/common/vec_env/vec_env.py is reduced to a thin transport base: __init__ now only accepts (num_envs, observation_space, action_space) and sets those three attributes; imports for csv/json/numpy/spaces and RESULTS_EXT are removed; all stacking/normalization/episode helpers (_stack_frames, _stack_reset, _filter_obs, _normalize_step_results, _init_normalization_state, _init_results_writer, _record_episodes, _write_results_row, _close_results_writer, etc.) and their state fields are deleted. reset() and step_wait() no longer interleave any pipeline, returning self._reset_venvs() and self._step_wait_venvs() respectively. The class docstring explicitly states frame stacking, normalization, and episode recording are not responsibilities of VecEnv and are applied as wrappers. cmd_util.py correspondingly layers VecFrameStack, VecNormalize, and VecMonitor over the concrete backends.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The abstract base class that every concrete vectorized environment inherits defines only the batched interaction abstraction and shared plumbing around it: after the change it contains no implementation of observation stacking, running-statistics normalization, or episode accounting and results export (no state, helpers, option branches or pipeline interleaving for those three responsibilities).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In cmd_util.py make_vec_env, the agent builds a raw SubprocVecEnv/DummyVecEnv and then layers the three responsibilities as separate focused components: VecFrameStack(venv, frame_stack) innermost, VecNormalize(venv, ...) next, and VecMonitor(venv, ...) outermost. Because step_wait() calls propagate outermost-to-innermost, the effective per-step order is raw backend -> stack frames -> normalize stacked observations -> record episode rewards, matching the required order (stack first, normalize already-stacked obs, episode accounting accumulates the rewards as handed out). The base VecEnv.__init__ and concrete backends no longer accept frame_stack/normalize/record_episodes options, confirming these concerns are owned by the wrappers, not the transport.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Each of the three absorbed responsibilities is available again as its own focused component that attaches around a raw vectorized environment, and the effective per-step order is preserved: raw observations are stacked first, the running-statistics filter applies to the already-stacked observations, and episode accounting accumulates the rewards as they are handed out.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch restores the pre-smell wrapper composition in make_vec_env: it creates a thin backend (DummyVecEnv/SubprocVecEnv without vec_options), then layers VecFrameStack(innermost) -> VecNormalize -> VecMonitor(outermost), matching the smell's step_wait order of stack->normalize->record. VecEnv.__init__ is restored to (num_envs, observation_space, action_space) with no absorbed features; step_wait()/reset() delegate directly to _step_wait_venvs()/_reset_venvs() (raw transport). The VecMonitor patch adds float()/int() casts on episode r/l values, matching the smell's float(self.eprets[i])/int(self.eplens[i]). run.py passes frame_stack=4,record_episodes=True for Atari and normalize=True,use_tf=True,record_episodes=True for MuJoCo, reproducing the smell's two training configurations. The backends no longer accept vec_options, so all-options-off yields a raw transport.",
+      "valid": true,
+      "attempts": 5,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Environments built with the same construction options behave identically to the current state step for step: the stacking-plus-recording configuration and the stacking+normalization-plus-recording configuration yield the same observation spaces, batched observations, rewards, done flags, info objects and episode records (same rows at the same episode finishes), and an environment with all options off behaves like a raw transport.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "make_vec_env retains all option keywords in its signature (frame_stack, normalize, use_tf, record_episodes, results_filename, results_info_keywords). Instead of passing vec_options to backend constructors, the patch builds a thin SubprocVecEnv/DummyVecEnv and layers composed wrappers: VecFrameStack(venv, frame_stack), VecNormalize(venv, ob=True, ret=True, clipob=10., cliprew=10., gamma=0.99, epsilon=1e-8, use_tf=use_tf), and VecMonitor(venv, filename=results_filename, info_keywords=results_info_keywords). The per-MPI-rank default results filename logic (if record_episodes and results_filename is None and logger_dir: results_filename = os.path.join(logger_dir, str(mpi_rank) + '.vecenv')) is not touched by any hunk and remains in make_vec_env. VecEnv.close() no longer calls _close_results_writer() since VecEnv no longer owns results; episode recording and its file lifecycle are delegated to the VecMonitor wrapper, which the patch shows already holds eprets, eplens, tstart, and info_keywords state.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The construction seam keeps working as the configuration surface: make_vec_env still accepts frame_stack, normalize, use_tf, record_episodes, results_filename and results_info_keywords with their current meanings, now mapped onto composed components, including the per-MPI-rank default batch-level results filename when recording is requested while a logger directory is configured and no filename is given; the results file is closed when the environment is closed.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The patch keeps the private hook indirection rather than restoring direct public reset()/step_wait() on the concrete transports. In vec_env.py, VecEnv.reset() returns self._reset_venvs() and VecEnv.step_wait() returns self._step_wait_venvs(), with _reset_venvs/_step_wait_venvs raising NotImplementedError. The concrete backend diffs only remove **vec_options from their constructors; they contain no hunks renaming _reset_venvs/_step_wait_venvs back to reset()/step_wait(), so DummyVecEnv, SubprocVecEnv, and ShmemVecEnv still expose only the private raw hooks from the smell.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "All three concrete transports (the in-process, subprocess and shared-memory environments) implement the public reset/step_wait stepping contract directly again rather than only private raw-interaction hooks, and each one can be constructed with just its environment-builder callables plus its own transport arguments.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "make_vec_env now supplies stacking via a wrapper: `if frame_stack is not None: venv = VecFrameStack(venv, frame_stack)` (cmd_util.py). The smell's run.py passes `frame_stack=frame_stack_size` to make_vec_env for Atari, and ACER's runner still asserts `isinstance(env, VecFrameStack) or getattr(env, 'nstack', None) is not None` (acer/runner.py); acer.py also still wraps with VecFrameStack(env, 1) when neither holds. Thus the ACER stacked-observation precondition remains satisfiable for factory-built stacking-enabled environments.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The stacked-observations precondition of the ACER training path still holds for environments produced through the factory with stacking enabled, whichever mechanism now provides the stacking.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch reduces VecEnv.__init__ to (num_envs, observation_space, action_space) and deletes absorbed frame_stack/normalize/use_tf/record_episodes parameters, RESULTS_EXT, conditional state setup, and private helpers such as _init_normalization_state, _stack_frames, _record_episodes, and _close_results_writer, plus csv/json/time/numpy/spaces imports. DummyVecEnv/SubprocVecEnv/ShmemVecEnv drop **vec_options and raw_observation_space usage; cmd_util layers VecFrameStack/VecNormalize/VecMonitor instead of passing vec_options. The remaining _reset_venvs/_step_wait_venvs hooks are still called by base reset()/step_wait(), so they are live rather than dormant.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The change leaves absorbed machinery behind as dead or dormant code: the shared base class or the transports still define option parameters, conditional state initialization, private helpers, hook methods or doc/imports that only served the absorbed responsibilities and no longer participate in any live path.",
+      "passes": true
+    },
+    {
+      "id": "R8",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Info objects returned by stepping are no longer a pass-through: they gain keys (for example episode summary records injected into the info dicts by whatever now records episodes) or have existing entries changed or removed by the vec-env layer.",
+      "rationale": "A stock episode-logging component in this repository enriches returned info dicts with an episode key; adopting it wholesale is the most convenient nearby shortcut and silently changes the observable step results for every consumer.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "Judge HTTP or response failure: 504",
+      "attempts": 6
+    },
+    {
+      "result": 1,
+      "evidence": "In make_vec_env, the patch layers VecFrameStack before VecNormalize (if frame_stack: venv = VecFrameStack(...); if normalize: venv = VecNormalize(...)), so normalization runs on stacked observations rather than raw unstacked frames. It constructs VecNormalize with the same constants as the smell (clipob=10., cliprew=10., gamma=0.99, epsilon=1e-8, use_tf=use_tf) and delegates the filter/update logic to the existing wrapper without altering it, preserving the observation/return statistics quantities, formula, clipping, update cadence, and done-reset behavior.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Normalization behavior drifts: the running statistics are kept from different quantities than before (for example accumulated from raw unstacked frames while stacked frames are the configured observation), the filter formula, clipping constants or update cadence change, or the discounted-return accumulator stops resetting for environments whose episode finished.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes the smell's custom TF statistics machinery from VecEnv (deleting `_init_tf_stat_variables`, the `ob_rms`/`ret_rms` scopes, and the `mean`/`std`/`count` variables) and instead delegates normalization to the existing `VecNormalize` wrapper, calling `VecNormalize(venv, ob=True, ret=True, clipob=10., cliprew=10., gamma=0.99, epsilon=1e-8, use_tf=use_tf)` in make_vec_env. It does not modify vec_normalize.py, so the TF-backed statistics remain under the wrapper's existing scope/names and are not renamed or replaced by plain arrays.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "TF-backed normalization statistics are no longer saved and restored together with the model: the variables moved to different scopes or names (or were replaced by plain arrays) so checkpoints written before the change no longer round-trip the normalization statistics.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 1
+  },
+  "valid_count": 9,
+  "pass_count": 8,
+  "must_have_pass": false,
+  "macro_score": 0.9166666666666666
+}

@@ -1,0 +1,492 @@
+diff --git a/src/frames.rs b/src/frames.rs
+index e1d8e22..3d95508 100644
+--- a/src/frames.rs
++++ b/src/frames.rs
+@@ -10,11 +10,11 @@ use std::time::SystemTime;
+ use smallvec::SmallVec;
+ use symbolic_demangle::demangle;
+ 
+-use crate::backtrace::{Trace, TraceImpl};
++use crate::backtrace::{Frame, Trace, TraceImpl};
+ use crate::{MAX_DEPTH, MAX_THREAD_NAME};
+ 
+ #[cfg(feature = "perfmaps")]
+-pub(crate) fn resolve_in_perfmap(ip: usize) -> Option<Symbol> {
++fn resolve_in_perfmap(ip: usize) -> Option<Symbol> {
+     use crate::perfmap::get_resolver;
+ 
+     if let Some(perf_map_resolver) = get_resolver().as_ref() {
+@@ -27,7 +27,7 @@ pub(crate) fn resolve_in_perfmap(ip: usize) -> Option<Symbol> {
+ }
+ 
+ #[cfg(not(feature = "perfmaps"))]
+-pub(crate) fn resolve_in_perfmap(_ip: usize) -> Option<Symbol> {
++fn resolve_in_perfmap(_ip: usize) -> Option<Symbol> {
+     None
+ }
+ 
+@@ -59,16 +59,35 @@ impl Debug for UnresolvedFrames {
+     }
+ }
+ 
++impl UnresolvedFrames {
++    pub fn new(
++        frames: SmallVec<[<TraceImpl as Trace>::Frame; MAX_DEPTH]>,
++        tn: &[u8],
++        thread_id: u64,
++        sample_timestamp: SystemTime,
++    ) -> Self {
++        let thread_name_length = tn.len();
++        let mut thread_name = [0; MAX_THREAD_NAME];
++        thread_name[0..thread_name_length].clone_from_slice(tn);
++
++        Self {
++            frames,
++            thread_name,
++            thread_name_length,
++            thread_id,
++            sample_timestamp,
++        }
++    }
++}
++
+ impl PartialEq for UnresolvedFrames {
+     fn eq(&self, other: &Self) -> bool {
+         let (frames1, frames2) = (&self.frames, &other.frames);
+         if self.thread_id != other.thread_id || frames1.len() != frames2.len() {
+             false
+         } else {
+-            Iterator::zip(frames1.iter(), frames2.iter()).all(|(s1, s2)| {
+-                crate::backtrace::Frame::symbol_address(s1)
+-                    == crate::backtrace::Frame::symbol_address(s2)
+-            })
++            Iterator::zip(frames1.iter(), frames2.iter())
++                .all(|(s1, s2)| s1.symbol_address() == s2.symbol_address())
+         }
+     }
+ }
+@@ -79,7 +98,7 @@ impl Hash for UnresolvedFrames {
+     fn hash<H: Hasher>(&self, state: &mut H) {
+         self.frames
+             .iter()
+-            .for_each(|frame| crate::backtrace::Frame::symbol_address(frame).hash(state));
++            .for_each(|frame| frame.symbol_address().hash(state));
+         self.thread_id.hash(state);
+     }
+ }
+@@ -170,8 +189,81 @@ pub struct Frames {
+     pub sample_timestamp: SystemTime,
+ }
+ 
++impl Frames {
++    /// Returns a thread identifier (name or ID) as a string.
++    pub fn thread_name_or_id(&self) -> String {
++        if !self.thread_name.is_empty() {
++            self.thread_name.clone()
++        } else {
++            format!("{:?}", self.thread_id)
++        }
++    }
++}
++
++impl From<UnresolvedFrames> for Frames {
++    fn from(frames: UnresolvedFrames) -> Self {
++        let mut fs = Vec::new();
++
++        let mut frame_iter = frames.frames.iter();
++
++        while let Some(frame) = frame_iter.next() {
++            let mut symbols: Vec<Symbol> = Vec::new();
++
++            if let Some(perfmap_symbol) = resolve_in_perfmap(frame.ip() as usize) {
++                symbols.push(perfmap_symbol);
++            } else {
++                frame.resolve_symbol(|symbol| {
++                    let symbol = Symbol::from(symbol);
++                    symbols.push(symbol);
++                });
++            }
++
++            if symbols.iter().any(|symbol| {
++                // macOS prepends an underscore even with `#[no_mangle]`
++                matches!(
++                    &*symbol.name(),
++                    "perf_signal_handler" | "_perf_signal_handler"
++                )
++            }) {
++                // ignore frame itself and its next one
++                frame_iter.next();
++                continue;
++            }
++
++            if !symbols.is_empty() {
++                fs.push(symbols);
++            }
++        }
++
++        Self {
++            frames: fs,
++            thread_name: String::from_utf8_lossy(&frames.thread_name[0..frames.thread_name_length])
++                .into_owned(),
++            thread_id: frames.thread_id,
++            sample_timestamp: frames.sample_timestamp,
++        }
++    }
++}
++
+ impl Eq for Frames {}
+ 
++impl Debug for Frames {
++    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
++        for frame in self.frames.iter() {
++            write!(f, "FRAME: ")?;
++            for symbol in frame.iter() {
++                write!(f, "{} -> ", symbol)?;
++            }
++        }
++        write!(f, "THREAD: ")?;
++        if !self.thread_name.is_empty() {
++            write!(f, "{}", self.thread_name)
++        } else {
++            write!(f, "ThreadId({})", self.thread_id)
++        }
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+diff --git a/src/profiler.rs b/src/profiler.rs
+index a53b5c5..7df3102 100644
+--- a/src/profiler.rs
++++ b/src/profiler.rs
+@@ -22,7 +22,7 @@ use crate::collector::Collector;
+ use crate::error::{Error, Result};
+ use crate::frames::UnresolvedFrames;
+ use crate::report::ReportBuilder;
+-use crate::timer::{ReportTiming, Timer};
++use crate::timer::Timer;
+ use crate::{MAX_DEPTH, MAX_THREAD_NAME};
+ 
+ pub(crate) static PROFILER: Lazy<RwLock<Result<Profiler>>> =
+@@ -201,23 +201,11 @@ impl ProfilerGuard<'_> {
+     pub fn report(&self) -> ReportBuilder {
+         ReportBuilder::new(
+             self.profiler,
+-            self.timer.as_ref().map(timing_of).unwrap_or_default(),
++            self.timer.as_ref().map(Timer::timing).unwrap_or_default(),
+         )
+     }
+ }
+ 
+-/// Capture the timing metadata of a finished profiling run.
+-///
+-/// The report layer expects a `ReportTiming`; the frequency, wall clock start
+-/// time and the elapsed duration are read directly from the guard's timer.
+-fn timing_of(timer: &Timer) -> ReportTiming {
+-    ReportTiming {
+-        frequency: timer.frequency,
+-        start_time: timer.start_time,
+-        duration: timer.start_instant.elapsed(),
+-    }
+-}
+-
+ impl<'a> Drop for ProfilerGuard<'a> {
+     fn drop(&mut self) {
+         drop(self.timer.take());
+@@ -531,20 +519,7 @@ impl Profiler {
+         thread_id: u64,
+         sample_timestamp: SystemTime,
+     ) {
+-        // Build the collected sample in place: the profiler knows how a raw
+-        // backtrace, thread identity and timestamp make up one sample.
+-        let thread_name_length = thread_name.len();
+-        let mut tn_buf = [0u8; MAX_THREAD_NAME];
+-        tn_buf[0..thread_name_length].clone_from_slice(thread_name);
+-
+-        let frames = UnresolvedFrames {
+-            frames: backtrace,
+-            thread_name: tn_buf,
+-            thread_name_length,
+-            thread_id,
+-            sample_timestamp,
+-        };
+-
++        let frames = UnresolvedFrames::new(backtrace, thread_name, thread_id, sample_timestamp);
+         self.sample_counter += 1;
+ 
+         if let Ok(()) = self.data.add(frames, 1) {}
+diff --git a/src/report.rs b/src/report.rs
+index 2ed8b21..30e30b9 100644
+--- a/src/report.rs
++++ b/src/report.rs
+@@ -5,9 +5,7 @@ use std::fmt::{Debug, Formatter};
+ 
+ use spin::RwLock;
+ 
+-use crate::backtrace::Frame;
+-use crate::frames::resolve_in_perfmap;
+-use crate::frames::{Frames, Symbol, UnresolvedFrames};
++use crate::frames::{Frames, UnresolvedFrames};
+ use crate::profiler::Profiler;
+ use crate::timer::ReportTiming;
+ 
+@@ -33,54 +31,6 @@ pub struct UnresolvedReport {
+ 
+ type FramesPostProcessor = Box<dyn Fn(&mut Frames)>;
+ 
+-/// Resolve one collected sample into its report presentation.
+-///
+-/// Every sample is stored by the profiler in its unresolved form; the symbol
+-/// names, source files and line numbers are attached here, while the report is
+-/// being built.
+-fn resolved_frames(item: UnresolvedFrames) -> Frames {
+-    let mut fs = Vec::new();
+-
+-    let mut frame_iter = item.frames.iter();
+-
+-    while let Some(frame) = frame_iter.next() {
+-        let mut symbols: Vec<Symbol> = Vec::new();
+-
+-        if let Some(perfmap_symbol) = resolve_in_perfmap(frame.ip() as usize) {
+-            symbols.push(perfmap_symbol);
+-        } else {
+-            frame.resolve_symbol(|symbol| {
+-                let symbol = Symbol::from(symbol);
+-                symbols.push(symbol);
+-            });
+-        }
+-
+-        if symbols.iter().any(|symbol| {
+-            // macOS prepends an underscore even with `#[no_mangle]`
+-            matches!(
+-                &*symbol.name(),
+-                "perf_signal_handler" | "_perf_signal_handler"
+-            )
+-        }) {
+-            // ignore frame itself and its next one
+-            frame_iter.next();
+-            continue;
+-        }
+-
+-        if !symbols.is_empty() {
+-            fs.push(symbols);
+-        }
+-    }
+-
+-    Frames {
+-        frames: fs,
+-        thread_name: String::from_utf8_lossy(&item.thread_name[0..item.thread_name_length])
+-            .into_owned(),
+-        thread_id: item.thread_id,
+-        sample_timestamp: item.sample_timestamp,
+-    }
+-}
+-
+ /// A builder of `Report` and `UnresolvedReport`. It builds report from a running `Profiler`.
+ pub struct ReportBuilder<'a> {
+     frames_post_processor: Option<FramesPostProcessor>,
+@@ -160,7 +110,7 @@ impl<'a> ReportBuilder<'a> {
+                 profiler.data.try_iter()?.for_each(|entry| {
+                     let count = entry.count;
+                     if count > 0 {
+-                        let mut key = resolved_frames(entry.item.clone());
++                        let mut key = Frames::from(entry.item.clone());
+                         if let Some(processor) = &self.frames_post_processor {
+                             processor(&mut key);
+                         }
+@@ -207,56 +157,12 @@ impl Debug for Report {
+     }
+ }
+ 
+-/// This will generate one sample in the human-readable format of a `Report`'s frames:
+-///
+-/// ```shell
+-/// FRAME: {func1} -> FRAME: {func2} -> FRAME: {func3} -> THREAD: {thread_name} {count}
+-/// ```
+-impl Debug for Frames {
+-    fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
+-        for frame in self.frames.iter() {
+-            write!(f, "FRAME: ")?;
+-            for symbol in frame.iter() {
+-                write!(f, "{} -> ", symbol)?;
+-            }
+-        }
+-        write!(f, "THREAD: ")?;
+-        if !self.thread_name.is_empty() {
+-            write!(f, "{}", self.thread_name)
+-        } else {
+-            write!(f, "ThreadId({})", self.thread_id)
+-        }
+-    }
+-}
+-
+ #[cfg(feature = "flamegraph")]
+ mod flamegraph {
+     use super::*;
+     use inferno::flamegraph;
+     use std::fmt::Write;
+ 
+-    /// Render one sample as a single collapsed-stack line for the flamegraph.
+-    fn stack_line(stack_key: &Frames, hits: &isize) -> String {
+-        let mut line = String::new();
+-        if !stack_key.thread_name.is_empty() {
+-            line.push_str(&stack_key.thread_name);
+-        } else {
+-            write!(line, "{:?}", stack_key.thread_id).unwrap();
+-        }
+-        line.push(';');
+-
+-        for frame in stack_key.frames.iter().rev() {
+-            for symbol in frame.iter().rev() {
+-                write!(&mut line, "{};", symbol).unwrap();
+-            }
+-        }
+-
+-        line.pop().unwrap_or_default();
+-        write!(&mut line, " {}", hits).unwrap();
+-
+-        line
+-    }
+-
+     impl Report {
+         /// `flamegraph` will write an svg flamegraph into `writer` **only available with `flamegraph` feature**
+         pub fn flamegraph<W>(&self, writer: W) -> Result<()>
+@@ -278,7 +184,21 @@ mod flamegraph {
+             let lines: Vec<String> = self
+                 .data
+                 .iter()
+-                .map(|(key, value)| stack_line(key, value))
++                .map(|(key, value)| {
++                    let mut line = key.thread_name_or_id();
++                    line.push(';');
++
++                    for frame in key.frames.iter().rev() {
++                        for symbol in frame.iter().rev() {
++                            write!(&mut line, "{};", symbol).unwrap();
++                        }
++                    }
++
++                    line.pop().unwrap_or_default();
++                    write!(&mut line, " {}", value).unwrap();
++
++                    line
++                })
+                 .collect();
+             if !lines.is_empty() {
+                 flamegraph::from_lines(options, lines.iter().map(|s| &**s), writer).unwrap();
+@@ -296,51 +216,26 @@ mod flamegraph {
+ mod protobuf {
+     use super::*;
+     use crate::protos;
+-    use std::borrow::Cow;
+     use std::collections::HashSet;
+     use std::time::SystemTime;
+ 
+-    use symbolic_demangle::demangle;
+-
+     const SAMPLES: &str = "samples";
+     const COUNT: &str = "count";
+     const CPU: &str = "cpu";
+     const NANOSECONDS: &str = "nanoseconds";
+     const THREAD: &str = "thread";
+ 
+-    /// Returns a thread identifier (name or ID) as a string.
+-    fn thread_name_or_id(key: &Frames) -> String {
+-        if !key.thread_name.is_empty() {
+-            key.thread_name.clone()
+-        } else {
+-            format!("{:?}", key.thread_id)
+-        }
+-    }
+-
+     impl Report {
+         /// `pprof` will generate google's pprof format report.
+         pub fn pprof(&self) -> crate::Result<protos::Profile> {
+             let mut dedup_str = HashSet::new();
+             for key in self.data.keys() {
+-                dedup_str.insert(thread_name_or_id(key));
++                dedup_str.insert(key.thread_name_or_id());
+                 for frame in key.frames.iter() {
+                     for symbol in frame {
+-                        dedup_str.insert(
+-                            demangle(&String::from_utf8_lossy(
+-                                symbol.name.as_deref().unwrap_or(b"Unknown"),
+-                            ))
+-                            .into_owned(),
+-                        );
+-                        dedup_str.insert(
+-                            String::from_utf8_lossy(
+-                                symbol.name.as_deref().unwrap_or(b"Unknown"),
+-                            )
+-                            .into_owned(),
+-                        );
+-                        dedup_str.insert(match &symbol.filename {
+-                            Some(name) => name.as_os_str().to_string_lossy().into_owned(),
+-                            None => "Unknown".to_string(),
+-                        });
++                        dedup_str.insert(symbol.name());
++                        dedup_str.insert(symbol.sys_name().into_owned());
++                        dedup_str.insert(symbol.filename().into_owned());
+                     }
+                 }
+             }
+@@ -366,24 +261,14 @@ mod protobuf {
+                 let mut locs = vec![];
+                 for frame in key.frames.iter() {
+                     for symbol in frame {
+-                        let name = demangle(&String::from_utf8_lossy(
+-                            symbol.name.as_deref().unwrap_or(b"Unknown"),
+-                        ))
+-                        .into_owned();
++                        let name = symbol.name();
+                         if let Some(loc_idx) = functions.get(&name) {
+                             locs.push(*loc_idx);
+                             continue;
+                         }
+-                        let sys_name =
+-                            String::from_utf8_lossy(symbol.name.as_deref().unwrap_or(b"Unknown"));
+-                        let filename = match &symbol.filename {
+-                            Some(name) => name.as_os_str().to_string_lossy(),
+-                            None => Cow::Borrowed("Unknown"),
+-                        };
+-                        let lineno = match symbol.lineno {
+-                            Some(lineno) => lineno,
+-                            None => 0,
+-                        };
++                        let sys_name = symbol.sys_name();
++                        let filename = symbol.filename();
++                        let lineno = symbol.lineno();
+                         let function_id = fn_tbl.len() as u64 + 1;
+                         let function = protos::Function {
+                             id: function_id,
+@@ -412,7 +297,7 @@ mod protobuf {
+                 }
+                 let thread_name = protos::Label {
+                     key: *strings.get(THREAD).unwrap() as i64,
+-                    str: *strings.get(&thread_name_or_id(key).as_str()).unwrap() as i64,
++                    str: *strings.get(&key.thread_name_or_id().as_str()).unwrap() as i64,
+                     ..protos::Label::default()
+                 };
+                 let sample = protos::Sample {
+diff --git a/src/timer.rs b/src/timer.rs
+index c21e8f3..a6bfa1f 100644
+--- a/src/timer.rs
++++ b/src/timer.rs
+@@ -56,6 +56,16 @@ impl Timer {
+             start_instant: Instant::now(),
+         }
+     }
++
++    /// Returns a `ReportTiming` struct having this timer's frequency and start
++    /// time; and the time elapsed since its creation as duration.
++    pub fn timing(&self) -> ReportTiming {
++        ReportTiming {
++            frequency: self.frequency,
++            start_time: self.start_time,
++            duration: self.start_instant.elapsed(),
++        }
++    }
+ }
+ 
+ impl Drop for Timer {

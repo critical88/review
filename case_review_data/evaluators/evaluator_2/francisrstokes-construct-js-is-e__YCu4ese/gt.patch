@@ -1,0 +1,183 @@
+diff --git a/src/index.ts b/src/index.ts
+index 61f8d2b..79064b1 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -37,11 +37,19 @@ export enum AlignmentPadding {
+   AfterData = 'AfterData'
+ }
+ 
++// Capability every field supports: it knows its byte size and how to
++// serialise itself into a buffer.
+ export interface IField {
+   computeBufferSize(): number;
+   toUint8Array(): Uint8Array;
+-  set(value: unknown): void;
+-  get(): unknown;
++}
++
++// A leaf field carrying a readable, settable scalar/array value. The numeric,
++// array, and string fields implement this; StructType, SizeOf, and Pointer do
++// not — their "values" are derived or, for structs, undefined.
++export interface IValue<T> {
++  set(value: T): void;
++  get(): T;
+ }
+ 
+ export class StructType implements IField {
+@@ -65,10 +73,6 @@ export class StructType implements IField {
+     return this.fieldMap[name].field as T;
+   }
+ 
+-  set(value: unknown): void {
+-    throw new Error(`Struct ${this.name} has no scalar value to set`);
+-  }
+-
+   getDeep<T extends ConstructDataType>(path: string): T {
+     assert(pathRegex.test(path), `Path "${path}" is not valid`);
+ 
+@@ -251,7 +255,7 @@ const normalise64 = (n: bigint) => {
+     : n;
+ };
+ 
+-class BaseField implements IField {
++class BaseField implements IField, IValue<number> {
+   private value: number;
+   private endian: Endian;
+ 
+@@ -326,7 +330,7 @@ class I32Type extends BaseField {
+   }
+ }
+ 
+-class BaseArrayField implements IField {
++class BaseArrayField implements IField, IValue<number[]> {
+   private values: Readonly<number[]>;
+   private endian: Endian;
+ 
+@@ -404,7 +408,7 @@ class I32sType extends BaseArrayField {
+   }
+ }
+ 
+-export class U64Type implements IField {
++export class U64Type implements IField, IValue<bigint> {
+   private value: bigint;
+   private endian: Endian;
+ 
+@@ -436,7 +440,7 @@ export class U64Type implements IField {
+   get() { return this.value; }
+ }
+ 
+-export class I64Type implements IField {
++export class I64Type implements IField, IValue<bigint> {
+   private value: bigint;
+   private endian: Endian;
+ 
+@@ -469,7 +473,7 @@ export class I64Type implements IField {
+   get() { return this.value; }
+ }
+ 
+-export class U64sType implements IField {
++export class U64sType implements IField, IValue<bigint[]> {
+   private values: Readonly<bigint[]>;
+   private endian: Endian;
+ 
+@@ -501,7 +505,7 @@ export class U64sType implements IField {
+   }
+ }
+ 
+-export class I64sType implements IField {
++export class I64sType implements IField, IValue<bigint[]> {
+   private values: Readonly<bigint[]>;
+   private endian: Endian;
+ 
+@@ -552,14 +556,6 @@ class BaseSizeOf implements IField {
+   toUint8Array(): Uint8Array {
+     return this.toBytesFn([this.target.computeBufferSize()], this.endian === Endian.Little);
+   }
+-
+-  get() {
+-    return this.target.computeBufferSize();
+-  }
+-
+-  set(value: unknown): void {
+-    throw new Error("SizeOf fields are read-only and cannot be changed");
+-  }
+ }
+ 
+ class SizeOf8Type extends BaseSizeOf {
+@@ -595,14 +591,6 @@ export class SizeOf64Type implements IField {
+     const bufferSize = BigInt(this.target.computeBufferSize());
+     return u64sTou8s([bufferSize], this.endian === Endian.Little);
+   }
+-
+-  get() {
+-    return BigInt(this.target.computeBufferSize());
+-  }
+-
+-  set(value: unknown): void {
+-    throw new Error("SizeOf fields are read-only and cannot be changed");
+-  }
+ }
+ 
+ class BasePointer implements IField {
+@@ -628,14 +616,6 @@ class BasePointer implements IField {
+   toUint8Array(): Uint8Array {
+     return this.toBytesFn([this.target.getDeepOffset(this.path)], this.endian === Endian.Little);
+   }
+-
+-  get() {
+-    return this.target.getDeepOffset(this.path);
+-  }
+-
+-  set(value: unknown): void {
+-    throw new Error("Pointer fields are read-only and cannot be changed");
+-  }
+ }
+ 
+ class Pointer8Type extends BasePointer {
+@@ -674,17 +654,9 @@ export class Pointer64Type implements IField {
+     const offset = BigInt(this.target.getDeepOffset(this.path));
+     return u64sTou8s([offset], this.endian === Endian.Little);
+   }
+-
+-  get() {
+-    return BigInt(this.target.getDeepOffset(this.path));
+-  }
+-
+-  set(value: unknown): void {
+-    throw new Error("Pointer fields are read-only and cannot be changed");
+-  }
+ }
+ 
+-export class RawStringType implements IField {
++export class RawStringType implements IField, IValue<string> {
+   private value: string;
+ 
+   constructor(value: string) {
+@@ -704,7 +676,7 @@ export class RawStringType implements IField {
+   get() { return this.value; }
+ }
+ 
+-export class NullTerminatedStringType implements IField {
++export class NullTerminatedStringType implements IField, IValue<string> {
+   private value: string;
+ 
+   constructor(value: string) {
+@@ -773,12 +745,14 @@ export type ConstructDataType =
+ 
+ export type DataType<T extends (...args: any[]) => ConstructDataType> = ReturnType<T>;
+ 
+-// Generic field-value accessors: read/write any field's value through the
+-// uniform IField handle, so callers don't need to know the concrete field type.
+-export function readFieldValue(field: IField): unknown {
++// Generic field-value accessors: read/write a field's value through the uniform
++// IValue handle, so callers don't need to know the concrete field type. Only
++// leaf value fields carry a settable value; StructType, SizeOf, and Pointer do
++// not, so they are (correctly) rejected by these signatures.
++export function readFieldValue(field: IValue<unknown>): unknown {
+   return field.get();
+ }
+ 
+-export function writeFieldValue(field: IField, value: unknown): void {
++export function writeFieldValue(field: IValue<unknown>, value: unknown): void {
+   field.set(value);
+ }

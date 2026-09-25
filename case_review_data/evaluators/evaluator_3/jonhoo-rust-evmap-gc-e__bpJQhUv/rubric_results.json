@@ -1,0 +1,136 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent patch removes all `impl<T, O> WriteHandle<T, O>` blocks from non-defining modules: it deletes `from_value`/`from_default` impls in src/lib.rs, `spawn_reader`/`snapshot_reader_epochs` in src/read.rs, `reader_factory` in src/read/factory.rs, and `enter_read_guard` in src/read/guard.rs. It moves `snapshot_reader_epochs` into src/write.rs and replaces `enter_read_guard()` usage with `self.r_handle.enter()`, leaving WriteHandle inherent impls only in the module that defines the type.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the solver's patch, the writer-side handle type no longer has inherent impl blocks living in any module file other than the one that defines it (the crate root, the reader module, the guard module, and the factory module no longer contain impl blocks of that type).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch deletes the smell-added inherent `WriteHandle` methods rather than just relocating their `impl` blocks: `from_value`/`from_default` are removed from lib.rs (construction reverts to the free `new_from_empty`/`new` functions), `spawn_reader` is removed from read.rs (test uses `r.clone()`), `reader_factory` is removed from read/factory.rs (test uses `r.factory()`), and `enter_read_guard` is removed from read/guard.rs (internal call site reverts to `self.r_handle.enter()`). Only `snapshot_reader_epochs` is retained, but it is moved back into write.rs as a `pub(crate)` helper cohesive with the writer's existing publish/wait duties. Thus the writer-side handle no longer carries the absorbed reader-lifecycle/construction responsibilities, reducing its inherent-method load instead of preserving it under a new layout.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The writer-side handle no longer carries the total inherent-method load it had accumulated: counting all inherent methods defined on it across the crate, it ends within the range a cohesive type in this codebase plausibly owns (the read-side handle type is the natural yardstick), rather than retaining every absorbed responsibility under a new layout.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch restores crate-root ownership of pair construction: in src/lib.rs, `new_from_empty` and `new` are reverted to direct construction (`let epochs = Default::default(); let r = ReadHandle::new(...); let w = WriteHandle::new(...); (w, r)`) rather than delegating to writer-handle methods. The injected `impl WriteHandle::from_value` and `impl WriteHandle::from_default` builder blocks are removed entirely, so no construction surface remains on the writer handle. Doc comments are updated to state 'Building the pair is a concern of the read side: the writer handle only ever consumes the already-wired table it is handed.' The free constructors `new`/`new_from_empty` continue to exist as crate-root code.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Pair construction is again owned where the components are defined: construction of a writer together with its reader (both the value form and the empty/Default form) is implemented by crate-root or component-owned code, and any builder-style methods that remain on the writer handle are at most thin delegations to that code.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes the writer-handle methods that the smell had injected for reader-lifecycle duties: `WriteHandle::spawn_reader` is deleted from src/read.rs, `WriteHandle::reader_factory` is deleted from src/read/factory.rs, and `WriteHandle::enter_read_guard` is deleted from src/read/guard.rs. The test is rewritten to use reader-side mechanisms instead: `let extra = r.clone();` and `let late = r.factory().handle();` replace `w.spawn_reader()` and `w.reader_factory().handle()`. The writer's internal call site in src/write.rs changes from `self.enter_read_guard()` to `self.r_handle.enter()`, delegating guard issuance to the reader handle. The `snapshot_reader_epochs` helper is moved into src/write.rs as a private writer-internal bookkeeping method rather than a reader-lifecycle method on the reader module. No writer-handle methods that build read-side structs from writer-held fields remain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Reader-lifecycle responsibilities — registering additional readers against the shared epoch table and minting reader factories for other threads — are implemented by the reader side (the reader handle type, the reader's factory type, or helpers in the reader module), not as writer-handle methods that build read-side structs from writer-held fields.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch deletes the entire `impl<T, O> WriteHandle<T, O> { pub fn enter_read_guard(...) }` block from src/read/guard.rs, removing the duplicated epoch-bump/fence/pointer-load/parity-restoration entry protocol, and also removes the `ReadGuard::enter_state` helper that was widened to support it. The surviving internal call site in src/write.rs is changed from `self.enter_read_guard()` to `self.r_handle.enter()`, delegating to the reader's existing `ReadHandle::enter` machinery. The test correspondingly uses `w.enter()` (via Deref to the reader) and `r.clone()`/`r.factory()` instead of writer-owned entry/spawn/factory methods, so no writer-side reimplementation of the entry protocol remains.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Entering the read side is again reader-owned machinery: the epoch-bump/fence/re-guarantee entry protocol (and the 'handle already dropped' parity restoration) is implemented on the read side, and any writer-side entry point that survives is a delegation to that machinery rather than a reimplementation that pokes reader-private epoch and enter counters directly.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The smell widened WriteHandle fields to `pub(crate) epochs`, `pub(crate) r_handle`, and `pub(crate) last_epochs`. agent.patch's write.rs hunks only add `snapshot_reader_epochs` and replace `enter_read_guard()` with `r_handle.enter()`; no hunk reverts those field declarations, so the epoch table, reader partner handle, and last-known reader-progress fields remain `pub(crate)` and reachable from other crate modules.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The intermediate visibility widenings that let foreign modules drive the writer's shared state are gone: the writer handle's epoch table, its held reader-side partner handle, and its last-known reader-progress fields are no longer reachable from other modules, and read-side internals (guard construction helper, reader struct fields, factory struct fields) are not left open for cross-module callers.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch restores both construction forms as whole free functions in lib.rs (new_from_empty/new inline-build epochs, reader, and writer and delete WriteHandle::from_value/from_default), moves snapshot_reader_epochs into impl WriteHandle in write.rs while removing it from read.rs, and removes the writer-side spawn_reader, reader_factory, and enter_read_guard methods so the test uses r.clone(), r.factory().handle(), and w.enter()/self.r_handle.enter(). Each responsibility is therefore owned by one side rather than split across owners.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The responsibilities were re-homed as complete chains rather than split across owners: both construction forms, reader registration and factory minting, snapshot tracking of reader epochs after swaps, and the writer's own pre-first-publish direct-read path each end up wholly owned (no half of a chain left on the coordinator while the other half moved).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the injected cross-module ownership comments and WriteHandle impls from read.rs, read/factory.rs, and read/guard.rs (e.g., 'The write handle is the owner of the reader lifecycle...'). It restores the lib.rs constructors with doc comments matching the implementation ('Construction wires up the shared epoch table... the writer handle only ever consumes the already-wired table it is handed'), moves snapshot_reader_epochs back into write.rs with an accurate doc comment, updates read.rs doc links to fully-qualified crate::WriteHandle paths, and rewrites the test comment to describe read-side ownership.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "should_have",
+      "criterion": "Comments and doc links across the touched modules describe the new ownership truthfully: no comment still documents cross-module reach-in arrangements (e.g., who else is allowed to call a read-side internals helper) as if they existed, and doc comments on the surviving public entry points match their actual implementation path.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "smell.diff widened WriteHandle fields to `pub(crate) epochs`, `pub(crate) r_handle`, and `pub(crate) last_epochs` to support cross-module impls. agent.patch removes those cross-module impls but never reverts the field visibility (its write.rs diff omits the struct definition), leaving dead `pub(crate)` widenings. It also keeps `pub(crate) fn snapshot_reader_epochs` in write.rs though it is only called within that module.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No re-homing scaffolding remains: no abandoned delegate-only impl blocks or forwarding families beyond the public API the crate already exposed, no unused imports or wildcard re-exports left behind by moved items, and no dead visibility widenings that the final layout no longer needs.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the duplicated writer-side entry protocol from guard.rs (enter_read_guard and ReadGuard::enter_state) and reverts the flush/purge call site to self.r_handle.enter(), so epoch bumping, SeqCst fence, Acquire pointer load, and dropped-handle parity restoration remain governed by the documented ReadHandle::enter. It also keeps snapshot_reader_epochs in write.rs with the same Acquire loads and MutexGuard-held post-swap ordering. No new unsafe blocks are introduced; the unsafe inner.as_ref() blocks from the smell's enter_read_guard are deleted.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not weaken the concurrency argument: epoch bumping, fence placement, enter-counter parity restoration (including the dropped-handle cases), and post-swap snapshot ordering under the epoch-table lock carry over with equivalent memory-ordering reasoning, and no unsafe block gains obligations the read-side documentation cannot support.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch restores the original free constructors `new_from_empty` and `new` in src/lib.rs (both value and default forms) and preserves the pre-existing public surface: `ReadHandle::enter`, `ReadHandle::factory`, and `ReadHandle::clone` remain, with the test exercising `r.clone()`, `r.factory().handle()`, `r.enter()`, and `w.enter()` (aliasing facade). Publish/wait/flush/append are retained; the internal flush path switches from the smell-added `enter_read_guard` to `self.r_handle.enter()` with equivalent semantics. The only removed APIs are the smell-introduced `WriteHandle::from_value/from_default/spawn_reader/reader_factory/enter_read_guard`, not the original capability envelope.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not reduce the crate’s externally visible capability set to make the structure work: consumers can still construct pairs both ways, publish (blocking and opportunistic), wait, flush, apply write-side operations, enter and iterate through guards, spawn readers, mint and use factories from other threads, clone raw handles, and use the aliasing facade, with the same observable semantics as before the change.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0,
+    "associated_changes": 1,
+    "core_resolution": 0.8333333333333334
+  },
+  "valid_count": 11,
+  "pass_count": 9,
+  "must_have_pass": false,
+  "macro_score": 0.7083333333333334
+}

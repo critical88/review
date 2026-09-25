@@ -1,0 +1,147 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent centralizes the decision in pkg/config: new (*Package).IsAquaOwnPackage() (aqua_own.go) is the single source for which packages count as aqua's own, and Package.PkgPath (package.go) is the single production implementation encoding the internal storage layout (filepath.Join(\"internal\",\"pkgs\",...)), with AbsPkgPath wrapping it. All seven previously-inline flows now delegate: InstallProxy calls pkg.AbsPkgPath (proxy.go), createLinks calls pkg.AbsPkgPath (link.go), recreateHardLinks calls pkg.AbsPkgPath (link.go), InstallAqua calls pkg.AbsPkgPath then joins only the exe name (aqua.go), InstallPackage calls pkg.AbsPkgPath (installer.go), getExePath calls pkg.AbsPkgPath for exeDir then joins only the exe name (which.go), and updateTimestamp calls pkg.PkgPath (exec.go). No production function outside the config owner encodes the \"internal/pkgs/...\" layout itself; the smell's inline filepath.Join(\"internal\",\"pkgs\",...) expressions in exec.go, which.go, aqua.go, installer.go, link.go, and proxy.go are all removed.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Exactly one production implementation decides where aqua's own first-party packages are installed on disk, and all of the flows that previously derived that location inline (proxy provisioning, Windows link creation, link re-creation during self-update, aqua self-installation, the generic install pipeline, exec-time executable lookup, and usage recording) now obtain it from that implementation; no production function outside that owner encodes the internal storage layout itself.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "New pkg/config/aqua_own.go defines (*Package).IsAquaOwnPackage() as the single owner/name/type test for aquaproj/aqua and aquaproj/aqua-proxy GitHub release/content packages. pkg/config/package.go PkgPath now calls p.IsAquaOwnPackage(); exec.updateTimestamp calls pkg.PkgPath; which.getExePath calls pkg.IsAquaOwnPackage()/pkg.AbsPkgPath; installpackage InstallPackage, InstallAqua, InstallProxy, createLinks, and recreateHardLinks call pkg.AbsPkgPath. The duplicated local RepoOwner/RepoName/Type conditions from the smell are removed.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The rule for which packages count as aqua's own (the fixed first-party owner/name/type combinations for aqua and aqua-proxy) is applied from one shared definition across installation, lookup and usage recording, not re-written as a local condition in each flow; whether the condition is exposed as a shared predicate or lives inside the shared location logic and is invisible to callers is acceptable.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "All call sites now route through Package.PkgPath/AbsPkgPath, which still produce the same paths. PkgPath returns filepath.Join(\"internal\",\"pkgs\",pkgInfo.Type,\"github.com\",pkgInfo.RepoOwner,pkgInfo.RepoName,pkg.Version,assetName) for aqua-own packages — identical to the smell's inline computations in installer.go, exec.go, and which.go. AbsPkgPath joins rootDir with that same relative path, matching the smell's filepath.Join(is.rootDir,\"internal\",\"pkgs\",...) in aqua.go, link.go, and proxy.go. The Windows executable-name logic in which.go is unchanged (WindowsExt → .sh for github_content → .exe default). Hard-link targets in link.go remain <AbsPkgPath>/aqua-proxy.exe. The relative usage-recording key in exec.go comes from PkgPath (no rootDir prefix), matching the smell's relative filepath.Join. IsAquaOwnPackage uses the same owner/name/type predicates as the smell's inline checks, so the aqua-own vs regular branch selection is equivalent.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "For identical inputs (root directory, package version, rendered asset, runtime platform), every location produced after the repair equals the pre-refactor value: the install destination, the installed executable path, the Windows proxy hard-link target, and the relative package key used by usage recording.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The rubric requires removing duplicated per-flow copies of the executable-name completion rule, but the agent's patch retains both copies identified in the rationale. In pkg/controller/which/which.go getExePath, the agent replaced the inline directory construction with pkg.AbsPkgPath but kept the full inline completion rule for aqua's own packages (the switch over pkgInfo.WindowsExt, PkgInfoTypeGitHubContent→.sh, default→.exe), unchanged from the smell. In pkg/installpackage/aqua.go InstallAqua, the agent replaced the inline directory construction with pkg.AbsPkgPath but kept the local .exe idiom (aquaExeName += exeExt on Windows), also unchanged from the smell. The location knowledge was unified via IsAquaOwnPackage/AbsPkgPath, but the duplicated completion-rule copies were not removed or replaced by calls to a shared completion function.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Executable file-name completion for aqua's own packages behaves exactly as before the cleanup in every affected flow: on Windows the .exe file names for aqua and aqua-proxy, and during lookup the package-declared file name overrides and per-type defaults, all resolve to the same file names as the pre-refactor code produced, without a duplicated per-flow copy of the completion rule.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "In pkg/installpackage/link.go, both Windows link flows now route through the shared implementation: createLinks calls `pkgPath, err := pkg.AbsPkgPath(is.rootDir, is.runtime)` and then `aquaProxyPathOnWindows = filepath.Join(pkgPath, \"aqua-proxy.exe\")`, replacing the previous local `filepath.Join(is.rootDir, \"internal\", \"pkgs\", pkgTypeGitHubRelease, \"github.com\", \"aquaproj\", proxyName, pkg.Package.Version, assetName)` assembly; recreateHardLinks calls `pkgDir, err := pkg.AbsPkgPath(is.rootDir, is.runtime)` and then `a := filepath.Join(pkgDir, \"aqua-proxy.exe\")`, replacing its own local `filepath.Join(is.rootDir, \"internal\", \"pkgs\", ...)` assembly. Both flows obtain the aqua-proxy binary target from AbsPkgPath rather than assembling it independently.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Both Windows link flows — the one that creates the bin hard links when the proxy is provisioned and the one that removes and re-creates them during aqua's own update — obtain the aqua-proxy binary target from the shared location implementation rather than assembling it locally, so the linked file is unchanged for every command entry.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In pkg/installpackage/aqua.go (InstallAqua), the agent removed the smell's inline directory composition (`filepath.Join(is.rootDir, \"internal\", \"pkgs\", pkg.PackageInfo.Type, \"github.com\", \"aquaproj\", pkg.PackageInfo.RepoName, pkg.Package.Version, assetName, aquaExeName)`) and replaced it with `pkgDir, err := pkg.AbsPkgPath(is.rootDir, is.runtime)` then `exePath := filepath.Join(pkgDir, aquaExeName)`, delegating the location to the shared AbsPkgPath implementation. Platform-specific naming is preserved (`aquaExeName := pkgNameAqua; if is.runtime.IsWindows() && filepath.Ext(aquaExeName) == \"\" { aquaExeName += exeExt }`). Because AbsPkgPath for aqua's own package yields `filepath.Join(rootDir, \"internal\", \"pkgs\", Type, \"github.com\", RepoOwner, RepoName, Version, assetName)` with RepoOwner==\"aquaproj\", the final exePath is identical to the smell's inline expression, so the same executable file is selected.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The flow that installs and updates the aqua binary itself resolves its own installed executable path through the shared location implementation (including platform-specific naming) instead of composing the path inline, and the resulting file is the same executable the pre-refactor code selected.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In pkg/installpackage/installer.go, the agent removes the smell's local first-party branch (`if pkgInfo.RepoOwner == \"aquaproj\" && (pkgInfo.RepoName == \"aqua\" || pkgInfo.RepoName == \"aqua-proxy\") ... { pkgPath = filepath.Join(is.rootDir, \"internal\", \"pkgs\", ...) }`) and replaces it with `pkgPath, err := pkg.AbsPkgPath(is.rootDir, is.runtime)`. The same shared `AbsPkgPath`/`PkgPath` implementation is used by which.go, exec.go, link.go, proxy.go, and aqua.go, and `Package.PkgPath` routes aqua's own packages through `p.IsAquaOwnPackage()` to the internal directory, so the generic install pipeline obtains aqua's own package destinations from the shared location implementation rather than a local derivation.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The generic installation pipeline that serves explicit and lazy installs obtains the destination for aqua's own packages from the same shared location implementation the other flows use, so a first-party package always installs to the place that lookup and usage recording expect.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In pkg/controller/exec/exec.go, updateTimestamp (the post-execution usage-recording step) no longer assembles the first-party key locally; the agent removed the injected `filepath.Join(\"internal\", \"pkgs\", pkgInfo.Type, ...)` branch and now derives the key solely via `pkgPath, err := pkg.PkgPath(rt)`, the shared root-relative implementation. PkgPath in pkg/config/package.go is the shared implementation and uses `p.IsAquaOwnPackage()` to emit `internal/pkgs/{type}/github.com/aquaproj/{name}/{version}/{assetName}` for aqua's own packages and `pkgs/{type}/github.com/{owner}/{name}/{version}/{assetName}` for regular packages — identical to the keys the smell's local copy and its else-branch produced, so vacuum.Update receives the same root-relative keys for both first-party and regular packages.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The usage-recording step that runs after command execution derives the package key it writes from the shared location implementation (in root-relative form), producing the same keys the pre-refactor code wrote for both first-party and regular packages, so the cleanup feature keeps finding the metadata it reads.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the injected local derivations and their supporting code: it deletes the now-unused path/filepath imports from exec.go and installer.go, removes the local assetName/pkgInfo/pkgPath variables and if/else branches in exec.go, installer.go, link.go, proxy.go, and aqua.go, and replaces the duplicated identity checks with calls to the new IsAquaOwnPackage helper, which itself has callers in package.go and which.go. No leftover unexported helper, variable, or unreachable branch is visible in the diff.",
+      "valid": true,
+      "attempts": 5,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The refactor leaves no dead code that only existed to support the removed local derivations: no unused imports (for example a path-joining import left after a join was removed), no unexported helpers or variables with no remaining caller, and no branches rendered unreachable by the consolidation.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch consolidates the internal storage layout into the shared owner Package.PkgPath/AbsPkgPath (pkg/config/package.go) and the ownership decision into Package.IsAquaOwnPackage (pkg/config/aqua_own.go). All previously-duplicated production sites now delegate instead of re-deriving: exec.go updateTimestamp calls pkg.PkgPath(rt); which.go getExePath calls pkg.IsAquaOwnPackage() and pkg.AbsPkgPath(c.rootDir, c.runtime) for the directory (retaining only executable-naming logic, not layout); installpackage/aqua.go calls pkg.AbsPkgPath then appends aquaExeName; installer.go InstallPackage calls pkg.AbsPkgPath; link.go createLinks and recreateHardLinks call pkg.AbsPkgPath then append 'aqua-proxy.exe'; proxy.go InstallProxy calls pkg.AbsPkgPath. No remaining production code outside package.go constructs 'internal/pkgs/...' paths or encodes the layout as format strings or segment constants.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The duplication is not merely relocated or re-shaped: no remaining production code outside the shared owner encodes the internal storage layout, whether as direct path construction, string format templates, segment constants, or private helpers that keep packages or flows resolving their own copies.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch routes all aqua-own path decisions through the new IsAquaOwnPackage() and the pre-existing PkgPath/AbsPkgPath, leaving regular-package logic untouched. In PkgPath (package.go), only the GitHubContent/GitHubRelease case's inline aquaproj check is replaced with p.IsAquaOwnPackage(); the other cases (go_build, http, go_install, crates.io) are not modified. In exec.go updateTimestamp, the smell's aqua-own branch is removed entirely, restoring the original single pkg.PkgPath(rt) call for all packages. In installer.go InstallPackage, the smell's if/else branch is removed, restoring the original pkg.AbsPkgPath call for all packages. In which.go getExePath, the aqua-own branch now uses pkg.AbsPkgPath while the else branch still delegates to pkg.ExePath for regular packages. link.go and proxy.go changes only affect aqua-proxy (an aqua-own package). IsAquaOwnPackage() checks the same owner/name/type conditions as the original inline checks (repoOwnerAquaproj, pkgNameAqua/pkgNameAquaProxy, GitHubRelease/GitHubContent), so no regular package is routed into or out of internal storage.",
+      "valid": true,
+      "attempts": 5,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Regular third-party packages are unaffected by the change: their storage layout, resolution and install behavior is unmodified, including the separate pre-existing handling for the verifier tooling aqua downloads and the go_build/http package layouts, and no regular package starts being routed into (or out of) the internal storage area.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch preserves all special first-party handling rather than removing it. (1) Internal storage: pkg/config/package.go PkgPath still returns filepath.Join(\"internal\",\"pkgs\",...) when p.IsAquaOwnPackage() is true; installer.go and proxy.go now route through AbsPkgPath which delegates to that same logic. (2) Windows bin links: link.go createLinks still sets aquaProxyPathOnWindows = filepath.Join(pkgPath, \"aqua-proxy.exe\") and recreateHardLinks still sets a := filepath.Join(pkgDir, \"aqua-proxy.exe\"), now resolving pkgPath/pkgDir via AbsPkgPath. (3) Self-update: aqua.go InstallAqua still computes exePath = filepath.Join(pkgDir, aquaExeName) with Windows exeExt appended, resolving pkgDir via AbsPkgPath. (4) Recognition rule: aqua_own.go IsAquaOwnPackage checks RepoOwner==repoOwnerAquaproj && (RepoName==pkgNameAqua || RepoName==pkgNameAquaProxy) && (Type==PkgInfoTypeGitHubRelease || Type==PkgInfoTypeGitHubContent), matching the original inline checks exactly—neither aqua nor aqua-proxy is dropped, no other packages are added. which.go retains its IsAquaOwnPackage branch with the same Windows ext/.sh/.exe naming and file.Link handling.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The special handling of aqua's own packages is not removed or disabled as a shortcut to consolidating it: first-party packages keep installing into the internal storage area (not the public package tree), Windows bin links keep pointing at the proxy binary, self-update keeps locating the installed aqua executable, and the first-party recognition rule is neither narrowed (dropping aqua or aqua-proxy) nor broadened (pulling in other packages).",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 0.75
+  },
+  "valid_count": 12,
+  "pass_count": 11,
+  "must_have_pass": false,
+  "macro_score": 0.9375
+}

@@ -1,0 +1,127 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Clang-Tidy",
+  "smell_type": "feature_envy",
+  "rule": {
+    "id": "libfuse-session-envy",
+    "description": "A function defined in a production library source (lib/*.c) outside the session-owning module lib/fuse_lowlevel.c performs concentrated surgery on struct fuse_session state: at least 4 member accesses in its body are rooted in a session object (the base chain ends in an expression of type struct fuse_session *, and every member along such a path counts as one access), those accesses enter at least 3 distinct session fields, and at least 70% of all member accesses in the body are session-rooted."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "lib/fuse_signals.c",
+      "class_name": null,
+      "function_name": "session_exit_from_signal"
+    },
+    {
+      "id": "E2",
+      "file_path": "lib/fuse_loop.c",
+      "class_name": null,
+      "function_name": "fuse_session_loop_30"
+    },
+    {
+      "id": "E3",
+      "file_path": "lib/fuse_loop_mt.c",
+      "class_name": null,
+      "function_name": "session_mt_begin_shutdown"
+    },
+    {
+      "id": "E4",
+      "file_path": "lib/mount.c",
+      "class_name": null,
+      "function_name": "fuse_session_mount_unwind"
+    }
+  ],
+  "injected_match_count": 4,
+  "checks": [
+    {
+      "id": "session-state-surgery-outside-session-module",
+      "description": "Detect functions in loop, signal and mount modules that bypass the session module's interface and manipulate struct fuse_session lifecycle state directly.",
+      "detected_relation": "foreign-module function -> session-record state owned by lib/fuse_lowlevel.c",
+      "why_this_is_the_smell": "The function treats the session record as its primary data: its exit flag, wakeup semaphore, worker-list lock, channel fd and mount bookkeeping are read and written through direct member access instead of through the session module that owns and encapsulates that state, so the behavior those fields implement lives with a module that is only a consumer of the session.",
+      "matches": [
+        {
+          "file": "lib/fuse_signals.c",
+          "symbol": "session_exit_from_signal",
+          "entry_ids": ["E1"],
+          "evidence": "The telemetry-signal teardown path stores the exit flag with atomic_store_explicit(&se->mt_exited, 1, ...), posts the session wakeup semaphore, logs under the session debug flag and writes se->error, all as direct member surgery on the session handed in by the handler that now only forwards to it.",
+          "measurement": {
+            "session_rooted_accesses": 4,
+            "distinct_session_fields": 4,
+            "session_access_share": 1.0
+          }
+        },
+        {
+          "file": "lib/fuse_loop.c",
+          "symbol": "fuse_session_loop_30",
+          "entry_ids": ["E2"],
+          "evidence": "The single-threaded request loop polls the exit flag with atomic_load_explicit(&se->mt_exited, ...) directly in its loop head, then reads se->error twice and reaches into the io_uring teardown state through se->uring.pool to decide the loop result, instead of asking the session for exit status and the final result.",
+          "measurement": {
+            "session_rooted_accesses": 5,
+            "distinct_session_fields": 3,
+            "session_access_share": 1.0
+          }
+        },
+        {
+          "file": "lib/fuse_loop_mt.c",
+          "symbol": "session_mt_begin_shutdown",
+          "entry_ids": ["E3"],
+          "evidence": "The multi-thread worker cancellation path parks on the session semaphore while polling se->mt_exited directly with atomics, logs under se->debug and takes the session worker-list lock se->mt_lock before returning it held to the caller, concentrating the session's shutdown sequencing in the loop module.",
+          "measurement": {
+            "session_rooted_accesses": 4,
+            "distinct_session_fields": 4,
+            "session_access_share": 1.0
+          }
+        },
+        {
+          "file": "lib/mount.c",
+          "symbol": "fuse_session_mount_unwind",
+          "entry_ids": ["E4"],
+          "evidence": "The mount module adopts the auto-unmount comm socket into se->auto_unmount_fd (deciding the session's socket ownership via se->mo->auto_unmount), spawns the auto-unmount helper, and on failure invalidates the session's channel state by writing se->fd, se->error and se->is_sync_init, publishing session channel lifecycle decisions from the mount module.",
+          "measurement": {
+            "session_rooted_accesses": 10,
+            "distinct_session_fields": 5,
+            "session_access_share": 1.0
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "file": "lib/cuse_lowlevel.c",
+      "symbol": "_cuse_lowlevel_init",
+      "reason": "Touches many session fields while wiring a new cuse session (26 session-rooted accesses into 7 fields), but only 44% of the member accesses in its body root in the session, well under the concentration threshold: it is session construction wiring, not a foreign function centered on session state."
+    },
+    {
+      "file": "lib/fuse_loop_mt.c",
+      "symbol": "fuse_session_loop_mt_312",
+      "reason": "The loop_mt driver touches se->mt_lock and se->mt_finish around worker bookkeeping, but under 30% of its member accesses root in the session; it coordinates a local struct fuse_mt, so the concentration gate keeps it out, in the injected state as well as the clean one."
+    },
+    {
+      "file": "lib/fuse_loop_mt.c",
+      "symbol": "fuse_clone_chan",
+      "reason": "Opens a second /dev/fuse channel with ioctl(FUSE_DEV_IOC_CLONE); it reads se->io and se->fd through a local session pointer (6 session-rooted accesses) but enters only 2 distinct session fields, below the field-diversity threshold."
+    },
+    {
+      "file": "lib/fuse_loop_mt.c",
+      "symbol": "fuse_do_work",
+      "reason": "The worker thread mutates the worker-list and availability counters on the session, but those session accesses are about a quarter of its member accesses, far below the concentration threshold for feature envy."
+    },
+    {
+      "file": "lib/fuse_signals.c",
+      "symbol": "exit_handler",
+      "reason": "In the clean tree the handler reads fuse_instance->debug and writes fuse_instance->error (2 accesses, 2 fields); it stays below the access and field thresholds and is the clean baseline counterpart of E1."
+    },
+    {
+      "file": "lib/mount.c",
+      "symbol": "fuse_session_mount_publish",
+      "reason": "Companion of E4 in the injected tree that publishes se->fd and se->mountpoint after a successful mount; with only 2 touches into 2 fields it is below the field-diversity threshold and is treated as support plumbing, not a credited manifestation."
+    },
+    {
+      "file": "lib/mount.c",
+      "symbol": "setup_auto_unmount",
+      "reason": "Operates on mount options and file descriptors returned to the session, never on the session record; it is mount-module business by construction."
+    }
+  ]
+}

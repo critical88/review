@@ -1,0 +1,2792 @@
+diff --git a/src/graphics/gpu/bind_group.rs b/src/graphics/gpu/bind_group.rs
+index 4ba8de9..f533fd6 100644
+--- a/src/graphics/gpu/bind_group.rs
++++ b/src/graphics/gpu/bind_group.rs
+@@ -221,8 +221,8 @@ impl<'a> BindGroupBuilder<'a> {
+ 
+ #[derive(Debug)]
+ pub struct BindGroupCache {
+-    layouts: HashMap<(Vec<wgpu::BindGroupLayoutEntry>, u64), wgpu::BindGroupLayout>,
+-    groups: HashMap<Vec<BindGroupEntryKey>, wgpu::BindGroup>,
++    pub(crate) layouts: HashMap<(Vec<wgpu::BindGroupLayoutEntry>, u64), wgpu::BindGroupLayout>,
++    pub(crate) groups: HashMap<Vec<BindGroupEntryKey>, wgpu::BindGroup>,
+ }
+ 
+ impl BindGroupCache {
+diff --git a/src/graphics/gpu/growing.rs b/src/graphics/gpu/growing.rs
+index 9c78acc..99db41c 100644
+--- a/src/graphics/gpu/growing.rs
++++ b/src/graphics/gpu/growing.rs
+@@ -6,9 +6,9 @@
+ /// - aligned: This is particularly important for uniform buffers as GPUs have a restriction on min alignment for dynamic offsets into UBOs
+ #[derive(Debug)]
+ pub struct GrowingBufferArena {
+-    buffers: Vec<(wgpu::Buffer, u64)>,
+-    alignment: u64,
+-    desc: wgpu::BufferDescriptor<'static>,
++    pub(crate) buffers: Vec<(wgpu::Buffer, u64)>,
++    pub(crate) alignment: u64,
++    pub(crate) desc: wgpu::BufferDescriptor<'static>,
+ }
+ 
+ impl GrowingBufferArena {
+diff --git a/src/graphics/gpu/pipeline.rs b/src/graphics/gpu/pipeline.rs
+index 6d1e561..4b4f858 100644
+--- a/src/graphics/gpu/pipeline.rs
++++ b/src/graphics/gpu/pipeline.rs
+@@ -21,8 +21,8 @@ pub struct RenderPipelineInfo {
+ /// Caches both the pipeline *and* the pipeline layout.
+ #[derive(Debug)]
+ pub struct PipelineCache {
+-    pipelines: HashMap<RenderPipelineInfo, wgpu::RenderPipeline>,
+-    layouts: HashMap<u64, wgpu::PipelineLayout>,
++    pub(crate) pipelines: HashMap<RenderPipelineInfo, wgpu::RenderPipeline>,
++    pub(crate) layouts: HashMap<u64, wgpu::PipelineLayout>,
+ }
+ 
+ impl PipelineCache {
+diff --git a/src/graphics/gpu/text.rs b/src/graphics/gpu/text.rs
+index 4ad984e..e7ba410 100644
+--- a/src/graphics/gpu/text.rs
++++ b/src/graphics/gpu/text.rs
+@@ -82,10 +82,6 @@ impl TextRenderer {
+         })
+     }
+ 
+-    pub fn queue(&self, section: glyph_brush::Section<'_, Extra>) {
+-        self.glyph_brush.borrow_mut().queue(section);
+-    }
+-
+     pub(crate) fn draw_queued(
+         &mut self,
+         device: &wgpu::Device,
+diff --git a/src/graphics/image.rs b/src/graphics/image.rs
+index 47770dc..5ac38ed 100644
+--- a/src/graphics/image.rs
++++ b/src/graphics/image.rs
+@@ -1,6 +1,5 @@
+ use super::{
+-    context::GraphicsContext, gpu::bind_group::BindGroupBuilder, Canvas, Color, Draw, DrawParam,
+-    Drawable, Rect, WgpuContext,
++    context::GraphicsContext, Canvas, Color, Draw, DrawParam, Drawable, Rect, WgpuContext,
+ };
+ use crate::{context::Has, Context, GameError, GameResult};
+ use image::ImageEncoder;
+@@ -377,31 +376,6 @@ impl Image {
+             h: h as f32 / self.height as f32,
+         }
+     }
+-
+-    pub(crate) fn fetch_buffer(
+-        &self,
+-        sampler: wgpu::Sampler,
+-        device: &wgpu::Device,
+-    ) -> wgpu::BindGroup {
+-        // Fast path: already in cache
+-        if let Some(buffer) = self.cache.read().unwrap().get(&sampler) {
+-            return buffer.clone();
+-        }
+-
+-        // Slow path
+-        self.cache
+-            .write()
+-            .unwrap()
+-            .entry(sampler)
+-            .or_insert_with_key(|sampler| {
+-                BindGroupBuilder::new()
+-                    .image(&self.view, wgpu::ShaderStages::FRAGMENT)
+-                    .sampler(sampler, wgpu::ShaderStages::FRAGMENT)
+-                    .create_uncached(device)
+-                    .0
+-            })
+-            .clone()
+-    }
+ }
+ 
+ impl Drawable for Image {
+diff --git a/src/graphics/internal_canvas.rs b/src/graphics/internal_canvas.rs
+index 9bb6240..a8ea6f5 100644
+--- a/src/graphics/internal_canvas.rs
++++ b/src/graphics/internal_canvas.rs
+@@ -2,10 +2,10 @@ use super::{
+     context::GraphicsContext,
+     draw::{DrawParam, DrawUniforms},
+     gpu::{
+-        bind_group::{BindGroupBuilder, BindGroupCache, BindGroupLayoutBuilder},
++        bind_group::{BindGroupBuilder, BindGroupCache, BindGroupEntryKey, BindGroupLayoutBuilder},
+         growing::{ArenaAllocation, GrowingBufferArena},
+         pipeline::{PipelineCache, RenderPipelineInfo},
+-        text::{TextRenderer, TextVertex},
++        text::{Extra, TextRenderer, TextVertex},
+     },
+     image::Image,
+     mesh::{Mesh, Vertex},
+@@ -15,8 +15,13 @@ use super::{
+ };
+ use crate::{GameError, GameResult};
+ use crevice::std140::AsStd140;
++use glyph_brush::GlyphCruncher;
+ use glam::{Mat4, Vec2, Vec4};
+-use std::{collections::HashMap, hash::Hash};
++use std::{
++    collections::{hash_map::DefaultHasher, HashMap},
++    hash::{Hash, Hasher},
++    num::NonZeroU64,
++};
+ 
+ /// A canvas represents a render pass and is how you render primitives such as meshes and text onto images.
+ #[allow(missing_debug_implementations)]
+@@ -318,23 +323,485 @@ impl<'a> InternalCanvas<'a> {
+             return;
+         }
+ 
+-        self.update_pipeline(ShaderType::Draw);
++        // The mesh hot path is deliberately flat: the pipeline selection that
++        // used to be update_pipeline, the arena bump from
++        // GrowingBufferArena::allocate and the image bookkeeping from set_image
++        // all happen inline so the whole render-pass state change is visible
++        // right here.
++        let ty = ShaderType::Draw;
++
++        if self.dirty_pipeline || self.shader_ty != Some(ty) {
++            self.dirty_pipeline = false;
++            self.shader_ty = Some(ty);
++
++            // sampled texture + filtering sampler, both fragment-stage
++            let texture_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Texture {
++                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                                view_dimension: wgpu::TextureViewDimension::D2,
++                                multisampled: false,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // two read-only storage buffers for the instance data, vertex-stage
++            let instance_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // the uniform binding is seeded by the shader kind so that plain
++            // draws, instanced draws and text never share a layout entry
++            let uniform_seed = {
++                let mut hasher = DefaultHasher::new();
++                ty.hash(&mut hasher);
++                hasher.finish()
++            };
++            let uniform_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![wgpu::BindGroupLayoutEntry {
++                        binding: 0,
++                        visibility: wgpu::ShaderStages::VERTEX,
++                        ty: wgpu::BindingType::Buffer {
++                            ty: wgpu::BufferBindingType::Uniform,
++                            has_dynamic_offset: true,
++                            min_binding_size: None,
++                        },
++                        count: None,
++                    }],
++                    uniform_seed,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // the empty layout/group pair is only used to reserve slot 2
++            let (dummy_group, dummy_layout) = {
++                let dummy_layout = self
++                    .bind_group_cache
++                    .layouts
++                    .entry((Vec::new(), 0))
++                    .or_insert_with_key(|(entries, _)| {
++                        self.wgpu
++                            .device
++                            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                label: None,
++                                entries,
++                            })
++                    })
++                    .clone();
++                let dummy_group = self
++                    .bind_group_cache
++                    .groups
++                    .entry(Vec::new())
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_bind_group(&wgpu::BindGroupDescriptor {
++                                label: None,
++                                layout: &dummy_layout,
++                                entries: &[],
++                            })
++                    })
++                    .clone();
++                (dummy_group, dummy_layout)
++            };
++
++            let mut groups = vec![Some(&uniform_layout), Some(&texture_layout)];
++
++            if let ShaderType::Instance { .. } = ty {
++                groups.push(Some(&instance_layout));
++            } else {
++                // the dummy group ensures the user's bind group is at index 3
++                groups.push(Some(&dummy_layout));
++                self.pass.set_bind_group(2, &dummy_group, &[]);
++            }
++
++            let shader = match ty {
++                ShaderType::Draw | ShaderType::Instance { .. } => {
++                    if let Some((ref bind_group, ref bind_group_layout, offset)) =
++                        self.shader_bind_group
++                    {
++                        self.pass.set_bind_group(3, bind_group, &[offset]);
++                        groups.push(Some(bind_group_layout));
++                    }
++
++                    &self.shader
++                }
++                ShaderType::Text => {
++                    if let Some((ref bind_group, ref bind_group_layout, offset)) =
++                        self.text_shader_bind_group
++                    {
++                        self.pass.set_bind_group(3, bind_group, &[offset]);
++                        groups.push(Some(bind_group_layout));
++                    }
++
++                    &self.text_shader
++                }
++            };
++
++            // pipeline layout, keyed by the hashed bind group layouts
++            let layout = {
++                let key = {
++                    let mut hasher = DefaultHasher::new();
++                    for bg in &groups {
++                        bg.hash(&mut hasher);
++                    }
++                    hasher.finish()
++                };
++                self.pipeline_cache
++                    .layouts
++                    .entry(key)
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                                label: None,
++                                bind_group_layouts: &groups,
++                                immediate_size: 0,
++                            })
++                    })
++                    .clone()
++            };
++
++            // the pipeline itself, cached by its full descriptor
++            let pipeline = {
++                let info = RenderPipelineInfo {
++                    layout,
++                    vs: if let Some(vs_module) = &shader.vs_module {
++                        vs_module.clone()
++                    } else {
++                        match ty {
++                            ShaderType::Draw => self.draw_sm.clone(),
++                            ShaderType::Instance { ordered: true } => self.instance_sm.clone(),
++                            ShaderType::Instance { ordered: false } => {
++                                self.instance_unordered_sm.clone()
++                            }
++                            ShaderType::Text => self.text_sm.clone(),
++                        }
++                    },
++                    fs: if let Some(fs_module) = &shader.fs_module {
++                        fs_module.clone()
++                    } else {
++                        match ty {
++                            ShaderType::Draw | ShaderType::Instance { .. } => self.draw_sm.clone(),
++                            ShaderType::Text => self.text_sm.clone(),
++                        }
++                    },
++                    vs_entry: "vs_main",
++                    fs_entry: "fs_main",
++                    samples: self.samples,
++                    format: self.format,
++                    blend: Some(wgpu::BlendState {
++                        color: self.blend_mode.color,
++                        alpha: self.blend_mode.alpha,
++                    }),
++                    depth: None,
++                    vertices: true,
++                    topology: match ty {
++                        ShaderType::Text => wgpu::PrimitiveTopology::TriangleStrip,
++                        _ => wgpu::PrimitiveTopology::TriangleList,
++                    },
++                    vertex_layout: match ty {
++                        ShaderType::Text => TextVertex::layout(),
++                        _ => Vertex::layout(),
++                    },
++                    cull_mode: None,
++                };
++                let vertex_buffers = [Some(info.vertex_layout.clone())];
++                self.pipeline_cache
++                    .pipelines
++                    .entry(info)
++                    .or_insert_with_key(|info| {
++                        self.wgpu
++                            .device
++                            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                                label: None,
++                                layout: Some(&info.layout),
++                                vertex: wgpu::VertexState {
++                                    module: &info.vs,
++                                    entry_point: Some("vs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    buffers: if info.vertices { &vertex_buffers } else { &[] },
++                                },
++                                primitive: wgpu::PrimitiveState {
++                                    topology: info.topology,
++                                    strip_index_format: None,
++                                    front_face: wgpu::FrontFace::Ccw,
++                                    cull_mode: info.cull_mode,
++                                    unclipped_depth: false,
++                                    polygon_mode: wgpu::PolygonMode::Fill,
++                                    conservative: false,
++                                },
++                                depth_stencil: info
++                                    .depth
++                                    .map(|depth_compare| wgpu::DepthStencilState {
++                                        format: wgpu::TextureFormat::Depth32Float,
++                                        depth_write_enabled: Some(true),
++                                        depth_compare: Some(depth_compare),
++                                        stencil: Default::default(),
++                                        bias: Default::default(),
++                                    }),
++                                multisample: wgpu::MultisampleState {
++                                    count: info.samples,
++                                    mask: !0,
++                                    alpha_to_coverage_enabled: false,
++                                },
++                                fragment: Some(wgpu::FragmentState {
++                                    module: &info.fs,
++                                    entry_point: Some("fs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    targets: &[Some(wgpu::ColorTargetState {
++                                        format: info.format,
++                                        blend: info.blend,
++                                        write_mask: wgpu::ColorWrites::ALL,
++                                    })],
++                                }),
++                                multiview_mask: None,
++                                cache: None,
++                            })
++                    })
++                    .clone()
++            };
++
++            self.pass.set_pipeline(&pipeline);
++        }
+ 
+         let alloc_size = DrawUniforms::std140_size_static() as u64;
+-        let uniform_alloc = self.uniform_arena.allocate(&self.wgpu.device, alloc_size);
+ 
+-        let (uniform_bind_group, _) = BindGroupBuilder::new()
+-            .buffer(
+-                &uniform_alloc.buffer,
++        // arena bump, spelled out: align the request, walk the buffers for one
++        // with room left, and mint a fresh buffer when the arena is full
++        // (the old helper grew the arena and recursed; this is the same
++        // behavior with one less jump).
++        let aligned_size =
++            (alloc_size + self.uniform_arena.alignment - 1) & !(self.uniform_arena.alignment - 1);
++        assert!(aligned_size <= self.uniform_arena.desc.size);
++        let uniform_alloc = {
++            let mut found: Option<ArenaAllocation> = None;
++            for (buffer, cursor) in &mut self.uniform_arena.buffers {
++                if aligned_size <= self.uniform_arena.desc.size - *cursor {
++                    let offset = *cursor;
++                    *cursor += aligned_size;
++                    found = Some(ArenaAllocation {
++                        buffer: buffer.clone(),
++                        offset,
++                    });
++                    break;
++                }
++            }
++            match found {
++                Some(allocation) => allocation,
++                None => {
++                    let buffer = self.wgpu.device.create_buffer(&self.uniform_arena.desc);
++                    self.uniform_arena.buffers.push((buffer.clone(), aligned_size));
++                    ArenaAllocation { buffer, offset: 0 }
++                }
++            }
++        };
++
++        // the uniform bind group for this draw, straight from its cache key
++        let uniform_bind_layout = self
++            .bind_group_cache
++            .layouts
++            .entry((
++                vec![wgpu::BindGroupLayoutEntry {
++                    binding: 0,
++                    visibility: wgpu::ShaderStages::VERTEX,
++                    ty: wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: true,
++                        min_binding_size: None,
++                    },
++                    count: None,
++                }],
+                 0,
+-                wgpu::ShaderStages::VERTEX,
+-                wgpu::BufferBindingType::Uniform,
+-                true,
+-                Some(alloc_size),
+-            )
+-            .create(&self.wgpu.device, self.bind_group_cache);
++            ))
++            .or_insert_with_key(|(entries, _)| {
++                self.wgpu
++                    .device
++                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                        label: None,
++                        entries,
++                    })
++            })
++            .clone();
++        let uniform_bind_group = self
++            .bind_group_cache
++            .groups
++            .entry(vec![BindGroupEntryKey::Buffer {
++                buffer: uniform_alloc.buffer.clone(),
++                offset: 0,
++                size: Some(alloc_size),
++            }])
++            .or_insert_with(|| {
++                self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                    label: None,
++                    layout: &uniform_bind_layout,
++                    entries: &[wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
++                            buffer: &uniform_alloc.buffer,
++                            offset: 0,
++                            size: NonZeroU64::new(alloc_size),
++                        }),
++                    }],
++                })
++            })
++            .clone();
+ 
+-        self.set_image(image.clone());
++        // set_image body inlined, including the sampler cache and the
++        // image-local bind group cache it used to consult
++        let owned_image = image.clone();
++        if self.curr_sampler != self.next_sampler
++            || self
++                .curr_image
++                .as_ref()
++                .is_none_or(|curr| *curr != owned_image.view)
++        {
++            self.curr_sampler = self.next_sampler;
++
++            let sampler_key = self.curr_sampler;
++            let sample = self
++                .sampler_cache
++                .cache
++                .entry(sampler_key)
++                .or_insert_with(|| {
++                    let descriptor: wgpu::SamplerDescriptor = sampler_key.into();
++                    self.wgpu.device.create_sampler(&descriptor)
++                })
++                .clone();
++
++            // fast path first: the image caches uploaded bind groups by sampler
++            let cached_bind = owned_image.cache.read().unwrap().get(&sample).cloned();
++            let image_bind = match cached_bind {
++                Some(bind) => bind,
++                None => owned_image
++                    .cache
++                    .write()
++                    .unwrap()
++                    .entry(sample)
++                    .or_insert_with_key(|sampler| {
++                        let layout =
++                            self.wgpu
++                                .device
++                                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                    label: None,
++                                    entries: &[
++                                        wgpu::BindGroupLayoutEntry {
++                                            binding: 0,
++                                            visibility: wgpu::ShaderStages::FRAGMENT,
++                                            ty: wgpu::BindingType::Texture {
++                                                sample_type:
++                                                    wgpu::TextureSampleType::Float {
++                                                    filterable: true,
++                                                },
++                                                view_dimension: wgpu::TextureViewDimension::D2,
++                                                multisampled: false,
++                                            },
++                                            count: None,
++                                        },
++                                        wgpu::BindGroupLayoutEntry {
++                                            binding: 1,
++                                            visibility: wgpu::ShaderStages::FRAGMENT,
++                                            ty: wgpu::BindingType::Sampler(
++                                                wgpu::SamplerBindingType::Filtering,
++                                            ),
++                                            count: None,
++                                        },
++                                    ],
++                                });
++                        self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                            label: None,
++                            layout: &layout,
++                            entries: &[
++                                wgpu::BindGroupEntry {
++                                    binding: 0,
++                                    resource: wgpu::BindingResource::TextureView(
++                                        &owned_image.view,
++                                    ),
++                                },
++                                wgpu::BindGroupEntry {
++                                    binding: 1,
++                                    resource: wgpu::BindingResource::Sampler(sampler),
++                                },
++                            ],
++                        })
++                    })
++                    .clone(),
++            };
++
++            self.curr_image = Some(owned_image.view);
++
++            self.pass.set_bind_group(1, &image_bind, &[]);
++        }
+ 
+         let mut uniforms = DrawUniforms::from_param(
+             &param,
+@@ -382,9 +849,314 @@ impl<'a> InternalCanvas<'a> {
+             return Ok(());
+         }
+ 
+-        self.update_pipeline(ShaderType::Instance {
++        // instanced draws carry their pipeline-creation path inline as well.
++        // Keeping the two mesh entry points independent of update_pipeline
++        // and set_image means everything needed for one draw is textually
++        // local to the caller.
++        let ty = ShaderType::Instance {
+             ordered: instances.ordered,
+-        });
++        };
++
++        if self.dirty_pipeline || self.shader_ty != Some(ty) {
++            self.dirty_pipeline = false;
++            self.shader_ty = Some(ty);
++
++            // sampled texture + filtering sampler, both fragment-stage
++            let texture_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Texture {
++                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                                view_dimension: wgpu::TextureViewDimension::D2,
++                                multisampled: false,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // two read-only storage buffers for the instance data, vertex-stage
++            let instance_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // uniform layout, distinct per shader kind via the seed
++            let uniform_seed = {
++                let mut hasher = DefaultHasher::new();
++                ty.hash(&mut hasher);
++                hasher.finish()
++            };
++            let uniform_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![wgpu::BindGroupLayoutEntry {
++                        binding: 0,
++                        visibility: wgpu::ShaderStages::VERTEX,
++                        ty: wgpu::BindingType::Buffer {
++                            ty: wgpu::BufferBindingType::Uniform,
++                            has_dynamic_offset: true,
++                            min_binding_size: None,
++                        },
++                        count: None,
++                    }],
++                    uniform_seed,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            let (dummy_group, dummy_layout) = {
++                let dummy_layout = self
++                    .bind_group_cache
++                    .layouts
++                    .entry((Vec::new(), 0))
++                    .or_insert_with_key(|(entries, _)| {
++                        self.wgpu
++                            .device
++                            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                label: None,
++                                entries,
++                            })
++                    })
++                    .clone();
++                let dummy_group = self
++                    .bind_group_cache
++                    .groups
++                    .entry(Vec::new())
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_bind_group(&wgpu::BindGroupDescriptor {
++                                label: None,
++                                layout: &dummy_layout,
++                                entries: &[],
++                            })
++                    })
++                    .clone();
++                (dummy_group, dummy_layout)
++            };
++
++            let mut groups = vec![Some(&uniform_layout), Some(&texture_layout)];
++
++            if let ShaderType::Instance { .. } = ty {
++                groups.push(Some(&instance_layout));
++            } else {
++                // the dummy group ensures the user's bind group is at index 3
++                groups.push(Some(&dummy_layout));
++                self.pass.set_bind_group(2, &dummy_group, &[]);
++            }
++
++            let shader = match ty {
++                ShaderType::Draw | ShaderType::Instance { .. } => {
++                    if let Some((ref bind_group, ref bind_group_layout, offset)) =
++                        self.shader_bind_group
++                    {
++                        self.pass.set_bind_group(3, bind_group, &[offset]);
++                        groups.push(Some(bind_group_layout));
++                    }
++
++                    &self.shader
++                }
++                ShaderType::Text => {
++                    if let Some((ref bind_group, ref bind_group_layout, offset)) =
++                        self.text_shader_bind_group
++                    {
++                        self.pass.set_bind_group(3, bind_group, &[offset]);
++                        groups.push(Some(bind_group_layout));
++                    }
++
++                    &self.text_shader
++                }
++            };
++
++            let layout = {
++                let key = {
++                    let mut hasher = DefaultHasher::new();
++                    for bg in &groups {
++                        bg.hash(&mut hasher);
++                    }
++                    hasher.finish()
++                };
++                self.pipeline_cache
++                    .layouts
++                    .entry(key)
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                                label: None,
++                                bind_group_layouts: &groups,
++                                immediate_size: 0,
++                            })
++                    })
++                    .clone()
++            };
++
++            let pipeline = {
++                let info = RenderPipelineInfo {
++                    layout,
++                    vs: if let Some(vs_module) = &shader.vs_module {
++                        vs_module.clone()
++                    } else {
++                        match ty {
++                            ShaderType::Draw => self.draw_sm.clone(),
++                            ShaderType::Instance { ordered: true } => self.instance_sm.clone(),
++                            ShaderType::Instance { ordered: false } => {
++                                self.instance_unordered_sm.clone()
++                            }
++                            ShaderType::Text => self.text_sm.clone(),
++                        }
++                    },
++                    fs: if let Some(fs_module) = &shader.fs_module {
++                        fs_module.clone()
++                    } else {
++                        match ty {
++                            ShaderType::Draw | ShaderType::Instance { .. } => self.draw_sm.clone(),
++                            ShaderType::Text => self.text_sm.clone(),
++                        }
++                    },
++                    vs_entry: "vs_main",
++                    fs_entry: "fs_main",
++                    samples: self.samples,
++                    format: self.format,
++                    blend: Some(wgpu::BlendState {
++                        color: self.blend_mode.color,
++                        alpha: self.blend_mode.alpha,
++                    }),
++                    depth: None,
++                    vertices: true,
++                    topology: match ty {
++                        ShaderType::Text => wgpu::PrimitiveTopology::TriangleStrip,
++                        _ => wgpu::PrimitiveTopology::TriangleList,
++                    },
++                    vertex_layout: match ty {
++                        ShaderType::Text => TextVertex::layout(),
++                        _ => Vertex::layout(),
++                    },
++                    cull_mode: None,
++                };
++                let vertex_buffers = [Some(info.vertex_layout.clone())];
++                self.pipeline_cache
++                    .pipelines
++                    .entry(info)
++                    .or_insert_with_key(|info| {
++                        self.wgpu
++                            .device
++                            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                                label: None,
++                                layout: Some(&info.layout),
++                                vertex: wgpu::VertexState {
++                                    module: &info.vs,
++                                    entry_point: Some("vs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    buffers: if info.vertices { &vertex_buffers } else { &[] },
++                                },
++                                primitive: wgpu::PrimitiveState {
++                                    topology: info.topology,
++                                    strip_index_format: None,
++                                    front_face: wgpu::FrontFace::Ccw,
++                                    cull_mode: info.cull_mode,
++                                    unclipped_depth: false,
++                                    polygon_mode: wgpu::PolygonMode::Fill,
++                                    conservative: false,
++                                },
++                                depth_stencil: info
++                                    .depth
++                                    .map(|depth_compare| wgpu::DepthStencilState {
++                                        format: wgpu::TextureFormat::Depth32Float,
++                                        depth_write_enabled: Some(true),
++                                        depth_compare: Some(depth_compare),
++                                        stencil: Default::default(),
++                                        bias: Default::default(),
++                                    }),
++                                multisample: wgpu::MultisampleState {
++                                    count: info.samples,
++                                    mask: !0,
++                                    alpha_to_coverage_enabled: false,
++                                },
++                                fragment: Some(wgpu::FragmentState {
++                                    module: &info.fs,
++                                    entry_point: Some("fs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    targets: &[Some(wgpu::ColorTargetState {
++                                        format: info.format,
++                                        blend: info.blend,
++                                        write_mask: wgpu::ColorWrites::ALL,
++                                    })],
++                                }),
++                                multiview_mask: None,
++                                cache: None,
++                            })
++                    })
++                    .clone()
++            };
++
++            self.pass.set_pipeline(&pipeline);
++        }
+ 
+         let alloc_size = u64::from(
+             self.wgpu
+@@ -392,20 +1164,169 @@ impl<'a> InternalCanvas<'a> {
+                 .limits()
+                 .min_uniform_buffer_offset_alignment,
+         );
+-        let uniform_alloc = self.uniform_arena.allocate(&self.wgpu.device, alloc_size);
+ 
+-        let (uniform_bind_group, _) = BindGroupBuilder::new()
+-            .buffer(
+-                &uniform_alloc.buffer,
++        // the arena bump, inline: align to GPU uniform-buffer offset
++        // requirements, bump the first cursor with room, or append a brand
++        // new buffer (which is exactly what a grow + retry would have picked)
++        let aligned_size =
++            (alloc_size + self.uniform_arena.alignment - 1) & !(self.uniform_arena.alignment - 1);
++        assert!(aligned_size <= self.uniform_arena.desc.size);
++        let uniform_alloc = {
++            let mut found: Option<ArenaAllocation> = None;
++            for (buffer, cursor) in &mut self.uniform_arena.buffers {
++                if aligned_size <= self.uniform_arena.desc.size - *cursor {
++                    let offset = *cursor;
++                    *cursor += aligned_size;
++                    found = Some(ArenaAllocation {
++                        buffer: buffer.clone(),
++                        offset,
++                    });
++                    break;
++                }
++            }
++            match found {
++                Some(allocation) => allocation,
++                None => {
++                    let buffer = self.wgpu.device.create_buffer(&self.uniform_arena.desc);
++                    self.uniform_arena.buffers.push((buffer.clone(), aligned_size));
++                    ArenaAllocation { buffer, offset: 0 }
++                }
++            }
++        };
++
++        // uniform bind group through its cache entry
++        let uniform_bind_layout = self
++            .bind_group_cache
++            .layouts
++            .entry((
++                vec![wgpu::BindGroupLayoutEntry {
++                    binding: 0,
++                    visibility: wgpu::ShaderStages::VERTEX,
++                    ty: wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: true,
++                        min_binding_size: None,
++                    },
++                    count: None,
++                }],
+                 0,
+-                wgpu::ShaderStages::VERTEX,
+-                wgpu::BufferBindingType::Uniform,
+-                true,
+-                Some(alloc_size),
+-            )
+-            .create(&self.wgpu.device, self.bind_group_cache);
++            ))
++            .or_insert_with_key(|(entries, _)| {
++                self.wgpu
++                    .device
++                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                        label: None,
++                        entries,
++                    })
++            })
++            .clone();
++        let uniform_bind_group = self
++            .bind_group_cache
++            .groups
++            .entry(vec![BindGroupEntryKey::Buffer {
++                buffer: uniform_alloc.buffer.clone(),
++                offset: 0,
++                size: Some(alloc_size),
++            }])
++            .or_insert_with(|| {
++                self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                    label: None,
++                    layout: &uniform_bind_layout,
++                    entries: &[wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
++                            buffer: &uniform_alloc.buffer,
++                            offset: 0,
++                            size: NonZeroU64::new(alloc_size),
++                        }),
++                    }],
++                })
++            })
++            .clone();
+ 
+-        self.set_image(instances.image.clone());
++        // set_image body inlined for the instance image
++        let owned_image = instances.image.clone();
++        if self.curr_sampler != self.next_sampler
++            || self
++                .curr_image
++                .as_ref()
++                .is_none_or(|curr| *curr != owned_image.view)
++        {
++            self.curr_sampler = self.next_sampler;
++
++            let inst_sampler_key = self.curr_sampler;
++            let inst_sampler = self
++                .sampler_cache
++                .cache
++                .entry(inst_sampler_key)
++                .or_insert_with(|| {
++                    let descriptor: wgpu::SamplerDescriptor = inst_sampler_key.into();
++                    self.wgpu.device.create_sampler(&descriptor)
++                })
++                .clone();
++
++            let cached_bind = owned_image.cache.read().unwrap().get(&inst_sampler).cloned();
++            let image_bind = match cached_bind {
++                Some(bind) => bind,
++                None => owned_image
++                    .cache
++                    .write()
++                    .unwrap()
++                    .entry(inst_sampler)
++                    .or_insert_with_key(|sampler| {
++                        let layout =
++                            self.wgpu
++                                .device
++                                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                    label: None,
++                                    entries: &[
++                                        wgpu::BindGroupLayoutEntry {
++                                            binding: 0,
++                                            visibility: wgpu::ShaderStages::FRAGMENT,
++                                            ty: wgpu::BindingType::Texture {
++                                                sample_type:
++                                                    wgpu::TextureSampleType::Float {
++                                                    filterable: true,
++                                                },
++                                                view_dimension: wgpu::TextureViewDimension::D2,
++                                                multisampled: false,
++                                            },
++                                            count: None,
++                                        },
++                                        wgpu::BindGroupLayoutEntry {
++                                            binding: 1,
++                                            visibility: wgpu::ShaderStages::FRAGMENT,
++                                            ty: wgpu::BindingType::Sampler(
++                                                wgpu::SamplerBindingType::Filtering,
++                                            ),
++                                            count: None,
++                                        },
++                                    ],
++                                });
++                        self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                            label: None,
++                            layout: &layout,
++                            entries: &[
++                                wgpu::BindGroupEntry {
++                                    binding: 0,
++                                    resource: wgpu::BindingResource::TextureView(
++                                        &owned_image.view,
++                                    ),
++                                },
++                                wgpu::BindGroupEntry {
++                                    binding: 1,
++                                    resource: wgpu::BindingResource::Sampler(sampler),
++                                },
++                            ],
++                        })
++                    })
++                    .clone(),
++            };
++
++            self.curr_image = Some(owned_image.view);
++
++            self.pass.set_bind_group(1, &image_bind, &[]);
++        }
+ 
+         let uniforms = InstanceUniforms {
+             // image scaling is non-sensical for instance array itself as the image scaling is applied locally (see below)
+@@ -447,32 +1368,537 @@ impl<'a> InternalCanvas<'a> {
+     pub fn draw_bounded_text(&mut self, text: &Text, mut param: DrawParam) -> GameResult {
+         if let Transform::Values { dest, offset, .. } = &mut param.transform {
+             if offset.x > 0. || offset.y > 0. {
+-                let bounds = text.measure_raw(self.text_renderer, self.fonts)?;
++                // inlined Text::measure_raw: lay the section out the way a
++                // no-frills measure would and read back its overall bounds.
++                // The section assembly that as_section used to do is spelled
++                // out so the offset fix below works on the same terms.
++                let bounds = {
++                    let defaults = DrawParam::default();
++                    let section = glyph_brush::Section {
++                        screen_position: (0., 0.),
++
++                        bounds: (text.bounds.x, text.bounds.y),
++                        layout: if text.wrap {
++                            glyph_brush::Layout::default_wrap()
++                        } else {
++                            glyph_brush::Layout::default_single_line()
++                        }
++                        .h_align(text.layout.h_align.into())
++                        .v_align(text.layout.v_align.into()),
++
++                        text: text
++                            .fragments
++                            .iter()
++                            .map(|fragment| {
++                                let font = fragment.font.as_ref().unwrap_or(&text.font);
++                                Ok(glyph_brush::Text {
++                                    text: &fragment.text,
++                                    scale: fragment.scale.unwrap_or(text.scale),
++                                    font_id: *self
++                                        .fonts
++                                        .get(font)
++                                        .ok_or_else(|| GameError::FontSelectError(font.clone()))?,
++                                    extra: Extra {
++                                        color: fragment.color.unwrap_or(defaults.color).into(),
++                                        transform: defaults.transform.to_bare_matrix_glam(),
++                                    },
++                                })
++                            })
++                            .collect::<GameResult<Vec<_>>>()?,
++                    };
++                    self.text_renderer
++                        .glyph_brush
++                        .borrow_mut()
++                        .glyph_bounds(section)
++                        .map(|rect| mint::Vector2::<f32> {
++                            x: rect.width(),
++                            y: rect.height(),
++                        })
++                        .unwrap_or_else(|| mint::Vector2::<f32> { x: 0., y: 0. })
++                };
+                 dest.x -= offset.x * bounds.x;
+                 dest.y -= offset.y * bounds.y;
+                 *offset = mint::Point2 { x: 0., y: 0. };
+             }
+         }
+ 
+-        self.text_renderer
+-            .queue(text.as_section(self.fonts, param)?);
++        // queue the section for the next flush; the section shape is again
++        // written inline rather than borrowed from as_section, this time with
++        // the real draw params
++        let section = glyph_brush::Section {
++            screen_position: (0., 0.),
+ 
+-        self.set_text_image(self.text_renderer.cache_view.clone());
++            bounds: (text.bounds.x, text.bounds.y),
++            layout: if text.wrap {
++                glyph_brush::Layout::default_wrap()
++            } else {
++                glyph_brush::Layout::default_single_line()
++            }
++            .h_align(text.layout.h_align.into())
++            .v_align(text.layout.v_align.into()),
++
++            text: text
++                .fragments
++                .iter()
++                .map(|fragment| {
++                    let font = fragment.font.as_ref().unwrap_or(&text.font);
++                    Ok(glyph_brush::Text {
++                        text: &fragment.text,
++                        scale: fragment.scale.unwrap_or(text.scale),
++                        font_id: *self
++                            .fonts
++                            .get(font)
++                            .ok_or_else(|| GameError::FontSelectError(font.clone()))?,
++                        extra: Extra {
++                            color: fragment.color.unwrap_or(param.color).into(),
++                            transform: param.transform.to_bare_matrix_glam(),
++                        },
++                    })
++                })
++                .collect::<GameResult<Vec<_>>>()?,
++        };
++        self.text_renderer.glyph_brush.borrow_mut().queue(section);
++
++        // set_text_image inlined: bind the glyph atlas view at slot 1, keyed
++        // by sampler in the shared caches
++        let view = self.text_renderer.cache_view.clone();
++        if self.curr_sampler != self.next_sampler
++            || self.curr_image.as_ref().is_none_or(|curr| *curr != view)
++        {
++            self.curr_sampler = self.next_sampler;
++
++            let sampler_key = self.curr_sampler;
++            let sample = self
++                .sampler_cache
++                .cache
++                .entry(sampler_key)
++                .or_insert_with(|| {
++                    let descriptor: wgpu::SamplerDescriptor = sampler_key.into();
++                    self.wgpu.device.create_sampler(&descriptor)
++                })
++                .clone();
++
++            let text_image_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Texture {
++                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                                view_dimension: wgpu::TextureViewDimension::D2,
++                                multisampled: false,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++            let image_bind = self
++                .bind_group_cache
++                .groups
++                .entry(vec![
++                    BindGroupEntryKey::Image(view.clone()),
++                    BindGroupEntryKey::Sampler(sample.clone()),
++                ])
++                .or_insert_with(|| {
++                    self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                        label: None,
++                        layout: &text_image_layout,
++                        entries: &[
++                            wgpu::BindGroupEntry {
++                                binding: 0,
++                                resource: wgpu::BindingResource::TextureView(&view),
++                            },
++                            wgpu::BindGroupEntry {
++                                binding: 1,
++                                resource: wgpu::BindingResource::Sampler(&sample),
++                            },
++                        ],
++                    })
++                })
++                .clone();
+ 
+-        let (text_uniforms_bind, _) = BindGroupBuilder::new()
+-            .buffer(
+-                &self.text_uniforms.buffer,
++            self.curr_image = Some(view);
++
++            self.pass.set_bind_group(1, &image_bind, &[]);
++        }
++
++        // the text uniforms bind group, constructed through its cache entry
++        // now that BindGroupBuilder is no longer used here
++        let alloc_size = TextUniforms::std140_size_static() as u64;
++        let text_uniforms_layout = self
++            .bind_group_cache
++            .layouts
++            .entry((
++                vec![wgpu::BindGroupLayoutEntry {
++                    binding: 0,
++                    visibility: wgpu::ShaderStages::VERTEX,
++                    ty: wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: true,
++                        min_binding_size: None,
++                    },
++                    count: None,
++                }],
+                 0,
+-                wgpu::ShaderStages::VERTEX,
+-                wgpu::BufferBindingType::Uniform,
+-                true,
+-                Some(TextUniforms::std140_size_static() as _),
+-            )
+-            .create(&self.wgpu.device, self.bind_group_cache);
++            ))
++            .or_insert_with_key(|(entries, _)| {
++                self.wgpu
++                    .device
++                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                        label: None,
++                        entries,
++                    })
++            })
++            .clone();
++        let text_uniforms_bind = self
++            .bind_group_cache
++            .groups
++            .entry(vec![BindGroupEntryKey::Buffer {
++                buffer: self.text_uniforms.buffer.clone(),
++                offset: 0,
++                size: Some(alloc_size),
++            }])
++            .or_insert_with(|| {
++                self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                    label: None,
++                    layout: &text_uniforms_layout,
++                    entries: &[wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
++                            buffer: &self.text_uniforms.buffer,
++                            offset: 0,
++                            size: NonZeroU64::new(alloc_size),
++                        }),
++                    }],
++                })
++            })
++            .clone();
+ 
+         self.pass
+             .set_bind_group(0, &text_uniforms_bind, &[self.text_uniforms.offset as u32]);
+ 
++        // bring the pass into text shape right away instead of waiting for the
++        // flush: every flush rebuilds the pipeline when anything about it has
++        // changed in the meantime, so setting it up at queue time is safe and
++        // keeps the whole text path inside this method
++        let ty = ShaderType::Text;
++        if self.dirty_pipeline || self.shader_ty != Some(ty) {
++            self.dirty_pipeline = false;
++            self.shader_ty = Some(ty);
++
++            let texture_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Texture {
++                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                                view_dimension: wgpu::TextureViewDimension::D2,
++                                multisampled: false,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            let instance_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            let uniform_seed = {
++                let mut hasher = DefaultHasher::new();
++                ty.hash(&mut hasher);
++                hasher.finish()
++            };
++            let uniform_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![wgpu::BindGroupLayoutEntry {
++                        binding: 0,
++                        visibility: wgpu::ShaderStages::VERTEX,
++                        ty: wgpu::BindingType::Buffer {
++                            ty: wgpu::BufferBindingType::Uniform,
++                            has_dynamic_offset: true,
++                            min_binding_size: None,
++                        },
++                        count: None,
++                    }],
++                    uniform_seed,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            let (dummy_group, dummy_layout) = {
++                let dummy_layout = self
++                    .bind_group_cache
++                    .layouts
++                    .entry((Vec::new(), 0))
++                    .or_insert_with_key(|(entries, _)| {
++                        self.wgpu
++                            .device
++                            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                label: None,
++                                entries,
++                            })
++                    })
++                    .clone();
++                let dummy_group = self
++                    .bind_group_cache
++                    .groups
++                    .entry(Vec::new())
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_bind_group(&wgpu::BindGroupDescriptor {
++                                label: None,
++                                layout: &dummy_layout,
++                                entries: &[],
++                            })
++                    })
++                    .clone();
++                (dummy_group, dummy_layout)
++            };
++
++            let mut groups = vec![Some(&uniform_layout), Some(&texture_layout)];
++
++            if let ShaderType::Instance { .. } = ty {
++                groups.push(Some(&instance_layout));
++            } else {
++                // the dummy group ensures the user's bind group is at index 3
++                groups.push(Some(&dummy_layout));
++                self.pass.set_bind_group(2, &dummy_group, &[]);
++            }
++
++            let shader = match ty {
++                ShaderType::Draw | ShaderType::Instance { .. } => {
++                    if let Some((ref bind_group, ref bind_group_layout, offset)) =
++                        self.shader_bind_group
++                    {
++                        self.pass.set_bind_group(3, bind_group, &[offset]);
++                        groups.push(Some(bind_group_layout));
++                    }
++
++                    &self.shader
++                }
++                ShaderType::Text => {
++                    if let Some((ref bind_group, ref bind_group_layout, offset)) =
++                        self.text_shader_bind_group
++                    {
++                        self.pass.set_bind_group(3, bind_group, &[offset]);
++                        groups.push(Some(bind_group_layout));
++                    }
++
++                    &self.text_shader
++                }
++            };
++
++            let layout = {
++                let key = {
++                    let mut hasher = DefaultHasher::new();
++                    for bg in &groups {
++                        bg.hash(&mut hasher);
++                    }
++                    hasher.finish()
++                };
++                self.pipeline_cache
++                    .layouts
++                    .entry(key)
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                                label: None,
++                                bind_group_layouts: &groups,
++                                immediate_size: 0,
++                            })
++                    })
++                    .clone()
++            };
++
++            let pipeline = {
++                let info = RenderPipelineInfo {
++                    layout,
++                    vs: if let Some(vs_module) = &shader.vs_module {
++                        vs_module.clone()
++                    } else {
++                        match ty {
++                            ShaderType::Draw => self.draw_sm.clone(),
++                            ShaderType::Instance { ordered: true } => self.instance_sm.clone(),
++                            ShaderType::Instance { ordered: false } => {
++                                self.instance_unordered_sm.clone()
++                            }
++                            ShaderType::Text => self.text_sm.clone(),
++                        }
++                    },
++                    fs: if let Some(fs_module) = &shader.fs_module {
++                        fs_module.clone()
++                    } else {
++                        match ty {
++                            ShaderType::Draw | ShaderType::Instance { .. } => self.draw_sm.clone(),
++                            ShaderType::Text => self.text_sm.clone(),
++                        }
++                    },
++                    vs_entry: "vs_main",
++                    fs_entry: "fs_main",
++                    samples: self.samples,
++                    format: self.format,
++                    blend: Some(wgpu::BlendState {
++                        color: self.blend_mode.color,
++                        alpha: self.blend_mode.alpha,
++                    }),
++                    depth: None,
++                    vertices: true,
++                    topology: match ty {
++                        ShaderType::Text => wgpu::PrimitiveTopology::TriangleStrip,
++                        _ => wgpu::PrimitiveTopology::TriangleList,
++                    },
++                    vertex_layout: match ty {
++                        ShaderType::Text => TextVertex::layout(),
++                        _ => Vertex::layout(),
++                    },
++                    cull_mode: None,
++                };
++                let vertex_buffers = [Some(info.vertex_layout.clone())];
++                self.pipeline_cache
++                    .pipelines
++                    .entry(info)
++                    .or_insert_with_key(|info| {
++                        self.wgpu
++                            .device
++                            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                                label: None,
++                                layout: Some(&info.layout),
++                                vertex: wgpu::VertexState {
++                                    module: &info.vs,
++                                    entry_point: Some("vs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    buffers: if info.vertices { &vertex_buffers } else { &[] },
++                                },
++                                primitive: wgpu::PrimitiveState {
++                                    topology: info.topology,
++                                    strip_index_format: None,
++                                    front_face: wgpu::FrontFace::Ccw,
++                                    cull_mode: info.cull_mode,
++                                    unclipped_depth: false,
++                                    polygon_mode: wgpu::PolygonMode::Fill,
++                                    conservative: false,
++                                },
++                                depth_stencil: info
++                                    .depth
++                                    .map(|depth_compare| wgpu::DepthStencilState {
++                                        format: wgpu::TextureFormat::Depth32Float,
++                                        depth_write_enabled: Some(true),
++                                        depth_compare: Some(depth_compare),
++                                        stencil: Default::default(),
++                                        bias: Default::default(),
++                                    }),
++                                multisample: wgpu::MultisampleState {
++                                    count: info.samples,
++                                    mask: !0,
++                                    alpha_to_coverage_enabled: false,
++                                },
++                                fragment: Some(wgpu::FragmentState {
++                                    module: &info.fs,
++                                    entry_point: Some("fs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    targets: &[Some(wgpu::ColorTargetState {
++                                        format: info.format,
++                                        blend: info.blend,
++                                        write_mask: wgpu::ColorWrites::ALL,
++                                    })],
++                                }),
++                                multiview_mask: None,
++                                cache: None,
++                            })
++                    })
++                    .clone()
++            };
++
++            self.pass.set_pipeline(&pipeline);
++        }
++
+         self.queuing_text = true;
+ 
+         Ok(())
+@@ -621,43 +2047,6 @@ impl<'a> InternalCanvas<'a> {
+             self.pass.set_pipeline(&pipeline);
+         }
+     }
+-
+-    fn set_image(&mut self, image: Image) {
+-        if self.curr_sampler != self.next_sampler
+-            || self
+-                .curr_image
+-                .as_ref()
+-                .is_none_or(|curr| *curr != image.view)
+-        {
+-            self.curr_sampler = self.next_sampler;
+-            let sample = self.sampler_cache.get(&self.wgpu.device, self.curr_sampler);
+-            let image_bind = image.fetch_buffer(sample, &self.wgpu.device);
+-
+-            self.curr_image = Some(image.view);
+-
+-            self.pass.set_bind_group(1, &image_bind, &[]);
+-        }
+-    }
+-
+-    fn set_text_image(&mut self, view: wgpu::TextureView) {
+-        if self.curr_sampler != self.next_sampler
+-            || self.curr_image.as_ref().is_none_or(|curr| *curr != view)
+-        {
+-            self.curr_sampler = self.next_sampler;
+-
+-            let (image_bind, _) = BindGroupBuilder::new()
+-                .image(&view, wgpu::ShaderStages::FRAGMENT)
+-                .sampler(
+-                    &self.sampler_cache.get(&self.wgpu.device, self.curr_sampler),
+-                    wgpu::ShaderStages::FRAGMENT,
+-                )
+-                .create(&self.wgpu.device, self.bind_group_cache);
+-
+-            self.curr_image = Some(view);
+-
+-            self.pass.set_bind_group(1, &image_bind, &[]);
+-        }
+-    }
+ }
+ 
+ impl Drop for InternalCanvas<'_> {
+diff --git a/src/graphics/internal_canvas3d.rs b/src/graphics/internal_canvas3d.rs
+index 9e086d3..4a51bbf 100644
+--- a/src/graphics/internal_canvas3d.rs
++++ b/src/graphics/internal_canvas3d.rs
+@@ -1,7 +1,7 @@
+ use super::{
+     context::GraphicsContext,
+     gpu::{
+-        bind_group::{BindGroupBuilder, BindGroupCache, BindGroupLayoutBuilder},
++        bind_group::{BindGroupCache, BindGroupEntryKey},
+         growing::{ArenaAllocation, GrowingBufferArena},
+         pipeline::{PipelineCache, RenderPipelineInfo},
+     },
+@@ -15,7 +15,11 @@ use super::{
+ use crate::{GameError, GameResult};
+ use crevice::std140::AsStd140;
+ use glam::{Mat4, Vec4};
+-use std::hash::Hash;
++use std::{
++    collections::hash_map::DefaultHasher,
++    hash::{Hash, Hasher},
++    num::NonZeroU64,
++};
+ 
+ /// A canvas represents a render pass and is how you render meshes .
+ #[allow(missing_debug_implementations)]
+@@ -287,20 +291,436 @@ impl<'a> InternalCanvas3d<'a> {
+     }
+ 
+     pub fn draw_mesh(&mut self, mesh: &'a RenderedMesh3d, image: &Image, idx: usize) {
+-        self.update_pipeline(ShaderType3d::Draw);
++        // the 3D draw path went the same way as its 2D counterpart: the
++        // pipeline assembly from update_pipeline, the bind group caches and
++        // the image/sampler bookkeeping from set_image all live inside the
++        // draw call now.
++        let ty = ShaderType3d::Draw;
++
++        if self.dirty_pipeline || self.shader_ty != Some(ty) {
++            self.dirty_pipeline = false;
++            self.shader_ty = Some(ty);
++
++            // sampled texture + filtering sampler, both fragment-stage
++            let texture_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Texture {
++                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                                view_dimension: wgpu::TextureViewDimension::D2,
++                                multisampled: false,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // two read-only storage buffers for the instance data, vertex-stage
++            let instance_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // the uniform binding is seeded by the shader kind
++            let uniform_seed = {
++                let mut hasher = DefaultHasher::new();
++                ty.hash(&mut hasher);
++                hasher.finish()
++            };
++            let uniform_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![wgpu::BindGroupLayoutEntry {
++                        binding: 0,
++                        visibility: wgpu::ShaderStages::VERTEX,
++                        ty: wgpu::BindingType::Buffer {
++                            ty: wgpu::BufferBindingType::Uniform,
++                            has_dynamic_offset: true,
++                            min_binding_size: None,
++                        },
++                        count: None,
++                    }],
++                    uniform_seed,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            let (dummy_group, dummy_layout) = {
++                let dummy_layout = self
++                    .bind_group_cache
++                    .layouts
++                    .entry((Vec::new(), 0))
++                    .or_insert_with_key(|(entries, _)| {
++                        self.wgpu
++                            .device
++                            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                label: None,
++                                entries,
++                            })
++                    })
++                    .clone();
++                let dummy_group = self
++                    .bind_group_cache
++                    .groups
++                    .entry(Vec::new())
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_bind_group(&wgpu::BindGroupDescriptor {
++                                label: None,
++                                layout: &dummy_layout,
++                                entries: &[],
++                            })
++                    })
++                    .clone();
++                (dummy_group, dummy_layout)
++            };
++
++            let mut groups = vec![Some(&uniform_layout), Some(&texture_layout)];
++
++            if let ShaderType3d::Instance { .. } = ty {
++                groups.push(Some(&instance_layout));
++            } else {
++                // the dummy group ensures the user's bind group is at index 3
++                groups.push(Some(&dummy_layout));
++                self.pass.set_bind_group(2, &dummy_group, &[]);
++            }
++
++            let shader = match ty {
++                ShaderType3d::Draw | ShaderType3d::Instance { .. } => {
++                    if let Some((ref bind_group, ref bind_group_layout, offset)) =
++                        self.shader_bind_group
++                    {
++                        self.pass.set_bind_group(3, bind_group, &[offset]);
++                        groups.push(Some(bind_group_layout));
++                    }
+ 
+-        let (uniform_bind_group, _) = BindGroupBuilder::new()
+-            .buffer(
+-                &self.uniform_alloc.as_ref().unwrap().buffer,
++                    &self.shader
++                }
++            };
++
++            // pipeline layout keyed by the hashed bind group layouts
++            let layout = {
++                let key = {
++                    let mut hasher = DefaultHasher::new();
++                    for bg in &groups {
++                        bg.hash(&mut hasher);
++                    }
++                    hasher.finish()
++                };
++                self.pipeline_cache
++                    .layouts
++                    .entry(key)
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                                label: None,
++                                bind_group_layouts: &groups,
++                                immediate_size: 0,
++                            })
++                    })
++                    .clone()
++            };
++
++            // the pipeline itself, cached by its full descriptor
++            let pipeline = {
++                let info = RenderPipelineInfo {
++                    layout,
++                    vs: if let Some(vs_module) = &shader.vs_module {
++                        vs_module.clone()
++                    } else {
++                        match ty {
++                            ShaderType3d::Draw => self.draw_sm.clone(),
++                            ShaderType3d::Instance { ordered: true } => self.instance_sm.clone(),
++                            ShaderType3d::Instance { ordered: false } => {
++                                self.instance_unordered_sm.clone()
++                            }
++                        }
++                    },
++                    fs: if let Some(fs_module) = &shader.fs_module {
++                        fs_module.clone()
++                    } else {
++                        match ty {
++                            ShaderType3d::Draw | ShaderType3d::Instance { .. } => {
++                                self.draw_sm.clone()
++                            }
++                        }
++                    },
++                    vs_entry: "vs_main",
++                    fs_entry: "fs_main",
++                    samples: self.samples,
++                    format: self.format,
++                    blend: Some(wgpu::BlendState {
++                        color: self.blend_mode.color,
++                        alpha: self.blend_mode.alpha,
++                    }),
++                    depth: Some(wgpu::CompareFunction::Less),
++                    vertices: true,
++                    topology: wgpu::PrimitiveTopology::TriangleList,
++                    vertex_layout: Vertex3d::desc(),
++                    cull_mode: Some(wgpu::Face::Back),
++                };
++                let vertex_buffers = [Some(info.vertex_layout.clone())];
++                self.pipeline_cache
++                    .pipelines
++                    .entry(info)
++                    .or_insert_with_key(|info| {
++                        self.wgpu
++                            .device
++                            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                                label: None,
++                                layout: Some(&info.layout),
++                                vertex: wgpu::VertexState {
++                                    module: &info.vs,
++                                    entry_point: Some("vs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    buffers: if info.vertices { &vertex_buffers } else { &[] },
++                                },
++                                primitive: wgpu::PrimitiveState {
++                                    topology: info.topology,
++                                    strip_index_format: None,
++                                    front_face: wgpu::FrontFace::Ccw,
++                                    cull_mode: info.cull_mode,
++                                    unclipped_depth: false,
++                                    polygon_mode: wgpu::PolygonMode::Fill,
++                                    conservative: false,
++                                },
++                                depth_stencil: info
++                                    .depth
++                                    .map(|depth_compare| wgpu::DepthStencilState {
++                                        format: wgpu::TextureFormat::Depth32Float,
++                                        depth_write_enabled: Some(true),
++                                        depth_compare: Some(depth_compare),
++                                        stencil: Default::default(),
++                                        bias: Default::default(),
++                                    }),
++                                multisample: wgpu::MultisampleState {
++                                    count: info.samples,
++                                    mask: !0,
++                                    alpha_to_coverage_enabled: false,
++                                },
++                                fragment: Some(wgpu::FragmentState {
++                                    module: &info.fs,
++                                    entry_point: Some("fs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    targets: &[Some(wgpu::ColorTargetState {
++                                        format: info.format,
++                                        blend: info.blend,
++                                        write_mask: wgpu::ColorWrites::ALL,
++                                    })],
++                                }),
++                                multiview_mask: None,
++                                cache: None,
++                            })
++                    })
++                    .clone()
++            };
++
++            self.pass.set_pipeline(&pipeline);
++        }
++
++        let alloc_size = DrawUniforms3d::std140_size_static() as u64;
++
++        // the draw's own uniform bind group, straight from its cache key
++        let uniform_bind_layout = self
++            .bind_group_cache
++            .layouts
++            .entry((
++                vec![wgpu::BindGroupLayoutEntry {
++                    binding: 0,
++                    visibility: wgpu::ShaderStages::VERTEX,
++                    ty: wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: true,
++                        min_binding_size: None,
++                    },
++                    count: None,
++                }],
+                 0,
+-                wgpu::ShaderStages::VERTEX,
+-                wgpu::BufferBindingType::Uniform,
+-                true,
+-                Some(DrawUniforms3d::std140_size_static() as u64),
+-            )
+-            .create(&self.wgpu.device, self.bind_group_cache);
++            ))
++            .or_insert_with_key(|(entries, _)| {
++                self.wgpu
++                    .device
++                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                        label: None,
++                        entries,
++                    })
++            })
++            .clone();
++        let uniform_bind_group = self
++            .bind_group_cache
++            .groups
++            .entry(vec![BindGroupEntryKey::Buffer {
++                buffer: self.uniform_alloc.as_ref().unwrap().buffer.clone(),
++                offset: 0,
++                size: Some(alloc_size),
++            }])
++            .or_insert_with(|| {
++                self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                    label: None,
++                    layout: &uniform_bind_layout,
++                    entries: &[wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
++                            buffer: &self.uniform_alloc.as_ref().unwrap().buffer,
++                            offset: 0,
++                            size: NonZeroU64::new(alloc_size),
++                        }),
++                    }],
++                })
++            })
++            .clone();
++
++        // set_image body inlined, sampler cache and image-local bind group
++        // cache included
++        let owned_image = image.clone();
++        if self.curr_sampler != self.next_sampler
++            || self
++                .curr_image
++                .as_ref()
++                .is_none_or(|curr| *curr != owned_image.view)
++        {
++            self.curr_sampler = self.next_sampler;
++
++            let sampler_key = self.curr_sampler;
++            let sample = self
++                .sampler_cache
++                .cache
++                .entry(sampler_key)
++                .or_insert_with(|| {
++                    let descriptor: wgpu::SamplerDescriptor = sampler_key.into();
++                    self.wgpu.device.create_sampler(&descriptor)
++                })
++                .clone();
++
++            // the image keeps its own bind group cache keyed by sampler
++            let cached_bind = owned_image.cache.read().unwrap().get(&sample).cloned();
++            let image_bind = match cached_bind {
++                Some(bind) => bind,
++                None => owned_image
++                    .cache
++                    .write()
++                    .unwrap()
++                    .entry(sample)
++                    .or_insert_with_key(|sampler| {
++                        let layout =
++                            self.wgpu
++                                .device
++                                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                    label: None,
++                                    entries: &[
++                                        wgpu::BindGroupLayoutEntry {
++                                            binding: 0,
++                                            visibility: wgpu::ShaderStages::FRAGMENT,
++                                            ty: wgpu::BindingType::Texture {
++                                                sample_type:
++                                                    wgpu::TextureSampleType::Float {
++                                                    filterable: true,
++                                                },
++                                                view_dimension: wgpu::TextureViewDimension::D2,
++                                                multisampled: false,
++                                            },
++                                            count: None,
++                                        },
++                                        wgpu::BindGroupLayoutEntry {
++                                            binding: 1,
++                                            visibility: wgpu::ShaderStages::FRAGMENT,
++                                            ty: wgpu::BindingType::Sampler(
++                                                wgpu::SamplerBindingType::Filtering,
++                                            ),
++                                            count: None,
++                                        },
++                                    ],
++                                });
++                        self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                            label: None,
++                            layout: &layout,
++                            entries: &[
++                                wgpu::BindGroupEntry {
++                                    binding: 0,
++                                    resource: wgpu::BindingResource::TextureView(
++                                        &owned_image.view,
++                                    ),
++                                },
++                                wgpu::BindGroupEntry {
++                                    binding: 1,
++                                    resource: wgpu::BindingResource::Sampler(sampler),
++                                },
++                            ],
++                        })
++                    })
++                    .clone(),
++            };
+ 
+-        self.set_image(image.clone());
++            self.curr_image = Some(owned_image.view);
++
++            self.pass.set_bind_group(1, &image_bind, &[]);
++        }
+ 
+         // 1. allocate some uniform buffer memory from GrowingBufferArena.
+         // 2. write the uniform data to that memory
+@@ -331,97 +751,153 @@ impl<'a> InternalCanvas3d<'a> {
+             return Ok(());
+         }
+ 
+-        self.update_pipeline(ShaderType3d::Instance {
++        // pipeline assembly inlined here too -- instanced draws keep the same
++        // layout as their plain siblings so the two paths stay obviously
++        // parallel
++        let ty = ShaderType3d::Instance {
+             ordered: instances.ordered,
+-        });
+-
+-        let alloc_size = u64::from(
+-            self.wgpu
+-                .device
+-                .limits()
+-                .min_uniform_buffer_offset_alignment,
+-        );
+-        let uniform_alloc = self.uniform_arena.allocate(&self.wgpu.device, alloc_size);
+-
+-        let (uniform_bind_group, _) = BindGroupBuilder::new()
+-            .buffer(
+-                &uniform_alloc.buffer,
+-                0,
+-                wgpu::ShaderStages::VERTEX,
+-                wgpu::BufferBindingType::Uniform,
+-                true,
+-                Some(alloc_size),
+-            )
+-            .create(&self.wgpu.device, self.bind_group_cache);
+-
+-        self.set_image(instances.image.clone());
+-        let draw_uniforms = DrawUniforms3d::from_param(&param).projection(self.transform);
+-        let uniforms = InstanceUniforms3d {
+-            model_transform: draw_uniforms.model_transform,
+-            camera_transform: draw_uniforms.camera_transform,
+-            color: glam::Vec4::from_array(param.color.into()),
+         };
+ 
+-        self.wgpu.queue.write_buffer(
+-            &uniform_alloc.buffer,
+-            uniform_alloc.offset,
+-            uniforms.as_std140().as_bytes(),
+-        );
+-
+-        self.pass
+-            .set_bind_group(0, &uniform_bind_group, &[uniform_alloc.offset as u32]);
+-        self.pass.set_bind_group(2, &instances.bind_group, &[]);
+-
+-        self.pass.set_vertex_buffer(0, mesh.vert_buffer.slice(..)); // These buffers should always exist if I recall correctly
+-        self.pass
+-            .set_index_buffer(mesh.ind_buffer.slice(..), wgpu::IndexFormat::Uint32);
+-
+-        self.pass
+-            .draw_indexed(0..mesh.ind_len as _, 0, 0..instances.len as _);
+-
+-        Ok(())
+-    }
+-
+-    pub fn finish(mut self) {
+-        self.finalize();
+-    }
+-
+-    fn finalize(&mut self) {}
+-
+-    fn update_pipeline(&mut self, ty: ShaderType3d) {
+         if self.dirty_pipeline || self.shader_ty != Some(ty) {
+             self.dirty_pipeline = false;
+             self.shader_ty = Some(ty);
+ 
+-            let texture_layout = BindGroupLayoutBuilder::new()
+-                .image(wgpu::ShaderStages::FRAGMENT)
+-                .sampler(wgpu::ShaderStages::FRAGMENT)
+-                .create(&self.wgpu.device, self.bind_group_cache);
+-
+-            let instance_layout = BindGroupLayoutBuilder::new()
+-                .buffer(
+-                    wgpu::ShaderStages::VERTEX,
+-                    wgpu::BufferBindingType::Storage { read_only: true },
+-                    false,
+-                )
+-                .buffer(
+-                    wgpu::ShaderStages::VERTEX,
+-                    wgpu::BufferBindingType::Storage { read_only: true },
+-                    false,
+-                )
+-                .create(&self.wgpu.device, self.bind_group_cache);
+-
+-            let uniform_layout = BindGroupLayoutBuilder::new()
+-                .seed(ty)
+-                .buffer(
+-                    wgpu::ShaderStages::VERTEX,
+-                    wgpu::BufferBindingType::Uniform,
+-                    true,
+-                )
+-                .create(&self.wgpu.device, self.bind_group_cache);
+-
+-            let (dummy_group, dummy_layout) =
+-                BindGroupBuilder::new().create(&self.wgpu.device, self.bind_group_cache);
++            // sampled texture + filtering sampler, both fragment-stage
++            let texture_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Texture {
++                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
++                                view_dimension: wgpu::TextureViewDimension::D2,
++                                multisampled: false,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::FRAGMENT,
++                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // two read-only storage buffers for the instance data, vertex-stage
++            let instance_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 0,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                        wgpu::BindGroupLayoutEntry {
++                            binding: 1,
++                            visibility: wgpu::ShaderStages::VERTEX,
++                            ty: wgpu::BindingType::Buffer {
++                                ty: wgpu::BufferBindingType::Storage { read_only: true },
++                                has_dynamic_offset: false,
++                                min_binding_size: None,
++                            },
++                            count: None,
++                        },
++                    ],
++                    0,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            // the uniform binding is seeded by the shader kind
++            let uniform_seed = {
++                let mut hasher = DefaultHasher::new();
++                ty.hash(&mut hasher);
++                hasher.finish()
++            };
++            let uniform_layout = self
++                .bind_group_cache
++                .layouts
++                .entry((
++                    vec![wgpu::BindGroupLayoutEntry {
++                        binding: 0,
++                        visibility: wgpu::ShaderStages::VERTEX,
++                        ty: wgpu::BindingType::Buffer {
++                            ty: wgpu::BufferBindingType::Uniform,
++                            has_dynamic_offset: true,
++                            min_binding_size: None,
++                        },
++                        count: None,
++                    }],
++                    uniform_seed,
++                ))
++                .or_insert_with_key(|(entries, _)| {
++                    self.wgpu
++                        .device
++                        .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                            label: None,
++                            entries,
++                        })
++                })
++                .clone();
++
++            let (dummy_group, dummy_layout) = {
++                let dummy_layout = self
++                    .bind_group_cache
++                    .layouts
++                    .entry((Vec::new(), 0))
++                    .or_insert_with_key(|(entries, _)| {
++                        self.wgpu
++                            .device
++                            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                label: None,
++                                entries,
++                            })
++                    })
++                    .clone();
++                let dummy_group = self
++                    .bind_group_cache
++                    .groups
++                    .entry(Vec::new())
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_bind_group(&wgpu::BindGroupDescriptor {
++                                label: None,
++                                layout: &dummy_layout,
++                                entries: &[],
++                            })
++                    })
++                    .clone();
++                (dummy_group, dummy_layout)
++            };
+ 
+             let mut groups = vec![Some(&uniform_layout), Some(&texture_layout)];
+ 
+@@ -446,10 +922,31 @@ impl<'a> InternalCanvas3d<'a> {
+                 }
+             };
+ 
+-            let layout = self.pipeline_cache.layout(&self.wgpu.device, &groups);
+-            let pipeline = self.pipeline_cache.render_pipeline(
+-                &self.wgpu.device,
+-                RenderPipelineInfo {
++            let layout = {
++                let key = {
++                    let mut hasher = DefaultHasher::new();
++                    for bg in &groups {
++                        bg.hash(&mut hasher);
++                    }
++                    hasher.finish()
++                };
++                self.pipeline_cache
++                    .layouts
++                    .entry(key)
++                    .or_insert_with(|| {
++                        self.wgpu
++                            .device
++                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
++                                label: None,
++                                bind_group_layouts: &groups,
++                                immediate_size: 0,
++                            })
++                    })
++                    .clone()
++            };
++
++            let pipeline = {
++                let info = RenderPipelineInfo {
+                     layout,
+                     vs: if let Some(vs_module) = &shader.vs_module {
+                         vs_module.clone()
+@@ -484,29 +981,270 @@ impl<'a> InternalCanvas3d<'a> {
+                     topology: wgpu::PrimitiveTopology::TriangleList,
+                     vertex_layout: Vertex3d::desc(),
+                     cull_mode: Some(wgpu::Face::Back),
+-                },
+-            );
++                };
++                let vertex_buffers = [Some(info.vertex_layout.clone())];
++                self.pipeline_cache
++                    .pipelines
++                    .entry(info)
++                    .or_insert_with_key(|info| {
++                        self.wgpu
++                            .device
++                            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
++                                label: None,
++                                layout: Some(&info.layout),
++                                vertex: wgpu::VertexState {
++                                    module: &info.vs,
++                                    entry_point: Some("vs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    buffers: if info.vertices { &vertex_buffers } else { &[] },
++                                },
++                                primitive: wgpu::PrimitiveState {
++                                    topology: info.topology,
++                                    strip_index_format: None,
++                                    front_face: wgpu::FrontFace::Ccw,
++                                    cull_mode: info.cull_mode,
++                                    unclipped_depth: false,
++                                    polygon_mode: wgpu::PolygonMode::Fill,
++                                    conservative: false,
++                                },
++                                depth_stencil: info
++                                    .depth
++                                    .map(|depth_compare| wgpu::DepthStencilState {
++                                        format: wgpu::TextureFormat::Depth32Float,
++                                        depth_write_enabled: Some(true),
++                                        depth_compare: Some(depth_compare),
++                                        stencil: Default::default(),
++                                        bias: Default::default(),
++                                    }),
++                                multisample: wgpu::MultisampleState {
++                                    count: info.samples,
++                                    mask: !0,
++                                    alpha_to_coverage_enabled: false,
++                                },
++                                fragment: Some(wgpu::FragmentState {
++                                    module: &info.fs,
++                                    entry_point: Some("fs_main"),
++                                    compilation_options:
++                                        wgpu::PipelineCompilationOptions::default(),
++                                    targets: &[Some(wgpu::ColorTargetState {
++                                        format: info.format,
++                                        blend: info.blend,
++                                        write_mask: wgpu::ColorWrites::ALL,
++                                    })],
++                                }),
++                                multiview_mask: None,
++                                cache: None,
++                            })
++                    })
++                    .clone()
++            };
+ 
+             self.pass.set_pipeline(&pipeline);
+         }
+-    }
+ 
+-    fn set_image(&mut self, image: Image) {
++        let alloc_size = u64::from(
++            self.wgpu
++                .device
++                .limits()
++                .min_uniform_buffer_offset_alignment,
++        );
++
++        // the arena bump from GrowingBufferArena::allocate, unfurled in place:
++        // align to the uniform offset limit, walk the cursors, and on the
++        // miss path append a new buffer exactly like the old grow-and-retry
++        let aligned_size =
++            (alloc_size + self.uniform_arena.alignment - 1) & !(self.uniform_arena.alignment - 1);
++        assert!(aligned_size <= self.uniform_arena.desc.size);
++        let uniform_alloc = {
++            let mut found: Option<ArenaAllocation> = None;
++            for (buffer, cursor) in &mut self.uniform_arena.buffers {
++                if aligned_size <= self.uniform_arena.desc.size - *cursor {
++                    let offset = *cursor;
++                    *cursor += aligned_size;
++                    found = Some(ArenaAllocation {
++                        buffer: buffer.clone(),
++                        offset,
++                    });
++                    break;
++                }
++            }
++            match found {
++                Some(allocation) => allocation,
++                None => {
++                    let buffer = self.wgpu.device.create_buffer(&self.uniform_arena.desc);
++                    self.uniform_arena.buffers.push((buffer.clone(), aligned_size));
++                    ArenaAllocation { buffer, offset: 0 }
++                }
++            }
++        };
++
++        // the instance uniform bind group, through its cache entries
++        let uniform_bind_layout = self
++            .bind_group_cache
++            .layouts
++            .entry((
++                vec![wgpu::BindGroupLayoutEntry {
++                    binding: 0,
++                    visibility: wgpu::ShaderStages::VERTEX,
++                    ty: wgpu::BindingType::Buffer {
++                        ty: wgpu::BufferBindingType::Uniform,
++                        has_dynamic_offset: true,
++                        min_binding_size: None,
++                    },
++                    count: None,
++                }],
++                0,
++            ))
++            .or_insert_with_key(|(entries, _)| {
++                self.wgpu
++                    .device
++                    .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                        label: None,
++                        entries,
++                    })
++            })
++            .clone();
++        let uniform_bind_group = self
++            .bind_group_cache
++            .groups
++            .entry(vec![BindGroupEntryKey::Buffer {
++                buffer: uniform_alloc.buffer.clone(),
++                offset: 0,
++                size: Some(alloc_size),
++            }])
++            .or_insert_with(|| {
++                self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                    label: None,
++                    layout: &uniform_bind_layout,
++                    entries: &[wgpu::BindGroupEntry {
++                        binding: 0,
++                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
++                            buffer: &uniform_alloc.buffer,
++                            offset: 0,
++                            size: NonZeroU64::new(alloc_size),
++                        }),
++                    }],
++                })
++            })
++            .clone();
++
++        // set_image body inlined for the instanced image
++        let owned_image = instances.image.clone();
+         if self.curr_sampler != self.next_sampler
+             || self
+                 .curr_image
+                 .as_ref()
+-                .is_none_or(|curr| *curr != image.view)
++                .is_none_or(|curr| *curr != owned_image.view)
+         {
+             self.curr_sampler = self.next_sampler;
+-            let sample = self.sampler_cache.get(&self.wgpu.device, self.curr_sampler);
+-            let image_bind = image.fetch_buffer(sample, &self.wgpu.device);
+ 
+-            self.curr_image = Some(image.view);
++            let inst_sampler_key = self.curr_sampler;
++            let inst_sampler = self
++                .sampler_cache
++                .cache
++                .entry(inst_sampler_key)
++                .or_insert_with(|| {
++                    let descriptor: wgpu::SamplerDescriptor = inst_sampler_key.into();
++                    self.wgpu.device.create_sampler(&descriptor)
++                })
++                .clone();
++
++            let cached_bind = owned_image.cache.read().unwrap().get(&inst_sampler).cloned();
++            let image_bind = match cached_bind {
++                Some(bind) => bind,
++                None => owned_image
++                    .cache
++                    .write()
++                    .unwrap()
++                    .entry(inst_sampler)
++                    .or_insert_with_key(|sampler| {
++                        let layout =
++                            self.wgpu
++                                .device
++                                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
++                                    label: None,
++                                    entries: &[
++                                        wgpu::BindGroupLayoutEntry {
++                                            binding: 0,
++                                            visibility: wgpu::ShaderStages::FRAGMENT,
++                                            ty: wgpu::BindingType::Texture {
++                                                sample_type:
++                                                    wgpu::TextureSampleType::Float {
++                                                    filterable: true,
++                                                },
++                                                view_dimension: wgpu::TextureViewDimension::D2,
++                                                multisampled: false,
++                                            },
++                                            count: None,
++                                        },
++                                        wgpu::BindGroupLayoutEntry {
++                                            binding: 1,
++                                            visibility: wgpu::ShaderStages::FRAGMENT,
++                                            ty: wgpu::BindingType::Sampler(
++                                                wgpu::SamplerBindingType::Filtering,
++                                            ),
++                                            count: None,
++                                        },
++                                    ],
++                                });
++                        self.wgpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
++                            label: None,
++                            layout: &layout,
++                            entries: &[
++                                wgpu::BindGroupEntry {
++                                    binding: 0,
++                                    resource: wgpu::BindingResource::TextureView(
++                                        &owned_image.view,
++                                    ),
++                                },
++                                wgpu::BindGroupEntry {
++                                    binding: 1,
++                                    resource: wgpu::BindingResource::Sampler(sampler),
++                                },
++                            ],
++                        })
++                    })
++                    .clone(),
++            };
++
++            self.curr_image = Some(owned_image.view);
+ 
+             self.pass.set_bind_group(1, &image_bind, &[]);
+         }
++
++        let draw_uniforms = DrawUniforms3d::from_param(&param).projection(self.transform);
++        let uniforms = InstanceUniforms3d {
++            model_transform: draw_uniforms.model_transform,
++            camera_transform: draw_uniforms.camera_transform,
++            color: glam::Vec4::from_array(param.color.into()),
++        };
++
++        self.wgpu.queue.write_buffer(
++            &uniform_alloc.buffer,
++            uniform_alloc.offset,
++            uniforms.as_std140().as_bytes(),
++        );
++
++        self.pass
++            .set_bind_group(0, &uniform_bind_group, &[uniform_alloc.offset as u32]);
++        self.pass.set_bind_group(2, &instances.bind_group, &[]);
++
++        self.pass.set_vertex_buffer(0, mesh.vert_buffer.slice(..)); // These buffers should always exist if I recall correctly
++        self.pass
++            .set_index_buffer(mesh.ind_buffer.slice(..), wgpu::IndexFormat::Uint32);
++
++        self.pass
++            .draw_indexed(0..mesh.ind_len as _, 0, 0..instances.len as _);
++
++        Ok(())
+     }
++
++    pub fn finish(mut self) {
++        self.finalize();
++    }
++
++    fn finalize(&mut self) {}
+ }
+ 
+ impl Drop for InternalCanvas3d<'_> {
+diff --git a/src/graphics/sampler.rs b/src/graphics/sampler.rs
+index 491adcb..1074639 100644
+--- a/src/graphics/sampler.rs
++++ b/src/graphics/sampler.rs
+@@ -114,7 +114,7 @@ impl From<FilterMode> for wgpu::FilterMode {
+ 
+ #[derive(Debug)]
+ pub(crate) struct SamplerCache {
+-    cache: HashMap<Sampler, wgpu::Sampler>,
++    pub(crate) cache: HashMap<Sampler, wgpu::Sampler>,
+ }
+ 
+ impl SamplerCache {
+diff --git a/src/graphics/text.rs b/src/graphics/text.rs
+index c06d150..d30f47d 100644
+--- a/src/graphics/text.rs
++++ b/src/graphics/text.rs
+@@ -99,12 +99,12 @@ impl<S: Into<String>> From<S> for TextFragment {
+ /// It implements [`Drawable`] so it can be drawn immediately with [`Canvas::draw()`].
+ #[derive(Debug, Clone)]
+ pub struct Text {
+-    fragments: Vec<TextFragment>,
+-    layout: TextLayout,
+-    wrap: bool,
+-    bounds: mint::Vector2<f32>,
+-    scale: PxScale,
+-    font: String,
++    pub(crate) fragments: Vec<TextFragment>,
++    pub(crate) layout: TextLayout,
++    pub(crate) wrap: bool,
++    pub(crate) bounds: mint::Vector2<f32>,
++    pub(crate) scale: PxScale,
++    pub(crate) font: String,
+ }
+ 
+ impl Default for Text {

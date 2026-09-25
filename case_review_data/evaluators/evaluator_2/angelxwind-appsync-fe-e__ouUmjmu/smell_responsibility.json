@@ -1,0 +1,126 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Clang-Tidy",
+  "smell_type": "feature_envy",
+  "rule": {
+    "id": "sb-feature-envy",
+    "description": "A function whose member-field accesses are dominated by the fields of a record type that is not part of its contract data: attributing every field access to its ultimate root storage (parameters of complete record type, the implicit this, locals, or intermediate call results), the function works on some foreign record at least 3 times, that record is not part of the function's contract, and those accesses outnumber the function's accesses to its own contract data. Opaque handles (never-defined records) confer no ownership, and a free function with no complete-record parameter is not profiled because it has no contract of its own to be envious away from."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "AppSyncUnified-installd/cdhash.m",
+      "class_name": null,
+      "function_name": "macho_validate"
+    },
+    {
+      "id": "E2",
+      "file_path": "AppSyncUnified-installd/cdhash.m",
+      "class_name": null,
+      "function_name": "compute_cdhash_macho"
+    },
+    {
+      "id": "E3",
+      "file_path": "AppSyncUnified-installd/dump.cpp",
+      "class_name": "MachHeader",
+      "function_name": "CopyEntitlementData"
+    }
+  ],
+  "injected_match_count": 4,
+  "checks": [
+    {
+      "id": "cs-superblob-validation-probe-foreign-storage",
+      "description": "Detect a file-layer function that reaches into the embedded-signature superblob's fields through storage it derived itself, while the record is not part of that function's contract.",
+      "detected_relation": "function -> foreign CS_SuperBlob layout interpretation through local storage",
+      "why_this_is_the_smell": "The function is more interested in interpreting another record's layout (magic, length, count) than in the header data its own interface promises to handle, so the superblob's interpretation belongs with the routines that own that record, not here.",
+      "matches": [
+        {
+          "file": "AppSyncUnified-installd/cdhash.m",
+          "symbol": "macho_validate",
+          "entry_ids": ["E1"],
+          "evidence": "During the load-command walk, macho_validate derives a CS_SuperBlob pointer from the first LC_CODE_SIGNATURE window and reads sb->magic, sb->length, and sb->count through that local pointer to decide the signature's shape (5 field accesses), versus 2 accesses to its own mach_header_host contract data (sizeofcmds); reported at AppSyncUnified-installd/cdhash.m:45.",
+          "measurement": {
+            "foreign_accesses": 5,
+            "foreign_record": "CS_SuperBlob",
+            "own_contract_accesses": 2,
+            "line": 45
+          }
+        }
+      ]
+    },
+    {
+      "id": "cs-superblob-and-codedirectory-scout-foreign-storage",
+      "description": "Detect a delegation-staging function that pre-walks the superblob index table and ranks code-directory candidates through local pointers, without either record being part of its contract.",
+      "detected_relation": "function -> foreign CS_SuperBlob and CS_CodeDirectory layout interpretation through local storage",
+      "why_this_is_the_smell": "The stage right before the blob delegation re-authors the blob layer's index walking, candidate bounds, and hash-type preference, which is interest in those records' layout that belongs with the records' owners rather than with the file-layer stage.",
+      "matches": [
+        {
+          "file": "AppSyncUnified-installd/cdhash.m",
+          "symbol": "compute_cdhash_macho",
+          "entry_ids": ["E2"],
+          "evidence": "compute_cdhash_macho scouts the mapped signature through a locally derived CS_SuperBlob pointer: 10 field accesses (magic, length, count, index[].type, index[].offset and bounds) against 0 accesses to any contract record; reported at AppSyncUnified-installd/cdhash.m:327.",
+          "measurement": {
+            "foreign_accesses": 10,
+            "foreign_record": "CS_SuperBlob",
+            "own_contract_accesses": 0,
+            "line": 327
+          }
+        },
+        {
+          "file": "AppSyncUnified-installd/cdhash.m",
+          "symbol": "compute_cdhash_macho",
+          "entry_ids": ["E2"],
+          "evidence": "The same scout ranks each candidate with 4 CS_CodeDirectory field accesses (hashType per candidate plus the length validation path) through locally derived pointers, against 0 contract accesses; reported at AppSyncUnified-installd/cdhash.m:327.",
+          "measurement": {
+            "foreign_accesses": 4,
+            "foreign_record": "CS_CodeDirectory",
+            "own_contract_accesses": 0,
+            "line": 327
+          }
+        }
+      ]
+    },
+    {
+      "id": "image-class-superblob-payload-foreign-storage",
+      "description": "Detect an image-class accessor that walks the signature superblob's payload table through a locally derived pointer instead of through the class's own image data.",
+      "detected_relation": "class accessor -> foreign SuperBlob payload layout interpretation through local storage",
+      "why_this_is_the_smell": "The method's effort is spent interpreting a record the image class does not own (the on-disk superblob attached to the image), which belongs with the code that interprets that payload structure, not with the class that owns image header layout and byte order.",
+      "matches": [
+        {
+          "file": "AppSyncUnified-installd/dump.cpp",
+          "symbol": "MachHeader::CopyEntitlementData",
+          "entry_ids": ["E3"],
+          "evidence": "MachHeader::CopyEntitlementData derives a SuperBlob pointer from the image base plus the signature's dataoff and then walks super->count and super->index[index].type/offset and the entitlement Blob length (6 field accesses) to extract the payload, versus 1 access to its own class-contract data (the signature->dataoff read through its parameter); reported at AppSyncUnified-installd/dump.cpp:272.",
+          "measurement": {
+            "foreign_accesses": 6,
+            "foreign_record": "SuperBlob",
+            "own_contract_accesses": 1,
+            "line": 272
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "file": "AppSyncUnified-installd/cdhash.m",
+      "symbol": "cs_superblob_cdhash / cs_codedirectory_validate / cs_codedirectory_rank / cs_codedirectory_cdhash",
+      "reason": "These routines take the records they walk as parameters (complete-record contract data), so their accesses are contract accessors, not misdirected interest."
+    },
+    {
+      "file": "AppSyncUnified-installd/dump.cpp",
+      "symbol": "copyEntitlementDataFromFile",
+      "reason": "In the injected state this caller only resolves file-level concerns and delegates the payload extraction; its blob accesses were moved into the MachHeader accessor rather than left in the free function."
+    },
+    {
+      "file": "AppSyncUnified-installd/dump.cpp",
+      "symbol": "output parameters of type CFMutableDataRef",
+      "reason": "Opaque handles to never-defined records: filling one through its API confers no record ownership and is never counted as contract or foreign record interest."
+    },
+    {
+      "file": "AppSyncUnified-installd/cdhash.m",
+      "symbol": "macho_identify / macho_next_load_command / macho_find_load_command / compute_cdhash / find_cdhash / cdhash_sha1 / cdhash_sha256",
+      "reason": "Either below the reporting thresholds inside their own layer, or holding no complete-record contract data (mach_header_host readers with fewer foreign accesses than contract accesses; functions whose only parameters are primitives or opaque handles are not profiled)."
+    }
+  ]
+}

@@ -1,0 +1,561 @@
+diff --git a/src/Lazy.ts b/src/Lazy.ts
+index f3f6ace..eab4a61 100644
+--- a/src/Lazy.ts
++++ b/src/Lazy.ts
+@@ -3,7 +3,7 @@ import type {
+   AnyObject,
+   ISchema,
+   ValidateOptions,
+-  InternalOptions,
++  NestedTestConfig,
+   InferType,
+ } from './types';
+ import type { ResolveOptions } from './Condition';
+@@ -117,21 +117,15 @@ class Lazy<T, TContext = AnyObject, TFlags extends Flags = any>
+     return this._resolve(value, options).cast(value, options as any);
+   }
+ 
+-  asNestedTest(
+-    key?: string,
+-    index?: number,
+-    parent?: any,
+-    parentPath?: string,
+-    originalParent?: any,
+-    options: InternalOptions<any> = {},
+-  ) {
+-    let value = parent![index ?? key!];
++  asNestedTest(config: NestedTestConfig) {
++    let { key, index, parent, options } = config;
++    let value = parent[index ?? key!];
+ 
+     return this._resolve(value, {
+       ...options,
+       value,
+       parent,
+-    }).asNestedTest(key, index, parent, parentPath, originalParent, options);
++    }).asNestedTest(config);
+   }
+ 
+   validate(value: any, options?: ValidateOptions<TContext>): Promise<T> {
+diff --git a/src/Reference.ts b/src/Reference.ts
+index 96889fc..c04ff16 100644
+--- a/src/Reference.ts
++++ b/src/Reference.ts
+@@ -62,8 +62,15 @@ export default class Reference<TValue = unknown> {
+     return result;
+   }
+ 
+-  cast(value: any, parent?: any, context?: any) {
+-    return this.getValue(value, parent, context);
++  /**
++   *
++   * @param {*} value
++   * @param {Object} options
++   * @param {Object=} options.context
++   * @param {Object=} options.parent
++   */
++  cast(value: any, options?: { parent?: {}; context?: {} }) {
++    return this.getValue(value, options?.parent, options?.context);
+   }
+ 
+   resolve() {
+diff --git a/src/array.ts b/src/array.ts
+index 657e2b9..29f030b 100644
+--- a/src/array.ts
++++ b/src/array.ts
+@@ -126,22 +126,22 @@ export default class ArraySchema<
+       // #950 Ensure that sparse array empty slots are validated
+       let tests: RunTest[] = new Array(value.length);
+       for (let index = 0; index < value.length; index++) {
+-        tests[index] = innerType!.asNestedTest(
+-          undefined,
+-          index,
+-          value,
+-          options.path,
+-          options.originalValue ?? _value,
++        tests[index] = innerType!.asNestedTest({
+           options,
+-        );
++          index,
++          parent: value,
++          parentPath: options.path,
++          originalParent: options.originalValue ?? _value,
++        });
+       }
+ 
+       this.runTests(
+-        tests,
+-        value,
+-        options.originalValue ?? _value,
+-        undefined,
+-        options,
++        {
++          value,
++          tests,
++          originalValue: options.originalValue ?? _value,
++          options,
++        },
+         panic,
+         (innerTypeErrors) => next(innerTypeErrors.concat(arrayErrors), value),
+       );
+diff --git a/src/object.ts b/src/object.ts
+index b6fcfe3..94dc817 100644
+--- a/src/object.ts
++++ b/src/object.ts
+@@ -205,13 +205,7 @@ export default class ObjectSchema<
+ 
+         fieldValue =
+           !options.__validating || !strict
+-            ? Reference.isRef(field)
+-              ? field.cast(
+-                  inputValue,
+-                  innerOptions.parent,
+-                  innerOptions.context,
+-                )
+-              : (field as ISchema<any>).cast(inputValue, innerOptions)
++            ? (field as ISchema<any>).cast(inputValue, innerOptions)
+             : inputValue;
+ 
+         if (fieldValue !== undefined) {
+@@ -267,23 +261,18 @@ export default class ObjectSchema<
+         }
+ 
+         tests.push(
+-          field.asNestedTest(
+-            key,
+-            undefined,
+-            value,
+-            options.path,
+-            originalValue,
++          field.asNestedTest({
+             options,
+-          ),
++            key,
++            parent: value,
++            parentPath: options.path,
++            originalParent: originalValue,
++          }),
+         );
+       }
+ 
+       this.runTests(
+-        tests,
+-        value,
+-        originalValue,
+-        undefined,
+-        options,
++        { tests, value, originalValue, options },
+         panic,
+         (fieldErrors) => {
+           next(fieldErrors.sort(this._sortErrors).concat(objectErrors), value);
+@@ -336,9 +325,9 @@ export default class ObjectSchema<
+     );
+   }
+ 
+-  protected _getDefault(value?: any, parent?: any, context?: any) {
++  protected _getDefault(options?: ResolveOptions<TContext>) {
+     if ('default' in this.spec) {
+-      return super._getDefault(value, parent, context);
++      return super._getDefault(options);
+     }
+ 
+     // if there is no default set invent one
+@@ -350,20 +339,18 @@ export default class ObjectSchema<
+     this._nodes.forEach((key) => {
+       const field = this.fields[key] as any;
+ 
+-      let innerValue: any;
+-      let innerParent: any;
+-      if (value) {
+-        innerValue = value[key];
+-        innerParent = value;
++      let innerOptions = options;
++      if (innerOptions?.value) {
++        innerOptions = {
++          ...innerOptions,
++          parent: innerOptions.value,
++          value: innerOptions.value[key],
++        };
+       }
+ 
+       dft[key] =
+         field && 'getDefault' in field
+-          ? field.getDefault({
+-              value: innerValue,
+-              parent: innerParent,
+-              context,
+-            })
++          ? field.getDefault(innerOptions)
+           : undefined;
+     });
+ 
+diff --git a/src/schema.ts b/src/schema.ts
+index 7e10627..2d20330 100644
+--- a/src/schema.ts
++++ b/src/schema.ts
+@@ -10,6 +10,7 @@ import createValidation, {
+   TestConfig,
+   NextCallback,
+   PanicCallback,
++  TestOptions,
+   resolveParams,
+ } from './util/createValidation';
+ import printValue from './util/printValue';
+@@ -22,6 +23,7 @@ import {
+   InternalOptions,
+   ExtraParams,
+   ISchema,
++  NestedTestConfig,
+   DefaultThunk,
+ } from './types';
+ 
+@@ -100,11 +102,7 @@ export interface CastOptionalityOptions<C = {}>
+ }
+ 
+ export type RunTest = (
+-  value: any,
+-  path: string | undefined,
+-  options: InternalOptions,
+-  originalValue: any,
+-  schema: AnySchema,
++  opts: TestOptions,
+   panic: PanicCallback,
+   next: NextCallback,
+ ) => void;
+@@ -447,11 +445,13 @@ export default abstract class Schema<
+     }
+ 
+     this.runTests(
+-      initialTests,
+-      value,
+-      originalValue,
+-      path,
+-      options,
++      {
++        path,
++        value,
++        originalValue,
++        options,
++        tests: initialTests,
++      },
+       panic,
+       (initialErrors) => {
+         // even if we aren't ending early we can't proceed further if the types aren't correct
+@@ -460,11 +460,13 @@ export default abstract class Schema<
+         }
+ 
+         this.runTests(
+-          this.tests,
+-          value,
+-          originalValue,
+-          path,
+-          options,
++          {
++            path,
++            value,
++            originalValue,
++            options,
++            tests: this.tests,
++          },
+           panic,
+           next,
+         );
+@@ -477,15 +479,12 @@ export default abstract class Schema<
+    * schema validate result.
+    */
+   protected runTests(
+-    tests: RunTest[],
+-    value: any,
+-    originalValue: any,
+-    path: string | undefined,
+-    options: InternalOptions,
++    runOptions: TestRunOptions,
+     panic: (err: Error, value: unknown) => void,
+     next: (errors: ValidationError[], value: unknown) => void,
+   ): void {
+     let fired = false;
++    let { tests, value, originalValue, path, options } = runOptions;
+ 
+     let panicOnce = (arg: Error) => {
+       if (fired) return;
+@@ -504,12 +503,18 @@ export default abstract class Schema<
+ 
+     if (!count) return nextOnce([]);
+ 
++    let args = {
++      value,
++      originalValue,
++      path,
++      options,
++      schema: this,
++    };
++
+     for (let i = 0; i < tests.length; i++) {
+       const test = tests[i];
+ 
+-      test(value, path, options, originalValue, this, panicOnce, function finishTestRun(
+-        err,
+-      ) {
++      test(args!, panicOnce, function finishTestRun(err) {
+         if (err) {
+           Array.isArray(err)
+             ? nestedErrors.push(...err)
+@@ -522,21 +527,21 @@ export default abstract class Schema<
+     }
+   }
+ 
+-  asNestedTest(
+-    key?: string,
+-    index?: number,
+-    parent?: any,
+-    parentPath?: string,
+-    originalParent?: any,
+-    options: InternalOptions<any> = {},
+-  ): RunTest {
++  asNestedTest({
++    key,
++    index,
++    parent,
++    parentPath,
++    originalParent,
++    options,
++  }: NestedTestConfig): RunTest {
+     const k = key ?? index;
+     if (k == null) {
+       throw TypeError('Must include `key` or `index` for nested validations');
+     }
+ 
+     const isIndex = typeof k === 'number';
+-    let value = parent![k];
++    let value = parent[k];
+ 
+     const testOptions = {
+       ...options,
+@@ -546,7 +551,7 @@ export default abstract class Schema<
+       strict: true,
+       parent,
+       value,
+-      originalValue: originalParent![k],
++      originalValue: originalParent[k],
+       // FIXME: tests depend on `index` being passed around deeply,
+       //   we should not let the options.key/index bleed through
+       key: undefined,
+@@ -558,15 +563,8 @@ export default abstract class Schema<
+           : (parentPath ? `${parentPath}.` : '') + key,
+     };
+ 
+-    return (
+-      _value: any,
+-      _path: string | undefined,
+-      _options: InternalOptions,
+-      _originalValue: any,
+-      _schema: AnySchema,
+-      panic: PanicCallback,
+-      next: NextCallback,
+-    ) => this.resolve(testOptions)._validate(value, testOptions, panic, next);
++    return (_: any, panic, next) =>
++      this.resolve(testOptions)._validate(value, testOptions, panic, next);
+   }
+ 
+   validate(
+@@ -657,7 +655,7 @@ export default abstract class Schema<
+     }
+   }
+ 
+-  protected _getDefault(value?: any, parent?: any, context?: any) {
++  protected _getDefault(options?: ResolveOptions<TContext>) {
+     let defaultValue = this.spec.default;
+ 
+     if (defaultValue == null) {
+@@ -665,7 +663,7 @@ export default abstract class Schema<
+     }
+ 
+     return typeof defaultValue === 'function'
+-      ? defaultValue.call(this, { value, parent, context })
++      ? defaultValue.call(this, options)
+       : cloneDeep(defaultValue);
+   }
+ 
+@@ -674,7 +672,7 @@ export default abstract class Schema<
+     // If schema is defaulted we know it's at least not undefined
+   ): TDefault {
+     let schema = this.resolve(options || {});
+-    return schema._getDefault(options?.value, options?.parent, options?.context);
++    return schema._getDefault(options);
+   }
+ 
+   default(def: DefaultThunk<any>): any {
+@@ -965,12 +963,7 @@ export default abstract class Schema<
+         .map((fn) => {
+           const params =
+             fn.OPTIONS!.params && options
+-              ? resolveParams(
+-                  { ...fn.OPTIONS!.params },
+-                  options.value,
+-                  options.parent,
+-                  options.context,
+-                )
++              ? resolveParams({ ...fn.OPTIONS!.params }, options)
+               : fn.OPTIONS!.params;
+ 
+           return {
+diff --git a/src/tuple.ts b/src/tuple.ts
+index 9bbf707..54bb8a9 100644
+--- a/src/tuple.ts
++++ b/src/tuple.ts
+@@ -143,22 +143,22 @@ export default class TupleSchema<
+ 
+       let tests: RunTest[] = [];
+       for (let [index, itemSchema] of itemTypes.entries()) {
+-        tests[index] = itemSchema!.asNestedTest(
+-          undefined,
+-          index,
+-          value,
+-          options.path,
+-          options.originalValue ?? _value,
++        tests[index] = itemSchema!.asNestedTest({
+           options,
+-        );
++          index,
++          parent: value,
++          parentPath: options.path,
++          originalParent: options.originalValue ?? _value,
++        });
+       }
+ 
+       this.runTests(
+-        tests,
+-        value,
+-        options.originalValue ?? _value,
+-        undefined,
+-        options,
++        {
++          value,
++          tests,
++          originalValue: options.originalValue ?? _value,
++          options,
++        },
+         panic,
+         (innerTypeErrors) => next(innerTypeErrors.concat(tupleErrors), value),
+       );
+diff --git a/src/types.ts b/src/types.ts
+index 2b5b504..9d64abf 100644
+--- a/src/types.ts
++++ b/src/types.ts
+@@ -23,14 +23,7 @@ export interface ISchema<T, C = any, F extends Flags = any, D = any> {
+ 
+   validate(value: any, options?: ValidateOptions<C>): Promise<T>;
+ 
+-  asNestedTest(
+-    key?: string,
+-    index?: number,
+-    parent?: any,
+-    parentPath?: string,
+-    originalParent?: any,
+-    options?: InternalOptions<any>,
+-  ): Test;
++  asNestedTest(config: NestedTestConfig): Test;
+ 
+   describe(options?: ResolveOptions<C>): SchemaFieldDescription;
+   resolve(options: ResolveOptions<C>): ISchema<T, C, F>;
+diff --git a/src/util/createValidation.ts b/src/util/createValidation.ts
+index a97d0e6..9243a44 100644
+--- a/src/util/createValidation.ts
++++ b/src/util/createValidation.ts
+@@ -10,6 +10,7 @@ import {
+ import Reference from '../Reference';
+ import type { AnySchema } from '../schema';
+ import isAbsent from './isAbsent';
++import { ResolveOptions } from '../Condition';
+ 
+ export type PanicCallback = (err: Error) => void;
+ 
+@@ -60,11 +61,7 @@ export type TestConfig<TValue = unknown, TContext = {}> = {
+ };
+ 
+ export type Test = ((
+-  value: any,
+-  path: string | undefined,
+-  options: InternalOptions,
+-  originalValue: any,
+-  schema: AnySchema,
++  opts: TestOptions,
+   panic: PanicCallback,
+   next: NextCallback,
+ ) => void) & {
+@@ -79,11 +76,7 @@ export default function createValidation(config: {
+   skipAbsent?: boolean;
+ }) {
+   function validate<TSchema extends AnySchema = AnySchema>(
+-    value: any,
+-    path: string | undefined,
+-    options: InternalOptions,
+-    originalValue: any,
+-    schema: TSchema,
++    { value, path = '', options, originalValue, schema }: TestOptions<TSchema>,
+     panic: PanicCallback,
+     next: NextCallback,
+   ) {
+@@ -94,9 +87,7 @@ export default function createValidation(config: {
+       abortEarly = schema.spec.abortEarly,
+       disableStackTrace = schema.spec.disableStackTrace,
+     } = options;
+-
+-    path = path || '';
+-
++    const resolveOptions = { value, parent, context };
+     function createError(overrides: CreateErrorOptions = {}) {
+       const nextParams = resolveParams(
+         {
+@@ -109,9 +100,7 @@ export default function createValidation(config: {
+           ...params,
+           ...overrides.params,
+         },
+-        value,
+-        parent,
+-        context,
++        resolveOptions,
+       );
+ 
+       const error = new ValidationError(
+@@ -134,7 +123,7 @@ export default function createValidation(config: {
+       from: options.from,
+       createError,
+       resolve<T>(item: T | Reference<T>) {
+-        return resolveMaybeRef(item, value, parent, context);
++        return resolveMaybeRef(item, resolveOptions);
+       },
+       options,
+       originalValue,
+@@ -186,25 +175,20 @@ export default function createValidation(config: {
+ // Warning: mutates the input
+ export function resolveParams<T extends ExtraParams>(
+   params: T,
+-  value?: any,
+-  parent?: any,
+-  context?: any,
++  options: ResolveOptions,
+ ) {
+   if (!params) return params;
+ 
+   type Keys = (keyof typeof params)[];
+   for (const key of Object.keys(params) as Keys) {
+-    params[key] = resolveMaybeRef(params[key], value, parent, context);
++    params[key] = resolveMaybeRef(params[key], options);
+   }
+ 
+   return params;
+ }
+ 
+-function resolveMaybeRef<T>(
+-  item: T | Reference<T>,
+-  value?: any,
+-  parent?: any,
+-  context?: any,
+-) {
+-  return Ref.isRef(item) ? item.getValue(value, parent, context) : item;
++function resolveMaybeRef<T>(item: T | Reference<T>, options: ResolveOptions) {
++  return Ref.isRef(item)
++    ? item.getValue(options.value, options.parent, options.context)
++    : item;
+ }

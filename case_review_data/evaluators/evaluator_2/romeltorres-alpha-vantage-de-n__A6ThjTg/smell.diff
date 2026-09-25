@@ -1,0 +1,268 @@
+diff --git a/alpha_vantage/alphavantage.py b/alpha_vantage/alphavantage.py
+index 40abd8b..4a9e73a 100644
+--- a/alpha_vantage/alphavantage.py
++++ b/alpha_vantage/alphavantage.py
+@@ -11,6 +11,7 @@ try:
+ except ImportError:
+     _PANDAS_FOUND = False
+ import csv
++from collections import deque
+ 
+ 
+ class AlphaVantage(object):
+@@ -24,6 +25,14 @@ class AlphaVantage(object):
+         "https://www.alphavantage.co/digital_currency_list/"
+ 
+     _RAPIDAPI_URL = "https://alpha-vantage.p.rapidapi.com/query?"
++    # Entitlement preflight and preview sampling were staged together while the
++    # upstream premium data program was in beta. Both programs are on hold
++    # until the provider finalizes the billing contract, so the switches stay
++    # disabled in the mean time.
++    _ENTITLEMENT_PREFLIGHT_ENABLED = False
++    _PREVIEW_SAMPLING_ENABLED = False
++    _SUPPORTED_ENTITLEMENTS = {'realtime', 'delayed'}
++    _PREVIEW_SAMPLE_LIMIT = 40
+ 
+     def __init__(self, key=None, output_format='json',
+                  treat_info_as_error=True, indexing_type='date', proxy=None, rapidapi=False):
+@@ -72,6 +81,8 @@ class AlphaVantage(object):
+         self._append_type = True
+         self.indexing_type = indexing_type
+         self.proxy = proxy or {}
++        self._preview_sample_size = AlphaVantage._PREVIEW_SAMPLE_LIMIT
++        self._preflight_failures = []
+ 
+     @classmethod
+     def _call_api_on_func(cls, func):
+@@ -121,6 +132,11 @@ class AlphaVantage(object):
+             # key for it and for its meta data.
+             function_name, data_key, meta_data_key = func(
+                 self, *args, **kwargs)
++            if self._ENTITLEMENT_PREFLIGHT_ENABLED and 'entitlement' in used_kwargs:
++                # Preflight premium requests before spending an api call on
++                # an entitlement this wrapper does not know how to ask for.
++                self._verify_entitlement(
++                    used_kwargs.get('entitlement'), function_name)
+             base_url = AlphaVantage._RAPIDAPI_URL if self.rapidapi else AlphaVantage._ALPHA_VANTAGE_API_URL
+             url = "{}function={}".format(base_url, function_name)
+             for idx, arg_name in enumerate(argspec.args[1:]):
+@@ -217,6 +233,11 @@ class AlphaVantage(object):
+         def _format_wrapper(self, *args, **kwargs):
+             call_response, data_key, meta_data_key = func(
+                 self, *args, **kwargs)
++            if self._PREVIEW_SAMPLING_ENABLED and data_key is not None:
++                # Cap heavy series at the preview window before the payload
++                # is converted into the requested output format.
++                call_response = self._sample_preview_payload(
++                    call_response, data_key)
+             if 'json' in self.output_format.lower() or 'pandas' \
+                     in self.output_format.lower():
+                 if data_key is not None:
+@@ -309,6 +330,41 @@ class AlphaVantage(object):
+         """
+         self.proxy = proxy or {}
+ 
++    def _verify_entitlement(self, entitlement, function_key):
++        """ Validate a premium entitlement key before the request is sent.
++
++        Keyword Arguments:
++            entitlement:  The premium entitlement name requested upstream.
++            function_key:  The api function the entitlement is meant for.
++        """
++        if entitlement is None:
++            return None
++        if entitlement not in self._SUPPORTED_ENTITLEMENTS:
++            # Keep the rejected pair around so support can reconstruct what
++            # the client asked for when a request was refused.
++            self._preflight_failures.append((function_key, entitlement))
++            raise ValueError(
++                "Entitlement {} is not supported for {}, supported "
++                "entitlements are: {}".format(
++                    entitlement, function_key,
++                    sorted(self._SUPPORTED_ENTITLEMENTS)))
++        return entitlement
++
++    def _sample_preview_payload(self, call_response, data_key):
++        """ Trim a heavy series response to the configured preview window.
++
++        Keyword Arguments:
++            call_response:  Raw api payload as returned by the request layer.
++            data_key:  The key holding the series to be trimmed.
++        """
++        if not isinstance(call_response, dict) or data_key is None:
++            return call_response
++        data_block = call_response.get(data_key, None)
++        if isinstance(data_block, dict):
++            window = deque(data_block.items(), maxlen=self._preview_sample_size)
++            call_response[data_key] = dict(window)
++        return call_response
++
+     def map_to_matype(self, matype):
+         """ Convert to the alpha vantage math type integer. It returns an
+         integer correspondent to the type of math to apply to a function. It
+diff --git a/alpha_vantage/async_support/alphavantage.py b/alpha_vantage/async_support/alphavantage.py
+index dc317da..f02a038 100644
+--- a/alpha_vantage/async_support/alphavantage.py
++++ b/alpha_vantage/async_support/alphavantage.py
+@@ -67,6 +67,12 @@ class AlphaVantage(AlphaVantageBase):
+             # key for it and for its meta data.
+             function_name, data_key, meta_data_key = func(
+                 self, *args, **kwargs)
++            if self._ENTITLEMENT_PREFLIGHT_ENABLED and 'entitlement' in used_kwargs:
++                # Same client-side preflight as the sync wrapper: this async
++                # class inherits the helper, so both pipelines validate
++                # premium requests identically.
++                self._verify_entitlement(
++                    used_kwargs.get('entitlement'), function_name)
+             base_url = AlphaVantage._RAPIDAPI_URL if self.rapidapi else AlphaVantage._ALPHA_VANTAGE_API_URL
+             url = "{}function={}".format(base_url, function_name)
+             for idx, arg_name in enumerate(argspec.args[1:]):
+@@ -163,6 +169,11 @@ class AlphaVantage(AlphaVantageBase):
+         async def _format_wrapper(self, *args, **kwargs):
+             call_response, data_key, meta_data_key = await func(
+                 self, *args, **kwargs)
++            if self._PREVIEW_SAMPLING_ENABLED and data_key is not None:
++                # Trim heavy series down to the preview window before the
++                # payload is converted, mirroring the sync format wrapper.
++                call_response = self._sample_preview_payload(
++                    call_response, data_key)
+             if 'json' in self.output_format.lower() or 'pandas' \
+                     in self.output_format.lower():
+                 data = call_response[data_key]
+diff --git a/alpha_vantage/cryptocurrencies.py b/alpha_vantage/cryptocurrencies.py
+index 9f8aeba..912035b 100644
+--- a/alpha_vantage/cryptocurrencies.py
++++ b/alpha_vantage/cryptocurrencies.py
+@@ -4,6 +4,23 @@ from .alphavantage import AlphaVantage as av
+ class CryptoCurrencies(av):
+     """This class implements all the crypto currencies api calls
+     """
++    # Digital-currency rows the preview sampler would retain per series,
++    # consulted only while client-side preview sampling is enabled.
++    _PREVIEW_DAILY_WINDOW_KEYS = {
++        'DIGITAL_CURRENCY_DAILY': 40,
++        'DIGITAL_CURRENCY_WEEKLY': 40,
++        'DIGITAL_CURRENCY_MONTHLY': 40,
++    }
++
++    def _preview_window_for(self, function_key):
++        """ Rows of a digital-currency series the preview sampler keeps once
++        it is switched on. Read on every heavy call so the retained window
++        can be tuned per endpoint.
++        """
++        window = self._PREVIEW_DAILY_WINDOW_KEYS.get(function_key)
++        if window:
++            return window
++        return self._preview_sample_size
+ 
+     @av._output_format
+     @av._call_api_on_func
+@@ -21,6 +38,10 @@ class CryptoCurrencies(av):
+             market in the market list. For example: market=CNY.
+         """
+         _FUNCTION_KEY = 'DIGITAL_CURRENCY_DAILY'
++        if self._PREVIEW_SAMPLING_ENABLED and market:
++            # Digital-currency history is heavy: pin the window the sampler
++            # would retain for this series before pulling it.
++            self._preview_keep = self._preview_window_for(_FUNCTION_KEY)
+         return _FUNCTION_KEY, 'Time Series (Digital Currency Daily)', 'Meta Data'
+ 
+     @av._output_format
+diff --git a/alpha_vantage/foreignexchange.py b/alpha_vantage/foreignexchange.py
+index f4885fb..4130692 100644
+--- a/alpha_vantage/foreignexchange.py
++++ b/alpha_vantage/foreignexchange.py
+@@ -1,6 +1,16 @@
+ from .alphavantage import AlphaVantage as av
+ 
+ 
++def _fx_preview_throttle(outputsize):
++    """ Downgrade a 'full' fx pull to 'compact' so the client side preview
++    sampler only ever works on light payloads. Only consulted while preview
++    sampling is enabled for the fx family.
++    """
++    if outputsize == 'full':
++        return 'compact'
++    return outputsize
++
++
+ class ForeignExchange(av):
+     """Realtime currency exchange rates for physical and digital currencies.
+     """
+@@ -73,6 +83,9 @@ class ForeignExchange(av):
+                 series, commonly above 1MB (default 'compact')
+         """
+         _FUNCTION_KEY = 'FX_DAILY'
++        if self._PREVIEW_SAMPLING_ENABLED:
++            # Keep fx previews light while the sampler is still dark.
++            outputsize = _fx_preview_throttle(outputsize)
+         return _FUNCTION_KEY, "Time Series FX (Daily)", 'Meta Data'
+ 
+     @av._output_format
+diff --git a/alpha_vantage/techindicators.py b/alpha_vantage/techindicators.py
+index f5c2046..b4a994e 100644
+--- a/alpha_vantage/techindicators.py
++++ b/alpha_vantage/techindicators.py
+@@ -4,6 +4,13 @@ from .alphavantage import AlphaVantage as av
+ class TechIndicators(av):
+     """This class implements all the technical indicator api calls
+     """
++    # Preview windows for heavy indicator series, consulted only while the
++    # client-side preview sampler is enabled. Indicators that emit several
++    # output bands keep a wider window than plain overlays.
++    _PREVIEW_SERIES_WINDOWS = {
++        'MACD': lambda limit: 3 * (limit or av._PREVIEW_SAMPLE_LIMIT),
++        'MACDEXT': lambda limit: 3 * (limit or av._PREVIEW_SAMPLE_LIMIT),
++    }
+ 
+     def __init__(self, *args, **kwargs):
+         """
+@@ -15,6 +22,21 @@ class TechIndicators(av):
+             raise ValueError("Output format {} is not comatible with the TechIndicators class".format(
+                 self.output_format.lower()))
+ 
++    def _preview_series_window(self, function_key, limit=None):
++        """ Number of rows the preview sampler keeps for a technical
++        indicator series. Indicators with several output bands retain a
++        widened window so the sampled payload stays meaningful.
++
++        Keyword Arguments:
++            function_key:  The api function being sampled
++            limit:  Requested window size, defaults to the client wide
++                preview sample size
++        """
++        override = self._PREVIEW_SERIES_WINDOWS.get(function_key)
++        if override is None:
++            return limit if limit is not None else self._preview_sample_size
++        return override(limit)
++
+     @av._output_format
+     @av._call_api_on_func
+     def get_sma(self, symbol, interval='daily', time_period=20, series_type='close', month=None, entitlement=None):
+@@ -270,6 +292,11 @@ class TechIndicators(av):
+                 or 'delayed' for 15-minute delayed US stock market data
+         """
+         _FUNCTION_KEY = "MACD"
++        if self._PREVIEW_SAMPLING_ENABLED:
++            # Macd history carries several bands per point: widen the window
++            # the preview sampler would retain while it stays dark.
++            self._preview_sample_size = self._preview_series_window(
++                _FUNCTION_KEY, self._preview_sample_size)
+         return _FUNCTION_KEY, 'Technical Analysis: MACD', 'Meta Data'
+ 
+     @av._output_format
+diff --git a/alpha_vantage/timeseries.py b/alpha_vantage/timeseries.py
+index d882564..b78501c 100644
+--- a/alpha_vantage/timeseries.py
++++ b/alpha_vantage/timeseries.py
+@@ -36,6 +36,10 @@ class TimeSeries(av):
+                 or 'delayed' for 15-minute delayed US stock market data
+         """
+         _FUNCTION_KEY = "TIME_SERIES_INTRADAY"
++        if self._ENTITLEMENT_PREFLIGHT_ENABLED and entitlement is not None:
++            # Realtime/delayed intraday is billable, so validate the premium
++            # entitlement before the call leaves the client.
++            self._verify_entitlement(entitlement, _FUNCTION_KEY)
+         return _FUNCTION_KEY, "Time Series ({})".format(interval), 'Meta Data'
+ 
+     @av._output_format

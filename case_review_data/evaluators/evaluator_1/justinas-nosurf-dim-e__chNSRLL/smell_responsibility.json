@@ -1,0 +1,98 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "go/analysis",
+  "smell_type": "deeply_inlined_method",
+  "task_id": "justinas-nosurf-dim-e",
+  "rule": {
+    "id": "deeplyinlined",
+    "description": "A production function whose body carries working copies of three or more of the library's primitive implementations (oneTimePad's XOR over slice elements, unmaskToken's tokenLength split, b64encode/b64decode's base64.StdEncoding calls, tokensEqual's constant-time compare, setTokenCookie's http.SetCookie emission, sameOrigin's scheme/host equality, sContains's membership scan, generateToken's io.ReadFull over rand.Reader), while those same primitives remain available as named functions elsewhere. Carrying that many distinct re-derived copies means the function body has flattened at least three call layers of the decomposed design into itself."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "handler.go",
+      "class_name": "CSRFHandler",
+      "function_name": "ServeHTTP"
+    },
+    {
+      "id": "E2",
+      "file_path": "handler.go",
+      "class_name": "CSRFHandler",
+      "function_name": "RegenerateToken"
+    },
+    {
+      "id": "E3",
+      "file_path": "token.go",
+      "class_name": null,
+      "function_name": "VerifyToken"
+    }
+  ],
+  "injected_match_count": 3,
+  "checks": [
+    {
+      "id": "inline-primitive-resurrection",
+      "description": "Detect a production function whose body re-derives the implementations of the library's named primitives inline (deep manual inlining).",
+      "detected_relation": "monolith function -> inlined copies of 3+ primitive implementations that still exist as named functions",
+      "why_this_is_the_smell": "The decomposed design keeps each primitive behind one or more call layers (pipeline step -> domain step -> primitive); a body that re-implements three or more of them inline has collapsed that layering into an unnavigable monolith, which is the deeply inlined method smell.",
+      "matches": [
+        {
+          "file": "handler.go",
+          "symbol": "CSRFHandler.ServeHTTP",
+          "entry_ids": ["E1"],
+          "evidence": "ServeHTTP re-derives the whole request pipeline inline: it decodes the bearer cookie with base64.StdEncoding.DecodeString, mints fresh entropy via io.ReadFull over rand.Reader, emits the http.SetCookie cookie, scans safeMethods and the exemption lists with inline equality loops, adjudicates Origin and Referer with inline scheme/host comparisons, and unmasks plus constant-time compares the submitted credential with a tokenLength-split XOR loop.",
+          "measurement": {
+            "inlined_primitive_implementations": 8,
+            "duplicated_primitives": [
+              "oneTimePad",
+              "unmaskToken",
+              "b64encode",
+              "b64decode",
+              "tokensEqual",
+              "setTokenCookie",
+              "sameOrigin",
+              "sContains",
+              "generateToken"
+            ],
+            "statements": 26,
+            "max_nesting_depth": 6
+          }
+        },
+        {
+          "file": "handler.go",
+          "symbol": "CSRFHandler.RegenerateToken",
+          "entry_ids": ["E2"],
+          "evidence": "RegenerateToken inlines its generation/issuance chain: it mints 32 bytes with io.ReadFull over rand.Reader, builds the cookie value with base64.StdEncoding.EncodeToString and hands it to the client through http.SetCookie, re-implementing what the decomposed design splits across generateToken, setTokenCookie and getCookieName.",
+          "measurement": {
+            "inlined_primitive_implementations": 3,
+            "duplicated_primitives": ["generateToken", "b64encode", "setTokenCookie"],
+            "statements": 8,
+            "max_nesting_depth": 2
+          }
+        },
+        {
+          "file": "token.go",
+          "symbol": "VerifyToken",
+          "entry_ids": ["E3"],
+          "evidence": "VerifyToken no longer delegates: it decodes both operands with base64.StdEncoding.DecodeString, folds a masked operand back to raw shape with a tokenLength-split XOR loop (the oneTimePad/unmaskToken recipe) and reaches the verdict with subtle.ConstantTimeCompare plus length checks (the tokensEqual recipe).",
+          "measurement": {
+            "inlined_primitive_implementations": 4,
+            "duplicated_primitives": [
+              "oneTimePad",
+              "unmaskToken",
+              "b64encode",
+              "b64decode",
+              "tokensEqual"
+            ],
+            "statements": 7,
+            "max_nesting_depth": 3
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    "Files ending in _test.go: tests are not production owners of the smell.",
+    "The primitive-owner functions (oneTimePad, maskToken, unmaskToken, b64encode, b64decode, generateToken, checkForPRNG, verifyToken, tokensEqual, setTokenCookie, sContains, sameOrigin, ctxSetToken, ctxSetReason, Token, Reason, addNosurfContext, getCookieName, extractToken, checkOrigin, checkReferer) legitimately contain their own logic; the rule measures who else duplicates them.",
+    "Legacy files carrying the !go1.7 build constraint (context_legacy.go, handler_legacy.go and their tests) are not compiled by the pinned go1.22 toolchain and are outside the analyzed package configurations."
+  ]
+}

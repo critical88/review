@@ -1,0 +1,263 @@
+diff --git a/script/sync-ghes/index.ts b/script/sync-ghes/index.ts
+index 4aded47..ec0ef82 100755
+--- a/script/sync-ghes/index.ts
++++ b/script/sync-ghes/index.ts
+@@ -3,9 +3,10 @@ import { promises as fs } from "fs";
+ import { safeLoad } from "js-yaml";
+ import { basename, extname, join } from "path";
+ import { exec } from "./exec";
+-import "../validate-data/templatePaths";
+-import "../validate-data/templateIcons";
+-import { registerTemplateRule, templateRuleFor } from "../validate-data/templateRules";
++import { registerTemplateConventions } from "../validate-data/templateConventions";
++import { templateRuleFor } from "../validate-data/templateRules";
++
++registerTemplateConventions();
+ 
+ interface WorkflowDesc {
+   folder: string;
+@@ -33,19 +34,6 @@ interface WorkflowsCheckResult {
+   incompatibleWorkflows: WorkflowDesc[];
+ }
+ 
+-// A partner template is published under a partner creator account
+-function isPartnerCreator(creator: string, partners: Set<string>): boolean {
+-  return partners.has(creator.toLowerCase());
+-}
+-
+-// code-scanning templates are enterprise-only unless marked otherwise
+-function isCodeScanningFolder(folder: string): boolean {
+-  return basename(folder) === 'code-scanning';
+-}
+-
+-registerTemplateRule("partners.creator.match", isPartnerCreator);
+-registerTemplateRule("folders.code-scanning.name", isCodeScanningFolder);
+-
+ async function checkWorkflows(
+   folders: string[],
+   enabledActions: string[],
+diff --git a/script/validate-data/index.ts b/script/validate-data/index.ts
+index 126680b..8cbb32d 100755
+--- a/script/validate-data/index.ts
++++ b/script/validate-data/index.ts
+@@ -4,9 +4,10 @@ import { safeLoad } from "js-yaml";
+ import { basename, extname, join, dirname } from "path";
+ import { Validator as validator } from "jsonschema";
+ import { endGroup, error, info, setFailed, startGroup } from '@actions/core';
+-import "./templatePaths";
+-import "./templateIcons";
+-import { registerTemplateRule, templateRuleFor } from "./templateRules";
++import { registerTemplateConventions } from "./templateConventions";
++import { templateRuleFor } from "./templateRules";
++
++registerTemplateConventions();
+ 
+ interface WorkflowWithErrors {
+   id: string;
+@@ -44,19 +45,6 @@ const propertiesSchema = {
+   }
+ }
+ 
+-// Blank templates are exempt from the category rules
+-function isBlankTemplate(workflowPath: string): boolean {
+-  return workflowPath.endsWith("blank.yml");
+-}
+-
+-// Deployment templates must declare a creator
+-function isDeploymentFolder(path: string): boolean {
+-  return basename(path).toLowerCase() == 'deployments';
+-}
+-
+-registerTemplateRule("template.blank.suffix", isBlankTemplate);
+-registerTemplateRule("folders.deployments.name", isDeploymentFolder);
+-
+ async function checkWorkflows(folders: string[], allowed_categories: object[], templateRules: object): Promise<WorkflowWithErrors[]> {
+   const result: WorkflowWithErrors[] = []
+   const workflow_template_names = new Set()
+diff --git a/script/validate-data/templateConventions.ts b/script/validate-data/templateConventions.ts
+new file mode 100644
+index 0000000..144ef58
+--- /dev/null
++++ b/script/validate-data/templateConventions.ts
+@@ -0,0 +1,101 @@
++// Single owner of starter-template convention rules.
++//
++// Every script that walks the starter-workflow tree (validate-data in CI and
++// sync-ghes for enterprise synchronization) must agree on the same conventions:
++// where a starter template keeps its metadata, how icon references resolve,
++// which templates are directory-specific or exempt, and which are eligible for
++// enterprise. Those conventions live here as a fixed set of named rules, so a
++// convention change is made once and every consumer picks it up. This is the
++// one place to add or change a convention; it replaces the per-helper and
++// per-script registrations that used to be scattered across templatePaths.ts,
++// templateIcons.ts and each script's index.ts.
++//
++// The registry in ./templateRules.ts stays a dumb name -> rule lookup table.
++// Each consumer maps the convention "slots" it cares about to concrete rule
++// names through the "templateRules" entries in its settings.json and resolves
++// them at runtime via templateRuleFor; the only thing scripts must agree on is
++// the slot keys and the registered rule names.
++
++import { basename, join } from "path";
++import { registerTemplateRule } from "./templateRules";
++
++// --- File and property layout ----------------------------------------------
++
++// Starter templates keep their metadata at properties/<id>.properties.json
++function propertiesPathFor(folder: string, templateId: string): string {
++  return join(folder, "properties", `${templateId}.properties.json`);
++}
++
++// Starter workflow files always live next to their properties folder
++function workflowPathFor(folder: string, templateId: string): string {
++  return join(folder, `${templateId}.yml`);
++}
++
++// --- Icon references --------------------------------------------------------
++
++// Embedded icon references use the `octicon <name>` form
++function iconRefIsOcticon(iconName: string): boolean {
++  return /^octicon\s+/.test(iconName);
++}
++
++// Locally stored icons live in the shared icons folder
++function svgIconPath(iconName: string): string {
++  return join("../../icons", `${iconName}.svg`);
++}
++
++// GHES sync treats any `octicon`-prefixed reference as an embedded icon
++function ghesIconIsEmbedded(iconName: string): boolean {
++  return iconName.startsWith("octicon");
++}
++
++// The embedded octicon name is everything after `octicon `
++function octiconNameFromRef(iconName: string): string | null {
++  const match = iconName.match(/^octicon\s+(.*)/);
++  return match ? match[1] : null;
++}
++
++// --- Classification and directory rules ------------------------------------
++
++// Blank templates are exempt from the category rules
++function isBlankTemplate(workflowPath: string): boolean {
++  return workflowPath.endsWith("blank.yml");
++}
++
++// Deployment templates must declare a creator
++function isDeploymentFolder(path: string): boolean {
++  return basename(path).toLowerCase() == 'deployments';
++}
++
++// --- Enterprise eligibility -------------------------------------------------
++
++// A partner template is published under a partner creator account
++function isPartnerCreator(creator: string, partners: Set<string>): boolean {
++  return partners.has(creator.toLowerCase());
++}
++
++// code-scanning templates are enterprise-only unless marked otherwise
++function isCodeScanningFolder(folder: string): boolean {
++  return basename(folder) === 'code-scanning';
++}
++
++// Register the full, shared set of starter-template convention rules into the
++// registry. Idempotent: calling again merely overwrites each entry.
++export function registerTemplateConventions(): void {
++  // File and property layout
++  registerTemplateRule("template.properties.join", propertiesPathFor);
++  registerTemplateRule("template.workflow.join", workflowPathFor);
++
++  // Icon references
++  registerTemplateRule("icons.ref.octicon-prefix", iconRefIsOcticon);
++  registerTemplateRule("icons.path.repo-svg", svgIconPath);
++  registerTemplateRule("icons.ghes.kind", ghesIconIsEmbedded);
++  registerTemplateRule("icons.ref.token", octiconNameFromRef);
++
++  // Classification and directory rules
++  registerTemplateRule("template.blank.suffix", isBlankTemplate);
++  registerTemplateRule("folders.deployments.name", isDeploymentFolder);
++
++  // Enterprise eligibility
++  registerTemplateRule("partners.creator.match", isPartnerCreator);
++  registerTemplateRule("folders.code-scanning.name", isCodeScanningFolder);
++}
+diff --git a/script/validate-data/templateIcons.ts b/script/validate-data/templateIcons.ts
+deleted file mode 100644
+index e401d58..0000000
+--- a/script/validate-data/templateIcons.ts
++++ /dev/null
+@@ -1,28 +0,0 @@
+-import { join } from "path";
+-import { registerTemplateRule } from "./templateRules";
+-
+-// Embedded icon references use the `octicon <name>` form
+-function iconRefIsOcticon(iconName: string): boolean {
+-  return /^octicon\s+/.test(iconName);
+-}
+-
+-// Locally stored icons live in the shared icons folder
+-function svgIconPath(iconName: string): string {
+-  return join("../../icons", `${iconName}.svg`);
+-}
+-
+-// GHES sync treats any `octicon`-prefixed reference as an embedded icon
+-function ghesIconIsEmbedded(iconName: string): boolean {
+-  return iconName.startsWith("octicon");
+-}
+-
+-// The embedded octicon name is everything after `octicon `
+-function octiconNameFromRef(iconName: string): string | null {
+-  const match = iconName.match(/^octicon\s+(.*)/);
+-  return match ? match[1] : null;
+-}
+-
+-registerTemplateRule("icons.ref.octicon-prefix", iconRefIsOcticon);
+-registerTemplateRule("icons.path.repo-svg", svgIconPath);
+-registerTemplateRule("icons.ghes.kind", ghesIconIsEmbedded);
+-registerTemplateRule("icons.ref.token", octiconNameFromRef);
+diff --git a/script/validate-data/templatePaths.ts b/script/validate-data/templatePaths.ts
+deleted file mode 100644
+index be8de70..0000000
+--- a/script/validate-data/templatePaths.ts
++++ /dev/null
+@@ -1,15 +0,0 @@
+-import { join } from "path";
+-import { registerTemplateRule } from "./templateRules";
+-
+-// Starter templates keep their metadata at properties/<id>.properties.json
+-function propertiesPathFor(folder: string, templateId: string): string {
+-  return join(folder, "properties", `${templateId}.properties.json`);
+-}
+-
+-// Starter workflow files always live next to their properties folder
+-function workflowPathFor(folder: string, templateId: string): string {
+-  return join(folder, `${templateId}.yml`);
+-}
+-
+-registerTemplateRule("template.properties.join", propertiesPathFor);
+-registerTemplateRule("template.workflow.join", workflowPathFor);
+diff --git a/script/validate-data/templateRules.ts b/script/validate-data/templateRules.ts
+index 912add4..0ba393e 100644
+--- a/script/validate-data/templateRules.ts
++++ b/script/validate-data/templateRules.ts
+@@ -1,11 +1,14 @@
+ // Shared registry for starter template convention rules.
+ //
+-// The template conventions (where a starter template keeps its metadata, how
+-// icon references resolve, and how templates are classified) are contributed as
+-// named rules by the script that owns them. Consumers select the concrete rule
+-// serving each convention slot through the "templateRules" map in their
+-// settings.json, so scripts must agree on both the slot keys and the
+-// registered rule names.
++// This is just a name -> rule lookup table. The conventions themselves (where a
++// starter template keeps its metadata, how icon references resolve, and how
++// templates are classified/filtered) are defined and registered in one place:
++// ./templateConventions.ts, via registerTemplateConventions(). Consumers select
++// the concrete rule serving each convention slot through the "templateRules"
++// map in their settings.json and resolve it at runtime via templateRuleFor, so
++// the only thing scripts must agree on is the slot keys and the registered rule
++// names. Add or change a convention in ./templateConventions.ts; do not register
++// rules here.
+ 
+ export interface TemplateRule {
+   (...args: any[]): any;

@@ -1,0 +1,166 @@
+diff --git a/cmd/sanitise_html_email/main.go b/cmd/sanitise_html_email/main.go
+index e613e6c..2968f23 100644
+--- a/cmd/sanitise_html_email/main.go
++++ b/cmd/sanitise_html_email/main.go
+@@ -26,8 +26,8 @@ func main() {
+ 	p := bluemonday.UGCPolicy()
+ 
+ 	// The email rules are declared against the definer that the policy
+-	// exposes, so that neither the rule block nor the runner below is tied to
+-	// the concrete policy type.
++	// exposes, so that the rule block below is not tied to the concrete
++	// policy type.
+ 	var pd bluemonday.PolicyDefiner = p
+ 
+ 	// The rule blocks that HTML email documents need on top of the UGC policy
+@@ -38,9 +38,15 @@ func main() {
+ 	p.AllowStyling()
+ 	p.AllowDataURIImages()
+ 
++	// The policy is run through the runner seam. The runner relies only on
++	// the policy's running capability, so the running path is decoupled from
++	// the declaration path above. The same concrete policy provides both
++	// capabilities.
++	var pr bluemonday.PolicyRunner = p
++
+ 	// Read input from stdin so that this is a nice unix utility and can receive
+ 	// piped input, then sanitise it and write it to stdout
+-	if err := sanitizeEmailInput(pd, os.Stdin, os.Stdout); err != nil {
++	if err := sanitizeEmailInput(pr, os.Stdin, os.Stdout); err != nil {
+ 		log.Fatal(err)
+ 	}
+ }
+@@ -79,7 +85,7 @@ func declareEmailRules(pd bluemonday.PolicyDefiner) {
+ 
+ // sanitizeEmailInput sanitises everything that can be read from in and writes
+ // the sanitised document to out.
+-func sanitizeEmailInput(pd bluemonday.PolicyDefiner, in io.Reader, out io.Writer) error {
++func sanitizeEmailInput(pr bluemonday.PolicyRunner, in io.Reader, out io.Writer) error {
+ 	dirty, err := io.ReadAll(in)
+ 	if err != nil {
+ 		return err
+@@ -88,7 +94,7 @@ func sanitizeEmailInput(pd bluemonday.PolicyDefiner, in io.Reader, out io.Writer
+ 	// Apply the policy and write to stdout
+ 	_, err = fmt.Fprint(
+ 		out,
+-		pd.Sanitize(
++		pr.Sanitize(
+ 			string(dirty),
+ 		),
+ 	)
+diff --git a/cmd/sanitise_ugc/main.go b/cmd/sanitise_ugc/main.go
+index 31a4da1..35b953d 100644
+--- a/cmd/sanitise_ugc/main.go
++++ b/cmd/sanitise_ugc/main.go
+@@ -20,20 +20,22 @@ func main() {
+ 	// Open external links in a new window/tab
+ 	p.AddTargetBlankToFullyQualifiedLinks(true)
+ 
+-	// From here the policy is handled only as a definer, so that the runner
+-	// below is not tied to the concrete policy type.
+-	var pd bluemonday.PolicyDefiner = p
++	// The rules above are declared directly on the concrete policy. From
++	// here the policy is handled only as a runner, so that the runner below
++	// is not tied to the concrete policy type and relies on no declaration
++	// capability.
++	var pr bluemonday.PolicyRunner = p
+ 
+ 	// Read input from stdin so that this is a nice unix utility and can receive
+ 	// piped input, then sanitise it and write it to stdout
+-	if err := sanitizeInput(pd, os.Stdin, os.Stdout); err != nil {
++	if err := sanitizeInput(pr, os.Stdin, os.Stdout); err != nil {
+ 		log.Fatal(err)
+ 	}
+ }
+ 
+ // sanitizeInput sanitises everything that can be read from in and writes the
+ // sanitised document to out.
+-func sanitizeInput(pd bluemonday.PolicyDefiner, in io.Reader, out io.Writer) error {
++func sanitizeInput(pr bluemonday.PolicyRunner, in io.Reader, out io.Writer) error {
+ 	dirty, err := io.ReadAll(in)
+ 	if err != nil {
+ 		return err
+@@ -42,7 +44,7 @@ func sanitizeInput(pd bluemonday.PolicyDefiner, in io.Reader, out io.Writer) err
+ 	// Apply the policy and write to stdout
+ 	_, err = fmt.Fprint(
+ 		out,
+-		pd.Sanitize(
++		pr.Sanitize(
+ 			string(dirty),
+ 		),
+ 	)
+diff --git a/policy.go b/policy.go
+index 7a259a1..6285d83 100644
+--- a/policy.go
++++ b/policy.go
+@@ -209,28 +209,28 @@ type urlPolicy func(url *url.URL) (allowUrl bool)
+ 
+ type urlRewriter func(*url.URL)
+ 
+-// PolicyDefiner is the single seam through which anything that defines a
+-// sanitization policy declares its rules, and through which a policy is run.
++// PolicyDefiner is the seam through which anything that defines a
++// sanitization policy declares its rules.
+ //
+ // Every component that contributes rules to a policy, whether that is one of
+ // the bundled rule blocks shipped with bluemonday, one of the command line
+ // tools, or an embedding application, is written against a PolicyDefiner
+-// rather than against the concrete policy type. This keeps all rule
+-// definitions interchangeable: wrapper policies, conformance guards, and
+-// future definition sources can be swapped in without touching the callers,
+-// and policy definitions remain portable between policies built in different
++// rather than against the concrete policy type. This keeps rule definitions
++// interchangeable: wrapper policies, conformance guards, and future
++// definition sources can be swapped in without touching the callers, and
++// policy definitions remain portable between policies built in different
+ // places.
+ //
+-// *Policy implements PolicyDefiner directly, as do any policy wrappers, so
+-// callers can keep working with the concrete type where they have one and
+-// hand it to anything that expects a definer.
++// PolicyDefiner intentionally carries only the declaration surface. Running
++// a built policy over input is a separate responsibility, carried by the
++// PolicyRunner seam, so that a component whose only job is to declare rules
++// is never handed running capability, and changes to the declaration path do
++// not touch components that only sanitize.
++//
++// *Policy implements PolicyDefiner directly, as do any policy wrappers that
++// can accept declarations, so callers can keep working with the concrete
++// type where they have one and hand it to anything that expects a definer.
+ type PolicyDefiner interface {
+-	// Running a policy over untrusted input:
+-	Sanitize(s string) string
+-	SanitizeBytes(b []byte) []byte
+-	SanitizeReader(r io.Reader) *bytes.Buffer
+-	SanitizeReaderToWriter(r io.Reader, w io.Writer) error
+-
+ 	// Declaring which elements are permitted, and whether their content is
+ 	// kept or dropped when the element itself is not allowed:
+ 	AllowElements(names ...string) *Policy
+@@ -274,6 +274,26 @@ type PolicyDefiner interface {
+ 	AddSpaceWhenStrippingTag(allow bool) *Policy
+ }
+ 
++// PolicyRunner is the seam through which a built policy is run over
++// untrusted input.
++//
++// Every component whose only responsibility is to apply a finished policy,
++// such as the command line tools and embedding applications that sanitize at
++// the edge, is written against a PolicyRunner rather than against the
++// concrete policy type or against PolicyDefiner. Keeping the running path on
++// its own capability set decouples it from the declaration path, so changes
++// to how rules are declared do not touch components that only sanitize, and a
++// runner is never handed declaration capability it does not use.
++//
++// *Policy implements PolicyRunner directly.
++type PolicyRunner interface {
++	// Running a policy over untrusted input:
++	Sanitize(s string) string
++	SanitizeBytes(b []byte) []byte
++	SanitizeReader(r io.Reader) *bytes.Buffer
++	SanitizeReaderToWriter(r io.Reader, w io.Writer) error
++}
++
+ type SandboxValue int64
+ 
+ const (

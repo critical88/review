@@ -1,0 +1,213 @@
+diff --git a/packages/cli-utils/src/commands/scan/__tests__/module-graph.test.ts b/packages/cli-utils/src/commands/scan/__tests__/module-graph.test.ts
+index 2a12824..e55bfd6 100644
+--- a/packages/cli-utils/src/commands/scan/__tests__/module-graph.test.ts
++++ b/packages/cli-utils/src/commands/scan/__tests__/module-graph.test.ts
+@@ -36,4 +36,15 @@ describe('ModuleGraph', () => {
+     expect(reach.entryPoints).toEqual(['/p/app.ts']);
+     expect(reach.areas.sort()).toEqual(['(root)', 'feature-a', 'feature-b', 'shared']);
+   });
++
++  it('reports the blast radius of a set of modules (union of their reach)', () => {
++    const reach = graph.reach(['/p/feature-a/list.ts', '/p/feature-b/card.ts']);
++    expect(reach.modules.sort()).toEqual([
++      '/p/app.ts',
++      '/p/feature-a/list.ts',
++      '/p/feature-b/card.ts',
++    ]);
++    expect(reach.areas).toEqual(['(root)', 'feature-a', 'feature-b']);
++    expect(reach.entryPoints).toEqual(['/p/app.ts']);
++  });
+ });
+diff --git a/packages/cli-utils/src/commands/scan/module-graph.ts b/packages/cli-utils/src/commands/scan/module-graph.ts
+index 19a090d..68b6817 100644
+--- a/packages/cli-utils/src/commands/scan/module-graph.ts
++++ b/packages/cli-utils/src/commands/scan/module-graph.ts
+@@ -23,6 +23,7 @@ export class ModuleGraph {
+   private _entryPoints: Set<string> | undefined;
+   private _distance: Map<string, number> | undefined;
+   private readonly _dependents = new Map<string, Set<string>>();
++  private readonly _areas = new Map<string, string>();
+ 
+   constructor(edges: Map<string, string[]>, cwd: string = process.cwd()) {
+     this._edges = edges;
+@@ -34,11 +35,17 @@ export class ModuleGraph {
+     return this._edges;
+   }
+ 
+-  /** The "area" a module belongs to: its directory, relative to the cwd. */
++  /** The "area" a module belongs to: its directory, relative to the cwd.
++   * Memoised, so building an area table over the whole graph is a sequence of
++   * cheap lookups rather than repeated path arithmetic. */
+   areaOf(modulePath: string): string {
++    const cached = this._areas.get(modulePath);
++    if (cached !== undefined) return cached;
+     const rel = path.relative(this._cwd, modulePath);
+     const dir = path.dirname(!rel.startsWith('..') ? rel : modulePath);
+-    return dir === '.' ? '(root)' : dir;
++    const area = dir === '.' ? '(root)' : dir;
++    this._areas.set(modulePath, area);
++    return area;
+   }
+ 
+   /** Modules that nothing else imports — the roots of the graph. */
+@@ -99,16 +106,31 @@ export class ModuleGraph {
+   }
+ 
+   /** The blast radius of a module: itself plus everything that depends on it. */
+-  reach(modulePath: string): ModuleReach {
++  reach(modulePath: string): ModuleReach;
++  /** The blast radius of a set of modules: each one plus everything that
++   * depends on any of them, the areas they cover, and the entry points among
++   * them. Used when one thing (e.g. a schema field) is reached from several
++   * modules and its footprint is the union of their reach. */
++  reach(modules: Iterable<string>): ModuleReach;
++  reach(modules: string | Iterable<string>): ModuleReach {
+     const entryPoints = this.entryPoints();
+-    const modules = new Set<string>([modulePath, ...this.dependents(modulePath)]);
++    const moduleSet = new Set<string>();
++    const seeds = typeof modules === 'string' ? [modules] : modules;
++    for (const seed of seeds) {
++      moduleSet.add(seed);
++      for (const dependent of this.dependents(seed)) moduleSet.add(dependent);
++    }
+     const areas = new Set<string>();
+     const reachedEntries = new Set<string>();
+-    for (const module of modules) {
++    for (const module of moduleSet) {
+       areas.add(this.areaOf(module));
+       if (entryPoints.has(module)) reachedEntries.add(module);
+     }
+-    return { modules: [...modules], areas: [...areas].sort(), entryPoints: [...reachedEntries] };
++    return {
++      modules: [...moduleSet],
++      areas: [...areas].sort(),
++      entryPoints: [...reachedEntries],
++    };
+   }
+ 
+   private _reverseGraph(): Map<string, Set<string>> {
+diff --git a/packages/cli-utils/src/commands/scan/rules/cross-feature-fragments.ts b/packages/cli-utils/src/commands/scan/rules/cross-feature-fragments.ts
+index 203a7a7..2722d74 100644
+--- a/packages/cli-utils/src/commands/scan/rules/cross-feature-fragments.ts
++++ b/packages/cli-utils/src/commands/scan/rules/cross-feature-fragments.ts
+@@ -18,15 +18,8 @@ export const crossFeatureFragments: ScanRule<CrossFeatureData> = {
+ 
+     const graph = context.getModuleGraph();
+     const fragments = context.getFragmentGraph();
+-    // Resolve the area of every module the graph knows about up front, so
+-    // spread sites and defining modules can be labelled from one table.
+-    const moduleAreas = new Map<string, string>();
+-    for (const [module, imports] of graph.importMap()) {
+-      if (!moduleAreas.has(module)) moduleAreas.set(module, graph.areaOf(module));
+-      for (const target of imports) {
+-        if (!moduleAreas.has(target)) moduleAreas.set(target, graph.areaOf(target));
+-      }
+-    }
++    // `areaOf` is memoised on the graph, so labelling spread sites and defining
++    // modules is a sequence of cheap lookups the graph owns.
+ 
+     return {
+       visitor: {
+@@ -38,7 +31,7 @@ export const crossFeatureFragments: ScanRule<CrossFeatureData> = {
+             if (!id) return;
+             let areas = consumerAreas.get(id);
+             if (!areas) consumerAreas.set(id, (areas = new Set()));
+-            areas.add(moduleAreas.get(definition.module) ?? graph.areaOf(definition.module));
++            areas.add(graph.areaOf(definition.module));
+             spreadCount.set(id, (spreadCount.get(id) || 0) + 1);
+           },
+         },
+@@ -50,7 +43,7 @@ export const crossFeatureFragments: ScanRule<CrossFeatureData> = {
+         for (const [id, areas] of consumerAreas) {
+           const fragment = byId.get(id);
+           if (!fragment) continue;
+-          const definingArea = moduleAreas.get(fragment.module) ?? graph.areaOf(fragment.module);
++          const definingArea = graph.areaOf(fragment.module);
+           // Areas other than where the fragment itself lives.
+           const externalAreas = [...areas].filter((area) => area !== definingArea).sort();
+           if (!externalAreas.length) continue;
+diff --git a/packages/cli-utils/src/commands/scan/rules/fetch-depth.ts b/packages/cli-utils/src/commands/scan/rules/fetch-depth.ts
+index 43602ea..9533cf5 100644
+--- a/packages/cli-utils/src/commands/scan/rules/fetch-depth.ts
++++ b/packages/cli-utils/src/commands/scan/rules/fetch-depth.ts
+@@ -22,29 +22,13 @@ export const fetchDepth: ScanRule<FetchDepthData> = {
+       visitor: {},
+       collect() {
+         const graph = context.getModuleGraph();
+-        // Walk the import graph outwards from the entry points, recording how
+-        // far each module sits, then place each query by that distance.
+-        const distance = new Map<string, number>();
+-        let frontier = [...graph.entryPoints()];
+-        let depth = 0;
+-        while (frontier.length) {
+-          const next: string[] = [];
+-          for (const node of frontier) {
+-            if (distance.has(node)) continue;
+-            distance.set(node, depth);
+-            for (const to of graph.importMap().get(node) || []) {
+-              if (!distance.has(to)) next.push(to);
+-            }
+-          }
+-          frontier = next;
+-          depth++;
+-        }
+-        // Place each query by the distance recorded above, labelling it with
+-        // the area of its defining module as we go.
++        // Distance from an entry point to each module is the graph's concern
++        // (memoised there); place each query by that distance, labelling it
++        // with the area of its defining module as we go.
+         const datapoints: RuleDatapoint<FetchDepthData>[] = [];
+         for (const op of context.operations) {
+           if (op.kind !== 'query') continue;
+-          const entryDistance = distance.get(op.module);
++          const entryDistance = graph.distanceFromEntry(op.module);
+           const moduleArea = graph.areaOf(op.module);
+           datapoints.push({
+             ref: { kind: 'operation' as const, id: op.id },
+diff --git a/packages/cli-utils/src/commands/scan/rules/field-usage.ts b/packages/cli-utils/src/commands/scan/rules/field-usage.ts
+index 5642dd3..0485b92 100644
+--- a/packages/cli-utils/src/commands/scan/rules/field-usage.ts
++++ b/packages/cli-utils/src/commands/scan/rules/field-usage.ts
+@@ -89,24 +89,15 @@ export const fieldUsage: ScanRule<FieldUsageData> = {
+             const module = moduleById.get(id);
+             if (module) sourceModules.add(module);
+           }
+-          // Everything that transitively depends on the selected modules, the
+-          // areas they cover, and the entry points among them.
+-          const reachModules = new Set<string>();
+-          const reachAreas = new Set<string>();
+-          const reachEntries = new Set<string>();
+-          for (const module of sourceModules) {
+-            for (const dependent of graph.dependents(module)) reachModules.add(dependent);
+-            reachModules.add(module);
+-          }
+-          for (const module of reachModules) {
+-            reachAreas.add(graph.areaOf(module));
+-            if (graph.entryPoints().has(module)) reachEntries.add(module);
+-          }
++          // The blast radius (modules + their dependents, the areas they cover,
++          // and the entry points among them) is the graph's concern; we report
++          // its sizes and the sorted area list.
++          const reach = graph.reach(sourceModules);
+ 
+           datapoints.push({
+             ref: { kind: 'field', coordinate },
+             message: `${coordinate} selected ${entry.directUsages.length} time(s)`,
+-            weight: hasEntryPoints ? reachEntries.size : reachModules.size,
++            weight: hasEntryPoints ? reach.entryPoints.length : reach.modules.length,
+             data: {
+               typeName: entry.typeName,
+               fieldName: entry.fieldName,
+@@ -117,9 +108,9 @@ export const fieldUsage: ScanRule<FieldUsageData> = {
+               directUsages: entry.directUsages,
+               operations: [...operations],
+               reach: {
+-                modules: reachModules.size,
+-                areas: [...reachAreas].sort(),
+-                entryPoints: reachEntries.size,
++                modules: reach.modules.length,
++                areas: reach.areas,
++                entryPoints: reach.entryPoints.length,
+               },
+             },
+           });

@@ -1,0 +1,514 @@
+diff --git a/src/arbitrary.rs b/src/arbitrary.rs
+index c391fc2..2e71569 100644
+--- a/src/arbitrary.rs
++++ b/src/arbitrary.rs
+@@ -23,8 +23,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
+ 
+ use rand::prelude::*;
+ 
+-use crate::tester::QuickCheck;
+-
+ /// `Gen` represents a PRNG.
+ ///
+ /// It is the source of randomness from which QuickCheck will generate values.
+@@ -291,7 +289,7 @@ impl<A: Arbitrary> Arbitrary for Vec<A> {
+     }
+ 
+     fn shrink(&self) -> Box<dyn Iterator<Item = Vec<A>>> {
+-        QuickCheck::new_vec_shrinker(self.clone())
++        VecShrinker::new(self.clone())
+     }
+ }
+ 
+@@ -307,12 +305,9 @@ struct VecShrinker<A> {
+     element_shrinker: Box<dyn Iterator<Item = A>>,
+ }
+ 
+-impl QuickCheck {
+-    /// Builds the iterator yielding the successive attempts to shrink the
+-    /// vector `seed`.
+-    fn new_vec_shrinker<A: Arbitrary>(
+-        seed: Vec<A>,
+-    ) -> Box<dyn Iterator<Item = Vec<A>>> {
++impl<A: Arbitrary> VecShrinker<A> {
++    #[allow(clippy::new_ret_no_self)]
++    fn new(seed: Vec<A>) -> Box<dyn Iterator<Item = Vec<A>>> {
+         let es = match seed.first() {
+             Some(e) => e.shrink(),
+             None => return empty_shrinker(),
+@@ -326,50 +321,50 @@ impl QuickCheck {
+         })
+     }
+ 
+-    /// Produces the next shrunk element if any, `shrinker.offset` points to
+-    /// the index after the returned element after the function returns
+-    fn vec_shrinker_next_element<A: Arbitrary>(
+-        shrinker: &mut VecShrinker<A>,
+-    ) -> Option<A> {
++    /// Returns the next shrunk element if any, `offset` points to the index
++    /// after the returned element after the function returns
++    fn next_element(&mut self) -> Option<A> {
+         loop {
+-            match shrinker.element_shrinker.next() {
++            match self.element_shrinker.next() {
+                 Some(e) => return Some(e),
+-                None => match shrinker.seed.get(shrinker.offset) {
++                None => match self.seed.get(self.offset) {
+                     Some(e) => {
+-                        shrinker.element_shrinker = e.shrink();
+-                        shrinker.offset += 1;
++                        self.element_shrinker = e.shrink();
++                        self.offset += 1;
+                     }
+                     None => return None,
+                 },
+             }
+         }
+     }
++}
+ 
+-    /// Produces the next smaller vector from the shrinking plan recorded in
+-    /// `shrinker`.
+-    fn vec_shrinker_next<A: Arbitrary>(
+-        shrinker: &mut VecShrinker<A>,
+-    ) -> Option<Vec<A>> {
++impl<A> Iterator for VecShrinker<A>
++where
++    A: Arbitrary,
++{
++    type Item = Vec<A>;
++    fn next(&mut self) -> Option<Vec<A>> {
+         // Try with an empty vector first
+-        if shrinker.size == shrinker.seed.len() {
+-            shrinker.size /= 2;
+-            shrinker.offset = shrinker.size;
++        if self.size == self.seed.len() {
++            self.size /= 2;
++            self.offset = self.size;
+             return Some(vec![]);
+         }
+-        if shrinker.size != 0 {
++        if self.size != 0 {
+             // Generate a smaller vector by removing the elements between
+             // (offset - size) and offset
+-            let xs1 = shrinker.seed[..(shrinker.offset - shrinker.size)]
++            let xs1 = self.seed[..(self.offset - self.size)]
+                 .iter()
+-                .chain(&shrinker.seed[shrinker.offset..])
++                .chain(&self.seed[self.offset..])
+                 .cloned()
+                 .collect();
+-            shrinker.offset += shrinker.size;
++            self.offset += self.size;
+             // Try to reduce the amount removed from the vector once all
+             // previous sizes tried
+-            if shrinker.offset > shrinker.seed.len() {
+-                shrinker.size /= 2;
+-                shrinker.offset = shrinker.size;
++            if self.offset > self.seed.len() {
++                self.size /= 2;
++                self.offset = self.size;
+             }
+             Some(xs1)
+         } else {
+@@ -378,19 +373,19 @@ impl QuickCheck {
+             // element to shrink
+ 
+             // The first element shrinker is already created so skip the first
+-            // offset (shrinker.offset == 0 only on first entry to this part of
+-            // the iterator)
+-            if shrinker.offset == 0 {
+-                shrinker.offset = 1;
++            // offset (self.offset == 0 only on first entry to this part of the
++            // iterator)
++            if self.offset == 0 {
++                self.offset = 1;
+             }
+ 
+-            match QuickCheck::vec_shrinker_next_element(shrinker) {
++            match self.next_element() {
+                 Some(e) => Some(
+-                    shrinker.seed[..shrinker.offset - 1]
++                    self.seed[..self.offset - 1]
+                         .iter()
+                         .cloned()
+                         .chain(Some(e))
+-                        .chain(shrinker.seed[shrinker.offset..].iter().cloned())
++                        .chain(self.seed[self.offset..].iter().cloned())
+                         .collect(),
+                 ),
+                 None => None,
+@@ -399,16 +394,6 @@ impl QuickCheck {
+     }
+ }
+ 
+-impl<A> Iterator for VecShrinker<A>
+-where
+-    A: Arbitrary,
+-{
+-    type Item = Vec<A>;
+-    fn next(&mut self) -> Option<Vec<A>> {
+-        QuickCheck::vec_shrinker_next(self)
+-    }
+-}
+-
+ impl<K: Arbitrary + Ord, V: Arbitrary> Arbitrary for BTreeMap<K, V> {
+     fn arbitrary(g: &mut Gen) -> BTreeMap<K, V> {
+         let vec: Vec<(K, V)> = Arbitrary::arbitrary(g);
+@@ -671,7 +656,7 @@ impl Arbitrary for CString {
+     fn shrink(&self) -> Box<dyn Iterator<Item = CString>> {
+         // Use the implementation for a vec here, but make sure null characters
+         // are filtered out.
+-        Box::new(QuickCheck::new_vec_shrinker(self.as_bytes().to_vec()).map(|bytes| {
++        Box::new(VecShrinker::new(self.as_bytes().to_vec()).map(|bytes| {
+             CString::new(
+                 bytes.into_iter().filter(|&c| c != 0).collect::<Vec<u8>>(),
+             )
+diff --git a/src/lib.rs b/src/lib.rs
+index f286a60..8ff9a40 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -73,6 +73,10 @@ macro_rules! quickcheck {
+     )
+ }
+ 
++#[cfg(feature = "use_logging")]
++fn env_logger_init() -> Result<(), log::SetLoggerError> {
++    env_logger::try_init()
++}
+ #[cfg(feature = "use_logging")]
+ macro_rules! info {
+     ($($tt:tt)*) => {
+@@ -80,6 +84,8 @@ macro_rules! info {
+     };
+ }
+ 
++#[cfg(not(feature = "use_logging"))]
++fn env_logger_init() {}
+ #[cfg(not(feature = "use_logging"))]
+ macro_rules! info {
+     ($($_ignore:tt)*) => {
+diff --git a/src/tester.rs b/src/tester.rs
+index 392f4dc..1655b53 100644
+--- a/src/tester.rs
++++ b/src/tester.rs
+@@ -10,11 +10,6 @@ use crate::{
+ 
+ /// The main `QuickCheck` type for setting configuration and running
+ /// `QuickCheck`.
+-///
+-/// `QuickCheck` owns the full life cycle of a property run: it reads its
+-/// configuration, decides what a passing or failing run means, captures
+-/// panics from the property, prepares logging, and drives shrinking of
+-/// generated inputs.
+ pub struct QuickCheck {
+     tests: u64,
+     max_tests: u64,
+@@ -22,6 +17,38 @@ pub struct QuickCheck {
+     rng: Gen,
+ }
+ 
++fn qc_tests() -> u64 {
++    let default = 100;
++    match env::var("QUICKCHECK_TESTS") {
++        Ok(val) => val.parse().unwrap_or(default),
++        Err(_) => default,
++    }
++}
++
++fn qc_max_tests() -> u64 {
++    let default = 10_000;
++    match env::var("QUICKCHECK_MAX_TESTS") {
++        Ok(val) => val.parse().unwrap_or(default),
++        Err(_) => default,
++    }
++}
++
++fn qc_gen_size() -> usize {
++    let default = 100;
++    match env::var("QUICKCHECK_GENERATOR_SIZE") {
++        Ok(val) => val.parse().unwrap_or(default),
++        Err(_) => default,
++    }
++}
++
++fn qc_min_tests_passed() -> u64 {
++    let default = 0;
++    match env::var("QUICKCHECK_MIN_TESTS_PASSED") {
++        Ok(val) => val.parse().unwrap_or(default),
++        Err(_) => default,
++    }
++}
++
+ impl Default for QuickCheck {
+     fn default() -> Self {
+         Self::new()
+@@ -39,142 +66,14 @@ impl QuickCheck {
+     /// number of overall tests is set to `10000` and the generator is created
+     /// with a size of `100`.
+     pub fn new() -> QuickCheck {
+-        let rng = Gen::new(Self::default_gen_size());
+-        let tests = Self::default_tests();
+-        let max_tests = cmp::max(tests, Self::default_max_tests());
+-        let min_tests_passed = Self::default_min_tests_passed();
++        let rng = Gen::new(qc_gen_size());
++        let tests = qc_tests();
++        let max_tests = cmp::max(tests, qc_max_tests());
++        let min_tests_passed = qc_min_tests_passed();
+ 
+         QuickCheck { tests, max_tests, min_tests_passed, rng }
+     }
+ 
+-    /// The number of tests the runner runs unless the caller configured
+-    /// otherwise, taken from `QUICKCHECK_TESTS`.
+-    fn default_tests() -> u64 {
+-        let default = 100;
+-        match env::var("QUICKCHECK_TESTS") {
+-            Ok(val) => val.parse().unwrap_or(default),
+-            Err(_) => default,
+-        }
+-    }
+-
+-    /// The upper bound on invocations of a property, taken from
+-    /// `QUICKCHECK_MAX_TESTS`.
+-    fn default_max_tests() -> u64 {
+-        let default = 10_000;
+-        match env::var("QUICKCHECK_MAX_TESTS") {
+-            Ok(val) => val.parse().unwrap_or(default),
+-            Err(_) => default,
+-        }
+-    }
+-
+-    /// The generator size the runner seeds new generators with, taken from
+-    /// `QUICKCHECK_GENERATOR_SIZE`.
+-    fn default_gen_size() -> usize {
+-        let default = 100;
+-        match env::var("QUICKCHECK_GENERATOR_SIZE") {
+-            Ok(val) => val.parse().unwrap_or(default),
+-            Err(_) => default,
+-        }
+-    }
+-
+-    /// The minimum number of passed tests the runner insists on, taken
+-    /// from `QUICKCHECK_MIN_TESTS_PASSED`.
+-    fn default_min_tests_passed() -> u64 {
+-        let default = 0;
+-        match env::var("QUICKCHECK_MIN_TESTS_PASSED") {
+-            Ok(val) => val.parse().unwrap_or(default),
+-            Err(_) => default,
+-        }
+-    }
+-
+-    /// Initializes logging for a run of properties, so that a runner emits
+-    /// progress information when the caller asked for it.
+-    #[cfg(feature = "use_logging")]
+-    fn init_logging() -> Result<(), log::SetLoggerError> {
+-        env_logger::try_init()
+-    }
+-
+-    /// Initializes logging for a run of properties. Without the
+-    /// `use_logging` feature there is nothing to initialize.
+-    #[cfg(not(feature = "use_logging"))]
+-    fn init_logging() {}
+-
+-    /// Produces the outcome of a passing or failing invocation of a
+-    /// property from a `bool`.
+-    fn result_from_bool(b: bool) -> TestResult {
+-        TestResult {
+-            status: if b { Pass } else { Fail },
+-            arguments: None,
+-            err: None,
+-        }
+-    }
+-
+-    /// Produces the outcome that records the current invocation of a
+-    /// property as having passed.
+-    fn result_passed() -> TestResult {
+-        Self::result_from_bool(true)
+-    }
+-
+-    /// Produces the outcome that records the current invocation of a
+-    /// property as having failed.
+-    fn result_failed() -> TestResult {
+-        Self::result_from_bool(false)
+-    }
+-
+-    /// Produces the outcome that records a failure caused by a runtime
+-    /// error, along with the message describing it.
+-    fn result_error<S: Into<String>>(msg: S) -> TestResult {
+-        let mut r = Self::result_from_bool(false);
+-        r.err = Some(msg.into());
+-        r
+-    }
+-
+-    /// Produces the outcome that instructs the runner to ignore the
+-    /// current invocation of a property and replace it with a fresh one
+-    /// (up to the runner's limit).
+-    fn result_discard() -> TestResult {
+-        TestResult { status: Discard, arguments: None, err: None }
+-    }
+-
+-    /// Produces the outcome asserting that the property fails only if the
+-    /// given procedure fails while being executed.
+-    fn result_must_fail<T, F>(f: F) -> TestResult
+-    where
+-        F: FnOnce() -> T,
+-        F: 'static,
+-        T: 'static,
+-    {
+-        let f = panic::AssertUnwindSafe(f);
+-        Self::result_from_bool(panic::catch_unwind(f).is_err())
+-    }
+-
+-    /// Captures the result of running a property, converting a panic into
+-    /// an error message where possible.
+-    fn safe_run<T, F>(fun: F) -> Result<T, String>
+-    where
+-        F: FnOnce() -> T,
+-        F: 'static,
+-        T: 'static,
+-    {
+-        panic::catch_unwind(panic::AssertUnwindSafe(fun)).map_err(|any_err| {
+-            // Extract common types of panic payload:
+-            // panic and assert produce &str or String
+-            if let Some(&s) = any_err.downcast_ref::<&str>() {
+-                s.to_owned()
+-            } else if let Some(s) = any_err.downcast_ref::<String>() {
+-                s.to_owned()
+-            } else {
+-                "UNABLE TO SHOW RESULT OF PANIC.".to_owned()
+-            }
+-        })
+-    }
+-
+-    /// Formats the arguments of a failing invocation of a property for
+-    /// the failure report.
+-    fn debug_reprs(args: &[&dyn Debug]) -> Vec<String> {
+-        args.iter().map(|x| format!("{x:?}")).collect()
+-    }
+-
+     /// Set the random number generator to be used by `QuickCheck`.
+     pub fn rng(self, rng: Gen) -> QuickCheck {
+         QuickCheck { rng, ..self }
+@@ -276,7 +175,7 @@ impl QuickCheck {
+         A: Testable,
+     {
+         // Ignore log init failures, implying it has already been done.
+-        let _ = Self::init_logging();
++        let _ = crate::env_logger_init();
+ 
+         let n_tests_passed = match self.quicktest(f) {
+             Ok(n_tests_passed) => n_tests_passed,
+@@ -322,17 +221,19 @@ enum Status {
+ impl TestResult {
+     /// Produces a test result that indicates the current test has passed.
+     pub fn passed() -> TestResult {
+-        QuickCheck::result_passed()
++        TestResult::from_bool(true)
+     }
+ 
+     /// Produces a test result that indicates the current test has failed.
+     pub fn failed() -> TestResult {
+-        QuickCheck::result_failed()
++        TestResult::from_bool(false)
+     }
+ 
+     /// Produces a test result that indicates failure from a runtime error.
+     pub fn error<S: Into<String>>(msg: S) -> TestResult {
+-        QuickCheck::result_error(msg)
++        let mut r = TestResult::from_bool(false);
++        r.err = Some(msg.into());
++        r
+     }
+ 
+     /// Produces a test result that instructs `quickcheck` to ignore it.
+@@ -340,14 +241,18 @@ impl TestResult {
+     /// When a test is discarded, `quickcheck` will replace it with a
+     /// fresh one (up to a certain limit).
+     pub fn discard() -> TestResult {
+-        QuickCheck::result_discard()
++        TestResult { status: Discard, arguments: None, err: None }
+     }
+ 
+     /// Converts a `bool` to a `TestResult`. A `true` value indicates that
+     /// the test has passed and a `false` value indicates that the test
+     /// has failed.
+     pub fn from_bool(b: bool) -> TestResult {
+-        QuickCheck::result_from_bool(b)
++        TestResult {
++            status: if b { Pass } else { Fail },
++            arguments: None,
++            err: None,
++        }
+     }
+ 
+     /// Tests if a "procedure" fails when executed. The test passes only if
+@@ -358,7 +263,8 @@ impl TestResult {
+         F: 'static,
+         T: 'static,
+     {
+-        QuickCheck::result_must_fail(f)
++        let f = panic::AssertUnwindSafe(f);
++        TestResult::from_bool(panic::catch_unwind(f).is_err())
+     }
+ 
+     /// Returns `true` if and only if this test result describes a failing
+@@ -452,6 +358,11 @@ where
+     }
+ }
+ 
++/// Return a vector of the debug formatting of each item in `args`
++fn debug_reprs(args: &[&dyn Debug]) -> Vec<String> {
++    args.iter().map(|x| format!("{x:?}")).collect()
++}
++
+ macro_rules! testable_fn {
+     ($($name: ident),*) => {
+ 
+@@ -462,17 +373,17 @@ impl<T: Testable,
+         let self_ = *self;
+         let a: ($($name,)*) = Arbitrary::arbitrary(g);
+         let ( $($name,)* ) = a.clone();
+-        let mut r = QuickCheck::safe_run(move || {self_($($name),*)}).result(g);
++        let mut r = safe(move || {self_($($name),*)}).result(g);
+ 
+         if r.is_failure() {
+             let mut a = a.shrink();
+             while let Some(t) = a.next() {
+                 let ($($name,)*) = t.clone();
+-                let mut r_new = QuickCheck::safe_run(move || {self_($($name),*)}).result(g);
++                let mut r_new = safe(move || {self_($($name),*)}).result(g);
+                 if r_new.is_failure() {
+                     {
+                         let ($(ref $name,)*) : ($($name,)*) = t;
+-                        r_new.arguments = Some(QuickCheck::debug_reprs(&[$($name),*]));
++                        r_new.arguments = Some(debug_reprs(&[$($name),*]));
+                     }
+ 
+                     // The shrunk value *does* witness a failure, so remember
+@@ -500,6 +411,25 @@ testable_fn!(A, B, C, D, E, F);
+ testable_fn!(A, B, C, D, E, F, G);
+ testable_fn!(A, B, C, D, E, F, G, H);
+ 
++fn safe<T, F>(fun: F) -> Result<T, String>
++where
++    F: FnOnce() -> T,
++    F: 'static,
++    T: 'static,
++{
++    panic::catch_unwind(panic::AssertUnwindSafe(fun)).map_err(|any_err| {
++        // Extract common types of panic payload:
++        // panic and assert produce &str or String
++        if let Some(&s) = any_err.downcast_ref::<&str>() {
++            s.to_owned()
++        } else if let Some(s) = any_err.downcast_ref::<String>() {
++            s.to_owned()
++        } else {
++            "UNABLE TO SHOW RESULT OF PANIC.".to_owned()
++        }
++    })
++}
++
+ #[cfg(test)]
+ mod test {
+     use crate::{Gen, QuickCheck};

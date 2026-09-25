@@ -1,0 +1,117 @@
+diff --git a/AppSyncUnified-installd/cdhash.m b/AppSyncUnified-installd/cdhash.m
+index f06a9a3..f86df62 100644
+--- a/AppSyncUnified-installd/cdhash.m
++++ b/AppSyncUnified-installd/cdhash.m
+@@ -67,13 +67,15 @@ macho_validate(const struct mach_header_host *mh, size_t size) {
+ 		if (lc_next > lc_end) {
+ 			return false;
+ 		}
+-		// While we are already walking the load commands, look at the embedded
+-		// code signature the LC_CODE_SIGNATURE command points at, so amfid can
+-		// decline obviously unusable images right here instead of mapping and
+-		// hashing data we already know is bad.
++		// While we are already walking the load commands, check that the code
++		// signature range the LC_CODE_SIGNATURE command claims actually fits
++		// inside the file, so amfid can decline malformed images here rather
++		// than reading beyond the data we have. The signature's own shape is
++		// validated later by the blob parser (csblob_cdhash), which is the one
++		// component that knows how an embedded signature is laid out.
+ 		if (lc_cmd == LC_CODE_SIGNATURE && !checked_cs_cmd) {
+ 			// Only the first code signature command is ever consulted later, so
+-			// only that one is probed here too.
++			// only that one is checked here too.
+ 			checked_cs_cmd = true;
+ 			if (lc_cmdsize >= sizeof(struct linkedit_data_command)) {
+ 				const struct linkedit_data_command *cs_cmd =
+@@ -85,20 +87,6 @@ macho_validate(const struct mach_header_host *mh, size_t size) {
+ 				if (!((uint8_t *)mh < cs_data && cs_data < cs_end && cs_end <= (uint8_t *)mh + size)) {
+ 					return false;
+ 				}
+-				if (cs_datasize >= sizeof(CS_SuperBlob)) {
+-					const CS_SuperBlob *sb = (const CS_SuperBlob *)cs_data;
+-					if (ntohl(sb->magic) == CSMAGIC_EMBEDDED_SIGNATURE) {
+-						// The same shape requirements the blob parsing applies: a length
+-						// that lies about itself, or an index table we cannot walk, means
+-						// there is no point in continuing.
+-						if (ntohl(sb->length) > cs_datasize
+-								|| ntohl(sb->length) < sizeof(*sb)
+-								|| ntohl(sb->count) >= 0x10000
+-								|| ntohl(sb->count) == 0) {
+-							return false;
+-						}
+-					}
+-				}
+ 			}
+ 		}
+ 		lc_p = lc_next;
+@@ -339,65 +327,11 @@ compute_cdhash_macho(const struct mach_header_host *mh, size_t size, void *cdhas
+ 		ERROR("Invalid code signature");
+ 		return false;
+ 	}
+-	// Scan the embedded signature blob from here, so images whose best code
+-	// directory uses a hash we do not support are declined before the blob
+-	// parser spends time hashing anything.
+-	if (cs_end - cs_data >= (ptrdiff_t) sizeof(CS_SuperBlob)) {
+-		CS_SuperBlob *sb = (CS_SuperBlob *)cs_data;
+-		size_t sig_size = cs_end - cs_data;
+-		if (ntohl(sb->magic) == CSMAGIC_EMBEDDED_SIGNATURE
+-				&& ntohl(sb->length) <= sig_size) {
+-			size_t sb_length = ntohl(sb->length);
+-			if (ntohl(sb->count) >= 0x10000) {
+-				return false;
+-			}
+-			uint32_t count = ntohl(sb->count);
+-			if ((uintptr_t)&sb->index[count] > (uintptr_t)sb + sb_length) {
+-				return false;
+-			}
+-			// Walk the blob index exactly like the parser below and rank candidates
+-			// with the same hash preference table, but only to decide whether any
+-			// of them is usable at all.
+-			unsigned best_rank = 0;
+-			for (uint32_t i = 0; i < count; i++) {
+-				uint32_t type = ntohl(sb->index[i].type);
+-				uint32_t offset = ntohl(sb->index[i].offset);
+-				// Validate the offset.
+-				if (offset > sb_length) {
+-					return false;
+-				}
+-				// Look for a code directory.
+-				if (type == CSSLOT_CODEDIRECTORY ||
+-						(CSSLOT_ALTERNATE_CODEDIRECTORIES <= type && type < CSSLOT_ALTERNATE_CODEDIRECTORY_LIMIT)) {
+-					CS_CodeDirectory *cd = (CS_CodeDirectory *)((uint8_t *)sb + offset);
+-					size_t cd_size = cs_codedirectory_validate(cd, sb_length - offset);
+-					if (cd_size == 0) {
+-						return false;
+-					}
+-					// Rank the candidate by hand: SHA256 is preferred over SHA1, and
+-					// anything outside the known table is unusable.
+-					unsigned cd_rank = 0;
+-					if (cd->hashType == CS_HASHTYPE_SHA1) {
+-						cd_rank = 1;
+-					} else if (cd->hashType == CS_HASHTYPE_SHA256_TRUNCATED) {
+-						cd_rank = 2;
+-					} else if (cd->hashType == CS_HASHTYPE_SHA256) {
+-						cd_rank = 3;
+-					} else if (cd->hashType == CS_HASHTYPE_SHA384) {
+-						cd_rank = 4;
+-					}
+-					if (cd_rank > best_rank) {
+-						best_rank = cd_rank;
+-					}
+-				}
+-			}
+-			if (best_rank == 0) {
+-				ERROR("No usable code directory in signature");
+-				return false;
+-			}
+-		}
+-	}
+-	// Check that the code signature data looks correct.
++	// Compute the cdhash from the embedded signature blob. The blob parser
++	// (csblob_cdhash) is the one component that owns the shape of the embedded
++	// signature: it validates the superblob, walks its index, and declines
++	// images whose best code directory uses a hash type it does not support
++	// -- all before any hashing happens.
+ 	return csblob_cdhash((CS_GenericBlob *)cs_data, cs_end - cs_data, cdhash);
+ }
+ 

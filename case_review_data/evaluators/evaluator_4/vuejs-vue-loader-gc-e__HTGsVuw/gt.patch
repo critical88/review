@@ -1,0 +1,218 @@
+diff --git a/src/cssModules.ts b/src/cssModules.ts
+new file mode 100644
+index 0000000..2b8c6a9
+--- /dev/null
++++ b/src/cssModules.ts
+@@ -0,0 +1,41 @@
++/**
++ * CSS Modules code generation for a compiled single file component.
++ *
++ * For each `<style module>` block, vue-loader emits an import of the compiled
++ * css module, assigns it into a shared `cssModules` object (attached to the
++ * component as `__cssModules`), and — when hot reload is active — installs a
++ * per-style accept handler that refreshes the binding. This module assembles
++ * that source text; the coordinator (the `SFCLoader` entry) owns the shared
++ * `cssModules` declaration and the `__cssModules` prop attachment, and appends
++ * what this returns to the generated module. The identifiers referenced here
++ * (`cssModules`, `__VUE_HMR_RUNTIME__`, `module.hot`) resolve at runtime in the
++ * generated module's scope.
++ */
++
++export function genCSSModulesCode(opts: {
++  index: number
++  request: string
++  moduleName: string | boolean
++  id: string
++  needsHotReload: boolean
++}): string {
++  const { index, request, moduleName, id, needsHotReload } = opts
++  const styleVar = `style${index}`
++  let code = `\nimport ${styleVar} from ${request}`
++
++  // inject variable
++  const name = typeof moduleName === 'string' ? moduleName : '$style'
++  code += `\ncssModules["${name}"] = ${styleVar}`
++
++  if (needsHotReload) {
++    code += `
++if (module.hot) {
++  module.hot.accept(${request}, () => {
++    cssModules["${name}"] = ${styleVar}
++    __VUE_HMR_RUNTIME__.rerender("${id}")
++  })
++}`
++  }
++
++  return code
++}
+diff --git a/src/hotReload.ts b/src/hotReload.ts
+new file mode 100644
+index 0000000..93c8837
+--- /dev/null
++++ b/src/hotReload.ts
+@@ -0,0 +1,40 @@
++/**
++ * Hot Module Replacement code generation for a compiled single file component.
++ *
++ * This module emits the runtime HMR wiring that gets inlined into the proxy
++ * module vue-loader produces for a `.vue` request: it registers the component
++ * under an HMR id so edits to its script reload it in place, and — when a
++ * separate template request exists — accepts that request so that editing the
++ * `<template>` alone only rerenders. The snippets reference identifiers
++ * (`__exports__`, `__VUE_HMR_RUNTIME__`, `render`, `module.hot`, `api`) that
++ * live in the generated module's scope; this module only assembles the source
++ * text the coordinator appends to that module.
++ */
++
++// __VUE_HMR_RUNTIME__ is injected to global scope by @vue/runtime-core
++export function genHotReloadCode(opts: {
++  id: string
++  templateRequest?: string
++}): string {
++  const { id, templateRequest } = opts
++  return `
++/* hot reload */
++if (module.hot) {
++  __exports__.__hmrId = "${id}"
++  const api = __VUE_HMR_RUNTIME__
++  module.hot.accept()
++  if (!api.createRecord('${id}', __exports__)) {
++    api.reload('${id}', __exports__)
++  }
++  ${templateRequest ? genTemplateHotReloadCode(id, templateRequest) : ''}
++}
++`
++}
++
++function genTemplateHotReloadCode(id: string, request: string) {
++  return `
++  module.hot.accept(${request}, () => {
++    api.rerender('${id}', render)
++  })
++`
++}
+diff --git a/src/index.ts b/src/index.ts
+index 8de1bee..d643ebb 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -26,6 +26,8 @@ import {
+   testWebpack5,
+   resolveTemplateTSOptions,
+ } from './util'
++import { genHotReloadCode } from './hotReload'
++import { genCSSModulesCode } from './cssModules'
+ 
+ export { VueLoaderPlugin }
+ 
+@@ -65,14 +67,16 @@ const { parse, compileScript, generateCodeFrame } = compiler
+ const exportHelperPath = require.resolve('./exportHelper')
+ 
+ /**
+- * Coordinates the full compilation of a single file component.
++ * Coordinates the compilation of a single file component into the proxy module
++ * webpack consumes for a `.vue` request.
+  *
+- * All state involved in turning an SFC request into a webpack module lives
+- * here: the parsed descriptor and its cache, the resolved script blocks, the
+- * per-request options, the generated import code and the attached runtime
+- * props. Companion loaders (the template loader, the pitcher and the plugin
+- * variants for both webpack 4 and 5) also read the shared caches through this
+- * class, so they no longer need to import the helper modules individually.
++ * Owns the per-request state (parsed descriptor, computed scope id, generated
++ * import code, runtime props to attach) and the module-level caches (descriptor,
++ * resolved script blocks, type-dependency map) that the companion loaders — the
++ * template loader, the pitcher and the webpack 4 / 5 plugin variants — read
++ * through this class rather than importing the helpers individually.
++ * Block-level code generation that is not coordination — CSS modules wiring and
++ * hot-reload wiring — lives in its own modules and is delegated to from here.
+  */
+ export class SFCLoader {
+   // ---- shared state (module singletons owned by the coordinator) ----
+@@ -463,7 +467,13 @@ export class SFCLoader {
+               this.propsToAttach.push([`__cssModules`, `cssModules`])
+               hasCSSModules = true
+             }
+-            stylesCode += this.genCSSModulesCode(i, styleRequest, style.module)
++            stylesCode += genCSSModulesCode({
++              index: i,
++              request: styleRequest,
++              moduleName: style.module,
++              id: this.id,
++              needsHotReload: this.needsHotReload,
++            })
+           } else {
+             if (this.asCustomElement) {
+               stylesCode += `\nimport _style_${i} from ${styleRequest}`
+@@ -536,68 +546,16 @@ export class SFCLoader {
+     }
+ 
+     if (this.needsHotReload) {
+-      out += this.genHotReloadCode()
++      out += genHotReloadCode({
++        id: this.id,
++        templateRequest: this.templateRequest,
++      })
+     }
+ 
+     out += `\n\nexport default __exports__`
+     return out
+   }
+ 
+-  // ---------------------------------------------------------------------------
+-  // absorbed code generation helpers
+-  // ---------------------------------------------------------------------------
+-
+-  private genCSSModulesCode(
+-    index: number,
+-    request: string,
+-    moduleName: string | boolean
+-  ): string {
+-    const styleVar = `style${index}`
+-    let code = `\nimport ${styleVar} from ${request}`
+-
+-    // inject variable
+-    const name = typeof moduleName === 'string' ? moduleName : '$style'
+-    code += `\ncssModules["${name}"] = ${styleVar}`
+-
+-    if (this.needsHotReload) {
+-      code += `
+-if (module.hot) {
+-  module.hot.accept(${request}, () => {
+-    cssModules["${name}"] = ${styleVar}
+-    __VUE_HMR_RUNTIME__.rerender("${this.id}")
+-  })
+-}`
+-    }
+-
+-    return code
+-  }
+-
+-  // __VUE_HMR_RUNTIME__ is injected to global scope by @vue/runtime-core
+-  private genHotReloadCode(): string {
+-    const id = this.id
+-    const templateRequest = this.templateRequest
+-    return `
+-/* hot reload */
+-if (module.hot) {
+-  __exports__.__hmrId = "${id}"
+-  const api = __VUE_HMR_RUNTIME__
+-  module.hot.accept()
+-  if (!api.createRecord('${id}', __exports__)) {
+-    api.reload('${id}', __exports__)
+-  }
+-  ${templateRequest ? this.genTemplateHotReloadCode(id, templateRequest) : ''}
+-}
+-`
+-  }
+-
+-  private genTemplateHotReloadCode(id: string, request: string) {
+-    return `
+-  module.hot.accept(${request}, () => {
+-    api.rerender('${id}', render)
+-  })
+-`
+-  }
+-
+   // these are built-in query parameters so should be ignored
+   // if the user happen to add them as attrs
+   private static ignoreList = ['id', 'index', 'src', 'type']

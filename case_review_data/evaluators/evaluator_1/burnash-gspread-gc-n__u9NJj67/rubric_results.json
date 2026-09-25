@@ -1,0 +1,182 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "In agent.patch, gspread/auth.py now owns the credential lifecycle: it imports InstalledAppFlow/OAuthCredentials/SACredentials/APIKeyCredentials, defines DEFAULT_SCOPES/READONLY_SCOPES, implements get_config_dir() with the Windows/home path logic, defines DEFAULT_CONFIG_DIR/DEFAULT_CREDENTIALS_FILENAME/DEFAULT_AUTHORIZED_USER_FILENAME/DEFAULT_SERVICE_ACCOUNT_FILENAME, implements local_server_flow() via InstalledAppFlow.from_client_config(...).run_local_server(port=port), load_credentials() via OAuthCredentials.from_authorized_user_file(filename), and store_credentials() with filename.parent.mkdir(parents=True, exist_ok=True) and writing creds.to_json(strip). In gspread/client.py, the corresponding static/class members and methods (DEFAULT_SCOPES, get_config_dir, local_server_flow, load_credentials, store_credentials, oauth/service_account/api_key factories) are removed; Client no longer inherits HTTPClient and only retains a convert_credentials shim delegating to utils.convert_credentials.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The credential lifecycle is implemented in the package's authentication area (gspread/auth.py or a module dedicated to authentication), not on the client entry class: running the interactive local-server OAuth flow (google_auth_oauthlib InstalledAppFlow), loading an authorized-user credentials file, storing credentials to disk (including mkdir of the parent dir), computing the config directory, and defining the scope/file-location defaults are owned by the authentication area, and gspread.client.Client neither defines nor reimplements any of them (a visible delegating alias on Client is acceptable only if the authentication area owns all decisions and state).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, gspread/auth.py now owns the login construction logic: authorize() returns Client(auth=credentials, http_client=http_client, session=session); oauth() loads/stores credentials and returns Client(auth=creds, http_client=http_client); oauth_from_dict() builds OAuthCredentials and returns (Client(auth=creds, http_client=http_client), creds.to_json(\"token\")); service_account() uses SACredentials.from_service_account_file(...) then Client(auth=creds, http_client=http_client); service_account_from_dict() uses SACredentials.from_service_account_info(...) then Client(...); api_key() checks GOOGLE_AUTH_API_KEY_AVAILABLE, builds APIKeyCredentials(token), and returns Client(auth=creds, http_client=http_client). In gspread/client.py, the patch deletes the corresponding Client.authorize/oauth/oauth_from_dict/service_account/service_account_from_dict/api_key/local_server_flow/load_credentials/store_credentials/get_config_dir classmethods and scope/path constants; Client retains only a convert_credentials shim delegating to utils, not credential-acquisition login factories.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every documented login method's construction logic — credential-based login (authorize), OAuth login with stored/reloaded authorized-user file (oauth), OAuth login from dicts (oauth_from_dict), service-account login from file and from dict, and API-key login (including the google-auth availability guard) — is carried out in the authentication area of the package and ends by building a client around the supplied transport class; Client does not contain the bodies of these login factories as its own class-level factories implementing credential acquisition.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, gspread/client.py changes `class Client(HTTPClient):` to `class Client:` and removes `super().__init__(auth=auth, session=session)` from `__init__`, leaving only `self.http_client = http_client(auth, session)`. The class docstring states it 'neither inherits HTTP transport behavior nor builds a session of its own,' and methods delegate to the single transport, e.g. `self.http_client.values_get(...)` and `self.http_client.values_update(...)`. This matches the request that a client send all traffic through exactly one configured transport.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The entry class holds exactly one HTTP transport: gspread.client.Client no longer inherits from the HTTP transport class (no inherited request method, session or auth state), does not inherit from any class defined in gspread/http_client.py, and operates through the single transport instance constructed from the transport class it was given.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, gspread/utils.py restores the legacy conversion implementation: it imports OAuthCredentials and SACredentials at module top and defines convert_credentials with the same oauth2client module/class checks, plus _convert_oauth_credentials and _convert_service_account_credentials using the same field mapping and scopes logic as before. The injected lazy `from .client import Client` shim is removed, and utils.py no longer imports or calls gspread.client or Client.convert_credentials. In client.py, Client.convert_credentials is reduced to a thin shim that delegates to gspread.utils.convert_credentials, so the utility module no longer has a reverse dependency into the client.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Legacy oauth2client credential conversion (convert_credentials with its OAuth and service-account converters) is implemented in the package's utility/authentication area without importing or otherwise resolving gspread.client from it — no deferred/lazy import of the client module, no call into the entry class — and converting an oauth2client.service_account.ServiceAccountCredentials or oauth2client OAuth2Credentials still yields the same google.auth credentials as before.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, Client.get_spreadsheet_values now calls `self.http_client.values_get(spreadsheet_id, range_name, params=...)` and Client.update_spreadsheet_values now calls `self.http_client.values_update(spreadsheet_id, range_name, params=..., body={...})`; the previous `url = SPREADSHEET_VALUES_URL % (spreadsheet_id, quote(range_name))` construction and `self.http_client.request(...)` calls are removed. The client imports no longer include `SPREADSHEET_VALUES_URL` or `quote`, so the entry class no longer builds or quotes values-family URLs itself and routes through the transport/endpoint owner.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The endpoint duplication is removed: the injected by-key range accessors on Client (get_spreadsheet_values / update_spreadsheet_values) no longer build Sheets values URLs themselves inside the entry class — either they are removed or they route through the single request/endpoint owner so that exactly one place in the package builds values-family URLs (including quote-ing of the range name) for these operations.",
+      "passes": true
+    },
+    {
+      "id": "R6",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The public login surface keeps working with unchanged signatures and return contracts from both import locations: gspread.authorize, gspread.oauth, gspread.oauth_from_dict, gspread.service_account, gspread.service_account_from_dict and gspread.api_key at package top level, and the same names plus the local-server flow runner, credential load/store helpers and the config-dir helper in gspread.auth (the package top-level __init__ imports these from .auth and must keep working without edits). oauth_from_dict still returns the tuple of (client, authorized-user dict safe to store); oauth still reuses a stored authorized-user file when valid, otherwise runs the flow and persists the authorized-user file on first login, honoring custom credentials_filename/authorized_user_filename paths.",
+      "rationale": "This is the caller graph the untangling must preserve: the top-level gspread/__init__.py re-exports these names from the auth module, and the recorded behavior of stored-credential reuse plus token persistence is part of the library's documented promise.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    },
+    {
+      "result": 1,
+      "evidence": "The problem asks to preserve OAuth behavior. In agent.patch, gspread/auth.py defines `class FlowCallable(Protocol)` with `__call__(self, client_config, scopes, port=0) -> OAuthCredentials`, keeps `local_server_flow(client_config, scopes, port: int = 0)` building `InstalledAppFlow.from_client_config(client_config, scopes)` and calling `run_local_server(port=port)`, and both `oauth(..., flow: FlowCallable = local_server_flow, ...)` and `oauth_from_dict(..., flow: FlowCallable = local_server_flow, ...)` accept a user-supplied flow and invoke it as `flow(client_config=..., scopes=...)`.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The OAuth flow stays pluggable: the OAuth login helpers accept a user-supplied flow callable matching the documented protocol (called with client_config and scopes, returning credentials), passed as the flow argument; the default local-server strategy still works with the same argument surface (port parameter included) after the separation.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch makes Client a plain `class Client:` that composes one transport: `__init__` accepts `session: Optional[Session] = None` and `http_client: HTTPClientType = HTTPClient`, then does `self.http_client = http_client(auth, session)`. `authorize` keeps both `http_client` and `session` and passes them to `Client(...)`; `oauth`, `oauth_from_dict`, `service_account`, `service_account_from_dict`, and `api_key` all keep `http_client: HTTPClientType = HTTPClient` and pass it to `Client(...)`. `get_spreadsheet_values`/`update_spreadsheet_values` now delegate to `self.http_client.values_get`/`self.http_client.values_update`, and the Client docstring says it hands off the HTTP transport to models and delegates every request to it. The patch does not modify `gspread/http_client.py` or package `__init__.py`, leaving `HTTPClient`/`BackOffHTTPClient` and their backoff sleep behavior intact.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Custom transports remain first-class: every login entry point and direct Client(...) construction accept an http_client transport-class argument and an optional requests.Session, instantiate that supplied class, and after construction all spreadsheet/worksheet interactions are served through that instance (objects handed to spreadsheets/worksheets are the supplied transport instance); gspread.http_client.HTTPClient and gspread.http_client.BackOffHTTPClient remain independently constructible, importable from the package top level, and functional as standalone transports with the built-in backoff transport still selecting retry delays through gspread.http_client.time.sleep.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch modifies only production modules (gspread/auth.py, gspread/client.py, gspread/utils.py); no test files, conftest fixtures, cassettes, or test requirements are edited, deleted, skipped, xfailed, or narrowed. It restores the pre-smell auth ownership (auth.py owns OAuth/service-account/API-key flows, scopes, config paths, credential load/store) and credential conversion (utils.convert_credentials with _convert_oauth_credentials/_convert_service_account_credentials), removes Client’s HTTPClient inheritance and auth methods, and delegates Client.get_spreadsheet_values/update_spreadsheet_values to existing http_client.values_get/values_update, preserving public calling conventions and import acyclicity (auth->client->utils, no reverse dependency).",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The complete recorded test suite passes on the repaired tree with the same passing set as the clean baseline (166 tests) and no test asset was weakened: no test file, conftest fixture, cassette or test requirement was edited, deleted, skipped, xfailed, or replaced by a narrower equivalent.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only modifies auth.py, client.py, and utils.py; spreadsheet.py is absent and no hunks touch insert_permission/share/list_permissions, copy(), export/import_csv, del_spreadsheet, list/open/create, or set_timeout. Client.__init__ still constructs a single self.http_client = http_client(auth, session) for delegation, and the expiry property is retained unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The coordinator's public behavioral surface is unchanged: permission helpers keep their exact keyword names and semantics (value, perm_type, role, notify, email_message, with_link on the client-level insert-permission path; the same for the spreadsheet-level share/list-permissions behavior), copy() keeps copy_permissions/folder_id/copy_comments behavior including permission and comment re-creation, export/import_csv/del_spreadsheet/list/open/create signatures and effects are untouched, set_timeout applied to the client still governs subsequent API calls, and the credentials' expiry remains readable off the client.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The import graph is acyclic after the patch. gspread/utils.py no longer imports gspread.client at all — the lazy `from .client import Client` was removed and the credential-conversion logic (_convert_oauth_credentials, _convert_service_account_credentials) was moved back into utils.py itself, eliminating the utils→client→utils cycle the smell introduced. gspread/auth.py imports `.client` and `.http_client` but neither imports `.auth` back. gspread/client.py imports `.exceptions`, `.http_client`, `.spreadsheet`, `.urls`, `.utils` — none of which import client or auth. No module-level deferred imports remain. Import-time work is limited to what the clean tree does: auth.py computes `DEFAULT_CONFIG_DIR = get_config_dir()` and the derived filename constants at module scope (explicitly allowed), while client.py no longer evaluates `get_config_dir()` at class-body/import time (the smell's class-level `DEFAULT_CONFIG_DIR = get_config_dir()` was removed). All four modules can be imported individually without triggering a circular import.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Import hygiene holds after the reorganization: importing gspread (and gspread.auth, gspread.http_client, gspread.utils, gspread.client individually) succeeds in a fresh interpreter with no circular-import error and no new import-order constraint between the client, auth, transport and utility modules; none of these modules performs network or filesystem work at import time beyond what the clean tree does (the config-dir/file defaults must still be computable as import-time constants).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, gspread/auth.py restores the API-key guard and construction: it imports APIKeyCredentials in a try/except and sets GOOGLE_AUTH_API_KEY_AVAILABLE, and api_key() contains `if GOOGLE_AUTH_API_KEY_AVAILABLE is False: raise NotImplementedError(\"api_key is only available with package google.auth>=2.15.0. ...\")` followed by `creds = APIKeyCredentials(token); return Client(auth=creds, http_client=http_client)`. The Client class no longer defines api_key, so the unavailable-submodule branch and working-client construction remain present in auth.py.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "API-key login still raises the documented NotImplementedError naming the required google-auth version when google.auth.api_key is unavailable (verified by behavior/branch inspection or by simulating the missing submodule), and still constructs a working client when it is available.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In the final patch, gspread/auth.py defines its public constants locally (DEFAULT_SCOPES, READONLY_SCOPES, GOOGLE_AUTH_API_KEY_AVAILABLE via its own try/except, DEFAULT_CONFIG_DIR/credentials filenames from its own get_config_dir) rather than assigning them from Client. Its module-level functions implement behavior directly (local_server_flow uses InstalledAppFlow, load_credentials/store_credentials use OAuthCredentials, oauth/oauth_from_dict/service_account/service_account_from_dict/api_key build credentials and return Client(...)) with no single-expression `return Client.<member>(...)` forwarders. gspread/utils.py convert_credentials is restored to a local implementation with _convert_oauth_credentials/_convert_service_account_credentials and no Client import or delegation.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No pass-through forwarders survive in the helper modules: the repair does not leave any module-level function in the authentication module (gspread/auth.py or its replacement) or in gspread/utils.py whose body only delegates into the client entry class (single-expression bodies of the shape `return Client.<member>(...)`), and neither module re-exports its public constants (scope lists, config directory, credential/service-account file defaults, API-key availability flag) from gspread.client.Client.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the absorbed auth concerns from gspread/client.py: it deletes the FlowCallable protocol, DEFAULT_SCOPES/READONLY_SCOPES, get_config_dir and DEFAULT_*_FILENAME constants, local_server_flow, load_credentials, store_credentials, _convert_oauth/_convert_service_account, authorize/oauth/oauth_from_dict/service_account/service_account_from_dict/api_key, and drops the supporting imports for InstalledAppFlow, OAuthCredentials, SACredentials, APIKeyCredentials, json, os, Path, SPREADSHEET_VALUES_URL, and quote. The remaining convert_credentials is a one-line delegation to utils.convert_credentials, not a duplicate implementation, so no dead absorbed members or injection imports linger in the client module.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No dead absorbed members or imports linger in the client module: gspread/client.py does not retain unused copies of the moved credential-flow/persistence/conversion members (the flow runner, credential file load/store, conversion helpers, credential scope/file defaults, the flow-callable protocol) nor the injection's supporting imports (InstalledAppFlow, OAuthCredentials/SACredentials, APIKeyCredentials, credential-file constants) — the client module imports only what its remaining coordinator code uses, with no leftover dead code from the moved concerns.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch untangles rather than re-packs: gspread/auth.py reclaims the auth lifecycle (DEFAULT_SCOPES, get_config_dir, load_credentials/store_credentials, oauth/oauth_from_dict, service_account/service_account_from_dict, api_key, local_server_flow), while gspread/client.py drops `class Client(HTTPClient)` to `class Client:`, removes the OAuth/service-account/API-key factories and credential storage methods, and keeps only `self.http_client = http_client(auth, session)` as a single transport. gspread/utils.py reowns `convert_credentials` with `_convert_oauth_credentials`/`_convert_service_account_credentials` and no longer lazy-imports Client. Client no longer builds values URLs itself: `get_spreadsheet_values`/`update_spreadsheet_values` delegate to `self.http_client.values_get`/`values_update`. Thus no transport/helper class gains credentials plus login factories plus endpoint construction.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair is not a re-packing of the same accumulation: the request pipeline is not handed to a new single over-tenant — e.g. the transport class does not gain the credential lifecycle or login factories alongside request sending, and no new helper class ends up owning transport plus credentials plus endpoint construction together — each separated concern lands with a cohesive, single-responsibility owner.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 1
+  },
+  "valid_count": 14,
+  "pass_count": 14,
+  "must_have_pass": false,
+  "macro_score": 1
+}

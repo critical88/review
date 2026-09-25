@@ -1,0 +1,149 @@
+{
+  "schema_version": "smellbench.solve_rubrics.v3",
+  "execution_mode": "one_independent_call_per_rubric",
+  "aggregation": "macro_average_by_category",
+  "instance_context": {
+    "task_id": "xtaci-kcp-go-fe-n",
+    "smell_type": "feature_envy",
+    "summary": "kcp-go connection-layer methods (and one shard-period tuner method) absorbed behavior that belongs to the components they wrap: direct manipulation of the KCP engine's queues, sizing and pacing fields; re-implementation of the FEC encoder's parity generation; and outside-in rebuilding of the FEC decoder by the period detector. The solver must re-home dominantly-envied behavior onto its data owner, rewire the callers, delete the displaced copies, and preserve protocol/API behavior exactly. Equivalent refactorings are acceptable; exact original names, signatures or file layout are not required.",
+    "note_on_grading": "Accept any decomposition that moves the specified behavior to the data owner (owner-side method plus delegation, relocation as an owner method, or an equivalent owner-owned arrangement). A negative rubric is answered 'yes' when the undesirable outcome is present in the final patch; the aggregator treats 'yes' on a negative rubric as a failure."
+  },
+  "rubrics": [
+    {
+      "id": "R1",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Receive-side reassembly mechanics are owned by the embedded protocol engine again: the code that drains the engine's receive queue into a caller's buffer, promotes segments from the engine's receive buffer into that queue while advancing the expected sequence, and arms the window tell-probe after a fast recovery, now executes as engine-side code that the session read paths reach through the engine, instead of a session method chaining through the engine's receive-queue, receive-buffer, window and probe fields directly.",
+      "rationale": "This is the injected case's central receive-datapath displacement; grading must confirm the queue manipulation lives on the struct that owns those queues, however the solver names or splits the operation."
+    },
+    {
+      "id": "R2",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Send-side segmentation mechanics are owned by the protocol engine again: sizing application buffers by the engine's maximum segment size, appending streamed data onto the tail of the engine's send queue, deciding the fragment countdown, and inserting new segments into that queue, now execute as engine-side code that the session write paths reach through the engine, instead of a session method chaining through the engine's segment-size, stream and queue fields directly.",
+      "rationale": "The write datapath is the second whole-rule displacement in this case; the segmentation rule must no longer exist only in the session layer."
+    },
+    {
+      "id": "R3",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Delay/pacing configuration is applied by engine-owned logic again: the session's configuration setter delegates the assignment (including argument validity, interval clamping, retransmission-floor profile selection and the fast-resend/no-congestion stores) to the engine, and no session method assigns the engine's tuning fields field-by-field.",
+      "rationale": "This setter's inlining is the case's clone-with-original-kept shape; delegation restored, an owner-side merge, or moving the setter's protocol half onto the engine all satisfy it."
+    },
+    {
+      "id": "R4",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Outgoing FEC shard sealing and Reed-Solomon parity generation are performed by the FEC encoder component again: the sealing of a data shard into the encoder's cache, quorum tracking, shard-tail clearing, the continuity-window decision and parity sealing now execute in encoder-side code, and no session-level reimplementation of the encode stage executes on any outgoing path.",
+      "rationale": "The outgoing-pipeline stage is the largest displaced block in the case (the session copy manipulates the encoder's cache, offsets, counters, timestamp and codec); the encode rule must be back behind the encoder."
+    },
+    {
+      "id": "R5",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Decoder reconfiguration on detected shard-parameter change is decoder-owned again: the FEC decoder applies a detection itself (overwriting its shard geometry, recycling/dropping its shard sets via the shared buffer pool, reallocating its caches, recomputing its wrap guard, rebuilding its codec and clearing its tuning flag) from its own code, and the period-detection helper performs detection only — it no longer mutates a decoder handed to it.",
+      "rationale": "This is the case's parameter-inverted shape: the envy crossed a foreign-object parameter. Grading confirms the dependency is re-aimed outward (decoder interprets detections) rather than the tuner rebuilding decoders."
+    },
+    {
+      "id": "R6",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every internal caller that previously executed re-homed logic through the displaced copies now executes the owner-side code: both session read fast paths (direct-buffer copy and the receive-buffer path), the write-vector splitting loop, the outgoing pipeline's FEC stage, and the decoder's shard-collection/tuning branch — with no caller left invoking a removed clone and no caller bypassing the re-homed logic by re-stating field manipulation locally.",
+      "rationale": "The injection rewired several call sites to the displaced copies; a repair that restores ownership but leaves callers on the copies (or re-inlines at one caller) is an incomplete coordination, even if it compiles."
+    },
+    {
+      "id": "R7",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Behavioral bookkeeping traveled with the re-homed logic: the per-operation debug logging of stream/conv attributes and segment recycling run with the engine-owned receive/send mechanics, and pooled-buffer recycling plus cache/wrap-guard/codec rebuild bookkeeping stay inside the decoder-side reconfiguration.",
+      "rationale": "These side-observable details moved out of the owner with the displacement; leaving them behind (e.g. dropping the debug log or pool recycling) changes component behavior, not just placement."
+    },
+    {
+      "id": "R8",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The concurrency shape at the re-homed call intersections is unchanged: session read and write paths still hold the session mutex around protocol-engine mutation exactly as before (the lock is not dropped, widened, or introduced around the re-homed calls in a way that alters which goroutines can concurrently observe protocol state).",
+      "rationale": "The displaced methods were called under the session mutex; a location shuffle that silently changes lock coverage introduces the kind of regression this case exists to make visible."
+    },
+    {
+      "id": "R9",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Uncalled duplicate implementations of any re-homed behavior remain anywhere in the package after the repair: a session-side or tuner-side copy of the moved mechanics that no live path calls, an owner-side operation added during the repair that nothing invokes, or a forwarding stub retained beside the real owner implementation.",
+      "rationale": "Every displaced site in this case coexists with or replaced an owner capability; the classic half-done repair here is delegating in one place while stranding the displaced twin. Answer 'yes' when any such dead or duplicated twin is present."
+    },
+    {
+      "id": "R10",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Comments or doc comments in the affected areas still describe the displaced arrangement and now contradict the code — e.g. proclaiming that a session method implements the receive/send mechanics itself, that the session's pipeline stage produces parity directly, or that the period detector is the component that reconfigures the decoder.",
+      "rationale": "This case's diff carried explanatory comments asserting the displaced ownership; leaving them stale misdirects the next maintainer even when the code is fixed. Answer 'yes' when such stale claims survive."
+    },
+    {
+      "id": "R11",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Receive-path delivery semantics are preserved: session reads still return only completely reassembled messages and in order, still choose between the direct-buffer path and the buffered path by the same condition, and still maintain the identical buffering-pointer bookkeeping and received-byte accounting.",
+      "rationale": "Reassembly was relocated in this case; the observable contract of session reads is the primary consumer-facing behavior at risk and must be provably untouched."
+    },
+    {
+      "id": "R12",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Send-path semantics are preserved: stream-mode writes still append to the tail of the send queue up to the engine's maximum segment size, message-mode fragmentation still assigns the same fragment countdown, and a write requiring more segments than the engine supports is rejected with the same value as before the repair.",
+      "rationale": "Segmentation rules were relocated; the splitting, tail-growth and rejection values are protocol-visible and were carried by the exact code that moved."
+    },
+    {
+      "id": "R13",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The delay/pacing configuration keeps its exact argument interpretation: negative arguments still select no change, the internal update interval is still clamped to the same minimum and maximum, the retransmission floor still follows the nodelay profile selection, and fast-resend and no-congestion are stored with the same semantics.",
+      "rationale": "The setter's inlined copy contains the only place this clamping/profile logic appears after the injection; re-homing must not restate it with drifted bounds or conditions."
+    },
+    {
+      "id": "R14",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "FEC decoder adaptation behavior is preserved: on a detected peer shard-parameter change the decoder still rebuilds with the detected geometry when both detected counts are valid (recycling pooled shard buffers, reallocating decode caches, recomputing the wrap guard, rebuilding the codec, clearing the tuning flag) and still discards incoming packets while detection is incomplete, unblocking exactly when a valid detection is available.",
+      "rationale": "The decoder-rebuild block is the subtlest moved code in this case, including its drop-while-undetected early return; a repair that drops the early return would deadlock adaptation without breaking most tests."
+    },
+    {
+      "id": "R15",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "FEC parity emission is preserved: parity is still emitted only when the data-shard quorum is reached within the continuity window relative to the latest data packet, skipped or failed generations still advance the FEC sequence numbers so they remain monotonic, size tracking still resets after each generation, and the latest-packet timestamp still advances on every encoded shard.",
+      "rationale": "The encode-stage copy controls seqid and cache geometry for the whole FEC stream; the timing and monotonicity rules are the protocol property the moved code was carrying."
+    },
+    {
+      "id": "R16",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The package's exported surface differs from before the repair: an exported symbol (type, function, method or exported field) is added or removed, or an existing exported symbol's signature changes, anywhere in the package as a means of accomplishing the re-homing.",
+      "rationale": "This library's value is drop-in compatibility; the prompts make the unchanged exported API an explicit boundary condition for this instance, including removal of exports as a break. Answer 'yes' when the patch widens, narrows or alters that surface."
+    },
+    {
+      "id": "R17",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair acquires the session mutex — or any session-level lock introduced to coordinate engine or FEC state — around the FEC decoder's shard-parameter reconfiguration path, where the original arrangement holds no such lock: in the injected and the intended repaired code the decoder is fed and re-tuned by the receive-side goroutine independently of the session mutex, and acquiring it there serializes the receive path against every session read/write or introduces a lock-ordering hazard.",
+      "rationale": "This case's decoder rebuild is specific to the non-session receive goroutine; a solver that 'restores ownership' by wrapping that mutation in the session lock introduces a throughput or deadlock regression the package's tests only partially cover."
+    }
+  ]
+}

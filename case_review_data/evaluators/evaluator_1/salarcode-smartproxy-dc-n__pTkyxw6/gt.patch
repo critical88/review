@@ -1,0 +1,331 @@
+diff --git a/src/core/SubscriptionUpdater.ts b/src/core/SubscriptionUpdater.ts
+index 0829573..1e5237b 100644
+--- a/src/core/SubscriptionUpdater.ts
++++ b/src/core/SubscriptionUpdater.ts
+@@ -168,13 +168,7 @@ export class SubscriptionUpdater {
+ 			subscription.stats = new SubscriptionStats();
+ 		}
+ 
+-		ProxyImporter.readFromServer(subscription.url,
+-			subscription.username,
+-			subscription.password,
+-			subscription.obfuscation,
+-			subscription.format,
+-			subscription.applyProxy,
+-			subscription.proxyProtocol,
++		ProxyImporter.readFromServer(subscription,
+ 			function (response: {
+ 				success: boolean,
+ 				message: string,
+@@ -357,12 +351,7 @@ export class SubscriptionUpdater {
+ 			subscription.stats = new SubscriptionStats();
+ 		}
+ 
+-		RuleImporter.readFromServerAndImport(subscription.url,
+-			subscription.username,
+-			subscription.password,
+-			subscription.obfuscation,
+-			subscription.format,
+-			subscription.applyProxy,
++		RuleImporter.readFromServerAndImport(subscription,
+ 			(importResult: {
+ 				success: boolean;
+ 				message: string;
+diff --git a/src/core/definitions.ts b/src/core/definitions.ts
+index 31b2f75..ff11baf 100644
+--- a/src/core/definitions.ts
++++ b/src/core/definitions.ts
+@@ -1147,7 +1147,7 @@ export class ProxyServerFromSubscription extends ProxyServer {
+ 	public subscriptionName: string;
+ }
+ 
+-export class ProxyServerSubscription implements Cloneable {
++export class ProxyServerSubscription implements Cloneable, SubscriptionConnectionConfig {
+ 	public name: string;
+ 	public url: string;
+ 	public enabled: boolean = false;
+@@ -1224,18 +1224,31 @@ export enum ExternalRulesFormat {
+ 	SwitchyOmega,
+ }
+ 
+-export interface IExternalRulesConfig {
++/**
++ * The connection settings shared by every subscription that is fetched from a
++ * remote source: the `url` to download, the optional Basic-auth `username`/
++ * `password`, and the `applyProxy` mode that tells the proxy engine how (and
++ * whether) to route the special request through a proxy.
++ *
++ * Both proxy-server and proxy-rule subscriptions carry these fields, so the
++ * shared download helper depends only on this slice instead of on either
++ * concrete subscription type. Pass the subscription itself rather than
++ * unpacking these fields at every call site.
++ */
++export interface SubscriptionConnectionConfig {
+ 	url: string;
+ 
+ 	username: string;
+ 	password: string;
+ 
++	applyProxy: SpecialRequestApplyProxyMode;
++}
++
++export interface IExternalRulesConfig extends SubscriptionConnectionConfig {
+ 	// types stored in proxyServerSubscriptionObfuscate
+ 	obfuscation: string;
+ 
+ 	format: ExternalRulesFormat;
+-
+-	applyProxy: SpecialRequestApplyProxyMode;
+ }
+ 
+ export class ProxyRulesSubscription implements IExternalRulesConfig {
+diff --git a/src/lib/ProxyImporter.ts b/src/lib/ProxyImporter.ts
+index 4752bd8..933fc5d 100644
+--- a/src/lib/ProxyImporter.ts
++++ b/src/lib/ProxyImporter.ts
+@@ -16,24 +16,18 @@
+  */
+ import { Utils } from "./Utils";
+ import { api } from "./environment";
+-import { ProxyServer, ProxyServerSubscriptionFormat, SpecialRequestApplyProxyMode } from "../core/definitions";
++import { ProxyServer, ProxyServerSubscription, ProxyServerSubscriptionFormat } from "../core/definitions";
+ import { Debug } from "./Debug";
+ import { Settings } from "../core/Settings";
+ import { SubscriptionFetch } from "./SubscriptionFetch";
+ 
+ export const ProxyImporter = {
+ 	readFromServer(
+-		url: string,
+-		username: string,
+-		password: string,
+-		obfuscation: string,
+-		format: ProxyServerSubscriptionFormat,
+-		applyProxy: SpecialRequestApplyProxyMode,
+-		proxyProtocol: string,
++		subscription: ProxyServerSubscription,
+ 		success?: Function,
+ 		fail?: Function
+ 	) {
+-		if (!url) {
++		if (!subscription || !subscription.url) {
+ 			if (fail) fail();
+ 			return;
+ 		}
+@@ -63,18 +57,13 @@ export const ProxyImporter = {
+ 					if (fail)
+ 						fail(error);
+ 				},
+-				obfuscation,
+-				format,
+-				proxyProtocol);
++				subscription.obfuscation,
++				subscription.format,
++				subscription.proxyProtocol);
+ 		}
+ 
+ 		SubscriptionFetch.fetchSubscriptionText(
+-			url,
+-			username,
+-			password,
+-			obfuscation,
+-			format,
+-			applyProxy,
++			subscription,
+ 			(responseText: string, statusCode: number, statusText: string) => {
+ 				if (statusCode === 200) {
+ 					ajaxSuccess(responseText);
+diff --git a/src/lib/RuleImporter.ts b/src/lib/RuleImporter.ts
+index 3dc3bda..9ff4ff3 100644
+--- a/src/lib/RuleImporter.ts
++++ b/src/lib/RuleImporter.ts
+@@ -18,27 +18,22 @@ import { Utils } from './Utils';
+ import { api } from './environment';
+ import {
+ 	ExternalRulesFormat,
++	ProxyRulesSubscription,
+ 	SubscriptionProxyRule,
+ 	ProxyRule,
+ 	CompiledProxyRuleType,
+ 	ImportedProxyRule,
+-	SpecialRequestApplyProxyMode,
+ } from '../core/definitions';
+ import { SubscriptionFetch } from './SubscriptionFetch';
+ import * as ruleImporterSwitchyScript from './RuleImporterSwitchy';
+ 
+ export const RuleImporter = {
+ 	readFromServerAndImport(
+-		url: string,
+-		username: string,
+-		password: string,
+-		obfuscation: string,
+-		format: ExternalRulesFormat,
+-		applyProxy: SpecialRequestApplyProxyMode,
++		subscription: ProxyRulesSubscription,
+ 		success?: Function,
+ 		fail?: Function
+ 	) {
+-		if (!url) {
++		if (!subscription || !subscription.url) {
+ 			if (fail) fail();
+ 			return;
+ 		}
+@@ -53,8 +48,8 @@ export const RuleImporter = {
+ 
+ 			// ----
+ 			RuleImporter.importRulesBatch(
+-				obfuscation,
+-				format,
++				subscription.obfuscation,
++				subscription.format,
+ 				response,
+ 				null,
+ 				false,
+@@ -80,12 +75,7 @@ export const RuleImporter = {
+ 		}
+ 
+ 		SubscriptionFetch.fetchSubscriptionText(
+-			url,
+-			username,
+-			password,
+-			obfuscation,
+-			format,
+-			applyProxy,
++			subscription,
+ 			(responseText: any) => {
+ 				ajaxSuccess(responseText);
+ 			},
+diff --git a/src/lib/SubscriptionFetch.ts b/src/lib/SubscriptionFetch.ts
+index c21095d..653a359 100644
+--- a/src/lib/SubscriptionFetch.ts
++++ b/src/lib/SubscriptionFetch.ts
+@@ -14,7 +14,7 @@
+  * You should have received a copy of the GNU General Public License
+  * along with SmartProxy.  If not, see <http://www.gnu.org/licenses/>.
+  */
+-import { SpecialRequestApplyProxyMode } from '../core/definitions';
++import { SubscriptionConnectionConfig } from '../core/definitions';
+ import { ProxyEngineSpecialRequests } from '../core/ProxyEngineSpecialRequests';
+ 
+ export class SubscriptionFetch {
+@@ -22,35 +22,31 @@ export class SubscriptionFetch {
+ 	/**
+ 	 * Reads the remote text of a subscription source. This is the transport
+ 	 * shared by both the proxy-server subscriptions and the proxy-rule
+-	 * subscriptions, so all connection fields arrive as individual parameters:
+-	 * `obfuscation` and `format` are carried along for the parse step.
++	 * subscriptions, so it depends only on the subscription's connection
++	 * settings (`SubscriptionConnectionConfig`) rather than on either concrete
++	 * subscription type or on a row of unpacked fields.
+ 	 */
+ 	public static fetchSubscriptionText(
+-		url: string,
+-		username: string,
+-		password: string,
+-		obfuscation: string,
+-		format: number,
+-		applyProxy: SpecialRequestApplyProxyMode,
++		config: SubscriptionConnectionConfig,
+ 		success: Function,
+ 		fail?: Function
+ 	) {
+-		if (applyProxy !== null)
++		if (config.applyProxy !== null)
+ 			// mark this request as special
+-			ProxyEngineSpecialRequests.setSpecialUrl(url, applyProxy);
++			ProxyEngineSpecialRequests.setSpecialUrl(config.url, config.applyProxy);
+ 
+ 		let fetchRequest: RequestInit = {
+ 			method: 'GET',
+ 			cache: 'no-store'
+ 		};
+-		if (username) {
+-			let pass = atob(password);
++		if (config.username) {
++			let pass = atob(config.password);
+ 			fetchRequest.headers =
+ 			{
+-				'Authorization': 'Basic ' + btoa(username + ':' + pass)
++				'Authorization': 'Basic ' + btoa(config.username + ':' + pass)
+ 			};
+ 		}
+-		fetch(url, fetchRequest)
++		fetch(config.url, fetchRequest)
+ 			.then(async (response) => {
+ 				let responseText = await response.text();
+ 				if (success)
+diff --git a/src/ui/code/settingsPage.ts b/src/ui/code/settingsPage.ts
+index d6cde28..1ad5d34 100644
+--- a/src/ui/code/settingsPage.ts
++++ b/src/ui/code/settingsPage.ts
+@@ -3711,13 +3711,7 @@ export class settingsPage {
+ 			jq("#btnSaveServerSubscription").attr("data-loading-text", api.i18n.getMessage("settingsServerSubscriptionSavingButton"));
+ 			jq("#btnSaveServerSubscription").button("loading");
+ 
+-			ProxyImporter.readFromServer(subscriptionModel.url,
+-				subscriptionModel.username,
+-				subscriptionModel.password,
+-				subscriptionModel.obfuscation,
+-				subscriptionModel.format,
+-				subscriptionModel.applyProxy,
+-				subscriptionModel.proxyProtocol,
++			ProxyImporter.readFromServer(subscriptionModel,
+ 				(response: {
+ 					success: boolean,
+ 					message: string,
+@@ -3813,13 +3807,7 @@ export class settingsPage {
+ 					if (response.message)
+ 						messageBox.success(response.message);
+ 
+-					ProxyImporter.readFromServer(subscriptionModel.url,
+-						subscriptionModel.username,
+-						subscriptionModel.password,
+-						subscriptionModel.obfuscation,
+-						subscriptionModel.format,
+-						subscriptionModel.applyProxy,
+-						subscriptionModel.proxyProtocol,
++					ProxyImporter.readFromServer(subscriptionModel,
+ 						(response: {
+ 							success: boolean,
+ 							message: string,
+@@ -3978,12 +3966,7 @@ export class settingsPage {
+ 				editingSubscription.stats = new SubscriptionStats();
+ 			}
+ 
+-			RuleImporter.readFromServerAndImport(editingSubscription.url,
+-				editingSubscription.username,
+-				editingSubscription.password,
+-				editingSubscription.obfuscation,
+-				editingSubscription.format,
+-				editingSubscription.applyProxy,
++			RuleImporter.readFromServerAndImport(editingSubscription,
+ 				(importResult: {
+ 					success: boolean;
+ 					message: string;
+@@ -4094,12 +4077,7 @@ export class settingsPage {
+ 			tabContainer.find("#btnSaveRulesSubscriptions").attr("data-loading-text", api.i18n.getMessage("settingsRulesSubscriptionSavingButton"));
+ 			tabContainer.find("#btnSaveRulesSubscriptions").button("loading");
+ 
+-			RuleImporter.readFromServerAndImport(subscriptionModel.url,
+-				subscriptionModel.username,
+-				subscriptionModel.password,
+-				subscriptionModel.obfuscation,
+-				subscriptionModel.format,
+-				subscriptionModel.applyProxy,
++			RuleImporter.readFromServerAndImport(subscriptionModel,
+ 				(importResult: {
+ 					success: boolean;
+ 					message: string;
+@@ -4220,12 +4198,7 @@ export class settingsPage {
+ 					if (response.message)
+ 						messageBox.success(response.message);
+ 
+-					RuleImporter.readFromServerAndImport(subscriptionModel.url,
+-						subscriptionModel.username,
+-						subscriptionModel.password,
+-						subscriptionModel.obfuscation,
+-						subscriptionModel.format,
+-						subscriptionModel.applyProxy,
++					RuleImporter.readFromServerAndImport(subscriptionModel,
+ 						(importResult: {
+ 							success: boolean;
+ 							message: string;

@@ -1,0 +1,366 @@
+diff --git a/build/augment.go b/build/augment.go
+index 6dde842..17a6956 100644
+--- a/build/augment.go
++++ b/build/augment.go
+@@ -17,8 +17,8 @@ import (
+ 	"golang.org/x/tools/go/buildutil"
+ )
+ 
+-// overrideInfo is used by the Session's parseAndAugment methods to manage
+-// directives and how the overlay and original are merged.
++// overrideInfo is used by the augmenter to manage directives and how the
++// overlay and original are merged.
+ type overrideInfo struct {
+ 	// replace indicates that the original code is expected to exist.
+ 	// If the original code is not present, then error to let us know
+@@ -79,35 +79,36 @@ type overrideInfo struct {
+ //   - New identifiers that don't exist in original package get added.
+ //     Use `gopherjs:new` to ensure that the identifier is new and there was
+ //     no original code for it.
++//
++// This method is the coordination entry point of the augmentation pipeline.
++// It loads the overlay and original files and hands them, alongside a fresh
++// per-package augmenter, to the augmentation steps below. The augmenter owns
++// all per-package state for the pass, keeping it off the Session, which is
++// shared across packages.
+ func (s *Session) parseAndAugment(pkg *PackageData, isTest bool, fileSet *token.FileSet) ([]*ast.File, []incjs.File, error) {
+-	// The overrides and the found sets are internal per-package state of the
+-	// augmentation pass. Reset both so a session can safely be reused for
+-	// more than one package.
+-	s.augOverrides = make(map[string]overrideInfo)
+-	s.augFound = nil
+-
+ 	jsFiles, overlayFiles := s.parseOverlayFiles(pkg, isTest, fileSet)
+ 
+-	originalFiles, err := s.parserOriginalFiles(pkg, fileSet)
++	originalFiles, err := parseOriginalFiles(pkg, fileSet)
+ 	if err != nil {
+ 		return nil, nil, err
+ 	}
+ 
++	aug := newAugmenter()
+ 	for _, file := range overlayFiles {
+-		s.augmentOverlayFile(file)
++		aug.augmentOverlayFile(file)
+ 	}
+-	delete(s.augOverrides, "init")
++	delete(aug.overrides, "init")
+ 
+ 	for _, file := range originalFiles {
+-		s.augmentOriginalImports(pkg.ImportPath, file)
++		augmentOriginalImports(pkg.ImportPath, file)
+ 	}
+ 
+-	if len(s.augOverrides) > 0 {
+-		s.augFound = make(map[string]struct{}, len(s.augOverrides))
++	if len(aug.overrides) > 0 {
++		aug.found = make(map[string]struct{}, len(aug.overrides))
+ 		for _, file := range originalFiles {
+-			s.augmentOriginalFile(file)
++			aug.augmentOriginalFile(file)
+ 		}
+-		err := s.checkOverrides(pkg.ImportPath)
++		err := aug.checkOverrides(pkg.ImportPath)
+ 		if err != nil {
+ 			return nil, nil, err
+ 		}
+@@ -161,8 +162,8 @@ func (s *Session) parseOverlayFiles(pkg *PackageData, isTest bool, fileSet *toke
+ 	return jsFiles, files
+ }
+ 
+-// parserOriginalFiles loads and parses the original files to augment.
+-func (s *Session) parserOriginalFiles(pkg *PackageData, fileSet *token.FileSet) ([]*ast.File, error) {
++// parseOriginalFiles loads and parses the original files to augment.
++func parseOriginalFiles(pkg *PackageData, fileSet *token.FileSet) ([]*ast.File, error) {
+ 	var files []*ast.File
+ 	var errList errlist.ErrorList
+ 	for _, name := range pkg.GoFiles {
+@@ -200,13 +201,44 @@ func (s *Session) parserOriginalFiles(pkg *PackageData, fileSet *token.FileSet)
+ 	return files, nil
+ }
+ 
++// augmenter performs a single, self-contained per-package augmentation pass
++// over the native overlay files and the original files of a package.
++//
++// It owns the override tables that the overlay files populate and the original
++// files consume. Because the pass state lives on the augmenter rather than on
++// the Session, the augmentation of one package cannot leak into another's, and
++// parseAndAugment simply constructs a fresh augmenter per package instead of
++// resetting shared state.
++type augmenter struct {
++	// overrides maps an identifier that uniquely identifies a top-level
++	// declaration (a function name, a method key such as "Type.Method", or a
++	// type/value name) to how the original declaration should be merged with
++	// its overlay. It is populated while the overlay files are processed.
++	overrides map[string]overrideInfo
++
++	// found records the identifiers whose original declaration matched an
++	// override. It is a subset of the keys in overrides and is used by
++	// checkOverrides to detect overrides that missed (or should not have hit)
++	// their original.
++	found map[string]struct{}
++}
++
++// newAugmenter returns a new augmenter with an empty override table. The
++// found set is left nil; it is only allocated when there are overrides to
++// check, mirroring the original lazy allocation in parseAndAugment.
++func newAugmenter() *augmenter {
++	return &augmenter{
++		overrides: make(map[string]overrideInfo),
++	}
++}
++
+ // augmentOverlayFile is the part of parseAndAugment that processes
+ // an overlay file AST to collect information such as compiler directives
+ // and perform any initial augmentation needed to the overlay.
+ //
+-// The collected override information is stored on the session in
+-// s.augOverrides.
+-func (s *Session) augmentOverlayFile(file *ast.File) {
++// The collected override information is stored on the augmenter in
++// a.overrides.
++func (a *augmenter) augmentOverlayFile(file *ast.File) {
+ 	anyChange := false
+ 	for i, decl := range file.Decls {
+ 		replaceDecl := astutil.DirectiveReplace(decl)
+@@ -225,7 +257,7 @@ func (s *Session) augmentOverlayFile(file *ast.File) {
+ 				oi.overrideSignature = d
+ 				purgeDecl = true
+ 			}
+-			s.augOverrides[k] = oi
++			a.overrides[k] = oi
+ 		case *ast.GenDecl:
+ 			for j, spec := range d.Specs {
+ 				purgeSpec := purgeDecl || astutil.Purge(spec)
+@@ -233,14 +265,14 @@ func (s *Session) augmentOverlayFile(file *ast.File) {
+ 				newSpec := newDecl || astutil.DirectiveNew(spec)
+ 				switch t := spec.(type) {
+ 				case *ast.TypeSpec:
+-					s.augOverrides[t.Name.Name] = overrideInfo{
++					a.overrides[t.Name.Name] = overrideInfo{
+ 						purgeMethods: purgeSpec,
+ 						replace:      replaceSpec,
+ 						new:          newSpec,
+ 					}
+ 				case *ast.ValueSpec:
+ 					for _, name := range t.Names {
+-						s.augOverrides[name.Name] = overrideInfo{
++						a.overrides[name.Name] = overrideInfo{
+ 							replace: replaceSpec,
+ 							new:     newSpec,
+ 						}
+@@ -258,14 +290,14 @@ func (s *Session) augmentOverlayFile(file *ast.File) {
+ 		}
+ 	}
+ 	if anyChange {
+-		s.finalizeRemovals(file)
+-		s.pruneImports(file)
++		finalizeRemovals(file)
++		pruneImports(file)
+ 	}
+ }
+ 
+ // augmentOriginalImports is the part of parseAndAugment that processes
+ // an original file AST to modify the imports for that file.
+-func (s *Session) augmentOriginalImports(importPath string, file *ast.File) {
++func augmentOriginalImports(importPath string, file *ast.File) {
+ 	switch importPath {
+ 	case "crypto/rand", "encoding/gob", "encoding/json", "expvar", "go/token", "log", "math/big", "math/rand", "regexp", "time":
+ 		for _, spec := range file.Imports {
+@@ -286,17 +318,17 @@ func (s *Session) augmentOriginalImports(importPath string, file *ast.File) {
+ //
+ // The overrides and found maps key with an identifier that uniquely identifies
+ // the top-level object being augmented.
+-// The s.augOverrides map should be populated with the overrides to apply
+-// and s.augFound will be populated with the objects that had an override
++// The a.overrides map should be populated with the overrides to apply
++// and a.found will be populated with the objects that had an override
+ // applied.
+-func (s *Session) augmentOriginalFile(file *ast.File) {
++func (a *augmenter) augmentOriginalFile(file *ast.File) {
+ 	anyChange := false
+ 	for i, decl := range file.Decls {
+ 		switch d := decl.(type) {
+ 		case *ast.FuncDecl:
+ 			funcKey := astutil.FuncKey(d)
+-			if info, ok := s.augOverrides[funcKey]; ok {
+-				s.augFound[funcKey] = struct{}{}
++			if info, ok := a.overrides[funcKey]; ok {
++				a.found[funcKey] = struct{}{}
+ 				anyChange = true
+ 				removeFunc := true
+ 				if info.keepOriginal {
+@@ -317,8 +349,8 @@ func (s *Session) augmentOriginalFile(file *ast.File) {
+ 				}
+ 			} else if recvKey := astutil.FuncReceiverKey(d); len(recvKey) > 0 {
+ 				// check if the receiver has been purged, if so, remove the method too.
+-				if info, ok := s.augOverrides[recvKey]; ok && info.purgeMethods {
+-					s.augFound[recvKey] = struct{}{}
++				if info, ok := a.overrides[recvKey]; ok && info.purgeMethods {
++					a.found[recvKey] = struct{}{}
+ 					anyChange = true
+ 					file.Decls[i] = nil
+ 				}
+@@ -327,8 +359,8 @@ func (s *Session) augmentOriginalFile(file *ast.File) {
+ 			for j, spec := range d.Specs {
+ 				switch t := spec.(type) {
+ 				case *ast.TypeSpec:
+-					if _, ok := s.augOverrides[t.Name.Name]; ok {
+-						s.augFound[t.Name.Name] = struct{}{}
++					if _, ok := a.overrides[t.Name.Name]; ok {
++						a.found[t.Name.Name] = struct{}{}
+ 						anyChange = true
+ 						d.Specs[j] = nil
+ 					}
+@@ -341,8 +373,8 @@ func (s *Session) augmentOriginalFile(file *ast.File) {
+ 						// However, if that call has a side effect which still needs
+ 						// to be run, add the call into the overlay.
+ 						for k, name := range t.Names {
+-							if _, ok := s.augOverrides[name.Name]; ok {
+-								s.augFound[name.Name] = struct{}{}
++							if _, ok := a.overrides[name.Name]; ok {
++								a.found[name.Name] = struct{}{}
+ 								anyChange = true
+ 								t.Names[k] = nil
+ 								t.Values[k] = nil
+@@ -357,8 +389,8 @@ func (s *Session) augmentOriginalFile(file *ast.File) {
+ 						// still needs to be run, add the call into the overlay.
+ 						nameRemoved := false
+ 						for _, name := range t.Names {
+-							if _, ok := s.augOverrides[name.Name]; ok {
+-								s.augFound[name.Name] = struct{}{}
++							if _, ok := a.overrides[name.Name]; ok {
++								a.found[name.Name] = struct{}{}
+ 								nameRemoved = true
+ 								name.Name = `_`
+ 							}
+@@ -382,8 +414,8 @@ func (s *Session) augmentOriginalFile(file *ast.File) {
+ 		}
+ 	}
+ 	if anyChange {
+-		s.finalizeRemovals(file)
+-		s.pruneImports(file)
++		finalizeRemovals(file)
++		pruneImports(file)
+ 	}
+ }
+ 
+@@ -393,12 +425,12 @@ func (s *Session) augmentOriginalFile(file *ast.File) {
+ //
+ // The overrides and found maps key with an identifier
+ // that uniquely identifies the top-level object being augmented.
+-// s.augFound is populated with the objects that had an override applied
+-// so the found keys should be a subset of the keys in the s.augOverrides map.
+-func (s *Session) checkOverrides(pkgPath string) error {
++// a.found is populated with the objects that had an override applied
++// so the found keys should be a subset of the keys in the a.overrides map.
++func (a *augmenter) checkOverrides(pkgPath string) error {
+ 	el := errlist.ErrorList{}
+-	for name, info := range s.augOverrides {
+-		_, wasFound := s.augFound[name]
++	for name, info := range a.overrides {
++		_, wasFound := a.found[name]
+ 		switch {
+ 		case wasFound && info.new:
+ 			el = el.Append(fmt.Errorf("gopherjs: original code for %s.%s was found, but override had `new` directive", pkgPath, name))
+@@ -416,7 +448,7 @@ func (s *Session) checkOverrides(pkgPath string) error {
+ }
+ 
+ // isOnlyImports determines if this file is empty except for imports.
+-func (s *Session) isOnlyImports(file *ast.File) bool {
++func isOnlyImports(file *ast.File) bool {
+ 	for _, decl := range file.Decls {
+ 		if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.IMPORT {
+ 			continue
+@@ -444,8 +476,8 @@ func (s *Session) isOnlyImports(file *ast.File) bool {
+ // or if the import is defined using a relative path (e.g. `./..`).
+ // Those cases don't exist in the native for Go, so we should only run
+ // this pruning when we have native overlays, but not for unknown packages.
+-func (s *Session) pruneImports(file *ast.File) {
+-	if s.isOnlyImports(file) && !astutil.HasDirectivePrefix(file, `//go:linkname `) {
++func pruneImports(file *ast.File) {
++	if isOnlyImports(file) && !astutil.HasDirectivePrefix(file, `//go:linkname `) {
+ 		// The file is empty, remove all imports including any `.` or `_` imports.
+ 		file.Imports = nil
+ 		file.Decls = nil
+@@ -511,13 +543,13 @@ func (s *Session) pruneImports(file *ast.File) {
+ 		file.Imports[index] = nil
+ 	}
+ 
+-	s.finalizeRemovals(file)
++	finalizeRemovals(file)
+ }
+ 
+ // finalizeRemovals fully removes any declaration, specification, imports
+ // that have been set to nil. This will also remove any unassociated comment
+ // groups, including the comments from removed code.
+-func (s *Session) finalizeRemovals(file *ast.File) {
++func finalizeRemovals(file *ast.File) {
+ 	fileChanged := false
+ 	for i, decl := range file.Decls {
+ 		switch d := decl.(type) {
+diff --git a/build/build.go b/build/build.go
+index ee1146c..b2723e0 100644
+--- a/build/build.go
++++ b/build/build.go
+@@ -196,13 +196,6 @@ type Session struct {
+ 	// is the unresolved import path and source directory.
+ 	importPaths map[string]map[string]string
+ 
+-	// augOverrides and augFound carry the native overlay augmentation state for
+-	// the package that the session is currently assembling. They are reset at
+-	// the start of every parseAndAugment pass and are only meaningful while the
+-	// session is inside the augmentation pipeline.
+-	augOverrides map[string]overrideInfo
+-	augFound     map[string]struct{}
+-
+ 	// packages caches imported package metadata by resolved import path.
+ 	// This avoids repeated xctx.Import calls for the same package.
+ 	packages map[string]*PackageData
+diff --git a/build/build_test.go b/build/build_test.go
+index ad2f109..b0bee7f 100644
+--- a/build/build_test.go
++++ b/build/build_test.go
+@@ -423,9 +423,9 @@ func TestOverlayAugmentation(t *testing.T) {
+ 			f := srctesting.New(t)
+ 			fileSrc := f.Parse("test.go", pkgName+test.src)
+ 
+-			s := &Session{augOverrides: map[string]overrideInfo{}}
++			s := &augmenter{overrides: map[string]overrideInfo{}}
+ 			s.augmentOverlayFile(fileSrc)
+-			s.pruneImports(fileSrc)
++			pruneImports(fileSrc)
+ 
+ 			got := srctesting.Format(t, f.FileSet, fileSrc)
+ 
+@@ -437,7 +437,7 @@ func TestOverlayAugmentation(t *testing.T) {
+ 					"returned:\n\t%q\nwant:\n\t%q", got, want)
+ 			}
+ 
+-			overrides := s.augOverrides
++			overrides := s.overrides
+ 			for key, expInfo := range test.expInfo {
+ 				if gotInfo, ok := overrides[key]; !ok {
+ 					t.Errorf(`%q was expected but not gotten`, key)
+@@ -725,16 +725,16 @@ func TestOriginalAugmentation(t *testing.T) {
+ 			f := srctesting.New(t)
+ 			fileSrc := f.Parse("test.go", pkgName+test.src)
+ 
+-			s := &Session{}
+-			s.augmentOriginalImports(importPath, fileSrc)
++			s := &augmenter{}
++			augmentOriginalImports(importPath, fileSrc)
+ 			found := make(map[string]struct{})
+-			s.augOverrides = test.info
+-			s.augFound = found
++			s.overrides = test.info
++			s.found = found
+ 			s.augmentOriginalFile(fileSrc)
+ 			if err := s.checkOverrides(importPath); err != nil {
+ 				t.Errorf("check overrides: %v", err)
+ 			}
+-			s.pruneImports(fileSrc)
++			pruneImports(fileSrc)
+ 
+ 			got := srctesting.Format(t, f.FileSet, fileSrc)
+ 

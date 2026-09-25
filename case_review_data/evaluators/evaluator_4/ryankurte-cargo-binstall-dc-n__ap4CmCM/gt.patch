@@ -1,0 +1,564 @@
+diff --git a/crates/binstalk-fetchers/src/gh_crate_meta.rs b/crates/binstalk-fetchers/src/gh_crate_meta.rs
+index f399148..09e3d60 100644
+--- a/crates/binstalk-fetchers/src/gh_crate_meta.rs
++++ b/crates/binstalk-fetchers/src/gh_crate_meta.rs
+@@ -12,8 +12,8 @@ use tracing::{debug, info, trace, warn};
+ use url::Url;
+ 
+ use crate::{
+-    common::*, futures_resolver::FuturesResolver, FetchError, InvalidPkgFmtError, RepoInfo,
+-    SignaturePolicy, SignatureVerifier, DEFAULT_GH_API_RETRY_DURATION,
++    common::*, futures_resolver::FuturesResolver, FetchContext, FetchError, InvalidPkgFmtError,
++    RepoInfo, SignaturePolicy, SignatureVerifier, DEFAULT_GH_API_RETRY_DURATION,
+ };
+ 
+ pub const FETCHER_GH_CRATE_META: &str = "GhCrateMeta";
+@@ -23,14 +23,7 @@ pub(crate) mod hosting;
+ pub struct GhCrateMeta {
+     client: Client,
+     gh_api_client: GhApiClient,
+-    name: CompactString,
+-    version: CompactString,
+-    repo: Option<String>,
+-    target: String,
+-    meta: PkgMeta,
+-    target_related_info: Arc<dyn leon::Values + Send + Sync>,
+-    repo_info_cache: Arc<tokio::sync::OnceCell<Option<RepoInfo>>>,
+-    signature_policy: SignaturePolicy,
++    ctx: FetchContext,
+     resolution: OnceCell<Resolved>,
+ }
+ 
+@@ -57,13 +50,13 @@ impl GhCrateMeta {
+     ) {
+         let render_url = |ext| {
+             let ctx = Context::from_parts(
+-                &self.name,
+-                &self.target,
+-                &self.version,
++                &self.ctx.name,
++                &self.ctx.target,
++                &self.ctx.version,
+                 ext,
+                 repo,
+                 subcrate,
+-                &*self.target_related_info,
++                &*self.ctx.target_related_info,
+             );
+             match ctx.render_url_with(pkg_url) {
+                 Ok(url) => Some(url),
+@@ -74,7 +67,7 @@ impl GhCrateMeta {
+             }
+         };
+ 
+-        let is_windows = self.target.contains("windows");
++        let is_windows = self.ctx.target.contains("windows");
+ 
+         let urls = if pkg_url.has_any_of_keys(&["format", "archive-format", "archive-suffix"]) {
+             // build up list of potential URLs
+@@ -145,42 +138,32 @@ impl super::Fetcher for GhCrateMeta {
+     fn new(
+         client: Client,
+         gh_api_client: GhApiClient,
+-        name: CompactString,
+-        version: CompactString,
+-        repo: Option<String>,
+-        target: String,
+-        meta: PkgMeta,
+-        target_related_info: Arc<dyn leon::Values + Send + Sync>,
+-        repo_info_cache: Arc<tokio::sync::OnceCell<Option<RepoInfo>>>,
+-        signature_policy: SignaturePolicy,
++        ctx: FetchContext,
+     ) -> Arc<dyn super::Fetcher> {
+         Arc::new(Self {
+             client,
+             gh_api_client,
+-            name,
+-            version,
+-            repo,
+-            target,
+-            meta,
+-            target_related_info,
+-            repo_info_cache,
+-            signature_policy,
++            ctx,
+             resolution: OnceCell::new(),
+         })
+     }
+ 
+     fn find(self: Arc<Self>) -> JoinHandle<Result<bool, FetchError>> {
+         tokio::spawn(async move {
+-            let info =
+-                RepoInfo::resolve(&self.repo, &self.repo_info_cache, &self.gh_api_client).await?;
++            let info = RepoInfo::resolve(
++                &self.ctx.repo,
++                &self.ctx.repo_info_cache,
++                &self.gh_api_client,
++            )
++            .await?;
+ 
+             let repo = info.map(|info| &info.repo);
+             let subcrate = info.and_then(|info| info.subcrate.as_deref());
+             let is_repo_private = info.map(|info| info.is_private).unwrap_or_default();
+ 
+-            let mut pkg_fmt = self.meta.pkg_fmt;
++            let mut pkg_fmt = self.ctx.meta.pkg_fmt;
+ 
+-            let pkg_urls = if let Some(pkg_url) = self.meta.pkg_url.as_deref() {
++            let pkg_urls = if let Some(pkg_url) = self.ctx.meta.pkg_url.as_deref() {
+                 let template = Template::parse(pkg_url)?;
+ 
+                 if pkg_fmt.is_none()
+@@ -195,9 +178,9 @@ impl super::Fetcher for GhCrateMeta {
+                     // just a best-effort
+                     pkg_fmt = PkgFmt::guess_pkg_format(pkg_url);
+ 
+-                    let crate_name = &self.name;
+-                    let version = &self.version;
+-                    let target = &self.target;
++                    let crate_name = &self.ctx.name;
++                    let version = &self.ctx.version;
++                    let target = &self.ctx.target;
+ 
+                     if pkg_fmt.is_none() {
+                         return Err(InvalidPkgFmtError {
+@@ -246,7 +229,7 @@ impl super::Fetcher for GhCrateMeta {
+                             "Unknown repository {}, cargo-binstall cannot provide default pkg_url for it.\n",
+                             "Please ask the upstream to provide it for target {}."
+                         ),
+-                        repo, self.target
++                        repo, self.ctx.target
+                     );
+ 
+                     return Ok(false);
+@@ -257,7 +240,7 @@ impl super::Fetcher for GhCrateMeta {
+                         "Package does not specify repository, cargo-binstall cannot provide default pkg_url for it.\n",
+                         "Please ask the upstream to provide it for target {}."
+                     ),
+-                    self.target
++                    self.ctx.target
+                 );
+ 
+                 return Ok(false);
+@@ -315,7 +298,7 @@ impl super::Fetcher for GhCrateMeta {
+             .expect("find() should be called once before fetch_and_extract()");
+         trace!(?resolved, "preparing to fetch");
+ 
+-        let verifier = match (self.signature_policy, &self.meta.signing) {
++        let verifier = match (self.ctx.signature_policy, &self.ctx.meta.signing) {
+             (SignaturePolicy::Ignore, _) | (SignaturePolicy::IfPresent, None) => {
+                 SignatureVerifier::Noop
+             }
+@@ -330,13 +313,13 @@ impl super::Fetcher for GhCrateMeta {
+                 trace!(?template, "parsed signature file template");
+ 
+                 let sign_url = Context::from_parts(
+-                    &self.name,
+-                    &self.target,
+-                    &self.version,
++                    &self.ctx.name,
++                    &self.ctx.target,
++                    &self.ctx.version,
+                     resolved.archive_suffix.as_deref(),
+                     resolved.repo.as_deref(),
+                     resolved.subcrate.as_deref(),
+-                    &*self.target_related_info,
++                    &*self.ctx.target_related_info,
+                 )
+                 .with_url(&resolved.url)
+                 .render_url_with(&template)?;
+@@ -377,7 +360,7 @@ impl super::Fetcher for GhCrateMeta {
+             if let Some(info) = verifier.info() {
+                 info!(
+                     "Verified signature for package '{}': {info}",
+-                    self.name
++                    self.ctx.name
+                 );
+             }
+             Ok(files)
+@@ -391,7 +374,7 @@ impl super::Fetcher for GhCrateMeta {
+     }
+ 
+     fn target_meta(&self) -> PkgMeta {
+-        let mut meta = self.meta.clone();
++        let mut meta = self.ctx.meta.clone();
+         meta.pkg_fmt = Some(self.pkg_fmt());
+         meta
+     }
+@@ -424,11 +407,11 @@ impl super::Fetcher for GhCrateMeta {
+     }
+ 
+     fn target(&self) -> &str {
+-        &self.target
++        &self.ctx.target
+     }
+ 
+     fn target_related_info(&self) -> &dyn leon::Values {
+-        &*self.target_related_info
++        &*self.ctx.target_related_info
+     }
+ }
+ 
+diff --git a/crates/binstalk-fetchers/src/lib.rs b/crates/binstalk-fetchers/src/lib.rs
+index 27139ee..d2cd10f 100644
+--- a/crates/binstalk-fetchers/src/lib.rs
++++ b/crates/binstalk-fetchers/src/lib.rs
+@@ -87,22 +87,41 @@ impl From<InvalidPkgFmtError> for FetchError {
+     }
+ }
+ 
++/// The pack of construction facts shared by every fetcher for a single
++/// (crate, target) resolution attempt.
++///
++/// Bundling these into one value means `Fetcher::new` and the helpers
++/// around it receive a single carrier rather than enumerating the same
++/// elements on every signature. When the constructor needs a new fact,
++/// it grows here once instead of being threaded through every call
++/// along the fetch pipeline.
++#[derive(Clone)]
++pub struct FetchContext {
++    /// Crate name being fetched.
++    pub name: CompactString,
++    /// Version being fetched.
++    pub version: CompactString,
++    /// Repository URL, if known from the manifest.
++    pub repo: Option<String>,
++    /// Target triple, e.g. `x86_64-unknown-linux-gnu`.
++    pub target: String,
++    /// Resolved package metadata (pkg-url, bin-dir, signing, ...).
++    pub meta: PkgMeta,
++    /// Extra target-derived template values, fed into `leon` rendering.
++    pub target_related_info: Arc<dyn leon::Values + Send + Sync>,
++    /// Cache shared by every fetcher resolving the same crate so the
++    /// repo-info lookup is computed at most once.
++    pub repo_info_cache: Arc<OnceCell<Option<RepoInfo>>>,
++    /// How the fetcher must treat package signatures.
++    pub signature_policy: SignaturePolicy,
++}
++
+ #[async_trait::async_trait]
+ pub trait Fetcher: Send + Sync {
+-    /// Create a new fetcher from the crate and target facts
++    /// Create a new fetcher from the crate and target facts carried in
++    /// `ctx`.
+     #[allow(clippy::new_ret_no_self)]
+-    fn new(
+-        client: Client,
+-        gh_api_client: GhApiClient,
+-        name: CompactString,
+-        version: CompactString,
+-        repo: Option<String>,
+-        target: String,
+-        meta: PkgMeta,
+-        target_related_info: Arc<dyn leon::Values + Send + Sync>,
+-        repo_info_cache: Arc<OnceCell<Option<RepoInfo>>>,
+-        signature_policy: SignaturePolicy,
+-    ) -> Arc<dyn Fetcher>
++    fn new(client: Client, gh_api_client: GhApiClient, ctx: FetchContext) -> Arc<dyn Fetcher>
+     where
+         Self: Sized;
+ 
+diff --git a/crates/binstalk-fetchers/src/quickinstall.rs b/crates/binstalk-fetchers/src/quickinstall.rs
+index e62222c..20262b6 100644
+--- a/crates/binstalk-fetchers/src/quickinstall.rs
++++ b/crates/binstalk-fetchers/src/quickinstall.rs
+@@ -11,7 +11,7 @@ use tracing::{error, info, trace};
+ use url::Url;
+ 
+ use crate::{
+-    common::*, FetchError, RepoInfo, SignaturePolicy, SignatureVerifier, SigningAlgorithm,
++    common::*, FetchContext, FetchError, SignaturePolicy, SignatureVerifier, SigningAlgorithm,
+ };
+ 
+ const BASE_URL: &str = "https://github.com/cargo-bins/cargo-quickinstall/releases/download";
+@@ -58,21 +58,15 @@ pub struct QuickInstall {
+     gh_api_client: GhApiClient,
+     is_supported_v: OnceCell<bool>,
+ 
+-    name: CompactString,
+-    version: CompactString,
+-    // The fetcher constructor grew these parameters; quickinstall keeps
+-    // them for the shared interface even though it never consults them.
+-    #[allow(dead_code)]
+-    repo: Option<String>,
+-    target: String,
+-    meta: PkgMeta,
+-    target_related_info: Arc<dyn leon::Values + Send + Sync>,
+-    #[allow(dead_code)]
+-    repo_info_cache: Arc<OnceCell<Option<RepoInfo>>>,
++    // The shared construction context. QuickInstall keeps the whole pack
++    // for the shared `Fetcher::new` interface even though it only
++    // consults a subset of the facts (name, version, target, meta,
++    // target_related_info, signature_policy) and never touches
++    // repo/repo_info_cache.
++    ctx: FetchContext,
+     package: String,
+     package_url: Url,
+     signature_url: Url,
+-    signature_policy: SignaturePolicy,
+ 
+     signature_verifier: OnceLock<SignatureVerifier>,
+     status: Mutex<Status>,
+@@ -107,7 +101,7 @@ impl QuickInstall {
+             .get_or_try_init(|| async {
+                 Ok(get_quickinstall_supported_targets(&self.client)
+                     .await?
+-                    .binary_search(&CompactString::new(&self.target))
++                    .binary_search(&CompactString::new(&self.ctx.target))
+                     .is_ok())
+             })
+             .await
+@@ -118,7 +112,7 @@ impl QuickInstall {
+         self: Arc<Self>,
+     ) -> AutoAbortJoinHandle<Result<SignatureVerifier, FetchError>> {
+         AutoAbortJoinHandle::spawn(async move {
+-            if self.signature_policy == SignaturePolicy::Ignore {
++            if self.ctx.signature_policy == SignaturePolicy::Ignore {
+                 Ok(SignatureVerifier::Noop)
+             } else {
+                 debug!(url=%self.signature_url, "Downloading signature");
+@@ -136,7 +130,7 @@ impl QuickInstall {
+                         SignatureVerifier::new(&config, &signature)
+                     }
+                     Err(err) => {
+-                        if self.signature_policy == SignaturePolicy::Require {
++                        if self.ctx.signature_policy == SignaturePolicy::Require {
+                             error!("Failed to download signature: {err}");
+                             Err(FetchError::MissingSignature)
+                         } else {
+@@ -163,37 +157,23 @@ impl super::Fetcher for QuickInstall {
+     fn new(
+         client: Client,
+         gh_api_client: GhApiClient,
+-        name: CompactString,
+-        version: CompactString,
+-        repo: Option<String>,
+-        target: String,
+-        meta: PkgMeta,
+-        target_related_info: Arc<dyn leon::Values + Send + Sync>,
+-        repo_info_cache: Arc<OnceCell<Option<RepoInfo>>>,
+-        signature_policy: SignaturePolicy,
++        ctx: FetchContext,
+     ) -> Arc<dyn super::Fetcher> {
+-        let package = format!("{name}-{version}-{target}");
++        let package = format!("{}-{}-{}", ctx.name, ctx.version, ctx.target);
+ 
+-        let url = format!("{BASE_URL}/{name}-{version}/{package}.tar.gz");
++        let url = format!("{BASE_URL}/{}-{}/{package}.tar.gz", ctx.name, ctx.version);
+ 
+         Arc::new(Self {
+             client,
+-            name,
+-            version,
+-            repo,
+-            target,
+-            meta,
+-            target_related_info,
+-            repo_info_cache,
+             gh_api_client,
+             is_supported_v: OnceCell::new(),
++            ctx,
+ 
+             package_url: Url::parse(&url)
+                 .expect("package_url is pre-generated and should never be invalid url"),
+             signature_url: Url::parse(&format!("{url}.sig"))
+                 .expect("signature_url is pre-generated and should never be invalid url"),
+             package,
+-            signature_policy,
+ 
+             signature_verifier: OnceLock::new(),
+             status: Mutex::new(Status::Start),
+@@ -236,7 +216,7 @@ impl super::Fetcher for QuickInstall {
+     fn report_to_upstream(self: Arc<Self>) {
+         if cfg!(debug_assertions) {
+             debug!("Not sending quickinstall report in debug mode");
+-        } else if is_universal_macos(&self.target) {
++        } else if is_universal_macos(&self.ctx.target) {
+             debug!(
+                 r#"Not sending quickinstall report for universal-apple-darwin
+ and universal2-apple-darwin.
+@@ -288,7 +268,7 @@ by rust officially."#,
+     }
+ 
+     fn target_meta(&self) -> PkgMeta {
+-        let mut meta = self.meta.clone();
++        let mut meta = self.ctx.meta.clone();
+         meta.pkg_fmt = Some(self.pkg_fmt());
+         meta.bin_dir = Some("{ bin }{ binary-ext }".to_string());
+         meta
+@@ -311,11 +291,11 @@ by rust officially."#,
+     }
+ 
+     fn target(&self) -> &str {
+-        &self.target
++        &self.ctx.target
+     }
+ 
+     fn target_related_info(&self) -> &dyn leon::Values {
+-        &*self.target_related_info
++        &*self.ctx.target_related_info
+     }
+ }
+ 
+@@ -324,7 +304,7 @@ impl QuickInstall {
+         if !self.is_supported().await? {
+             debug!(
+                 "Not sending quickinstall report for {} since Quickinstall does not support these targets.",
+-                self.target
++                self.ctx.target
+             );
+ 
+             return Ok(());
+@@ -333,9 +313,9 @@ impl QuickInstall {
+         let mut url = Url::parse(QUICKINSTALL_STATS_URL)
+             .expect("stats_url is pre-generated and should never be invalid url");
+         url.query_pairs_mut()
+-            .append_pair("crate", &self.name)
+-            .append_pair("version", &self.version)
+-            .append_pair("target", &self.target)
++            .append_pair("crate", &self.ctx.name)
++            .append_pair("version", &self.ctx.version)
++            .append_pair("target", &self.ctx.target)
+             .append_pair(
+                 "agent",
+                 concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")),
+diff --git a/crates/binstalk/src/ops.rs b/crates/binstalk/src/ops.rs
+index c7e01a6..709f457 100644
+--- a/crates/binstalk/src/ops.rs
++++ b/crates/binstalk/src/ops.rs
+@@ -3,33 +3,21 @@
+ use std::{path::PathBuf, sync::Arc, time::Duration};
+ 
+ use compact_str::CompactString;
+-use tokio::sync::OnceCell;
+ 
+ use crate::{
+-    fetchers::{Fetcher, RepoInfo, SignaturePolicy},
++    fetchers::{FetchContext, Fetcher, SignaturePolicy},
+     helpers::{
+         gh_api_client::GhApiClient, jobserver_client::LazyJobserverClient,
+         lazy_gh_api_client::LazyGhApiClient, remote::Client,
+     },
+-    manifests::cargo_toml_binstall::{PkgMeta, PkgOverride},
++    manifests::cargo_toml_binstall::PkgOverride,
+     registry::ResolvedRegistry,
+     DesiredTargets,
+ };
+ 
+ pub mod resolve;
+ 
+-pub type Resolver = fn(
+-    Client,
+-    GhApiClient,
+-    CompactString,
+-    CompactString,
+-    Option<String>,
+-    String,
+-    PkgMeta,
+-    Arc<dyn leon::Values + Send + Sync>,
+-    Arc<OnceCell<Option<RepoInfo>>>,
+-    SignaturePolicy,
+-) -> Arc<dyn Fetcher>;
++pub type Resolver = fn(Client, GhApiClient, FetchContext) -> Arc<dyn Fetcher>;
+ 
+ #[derive(Debug)]
+ #[non_exhaustive]
+diff --git a/crates/binstalk/src/ops/resolve.rs b/crates/binstalk/src/ops/resolve.rs
+index 32e7b32..cc90a5e 100644
+--- a/crates/binstalk/src/ops/resolve.rs
++++ b/crates/binstalk/src/ops/resolve.rs
+@@ -17,7 +17,7 @@ use url::Url;
+ use crate::{
+     bins,
+     errors::{BinstallError, VersionParseError},
+-    fetchers::{Fetcher, RepoInfo, SignaturePolicy},
++    fetchers::{FetchContext, Fetcher},
+     helpers::{
+         cargo_toml::Manifest, cargo_toml_workspace::load_manifest_from_workspace,
+         download::ExtractedFiles, gh_api_client::GhApiClient, remote::Client,
+@@ -130,14 +130,16 @@ async fn resolve_inner(
+                     |_| true,
+                     opts.client.clone(),
+                     gh_api_client.clone(),
+-                    &package_info.name,
+-                    &package_info.version_str,
+-                    package_info.repo.as_deref(),
+-                    target,
+-                    meta,
+-                    target_related_info,
+-                    &repo_info_cache,
+-                    opts.signature_policy,
++                    FetchContext {
++                        name: package_info.name.clone(),
++                        version: package_info.version_str.clone(),
++                        repo: package_info.repo.clone(),
++                        target: target.clone(),
++                        meta: meta.clone(),
++                        target_related_info: target_related_info.clone(),
++                        repo_info_cache: repo_info_cache.clone(),
++                        signature_policy: opts.signature_policy,
++                    },
+                 );
+             }
+         }
+@@ -154,14 +156,16 @@ async fn resolve_inner(
+                     |name| name == FETCHER_GH_CRATE_META,
+                     opts.client.clone(),
+                     gh_api_client.clone(),
+-                    &binary_name,
+-                    &package_info.version_str,
+-                    package_info.repo.as_deref(),
+-                    target,
+-                    meta,
+-                    target_related_info,
+-                    &repo_info_cache,
+-                    opts.signature_policy,
++                    FetchContext {
++                        name: binary_name.clone(),
++                        version: package_info.version_str.clone(),
++                        repo: package_info.repo.clone(),
++                        target: target.clone(),
++                        meta: meta.clone(),
++                        target_related_info: target_related_info.clone(),
++                        repo_info_cache: repo_info_cache.clone(),
++                        signature_policy: opts.signature_policy,
++                    },
+                 );
+             }
+         }
+@@ -287,29 +291,14 @@ fn push_fetcher_handle(
+     filter_fetcher_by_name_predicate: fn(&'static str) -> bool,
+     client: Client,
+     gh_api_client: GhApiClient,
+-    name: &str,
+-    version: &str,
+-    repo: Option<&str>,
+-    target: &str,
+-    meta: &PkgMeta,
+-    target_related_info: &Arc<dyn leon::Values + Send + Sync>,
+-    repo_info_cache: &Arc<OnceCell<Option<RepoInfo>>>,
+-    signature_policy: SignaturePolicy,
++    ctx: FetchContext,
+ ) {
+-    let fetcher = resolver(
+-        client,
+-        gh_api_client,
+-        name.to_compact_string(),
+-        version.to_compact_string(),
+-        repo.map(ToString::to_string),
+-        target.to_string(),
+-        meta.clone(),
+-        target_related_info.clone(),
+-        repo_info_cache.clone(),
+-        signature_policy,
+-    );
++    // `ctx` is moved into `resolver`, so snapshot the disabled-strategies
++    // list before handing the facts off.
++    let disabled_strategies = ctx.meta.disabled_strategies.clone();
++    let fetcher = resolver(client, gh_api_client, ctx);
+ 
+-    if let Some(disabled_strategies) = meta.disabled_strategies.as_deref() {
++    if let Some(disabled_strategies) = disabled_strategies.as_deref() {
+         if disabled_strategies.contains(&fetcher.strategy()) {
+             return;
+         }

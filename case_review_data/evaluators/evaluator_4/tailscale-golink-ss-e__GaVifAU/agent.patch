@@ -1,0 +1,168 @@
+diff --git a/db.go b/db.go
+index 74867c0..1019519 100644
+--- a/db.go
++++ b/db.go
+@@ -10,8 +10,6 @@
+ 	"errors"
+ 	"fmt"
+ 	"io/fs"
+-	"net/url"
+-	"strings"
+ 	"sync"
+ 	"time"
+ 
+@@ -102,7 +100,7 @@ func (s *SQLiteDB) Load(short string) (*Link, error) {
+ 
+ 	link := new(Link)
+ 	var created, lastEdit int64
+-	row := s.db.QueryRow("SELECT Short, Long, Created, LastEdit, Owner FROM Links WHERE ID = ?1 LIMIT 1", strings.ReplaceAll(url.PathEscape(strings.ToLower(short)), "-", ""))
++	row := s.db.QueryRow("SELECT Short, Long, Created, LastEdit, Owner FROM Links WHERE ID = ?1 LIMIT 1", canonicalShortName(short))
+ 	err := row.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner)
+ 	if err != nil {
+ 		if errors.Is(err, sql.ErrNoRows) {
+@@ -120,9 +118,7 @@ func (s *SQLiteDB) Save(link *Link) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 
+-	esc := url.PathEscape(strings.ToLower(link.Short))
+-	esc = strings.ReplaceAll(esc, "-", "")
+-	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Created, LastEdit, Owner) VALUES (?, ?, ?, ?, ?, ?)", esc, link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner)
++	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Created, LastEdit, Owner) VALUES (?, ?, ?, ?, ?, ?)", canonicalShortName(link.Short), link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -141,9 +137,7 @@ func (s *SQLiteDB) Delete(short string) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 
+-	id := url.PathEscape(strings.ToLower(short))
+-	id = strings.ReplaceAll(id, "-", "")
+-	result, err := s.db.Exec("DELETE FROM Links WHERE ID = ?", id)
++	result, err := s.db.Exec("DELETE FROM Links WHERE ID = ?", canonicalShortName(short))
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -165,7 +159,7 @@ func (s *SQLiteDB) LoadStats() (ClickStats, error) {
+ 	}
+ 	linkmap := make(map[string]string, len(allLinks)) // map ID => Short
+ 	for _, link := range allLinks {
+-		linkmap[strings.ReplaceAll(strings.ToLower(link.Short), "-", "")] = link.Short
++		linkmap[canonicalShortName(link.Short)] = link.Short
+ 	}
+ 
+ 	s.mu.RLock()
+@@ -202,9 +196,7 @@ func (s *SQLiteDB) SaveStats(stats ClickStats) error {
+ 	}
+ 	now := s.Now().Unix()
+ 	for short, clicks := range stats {
+-		repl := strings.NewReplacer("-", "")
+-		esc := repl.Replace(url.PathEscape(strings.ToLower(short)))
+-		_, err := tx.Exec("INSERT INTO Stats (ID, Created, Clicks) VALUES (?, ?, ?)", esc, now, clicks)
++		_, err := tx.Exec("INSERT INTO Stats (ID, Created, Clicks) VALUES (?, ?, ?)", canonicalShortName(short), now, clicks)
+ 		if err != nil {
+ 			tx.Rollback()
+ 			return err
+@@ -218,7 +210,7 @@ func (s *SQLiteDB) DeleteStats(short string) error {
+ 	s.mu.Lock()
+ 	defer s.mu.Unlock()
+ 
+-	_, err := s.db.Exec("DELETE FROM Stats WHERE ID = ?", strings.ReplaceAll(url.PathEscape(strings.ToLower(short)), "-", ""))
++	_, err := s.db.Exec("DELETE FROM Stats WHERE ID = ?", canonicalShortName(short))
+ 	if err != nil {
+ 		return err
+ 	}
+diff --git a/golink.go b/golink.go
+index 0fa1992..aa22d93 100644
+--- a/golink.go
++++ b/golink.go
+@@ -661,7 +661,7 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
+ 	if errors.Is(err, fs.ErrNotExist) {
+ 		// Trim common punctuation from the end and try again.
+ 		// This catches auto-linking and copy/paste issues that include punctuation.
+-		if s := strings.TrimRight(short, ".,()[]{}"); short != s {
++		if s := trimTrailingPunctuation(short); short != s {
+ 			short = s
+ 			link, err = db.Load(short)
+ 		}
+@@ -739,7 +739,7 @@ func serveDetail(w http.ResponseWriter, r *http.Request) {
+ 	raw := strings.TrimPrefix(r.URL.Path, "/.detail/")
+ 	// Short names match case-insensitively and ignore the trailing
+ 	// punctuation users paste from documents; fold both before lookup.
+-	short := strings.TrimRight(strings.ToLower(raw), ".,()[]{}")
++	short := trimTrailingPunctuation(strings.ToLower(raw))
+ 
+ 	link, err := db.Load(short)
+ 	if errors.Is(err, fs.ErrNotExist) {
+@@ -1042,7 +1042,7 @@ func serveDelete(w http.ResponseWriter, r *http.Request) {
+ 	raw := strings.TrimPrefix(r.URL.Path, "/.delete/")
+ 	// Normalize the incoming name before lookup: users paste links with
+ 	// stray whitespace, trailing punctuation, or the wrong case.
+-	short := strings.TrimRight(strings.ToLower(strings.TrimSpace(raw)), ".,()[]{}")
++	short := trimTrailingPunctuation(strings.ToLower(strings.TrimSpace(raw)))
+ 	if short == "" {
+ 		http.Error(w, "short required", http.StatusBadRequest)
+ 		return
+@@ -1118,7 +1118,7 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
+ 
+ 	// A new link must not shadow an existing one whose name only differs
+ 	// by case or dashes; fold both before the conflict check.
+-	conflict := strings.ReplaceAll(strings.ToLower(short), "-", "")
++	conflict := canonicalShortName(short)
+ 	link, err := db.Load(conflict)
+ 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+ 		http.Error(w, err.Error(), http.StatusInternalServerError)
+diff --git a/resolve.go b/resolve.go
+index 2212e98..779dd3f 100644
+--- a/resolve.go
++++ b/resolve.go
+@@ -25,7 +25,7 @@ func resolveLink(link *url.URL) (*url.URL, error) {
+ 	// Link names match case-insensitively and tolerate the trailing
+ 	// punctuation users frequently paste from documents or chat; fold both
+ 	// before looking the link up.
+-	short = strings.TrimRight(strings.ToLower(short), ".,()[]{}")
++	short = trimTrailingPunctuation(strings.ToLower(short))
+ 
+ 	l, err := db.Load(short)
+ 	if err != nil {
+diff --git a/shortname.go b/shortname.go
+new file mode 100644
+index 0000000..7affac8
+--- /dev/null
++++ b/shortname.go
+@@ -0,0 +1,36 @@
++// Copyright 2022 Tailscale Inc & Contributors
++// SPDX-License-Identifier: BSD-3-Clause
++
++package golink
++
++import (
++	"net/url"
++	"strings"
++)
++
++// linkPunctuation is the trailing punctuation stripped from a short name
++// before lookup. Users frequently paste links from documents or chat with a
++// stray period, comma, parenthesis, or bracket attached; folding it off here
++// keeps those from becoming distinct links.
++const linkPunctuation = ".,()[]{}"
++
++// trimTrailingPunctuation removes trailing linkPunctuation from s.
++func trimTrailingPunctuation(s string) string {
++	return strings.TrimRight(s, linkPunctuation)
++}
++
++// canonicalShortName reduces a short link name to the single form the database
++// matches and stores against. It is the only place that decides how a short
++// name is matched, so changes to any of these rules live here:
++//
++//   - case-insensitive: names are folded to lower case, so "Foo", "foo", and
++//     "FOO" resolve to the same link.
++//   - dashes-ignored: dashes are removed, so "foo-bar" and "foobar" collide.
++//   - escaped: the result is path-escaped so it is a safe storage key.
++//
++// Every database lookup, save, delete, stat record, and the new-link shadow
++// check in serveSave routes through this function so the matching rule stays
++// in one place.
++func canonicalShortName(short string) string {
++	return strings.ReplaceAll(url.PathEscape(strings.ToLower(short)), "-", "")
++}

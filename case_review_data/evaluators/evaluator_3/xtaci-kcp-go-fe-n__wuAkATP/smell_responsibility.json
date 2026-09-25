@@ -1,0 +1,152 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "go/analysis",
+  "smell_type": "feature_envy",
+  "rule": {
+    "id": "envy-dominant-foreign-state",
+    "description": "A method whose body reaches into the data fields of one other package-declared struct more often than into its own state (at least six data-field touches, strictly more than its own-state touches, and strictly more than any other foreign owner). Selecting or calling methods on the other object counts as legitimate collaboration, not envy, so only data-field chains are counted toward the relation."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "sess.go",
+      "class_name": "UDPSession",
+      "function_name": "kcpSend"
+    },
+    {
+      "id": "E2",
+      "file_path": "sess.go",
+      "class_name": "UDPSession",
+      "function_name": "kcpRecv"
+    },
+    {
+      "id": "E3",
+      "file_path": "sess.go",
+      "class_name": "UDPSession",
+      "function_name": "SetNoDelay"
+    },
+    {
+      "id": "E4",
+      "file_path": "autotune.go",
+      "class_name": "autoTune",
+      "function_name": "retune"
+    },
+    {
+      "id": "E5",
+      "file_path": "sess.go",
+      "class_name": "UDPSession",
+      "function_name": "parityFor"
+    }
+  ],
+  "injected_match_count": 5,
+  "checks": [
+    {
+      "id": "dominant-foreign-owner-state",
+      "description": "Report every method of a package-declared struct whose body is dominated by direct data-field access to one single other package-declared struct: chains rooted at the receiver become foreign once they pass through a field of another package struct, chains rooted at a parameter of another package struct are foreign from the start, and a method is reported only when a single foreign owner collects at least 6 data touches, strictly more than the method's own-state touches, and strictly more than every other foreign owner.",
+      "detected_relation": "method -> dominant foreign-owner data fields",
+      "why_this_is_the_smell": "The method's body is dominated by reads and writes of another struct's internal data, which places behavior with the wrong owner: the work belongs on the struct whose data it manipulates, or behind that struct's own methods.",
+      "matches": [
+        {
+          "file": "sess.go",
+          "symbol": "UDPSession.kcpSend",
+          "entry_ids": ["E1"],
+          "evidence": "Session write path re-implements the KCP send segmentation directly on the engine's state: it reads the maximum segment size to slice the application buffer, appends to and grows segments inside the engine's send queue, and branches on the engine's stream/conv fields, while calling back into the engine only for allocation and logging.",
+          "measurement": {
+            "dominant_foreign_owner": "KCP",
+            "foreign_data_field_touches": 10,
+            "own_state_touches": 0,
+            "distinct_foreign_fields": 3,
+            "dominant_foreign_fields": {"mss": 6, "stream": 3, "conv": 1}
+          }
+        },
+        {
+          "file": "sess.go",
+          "symbol": "UDPSession.kcpRecv",
+          "entry_ids": ["E2"],
+          "evidence": "Session read path re-implements the KCP receive reassembly directly on the engine's queues: it drains the engine's receive queue, promotes segments from the engine's receive buffer into its receive queue while advancing the expected sequence, arms the engine's tell-probe, and reads the engine's window/conv/stream fields, calling back into the engine only to peek, recycle, and log.",
+          "measurement": {
+            "dominant_foreign_owner": "KCP",
+            "foreign_data_field_touches": 10,
+            "own_state_touches": 0,
+            "distinct_foreign_fields": 6,
+            "dominant_foreign_fields": {"rcv_wnd": 3, "rcv_buf": 2, "rcv_nxt": 2, "conv": 1, "probe": 1, "stream": 1}
+          }
+        },
+        {
+          "file": "sess.go",
+          "symbol": "UDPSession.SetNoDelay",
+          "entry_ids": ["E3"],
+          "evidence": "The session's delay/pace setter no longer delegates to the engine's own tuning method; it writes the engine's pacing fields one by one from session code, including the retransmission floor selection that depends on the chosen profile.",
+          "measurement": {
+            "dominant_foreign_owner": "KCP",
+            "foreign_data_field_touches": 6,
+            "own_state_touches": 2,
+            "distinct_foreign_fields": 5,
+            "dominant_foreign_fields": {"rx_minrto": 2, "fastresend": 1, "interval": 1, "nocwnd": 1, "nodelay": 1}
+          }
+        },
+        {
+          "file": "autotune.go",
+          "symbol": "autoTune.retune",
+          "entry_ids": ["E4"],
+          "evidence": "The period-detection helper gained a method that rebuilds a decoder wholesale from outside: it overwrites the decoder's shard geometry, drains its shard sets through the shared buffer pool, reallocates its caches, recomputes its wrap guard, replaces its codec, and clears its tuning flag, while touching virtually none of the tuner's own state beyond calling its own detection methods.",
+          "measurement": {
+            "dominant_foreign_owner": "fecDecoder",
+            "foreign_data_field_touches": 16,
+            "own_state_touches": 2,
+            "distinct_foreign_fields": 9,
+            "dominant_foreign_fields": {"shardSize": 5, "dataShards": 2, "parityShards": 2, "shardSet": 2, "codec": 1, "decodeCache": 1, "flagCache": 1, "paws": 1, "shouldTune": 1}
+          }
+        },
+        {
+          "file": "sess.go",
+          "symbol": "UDPSession.parityFor",
+          "entry_ids": ["E5"],
+          "evidence": "The outgoing-packet pipeline stage no longer calls the FEC encoder's own encode method; the session re-implements shard sealing and Reed-Solomon parity generation directly on the encoder's shard cache, offsets, counters, size tracking, timestamp, encode cache and codec.",
+          "measurement": {
+            "dominant_foreign_owner": "fecEncoder",
+            "foreign_data_field_touches": 31,
+            "own_state_touches": 0,
+            "distinct_foreign_fields": 8,
+            "dominant_foreign_fields": {"maxSize": 6, "shardCache": 6, "shardCount": 6, "payloadOffset": 5, "dataShards": 3, "headerOffset": 2, "tsLatestPacket": 2, "encodeCache": 1}
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "file": "sess.go",
+      "symbol": "UDPSession.WriteBuffers",
+      "reason": "Touches KCP's maximum-segment-size field while splitting large writes, but the method is dominated by its own session state (deadlines, window bookkeeping, buffers and locks), so no single foreign owner dominates; this is normal collaboration."
+    },
+    {
+      "file": "sess.go",
+      "symbol": "UDPSession.kcpInput",
+      "reason": "Feeds both the KCP engine and the FEC decoder on the receive path, and reads both components' state, but remains dominated by its own session state; the touches are balanced across two owners, so there is no single dominant foreign owner."
+    },
+    {
+      "file": "sess.go",
+      "symbol": "UDPSession.postProcess",
+      "reason": "The outgoing pipeline stage coordinates stages owned by others but manipulates essentially only its own buffers and counters; component work stays behind the components' methods."
+    },
+    {
+      "file": "kcp.go",
+      "symbol": "KCP.parse_data",
+      "reason": "Manipulates received segments' fields while inserting them into its own queues, but its own engine state dominates the method; segments are transient value records moved by the engine rather than owners of the behavior."
+    },
+    {
+      "file": "kcp.go",
+      "symbol": "KCP.recycleSegment",
+      "reason": "Touches only the recycled segment's fields, but the count is far below the dominance floor and the segment is a short-lived value object; this bookkeeping belongs to the engine."
+    },
+    {
+      "file": "Listener.packetInput",
+      "reason": "Session lookup and delivery from the socket loop; nearly all touched state is the listener's own conn/registry state with sessions reached through their methods."
+    },
+    {
+      "file": "snmp.go / ringbuffer.go / timed_sched.go",
+      "reason": "Statistics counters, the value-container ring buffer and the timer scheduler touch non-local state, but no method of a package struct is dominated by another package struct's fields; they do not exhibit the targeted relation."
+    }
+  ]
+}

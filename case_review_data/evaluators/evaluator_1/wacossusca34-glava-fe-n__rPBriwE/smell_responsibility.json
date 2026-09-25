@@ -1,0 +1,135 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Clang-Tidy",
+  "smell_type": "feature_envy",
+  "rule": {
+    "id": "misplaced-owner-state-logic",
+    "description": "A function definition hosted in a module that does not own struct T -- and that is not the process composition root -- reads or writes three or more distinct direct members of struct T. The function is more invested in another module's data than in its own, so the behavior belongs in one of the owning modules."
+  },
+  "ownership_map": {
+    "struct audio_data": "owned by the audio input layer: glava/fifo.c and glava/pulse_input.c",
+    "struct glava_renderer": "owned by the render core: glava/render.c",
+    "glava/glava.c": "process composition root (glava_entry); may construct, wire and drain every struct"
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "glava/render.c",
+      "class_name": null,
+      "function_name": "rd_audio_zero"
+    },
+    {
+      "id": "E2",
+      "file_path": "glava/render.c",
+      "class_name": null,
+      "function_name": "rd_audio_shift_write"
+    },
+    {
+      "id": "E3",
+      "file_path": "glava/render.c",
+      "class_name": null,
+      "function_name": "rd_audio_shift_silence"
+    },
+    {
+      "id": "E4",
+      "file_path": "glava/render.c",
+      "class_name": null,
+      "function_name": "rd_audio_read"
+    },
+    {
+      "id": "E5",
+      "file_path": "glava/pulse_input.c",
+      "class_name": null,
+      "function_name": "pulse_apply_session_requests"
+    },
+    {
+      "id": "E6",
+      "file_path": "glava/fifo.c",
+      "class_name": null,
+      "function_name": "fifo_bind_session"
+    }
+  ],
+  "injected_match_count": 6,
+  "checks": [
+    {
+      "id": "audio-session-logic-outside-audio-layer",
+      "description": "Detect function definitions hosted outside the audio input layer that read or write three or more distinct direct members of the audio session struct.",
+      "detected_relation": "function hosted outside the audio layer -> audio session state (struct audio_data members)",
+      "why_this_is_the_smell": "Audio session lifecycle and buffer state belong to the audio input layer; a foreign-hosted function heavily manipulating that state is feature envy -- the behavior is more interested in another module's data than in its own.",
+      "matches": [
+        {
+          "file": "glava/render.c",
+          "symbol": "rd_audio_zero",
+          "entry_ids": ["E1"],
+          "evidence": "function 'rd_audio_zero' (host: glava/render.c) touches 3 distinct members (audio_buf_sz, audio_out_l, audio_out_r) of 'struct audio_data' owned by the audio input layer",
+          "measurement": { "distinct_members_touched": 3, "owner_struct": "audio_data", "host_file": "glava/render.c" }
+        },
+        {
+          "file": "glava/render.c",
+          "symbol": "rd_audio_shift_write",
+          "entry_ids": ["E2"],
+          "evidence": "function 'rd_audio_shift_write' (host: glava/render.c) touches 4 distinct members (audio_buf_sz, audio_out_l, audio_out_r, sample_sz) of 'struct audio_data' owned by the audio input layer",
+          "measurement": { "distinct_members_touched": 4, "owner_struct": "audio_data", "host_file": "glava/render.c" }
+        },
+        {
+          "file": "glava/render.c",
+          "symbol": "rd_audio_shift_silence",
+          "entry_ids": ["E3"],
+          "evidence": "function 'rd_audio_shift_silence' (host: glava/render.c) touches 4 distinct members (audio_buf_sz, audio_out_l, audio_out_r, sample_sz) of 'struct audio_data' owned by the audio input layer",
+          "measurement": { "distinct_members_touched": 4, "owner_struct": "audio_data", "host_file": "glava/render.c" }
+        },
+        {
+          "file": "glava/render.c",
+          "symbol": "rd_audio_read",
+          "entry_ids": ["E4"],
+          "evidence": "function 'rd_audio_read' (host: glava/render.c) touches 4 distinct members (audio_out_l, audio_out_r, modified, mutex) of 'struct audio_data' owned by the audio input layer",
+          "measurement": { "distinct_members_touched": 4, "owner_struct": "audio_data", "host_file": "glava/render.c" }
+        }
+      ]
+    },
+    {
+      "id": "renderer-request-logic-outside-render-core",
+      "description": "Detect function definitions hosted outside the render core that read or write three or more distinct direct members of the renderer state struct.",
+      "detected_relation": "function hosted outside the render core -> renderer request state (struct glava_renderer members)",
+      "why_this_is_the_smell": "The renderer request fields parameterize the audio session, but they are render-core state; an audio backend function mining three or more of those fields to reconfigure its session is feature envy toward the render core's data.",
+      "matches": [
+        {
+          "file": "glava/pulse_input.c",
+          "symbol": "pulse_apply_session_requests",
+          "entry_ids": ["E5"],
+          "evidence": "function 'pulse_apply_session_requests' (host: glava/pulse_input.c) touches 3 distinct members (mirror_input, rate_request, samplesize_request) of 'struct glava_renderer' owned by the render core",
+          "measurement": { "distinct_members_touched": 3, "owner_struct": "glava_renderer", "host_file": "glava/pulse_input.c" }
+        },
+        {
+          "file": "glava/fifo.c",
+          "symbol": "fifo_bind_session",
+          "entry_ids": ["E6"],
+          "evidence": "function 'fifo_bind_session' (host: glava/fifo.c) touches 3 distinct members (audio_source_request, bufsize_request, samplesize_request) of 'struct glava_renderer' owned by the render core",
+          "measurement": { "distinct_members_touched": 3, "owner_struct": "glava_renderer", "host_file": "glava/fifo.c" }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "location": "glava/glava.c",
+      "reason": "Process composition root: glava_entry constructs the audio session, selects and starts the audio backend, drains the session every frame and performs teardown/reload wiring. It is the one module allowed to touch every struct, so its session manipulation is not envy."
+    },
+    {
+      "location": "glava/fifo.c:entry and glava/pulse_input.c:entry/cb",
+      "reason": "The audio thread entrypoints and the PulseAudio server-info callback manipulate struct audio_data members heavily, but their host module is an owner of that struct, so the ownership relation holds."
+    },
+    {
+      "location": "glava/render.c renderer-lifecycle functions (rd_init, rd_destroy, rd_update)",
+      "reason": "render-core functions touching struct glava_renderer stay inside the owning module; only the audio-session helpers in the same file cross the ownership line toward struct audio_data."
+    },
+    {
+      "location": "glava/glava.c call sites in the audio_impl registry contract (struct audio_impl)",
+      "reason": "The backend registry stores function pointers and a name; it is shared contract data between the composition root and the audio layer, and no analyzed function reaches the member threshold across the ownership line through it."
+    }
+  ],
+  "notes": [
+    "Analysis hosts are the glava/render.c, glava/fifo.c and glava/pulse_input.c translation units plus headers located in the same source directory, so a finding survives relocation into a non-owning repository header; system headers are never analyzed.",
+    "Exit contract: 0 = no cross-ownership function in the analyzed hosts; 1 = N matching function definitions with per-match evidence; 2 = analysis cannot complete (missing or unparsable required source, plugin unavailable, no checks enabled)."
+  ]
+}

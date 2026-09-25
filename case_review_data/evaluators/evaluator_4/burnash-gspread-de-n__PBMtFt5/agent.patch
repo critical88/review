@@ -1,0 +1,282 @@
+diff --git a/gspread/auth.py b/gspread/auth.py
+index dfd758f..96c6bd0 100644
+--- a/gspread/auth.py
++++ b/gspread/auth.py
+@@ -144,14 +144,6 @@ def oauth(
+ 
+         gc = gspread.oauth()
+ 
+-    Another option is to run a console strategy. This way, the user is
+-    instructed to open the authorization URL in their browser. Once the
+-    authorization is complete, the user must then copy & paste the
+-    authorization code into the application::
+-
+-        gc = gspread.oauth(flow=gspread.auth.console_flow)
+-
+-
+     ``scopes`` parameter defaults to read/write scope available in
+     ``gspread.auth.DEFAULT_SCOPES``. It's read/write for Sheets
+     and Drive API::
+@@ -227,14 +219,6 @@ def oauth_from_dict(
+ 
+         gc = gspread.oauth_from_dict()
+ 
+-    Another option is to run a console strategy. This way, the user is
+-    instructed to open the authorization URL in their browser. Once the
+-    authorization is complete, the user must then copy & paste the
+-    authorization code into the application::
+-
+-        gc = gspread.oauth_from_dict(flow=gspread.auth.console_flow)
+-
+-
+     ``scopes`` parameter defaults to read/write scope available in
+     ``gspread.auth.DEFAULT_SCOPES``. It's read/write for Sheets
+     and Drive API::
+@@ -392,51 +376,3 @@ def api_key(token: str, http_client: HTTPClientType = HTTPClient) -> Client:
+         )
+     creds = APIKeyCredentials(token)
+     return Client(auth=creds, http_client=http_client)
+-
+-
+-# ---------------------------------------------------------------------------
+-# 6.0 OAuth-flow compatibility leftovers.
+-#
+-# Below is the retired "console strategy" OAuth flow and the by-name
+-# registry that the public ``oauth(flow="console")`` argument used to
+-# dispatch through. After the ``flow`` argument became a plain callable
+-# (``FlowCallable``) every invoker of the lookup helper went away, but the
+-# helper and the registry it indexes into stayed in the tree for one more
+-# minor release so third-party mirrors of ``local_server_flow`` could keep
+-# importing the module during the migration window. They are now only
+-# referenced by each other.
+-# ---------------------------------------------------------------------------
+-
+-def _console_flow(
+-    client_config: Mapping[str, Any], scopes: Iterable[str], port: int = 0
+-) -> OAuthCredentials:
+-    """Retired interactive ("console strategy") OAuth flow.
+-
+-    Before 6.0, users opted into the copy/paste-the-code strategy with
+-    ``gspread.oauth(flow=gspread.auth.console_flow)``. That public surface
+-    went away when the console strategy was dropped upstream (see the
+-    migration guide). The function was kept for one minor release so a
+-    mirror of :func:`local_server_flow` stayed visible side by side, then
+-    disconnected when the ``flow`` argument became a callable factory. It
+-    now sits behind a private registry nobody consults any more.
+-    """
+-    flow = InstalledAppFlow.from_client_config(client_config, scopes)
+-    return flow.run_console()  # type: ignore[attr-defined]
+-
+-
+-_LEGACY_FLOW_REGISTRY: Dict[str, FlowCallable] = {
+-    "console": _console_flow,
+-    "local_server_flow": local_server_flow,
+-}
+-
+-
+-def _legacy_flow_by_name(name: str) -> FlowCallable:
+-    """Lookup hook retained beside the registry.
+-
+-    Public callers once went through ``oauth(flow="console")``; that
+-    argument became a callable and this lookup helper lost every invoker.
+-    The only thing still keeping it syntactically alive is the registry it
+-    indexes into, which is itself only referenced from this helper.
+-    """
+-    return _LEGACY_FLOW_REGISTRY[name]
+-
+diff --git a/gspread/client.py b/gspread/client.py
+index 79288ae..957088b 100644
+--- a/gspread/client.py
++++ b/gspread/client.py
+@@ -476,40 +476,3 @@ class Client:
+         :param str permission_id: an ID for the permission.
+         """
+         self.http_client.remove_permission(file_id, permission_id)
+-
+-
+-# ---------------------------------------------------------------------------
+-# 6.0 transport-glue leftovers.
+-#
+-# When ``authorize(http_client="backoff")`` still accepted a string name,
+-# clients resolved their transport through a by-name registry exposed by
+-# :mod:`gspread.http_client`. The public argument became a plain callable
+-# factory (``HTTPClientType``) and every reachable caller stopped going
+-# through this helper. The dead ``_accepted_kwargs`` decorator from
+-# :mod:`gspread.utils` is left on it because this is exactly the kind of
+-# 5.x transport glue that pre-6.0 always carried the keyword-alias shim.
+-# ---------------------------------------------------------------------------
+-
+-from .utils import _accepted_kwargs  # noqa: E402  legacy kwargs shim
+-
+-
+-@_accepted_kwargs(engine="name")
+-def _resolve_legacy_client_engine(
+-    name: str,
+-    auth: Credentials,
+-    session: Optional[Session] = None,
+-) -> HTTPClient:
+-    """Retired by-name client factory.
+-
+-    Once upon a time ``authorize(http_client="backoff")`` accepted a string
+-    name and resolved it through the http-client registry mapping ``name ->
+-    factory``; the public argument became a callable factory and the lookup
+-    layer became a dangling helper that nobody calls. The only thing
+-    keeping it syntactically alive is the import of the registry it indexes
+-    into, which is only imported so this helper can read it.
+-    """
+-    from .http_client import _LEGACY_CLIENT_ENGINES  # legacy registry glue
+-
+-    factory = _LEGACY_CLIENT_ENGINES[name]
+-    return factory(auth, session)
+-
+diff --git a/gspread/http_client.py b/gspread/http_client.py
+index 35f84b1..f5aa3a4 100644
+--- a/gspread/http_client.py
++++ b/gspread/http_client.py
+@@ -644,70 +644,3 @@ class BackOffHTTPClient(HTTPClient):
+ 
+ 
+ HTTPClientType = Type[HTTPClient]
+-
+-
+-# ---------------------------------------------------------------------------
+-# 6.0 transport-compatibility leftovers.
+-#
+-# The "interactive login" transport and the manual ``key=<token>`` query
+-# parameter wiring are the engine room of the retired console-flow auth
+-# layer. They were kept in the tree for one minor release so external
+-# scripts that still reached for ``http_client="interactive"`` would keep
+-# importing, then they were disconnected once the public ``http_client``
+-# argument became a plain callable factory. The migration switch below
+-# stays ``False`` from the moment the public API dropped the string names;
+-# nothing reachable ever reads the registry any more.
+-# ---------------------------------------------------------------------------
+-
+-_LEGACY_LOGIN_ENGINE_COMPAT_ENABLED = False
+-
+-
+-class _InteractiveLoginEngine(HTTPClient):
+-    """Retired "interactive login" transport.
+-
+-    Before the :class:`HTTPClient` split (PR #1190) asked for an api key
+-    the way 5.x did, the request applied the key as a ``key`` query
+-    parameter inline. ``APIKeyCredentials`` (google-auth>=2.15) replaced
+-    that path; the engine that used to bind it was tagged "drop once the
+-    budget clears" and shipped a few minor releases instead of being
+-    cleaned up.
+-    """
+-
+-    def _apply_legacy_api_key_inline(self, params: ParamsType, key: str) -> ParamsType:
+-        """Attach the old ``key=<token>`` query style; never executed today."""
+-        return _apply_legacy_api_key_param(params, key)
+-
+-    def login_and_block(self) -> None:
+-        # Mirror of :meth:`HTTPClient.login` kept for structural parity with
+-        # the retired console flow; reachable only via the dead registry.
+-        from google.auth.transport.requests import Request
+-
+-        self.auth.refresh(Request(self.session))
+-        self.session.headers.update(
+-            {"Authorization": "Bearer %s" % self.auth.token}
+-        )
+-
+-
+-_LEGACY_CLIENT_ENGINES = {
+-    "backoff": BackOffHTTPClient,
+-    "interactive": _InteractiveLoginEngine,
+-}
+-
+-
+-def _apply_legacy_api_key_param(
+-    params: Optional[ParamsType], token: str
+-) -> ParamsType:
+-    """Pre-:class:`APIKeyCredentials` query-parameter wiring preserved in the tree.
+-
+-    Used to be the only way the api-key path worked. After google-auth grew
+-    ``APIKeyCredentials`` the public flows stopped touching it; only the dead
+-    ``_InteractiveLoginEngine`` machinery referenced it again, and it never
+-    runs because nothing reachable consults the engine registry any longer.
+-    """
+-    updated: ParamsType = dict(params) if params else {}
+-    updated["key"] = token
+-    return updated
+-
+-
+-if _LEGACY_LOGIN_ENGINE_COMPAT_ENABLED:  # pragma: no cover - permanently off
+-    _LEGACY_CLIENT_ENGINES["default"] = _InteractiveLoginEngine
+diff --git a/gspread/utils.py b/gspread/utils.py
+index b851f2a..1256196 100644
+--- a/gspread/utils.py
++++ b/gspread/utils.py
+@@ -8,7 +8,6 @@ This module contains utility functions.
+ 
+ import enum
+ import re
+-import warnings
+ from collections import defaultdict
+ from collections.abc import Sequence
+ from functools import wraps
+@@ -1159,63 +1158,3 @@ if __name__ == "__main__":
+     import doctest
+ 
+     doctest.testmod()
+-
+-
+-# ---------------------------------------------------------------------------
+-# 5.x -> 6.0 compatibility shard.
+-#
+-# The ``accepted_kwargs`` decorator and the per-method deprecation warning
+-# next to the disabled block above are the remaining transcript of the
+-# removed 5.x argument-aliasing layer. They were re-instated for one minor
+-# release so that the private transport helpers could stay self-describing
+-# while the downstream callers finished migrating, and were then orphaned
+-# once every affected public signature dropped the legacy spellings. The
+-# alias map stays only as a record of the renamed spellings.
+-# ---------------------------------------------------------------------------
+-
+-_LEGACY_KWARG_ALIASES = {
+-    "values": "range",
+-    "value_input_option": "value_input_option",
+-    "major_dimension": "major_dimension",
+-    "engine": "name",
+-}
+-
+-
+-def _accepted_kwargs(**aliases: str) -> Callable[..., Callable[..., T]]:
+-    """Decorator that rewrites legacy keyword spellings on the fly.
+-
+-    Pre-6.0 every public_write method went through this hooks so that
+-    documents migrating from the old spellings kept working for one
+-    release. The public decorators were dropped with the breaking
+-    release; only the private transport glue did keep using it until
+-    that glue itself was disconnected. It now does nothing other than
+-    sit in the tree.
+-    """
+-
+-    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+-        @wraps(func)
+-        def wrapped(*args: Any, **kwargs: Any) -> Any:
+-            for legacy_name, canonical_name in aliases.items():
+-                if legacy_name in kwargs:
+-                    _legacy_deprecation_warning("5.x", legacy_name)
+-                    kwargs.setdefault(canonical_name, kwargs.pop(legacy_name))
+-            return func(*args, **kwargs)
+-
+-        return wrapped
+-
+-    return decorator
+-
+-
+-def _legacy_deprecation_warning(version: str, msg: str) -> None:
+-    """Emit the per-method deprecation signal retained for the migration window.
+-
+-    Mirrors the disabled ``deprecation_warning`` block a few lines above: the
+-    message template and silence hook are identical, this wrapper is the only
+-    piece the dead ``_accepted_kwargs`` decorator reaches back to.
+-    """
+-    warnings.warn(
+-        "[Deprecated][in version {}]: {}".format(version, msg),
+-        DeprecationWarning,
+-        4,  # show the frame above the user's call, matching the disabled block
+-    )
+-

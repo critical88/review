@@ -1,0 +1,125 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes bind-variable materialization from TrackedBuffer entirely: tracked_buffer.go drops the `bindVars`/`redactPrefix` fields and deletes the `GenerateBoundQuery`, `ResolveBindVar`, and `EncodeBindValue` methods (and the querypb/sqltypes imports). Bound-query construction is moved to a new cohesive owner in bound_query.go: `boundQueryBuilder` carries its own `out *bytes.Buffer`, `bindVars`, and `extras`, and its `build(pq)` walks the precomputed bind locations, substitutes custom encoders via `extras[name[1:]]`, resolves supplied vars through the shared `resolveBindVar`, and encodes them via `encodeBindValue` (scalar + TUPLE/list expansion). parsed_query.go's `GenerateQuery` now delegates to `newBoundQueryBuilder(out, bindVariables, extras).build(pq)`. The missing-bind/type-mismatch error handling lives in bind_value.go's `resolveBindVar` (returning 'missing bind var', 'unexpected list arg type', 'empty list supplied', 'unexpected arg type (TUPLE) for non-list key'), invoked by the bound-generation path rather than the render buffer.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The query-rendering buffer type no longer owns bind-variable materialization: resolving supplied bind variables (scalars, TUPLE/list expansion, and any custom encoders) into a bound statement, and the missing-bind/type-mismatch error handling, are owned by the parsed-query bound-generation path (or another cohesive owner), not by the buffer that renders AST templates.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch removes bindVars/redactPrefix fields and SetBindVars/SetRedactPrefix/WriteRedacted from TrackedBuffer in tracked_buffer.go, leaving the buffer focused on rendering. Redaction is moved to redact_query.go as a redactor struct that owns bindVars and redactPrefix and performs Normalize plus margin-comment framing in render(); RedactSQLQuery calls newRedactor(buf, bindVars, \"redacted\").render(...). Thus literal redaction is owned by the redaction surface, not the rendering buffer.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The query-rendering buffer type no longer owns literal redaction: replacing literal values with generated bind variables for safe display (with margin comments preserved) is owned by the redaction surface, not by the buffer that renders AST templates.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The refactor request asks to give impossible-query production a cohesive owner while leaving the rendering buffer focused on rendering. In the agent patch, tracked_buffer.go deletes the TrackedBuffer.WriteImpossibleQuery method (and its select/union/default switch), and impossible_query.go introduces an impossibleQueryBuilder type with a build(node) method that owns the \"select ... where 1 != 1\", Union, and default formatting logic; FormatImpossibleQuery now delegates via newImpossibleQueryBuilder(buf).build(node). Thus shadow-query emission is owned by the impossible-query surface, not the buffer type.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The query-rendering buffer type no longer owns impossible/shadow-query emission: producing the always-empty select/union/default form used to fetch field metadata is owned by the impossible-query surface, not by the buffer that renders AST templates.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch restores cohesive owners: bound_query.go adds boundQueryBuilder.build owning GenerateQuery logic; redact_query.go adds redactor.render owning redaction; impossible_query.go adds impossibleQueryBuilder.build owning impossible-query production; bind_value.go adds shared resolveBindVar/encodeBindValue with EncodeValue/FetchBindVar delegating to them. Public entry points keep signatures: GenerateQuery still returns ([]byte, error), EncodeValue/FetchBindVar/RedactSQLQuery/FormatImpossibleQuery remain unchanged. TrackedBuffer loses bindVars, redactPrefix, SetBindVars/SetRedactPrefix, and GenerateBoundQuery/ResolveBindVar/EncodeBindValue/WriteRedacted/WriteImpossibleQuery, leaving it a rendering sink.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The bound-generation routine, the bind-variable lookup and value-encoding helpers, the redaction routine, and the impossible-query routine that were reduced to one-line delegations to the buffer are restored to cohesive ownership — each either holds its own logic or delegates to a dedicated owner — while all external call sites remain unchanged in behavior and signature.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent removes the absorbed-concern state from TrackedBuffer: in tracked_buffer.go it deletes the `bindVars` and `redactPrefix` fields and the `SetBindVars`/`SetRedactPrefix` setters, and the struct comment now says the buffer is focused on rendering. That state lives only in the new owners: `boundQueryBuilder` in bound_query.go holds `bindVars`, `redactor` in redact_query.go holds `bindVars` and `redactPrefix`, and `impossibleQueryBuilder` holds only the render buffer. This matches the request to give bound-query construction, redaction, and impossible-query production cohesive owners while leaving the rendering buffer focused on rendering.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The shared mutable state and configuration added to the rendering buffer only for the absorbed concerns — the bind-variable namespace, the redaction prefix, and the builder setters that install them — no longer reside on the rendering buffer; they live only where the owning concern needs them.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes all injected artifacts from tracked_buffer.go: the struct no longer has bindVars or redactPrefix fields (only *bytes.Buffer, bindLocations, nodeFormatter remain); SetBindVars and SetRedactPrefix setters are deleted; GenerateBoundQuery, ResolveBindVar, EncodeBindValue, WriteRedacted, and WriteImpossibleQuery methods are all deleted; and the querypb/sqltypes imports added solely for those concerns are removed, leaving only bytes and fmt (fmt still used by existing Myprintf). The relocated logic now lives in new files with correct imports: bind_value.go (bytes, fmt, querypb, sqltypes all used), bound_query.go (bytes, querypb both used), impossible_query.go (no external imports needed), redact_query.go (querypb used). parsed_query.go retains bytes and querypb, both still used by GenerateQuery. No unused or missing imports remain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No obsolete injected artifact remains on the rendering buffer after repair — the concern methods, the two added fields, and the builder setters are gone, and the imports added to the buffer solely for the relocated concerns are removed — with no newly unused import left behind in any file and no missing import where the logic now lives.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's boundQueryBuilder.build (bound_query.go) replicates the original GenerateQuery loop exactly: same literal-text slicing (pq.Query[current:loc.offset]), same extras lookup via name[1:], same EncodeSQL dispatch for custom encoders, and same resolve-then-encode order for bind vars. resolveBindVar (bind_value.go) copies FetchBindVar verbatim, including identical error strings ('missing bind var %s', 'unexpected list arg type (%v) for key %s', 'empty list supplied for %s', 'unexpected arg type (TUPLE) for non-list key %s') and the same missing→list-validation→non-list-TUPLE check order. encodeBindValue copies EncodeValue verbatim: scalar path via BindVariableToValue().EncodeSQL(out) and TUPLE path emitting '(' + comma-separated ProtoToValue().EncodeSQL(out) + ')'. Public EncodeValue and FetchBindVar delegate to these shared implementations, so both direct and indirect callers get identical bytes and errors.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair must not alter the bytes of a generated bound query for identical templates and bind variables, including TUPLE/list expansion and custom-encoder output, and must not change the missing-bind or type-mismatch errors raised on the same inputs.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch preserves the redaction output path: RedactSQLQuery creates an empty bindVars map and calls newRedactor(buf, bindVars, \"redacted\").render(comments.Leading, comments.Trailing, stmt), whose render() does Normalize(stmt, r.bindVars, r.redactPrefix) then r.buf.WriteString(leading), r.buf.WriteNode(stmt), r.buf.WriteString(trailing), and returns buf.String(). This is identical to the smell's WriteRedacted logic and equivalent to the original comments.Leading + String(stmt) + comments.Trailing, so leading margin comments, the scrubbed statement, and trailing margin comments are unchanged.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair must not alter the redacted query string — leading margin comments, the statement with literals scrubbed, and trailing margin comments — for any input.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch moves the impossible-query logic into impossibleQueryBuilder.build() but preserves the exact rendering for all three forms: Select emits `Myprintf(\"select %v from %v where 1 != 1\", node.SelectExprs, node.From)` with group-by passthrough via `node.GroupBy.Format(q.buf)`, Union emits `Myprintf(\"%v %s %v\", node.Left, node.Type, node.Right)`, and default calls `node.Format(q.buf)`. These match the original pre-smell FormatImpossibleQuery byte for byte, only substituting q.buf for buf, so the shadow query text is unaltered.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair must not alter the impossible/shadow query text produced for select, union, and default node forms, including the always-false predicate and group-by passthrough.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "All public entry-point signatures are preserved: GenerateQuery retains (bindVariables map[string]*querypb.BindVariable, extras map[string]Encodable) ([]byte, error) in parsed_query.go; EncodeValue retains (buf *bytes.Buffer, value *querypb.BindVariable) in bind_value.go; FetchBindVar retains (name string, bindVariables map[string]*querypb.BindVariable) (val *querypb.BindVariable, isList bool, err error) in bind_value.go; RedactSQLQuery retains (sql string) (string, error) in redact_query.go; FormatImpossibleQuery retains (buf *TrackedBuffer, node SQLNode) in impossible_query.go. The smell-introduced TrackedBuffer methods (SetBindVars, SetRedactPrefix, GenerateBoundQuery, ResolveBindVar, EncodeBindValue, WriteRedacted, WriteImpossibleQuery) were removed, but these were part of the injected smell, not pre-existing public entry points. Internal logic is delegated to new owner types (boundQueryBuilder, redactor, impossibleQueryBuilder) and shared functions (resolveBindVar, encodeBindValue) with equivalent behavior, so no compilation errors or test regressions are evident.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair must not change any public signature of the bound-generation, bind-variable-lookup, value-encoding, redaction, or impossible-query entry points, and must not cause the package test suite to fail.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 1
+  },
+  "valid_count": 10,
+  "pass_count": 10,
+  "must_have_pass": true,
+  "macro_score": 1
+}

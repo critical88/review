@@ -1,0 +1,762 @@
+diff --git a/canvas/generator.py b/canvas/generator.py
+index 5ca3dd7..ef1af9e 100644
+--- a/canvas/generator.py
++++ b/canvas/generator.py
+@@ -186,53 +186,6 @@ class CanvasFuzzFrontend(DocumentFuzzFrontend):
+             lines.append('/* canvasvar%05d */' % (i + 1))
+         html_context['element_lines'] = lines
+ 
+-    def extract_shader_stages(self, code):
+-        """Extracts (stage, function) pairs from a shader source.
+-
+-        Reports WebGL shader stages for the sample scripts that embed
+-        GLSL source with a stage pragma.
+-
+-        Args:
+-          code: The shader source code.
+-
+-        Returns:
+-          A list of (stage attribute, function name) tuples.
+-        """
+-        stages = []
+-        for match in re.finditer(r'@(vertex|fragment)\s+shader\s+(\w+)', code):
+-            stages.append(('@' + match.group(1), match.group(2)))
+-        return stages
+-
+-    def collect_shader_entrypoints(self, sources):
+-        """Formats grammar rules for the entrypoints of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <entrypoint> grammar rules.
+-        """
+-        entrypoints = []
+-        for shader in sources:
+-            for _, fn in self.extract_shader_stages(shader):
+-                entrypoints.append(fn)
+-        return ''.join('<entrypoint> = "%s"\n' % ep for ep in entrypoints)
+-
+-    def collect_shader_bindings(self, sources):
+-        """Formats grammar rules for the bindings of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <BindInt> grammar rules.
+-        """
+-        numbers = []
+-        for shader in sources:
+-            for match in re.finditer(r'binding\s*:\s*([0-9]+)', shader):
+-                numbers.append(match.group(1))
+-        return '\n'.join('<BindInt> = %s' % n for n in numbers)
+-
+     def describe_grammar_stats(self, grammar):
+         """Returns a JSON-able summary of a parsed grammar.
+ 
+diff --git a/frontends.py b/frontends.py
+index 32c83a0..18acad5 100644
+--- a/frontends.py
++++ b/frontends.py
+@@ -27,12 +27,16 @@ domato started shipping more frontends, the ClusterFuzz side wanted a
+ single face for all of them so that a runner can interact with whichever
+ generator is installed without knowing which file types it produces.
+ 
+-``FuzzFrontend`` is that single face. It bundles the sample-writing
+-pipeline we know every driver needs today with the extra capabilities a
+-uniform runner may want tomorrow: knowledge about DOM elements for the
+-frontends that emit documents, knowledge about GPU shader stages for the
+-frontends that emit shader code, and a few registry hooks used by the
+-ClusterFuzz fuzzer registry to describe a generator.
++``FuzzFrontend`` is that single face. The contract is deliberately
++narrow: the base class only carries the sample-writing pipeline every
++participant needs and the registry hooks every generator can use to
++describe itself. The capability sets that only some frontends exercise
++live on the tiers that own them -- ``DocumentFuzzFrontend`` adds the DOM
++element bookkeeping for frontends that emit documents, and
++``ShaderFuzzFrontend`` adds the shader stage / entrypoint / binding
++analysis for frontends that emit shader code -- so each participant is
++only asked to provide capabilities its samples can meaningfully
++support.
+ """
+ 
+ from __future__ import print_function
+@@ -45,10 +49,13 @@ class FuzzFrontend(abc.ABC):
+     """Uniform contract implemented by every domato generator frontend.
+ 
+     A frontend owns the complete path from template and grammar files to
+-    written testcase files. The contract covers the shared sample
+-    pipeline, the document (DOM) capabilities, the shader capabilities
+-    and the ClusterFuzz registry hooks so that any frontend can be
+-    driven through one interface.
++    written testcase files. The base contract covers only the shared
++    sample pipeline (which is concrete so every driver gets it once) and
++    the registry hooks a generator uses to describe itself. Capabilities
++    that not every frontend can support are pushed down to the
++    ``DocumentFuzzFrontend`` and ``ShaderFuzzFrontend`` tiers, so a
++    concrete frontend is never asked to implement a capability its
++    samples would not exercise.
+     """
+ 
+     def __init__(self, grammar_dir=None, template_name=None):
+@@ -60,9 +67,8 @@ class FuzzFrontend(abc.ABC):
+     # Shared sample pipeline.
+     # ------------------------------------------------------------------
+ 
+-    @abc.abstractmethod
+     def load_template_file(self, template_path=None):
+-        """Loads the template file used to render samples.
++        """Loads the frontend's template file into memory.
+ 
+         Args:
+           template_path: Path of the template file. If None, the path is
+@@ -71,6 +77,44 @@ class FuzzFrontend(abc.ABC):
+         Returns:
+           A string containing the template contents.
+         """
++        path = template_path
++        if path is None:
++            path = os.path.join(self.grammar_dir, self.template_name)
++        f = open(path)
++        template = f.read()
++        f.close()
++        self.template_text = template
++        return template
++
++    def write_samples(self, outfiles):
++        """Renders and writes a batch of testcase files.
++
++        Args:
++          outfiles: A list of output filenames.
++        """
++        template = self.template_text
++        if template is None:
++            template = self.load_template_file()
++
++        grammars = self.load_grammars()
++        if not grammars:
++            return
++
++        for outfile in outfiles:
++            result = self.generate_new_sample(template, *grammars)
++
++            if result is not None:
++                print('Writing a sample to ' + outfile)
++                self._write_outfile(outfile, result)
++
++    def _write_outfile(self, outfile, result):
++        """Writes one rendered sample to disk."""
++        try:
++            f = open(outfile, 'w')
++            f.write(result)
++            f.close()
++        except IOError:
++            print('Error writing to output')
+ 
+     @abc.abstractmethod
+     def load_grammars(self):
+@@ -88,189 +132,117 @@ class FuzzFrontend(abc.ABC):
+     def generate_new_sample(self, template, *grammars):
+         """Renders a single testcase from a template and grammars."""
+ 
+-    @abc.abstractmethod
+-    def write_samples(self, outfiles):
+-        """Renders and writes a batch of testcase files.
+-
+-        Args:
+-          outfiles: A list of output filenames.
+-        """
+-
+     # ------------------------------------------------------------------
+-    # Document (DOM) capabilities.
++    # ClusterFuzz registry hooks.
+     # ------------------------------------------------------------------
+ 
+     @abc.abstractmethod
+-    def prepare_html_context(self):
+-        """Creates the element variable bookkeeping for DOM samples."""
+-
+-    @abc.abstractmethod
+-    def annotate_document_ids(self, html_string, html_context):
+-        """Inserts stable element ids into a generated DOM tree.
++    def describe_grammar_stats(self, grammar):
++        """Returns a JSON-able summary of a parsed grammar.
+ 
+         Args:
+-          html_string: The generated HTML fragment.
+-          html_context: The element variable bookkeeping.
++          grammar: The grammar to describe.
+ 
+         Returns:
+-          The annotated HTML fragment.
++          A dictionary with rule and creator totals.
+         """
+ 
+     @abc.abstractmethod
+-    def spawn_document_elements(self, count, html_context):
+-        """Emits element constructor lines into the bookkeeping."""
+-
+-    # ------------------------------------------------------------------
+-    # Shader capabilities.
+-    # ------------------------------------------------------------------
+-
+-    @abc.abstractmethod
+-    def extract_shader_stages(self, code):
+-        """Extracts (stage, function) pairs from a shader source."""
+-
+-    @abc.abstractmethod
+-    def collect_shader_entrypoints(self, sources):
+-        """Formats grammar rules for the entrypoints of loaded shaders."""
+-
+-    @abc.abstractmethod
+-    def collect_shader_bindings(self, sources):
+-        """Formats grammar rules for the bindings of loaded shaders."""
++    def supports_language(self, language):
++        """Reports whether the frontend emits a given target language.
+ 
+-    # ------------------------------------------------------------------
+-    # ClusterFuzz registry hooks.
+-    # ------------------------------------------------------------------
++        Args:
++          language: The name of the language, e.g. 'js'.
++        """
+ 
+     @abc.abstractmethod
+-    def describe_grammar_stats(self, grammar):
+-        """Returns a JSON-able summary of a parsed grammar."""
++    def emit_probe_snippet(self, language):
++        """Returns a small probe snippet used to smoke-test a frontend.
+ 
+-    @abc.abstractmethod
+-    def supports_language(self, language):
+-        """Reports whether the frontend emits a given target language."""
++        Args:
++          language: The language the probe snippet is emitted for.
+ 
+-    @abc.abstractmethod
+-    def emit_probe_snippet(self, language):
+-        """Returns a small probe snippet used to smoke-test a frontend."""
++        Returns:
++          A string containing a tiny language sample, or None.
++        """
+ 
+ 
+ class DocumentFuzzFrontend(FuzzFrontend):
+     """Base class for frontends whose samples are DOM documents.
+ 
+-    Provides the template bookkeeping and the sample writing loop that
+-    is shared by every document-oriented frontend, so concrete
+-    frontends only provide their grammar and rendering specifics.
++    Adds the narrowed DOM capability -- the element variable bookkeeping
++    a document frontend threads through its rendering loop -- on top of
++    the shared sample pipeline. Concrete document frontends provide
++    their grammar, rendering and DOM bookkeeping specifics; nothing here
++    forces them to also reason about shader code they never emit.
+     """
+ 
+-    def __init__(self, grammar_dir=None, template_name=None):
+-        super(DocumentFuzzFrontend, self).__init__(grammar_dir, template_name)
++    @abc.abstractmethod
++    def prepare_html_context(self):
++        """Creates the element variable bookkeeping for DOM samples."""
+ 
+-    def load_template_file(self, template_path=None):
+-        """Loads the frontend's template file into memory.
++    @abc.abstractmethod
++    def annotate_document_ids(self, html_string, html_context):
++        """Inserts stable element ids into a generated DOM tree.
+ 
+         Args:
+-          template_path: Path of the template file. If None, the path is
+-              derived from the frontend's grammar directory.
++          html_string: The generated HTML fragment.
++          html_context: The element variable bookkeeping.
+ 
+         Returns:
+-          A string containing the template contents.
+-        """
+-        path = template_path
+-        if path is None:
+-            path = os.path.join(self.grammar_dir, self.template_name)
+-        f = open(path)
+-        template = f.read()
+-        f.close()
+-        self.template_text = template
+-        return template
+-
+-    def write_samples(self, outfiles):
+-        """Renders and writes a batch of testcase files.
+-
+-        Args:
+-          outfiles: A list of output filenames.
++          The annotated HTML fragment.
+         """
+-        template = self.template_text
+-        if template is None:
+-            template = self.load_template_file()
+-
+-        grammars = self.load_grammars()
+-        if not grammars:
+-            return
+-
+-        for outfile in outfiles:
+-            result = self.generate_new_sample(template, *grammars)
+-
+-            if result is not None:
+-                print('Writing a sample to ' + outfile)
+-                self._write_outfile(outfile, result)
+ 
+-    def _write_outfile(self, outfile, result):
+-        """Writes one rendered sample to disk."""
+-        try:
+-            f = open(outfile, 'w')
+-            f.write(result)
+-            f.close()
+-        except IOError:
+-            print('Error writing to output')
++    @abc.abstractmethod
++    def spawn_document_elements(self, count, html_context):
++        """Emits element constructor lines into the bookkeeping."""
+ 
+ 
+ class ShaderFuzzFrontend(FuzzFrontend):
+     """Base class for frontends that render GPU shader pipelines.
+ 
+-    Mirrors the document frontend's writing loop, and additionally
+-    keeps track of the shader sources a frontend loaded so that the
+-    shader analysis capabilities can be queried after generation.
++    Adds the narrowed shader capability -- extracting stages, entrypoints
++    and bindings from a shader corpus that only shader frontends load --
++    on top of the shared sample pipeline, and keeps track of the shader
++    sources a frontend loaded so the shader analysis can be queried
++    after generation. Concrete shader frontends provide their grammar and
++    rendering specifics; nothing here forces them to also keep DOM
++    element bookkeeping their samples do not address.
+     """
+ 
+     def __init__(self, grammar_dir=None, template_name=None):
+         super(ShaderFuzzFrontend, self).__init__(grammar_dir, template_name)
+         self.shader_sources = []
+ 
+-    def load_template_file(self, template_path=None):
+-        """Loads the frontend's template file into memory.
++    @abc.abstractmethod
++    def extract_shader_stages(self, code):
++        """Extracts (stage, function) pairs from a shader source.
+ 
+         Args:
+-          template_path: Path of the template file. If None, the path is
+-              derived from the frontend's grammar directory.
++          code: The shader source code.
+ 
+         Returns:
+-          A string containing the template contents.
++          A list of (stage attribute, function name) tuples.
+         """
+-        path = template_path
+-        if path is None:
+-            path = os.path.join(self.grammar_dir, self.template_name)
+-        f = open(path)
+-        template = f.read()
+-        f.close()
+-        self.template_text = template
+-        return template
+ 
+-    def write_samples(self, outfiles):
+-        """Renders and writes a batch of testcase files.
++    @abc.abstractmethod
++    def collect_shader_entrypoints(self, sources):
++        """Formats grammar rules for the entrypoints of loaded shaders.
+ 
+         Args:
+-          outfiles: A list of output filenames.
+-        """
+-        template = self.template_text
+-        if template is None:
+-            template = self.load_template_file()
++          sources: A list of shader sources.
+ 
+-        grammars = self.load_grammars()
+-        if not grammars:
+-            return
++        Returns:
++          A string of <entrypoint> grammar rules.
++        """
+ 
+-        for outfile in outfiles:
+-            result = self.generate_new_sample(template, *grammars)
++    @abc.abstractmethod
++    def collect_shader_bindings(self, sources):
++        """Formats grammar rules for the bindings of loaded shaders.
+ 
+-            if result is not None:
+-                print('Writing a sample to ' + outfile)
+-                self._write_outfile(outfile, result)
++        Args:
++          sources: A list of shader sources.
+ 
+-    def _write_outfile(self, outfile, result):
+-        """Writes one rendered sample to disk."""
+-        try:
+-            f = open(outfile, 'w')
+-            f.write(result)
+-            f.close()
+-        except IOError:
+-            print('Error writing to output')
++        Returns:
++          A string of <BindInt> grammar rules.
++        """
+diff --git a/generator.py b/generator.py
+index e8d9f27..d144ae9 100755
+--- a/generator.py
++++ b/generator.py
+@@ -317,55 +317,6 @@ class DomatoFuzzFrontend(DocumentFuzzFrontend):
+ 
+         return result
+ 
+-    def extract_shader_stages(self, code):
+-        """Extracts (stage, function) pairs from a shader source.
+-
+-        Args:
+-          code: The shader source code.
+-
+-        Returns:
+-          A list of (stage attribute, function name) tuples.
+-        """
+-        pattern = (r'@(?:compute|vertex|fragment)'
+-                   r'(?:\s+@[^(\n]+(?:\([^)]*\))?)*\s*(?:\n\s*)?fn\s+(\w+)')
+-        stages = []
+-        for match in re.finditer(pattern, code):
+-            stage_attr = re.search(
+-                r'@(compute|vertex|fragment)', match.group(0)).group(0)
+-            stages.append((stage_attr, match.group(1)))
+-        return stages
+-
+-    def collect_shader_entrypoints(self, sources):
+-        """Formats grammar rules for the entrypoints of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <entrypoint> grammar rules.
+-        """
+-        entrypoints = []
+-        for shader in sources:
+-            for _, fn in self.extract_shader_stages(shader):
+-                entrypoints.append(fn)
+-        return ''.join('<entrypoint> = "%s"\n' % ep for ep in entrypoints)
+-
+-    def collect_shader_bindings(self, sources):
+-        """Formats grammar rules for the bindings of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <BindInt> grammar rules.
+-        """
+-        binding_pattern = r'@binding\((\d+)\)'
+-        numbers = []
+-        for shader in sources:
+-            numbers.extend(
+-                match.group(1) for match in re.finditer(binding_pattern, shader))
+-        return '\n'.join('<BindInt> = %s' % n for n in numbers)
+-
+     def describe_grammar_stats(self, grammar):
+         """Returns a JSON-able summary of a parsed grammar.
+ 
+diff --git a/jscript/generator.py b/jscript/generator.py
+index d56534e..fea51f6 100755
+--- a/jscript/generator.py
++++ b/jscript/generator.py
+@@ -194,64 +194,6 @@ class JScriptFuzzFrontend(DocumentFuzzFrontend):
+         for i in range(count):
+             html_context['elements'].append('htmlvar%05d' % (i + 1))
+ 
+-    def extract_shader_stages(self, code):
+-        """Extracts (stage, function) pairs from a shader source.
+-
+-        JavaScript samples drive DOM and WebGL code from the same
+-        <jsfuzzer> block, so the analysis looks for the WebGL stage
+-        pragmas a sample may embed.
+-
+-        Args:
+-          code: The shader source code.
+-
+-        Returns:
+-          A list of (stage attribute, function name) tuples.
+-        """
+-        stages = []
+-        for match in re.finditer(
+-                r'gl\.(VERTEX|FRAGMENT)_SHADER',
+-                code):
+-            stages.append((match.group(0), 'main'))
+-        return stages
+-
+-    def collect_shader_entrypoints(self, sources):
+-        """Formats grammar rules for the entrypoints of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <entrypoint> grammar rules.
+-        """
+-        entrypoints = []
+-        for shader in sources:
+-            for _, fn in self.extract_shader_stages(shader):
+-                entrypoints.append(fn)
+-        entries = []
+-        for ep in entrypoints:
+-            entries.append('<entrypoint> = "%s"' % ep)
+-        return '\n'.join(entries)
+-
+-    def collect_shader_bindings(self, sources):
+-        """Formats grammar rules for the bindings of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <BindInt> grammar rules.
+-        """
+-        numbers = []
+-        for shader in sources:
+-            for match in re.finditer(
+-                    r'gl\.getAttribLocation\([^,]+,\s*[^)]+\)',
+-                    shader):
+-                numbers.append(str(len(numbers)))
+-        bindings = []
+-        for n in numbers:
+-            bindings.append('<BindInt> = %s' % n)
+-        return '\n'.join(bindings)
+-
+     def describe_grammar_stats(self, grammar):
+         """Returns a JSON-able summary of a parsed grammar.
+ 
+diff --git a/php/generator.py b/php/generator.py
+index af3ecaa..a609a48 100755
+--- a/php/generator.py
++++ b/php/generator.py
+@@ -181,61 +181,6 @@ class PhpFuzzFrontend(DocumentFuzzFrontend):
+             html_context['elements'].append(
+                 '$htmlvar%05d = new DOMElement();' % (i + 1))
+ 
+-    def extract_shader_stages(self, code):
+-        """Extracts (stage, function) pairs from a shader source.
+-
+-        PHP samples may embed WebGL shaders inside heredoc blocks, so
+-        the analysis looks for the stage attributes a shader declares.
+-
+-        Args:
+-          code: The shader source code.
+-
+-        Returns:
+-          A list of (stage attribute, function name) tuples.
+-        """
+-        stages = []
+-        for match in re.finditer(
+-                r'@\((compute|vertex|fragment)\)\s*function\s+(\w+)',
+-                code):
+-            stages.append(('@' + match.group(1), match.group(2)))
+-        return stages
+-
+-    def collect_shader_entrypoints(self, sources):
+-        """Formats grammar rules for the entrypoints of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <entrypoint> grammar rules.
+-        """
+-        entrypoints = []
+-        for shader in sources:
+-            for _, fn in self.extract_shader_stages(shader):
+-                entrypoints.append(fn)
+-        entries = []
+-        for ep in entrypoints:
+-            entries.append('<entrypoint> = "%s"' % ep)
+-        return '\n'.join(entries)
+-
+-    def collect_shader_bindings(self, sources):
+-        """Formats grammar rules for the bindings of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <BindInt> grammar rules.
+-        """
+-        numbers = []
+-        for shader in sources:
+-            for match in re.finditer(r'binding\s*=\s*([0-9]+)', shader):
+-                numbers.append(match.group(1))
+-        bindings = []
+-        for n in numbers:
+-            bindings.append('<BindInt> = %s' % n)
+-        return '\n'.join(bindings)
+-
+     def describe_grammar_stats(self, grammar):
+         """Returns a JSON-able summary of a parsed grammar.
+ 
+diff --git a/vbscript/generator.py b/vbscript/generator.py
+index 90fe8e2..a2ccb99 100755
+--- a/vbscript/generator.py
++++ b/vbscript/generator.py
+@@ -187,64 +187,6 @@ class VbScriptFuzzFrontend(DocumentFuzzFrontend):
+             html_context['ElementLines'].append(
+                 'Dim htmlvar%05d' % (i + 1))
+ 
+-    def extract_shader_stages(self, code):
+-        """Extracts (stage, function) pairs from a shader source.
+-
+-        VBScript samples can script the WebGL context through COM
+-        interop bindings, so the analysis reports the stage attributes
+-        of any embedded shader strings.
+-
+-        Args:
+-          code: The shader source code.
+-
+-        Returns:
+-          A list of (stage attribute, function name) tuples.
+-        """
+-        stages = []
+-        for match in re.finditer(
+-                r'(Vertex|Fragment)Shader\s*=\s*"?([\w.]*)',
+-                code):
+-            stages.append((match.group(1).lower(), match.group(2)))
+-        return stages
+-
+-    def collect_shader_entrypoints(self, sources):
+-        """Formats grammar rules for the entrypoints of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <entrypoint> grammar rules.
+-        """
+-        entrypoints = []
+-        for shader in sources:
+-            for _, fn in self.extract_shader_stages(shader):
+-                entrypoints.append(fn)
+-        entries = []
+-        for ep in entrypoints:
+-            entries.append('<entrypoint> = "%s"' % ep)
+-        return '\n'.join(entries)
+-
+-    def collect_shader_bindings(self, sources):
+-        """Formats grammar rules for the bindings of loaded shaders.
+-
+-        Args:
+-          sources: A list of shader sources.
+-
+-        Returns:
+-          A string of <BindInt> grammar rules.
+-        """
+-        numbers = []
+-        for shader in sources:
+-            for match in re.finditer(
+-                    r'GetUniformLocation\([^,]+,\s*([0-9]+)\)',
+-                    shader):
+-                numbers.append(match.group(1))
+-        bindings = []
+-        for n in numbers:
+-            bindings.append('<BindInt> = %s' % n)
+-        return '\n'.join(bindings)
+-
+     def describe_grammar_stats(self, grammar):
+         """Returns a JSON-able summary of a parsed grammar.
+ 
+diff --git a/webgl/generator.py b/webgl/generator.py
+index 516cf0e..347d3a5 100644
+--- a/webgl/generator.py
++++ b/webgl/generator.py
+@@ -214,42 +214,6 @@ class WebGLFuzzFrontend(ShaderFuzzFrontend):
+                 numbers.append(match.group(1))
+         return '\n'.join('<BindInt> = %s' % n for n in numbers)
+ 
+-    def prepare_html_context(self):
+-        """Creates the element variable bookkeeping for DOM samples.
+-
+-        WebGL samples draw into a single canvas element, so the
+-        bookkeeping only registers that element.
+-        """
+-        return {'canvas_id': 'htmlvar00001', 'element_ids': []}
+-
+-    def annotate_document_ids(self, html_string, html_context):
+-        """Inserts stable element ids into a generated DOM tree.
+-
+-        Args:
+-          html_string: The generated HTML fragment.
+-          html_context: The element variable bookkeeping.
+-
+-        Returns:
+-          The annotated HTML fragment.
+-        """
+-        annotated = html_string
+-        for match in re.finditer(r'<canvas([^>]*)>', html_string):
+-            if 'id=' not in match.group(1):
+-                annotated = annotated.replace(
+-                    match.group(0),
+-                    match.group(0).replace(
+-                        '<canvas',
+-                        '<canvas id="%s" ' % html_context['canvas_id'],
+-                        1),
+-                    1)
+-        return annotated
+-
+-    def spawn_document_elements(self, count, html_context):
+-        """Emits element constructor lines into the bookkeeping."""
+-        html_context.setdefault('element_ids', [])
+-        for i in range(count):
+-            html_context['element_ids'].append('htmlvar%05d' % (i + 1))
+-
+     def describe_grammar_stats(self, grammar):
+         """Returns a JSON-able summary of a parsed grammar.
+ 
+diff --git a/webgpu/generator.py b/webgpu/generator.py
+index 30a2ba7..753e4d9 100644
+--- a/webgpu/generator.py
++++ b/webgpu/generator.py
+@@ -243,36 +243,6 @@ class WebGpuFuzzFrontend(ShaderFuzzFrontend):
+         """
+         return parse_bindings(sources)
+ 
+-    def prepare_html_context(self):
+-        """Creates the element variable bookkeeping for DOM samples.
+-
+-        WebGPU samples render into a canvas element configured by the
+-        template, so the bookkeeping tracks that element first.
+-        """
+-        return {'canvas_id': 'htmlvar00001', 'element_ids': []}
+-
+-    def annotate_document_ids(self, html_string, html_context):
+-        """Inserts stable element ids into a generated DOM tree.
+-
+-        Args:
+-          html_string: The generated HTML fragment.
+-          html_context: The element variable bookkeeping.
+-
+-        Returns:
+-          The annotated HTML fragment.
+-        """
+-        for match in re.finditer(r'<([a-zA-Z0-9_-]+) ', html_string):
+-            if match.group(1) not in html_context['element_ids']:
+-                html_context['element_ids'].append(match.group(1))
+-        return html_string
+-
+-    def spawn_document_elements(self, count, html_context):
+-        """Emits element constructor lines into the bookkeeping."""
+-        html_context.setdefault('element_lines', [])
+-        for i in range(count):
+-            html_context['element_lines'].append(
+-                '/* htmlvar%05d */' % (i + 1))
+-
+     def describe_grammar_stats(self, grammar):
+         """Returns a JSON-able summary of a parsed grammar.
+ 

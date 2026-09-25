@@ -1,0 +1,128 @@
+diff --git a/autotune.go b/autotune.go
+index b160f1a..5491bb1 100644
+--- a/autotune.go
++++ b/autotune.go
+@@ -24,8 +24,6 @@ package kcp
+ 
+ import (
+ 	"sort"
+-
+-	"github.com/klauspost/reedsolomon"
+ )
+ 
+ const maxAutoTuneSamples = 258 // 256 + 2 extra samples for edge detection
+@@ -157,43 +155,3 @@ func (tune *autoTune) FindPeriod(bit bool) int {
+ 
+ 	return rightEdge - leftEdge
+ }
+-
+-// retune reconfigures a decoder with the shard parameters detected so far.
+-//
+-// The periods learned from the sampled signal give the data/parity shard
+-// counts; when both are detected and valid, the decoder's FEC parameters,
+-// caches and codec are rebuilt to match, and the tuning request is cleared.
+-// A decoder whose current parameters already match the detection is only
+-// unblocked.
+-func (tune *autoTune) retune(dec *fecDecoder) {
+-	autoDS := tune.FindPeriod(true)  // detect data shard period
+-	autoPS := tune.FindPeriod(false) // detect parity shard period
+-
+-	// validate the auto-tuned parameters
+-	if autoDS > 0 && autoPS > 0 && autoDS+autoPS < 256 {
+-		if autoDS != dec.dataShards || autoPS != dec.parityShards {
+-			// apply the new FEC parameters
+-			dec.dataShards = autoDS
+-			dec.parityShards = autoPS
+-			dec.shardSize = autoDS + autoPS
+-			// recycle old shards before creating new shardSet
+-			for _, shard := range dec.shardSet {
+-				for _, pkt := range shard.elements {
+-					defaultBufferPool.Put(pkt)
+-				}
+-			}
+-			dec.shardSet = make(map[uint32]*shardHeap) // empty the shard set
+-			codec, err := reedsolomon.New(autoDS, autoPS)
+-			if err != nil {
+-				return
+-			}
+-			dec.codec = codec
+-			dec.decodeCache = make([][]byte, dec.shardSize)
+-			dec.flagCache = make([]bool, dec.shardSize)
+-			dec.paws = 0xffffffff / uint32(dec.shardSize) * uint32(dec.shardSize)
+-		}
+-		// reset shouldTune flag regardless of whether parameters changed
+-		// to avoid permanent blocking when detected parameters match current ones
+-		dec.shouldTune = false
+-	}
+-}
+diff --git a/fec.go b/fec.go
+index 8ad5f8c..7224bcc 100644
+--- a/fec.go
++++ b/fec.go
+@@ -157,6 +157,50 @@ func newFECDecoder(dataShards, parityShards int) *fecDecoder {
+ 	return dec
+ }
+ 
++// retune reconfigures the decoder to the FEC shard parameters the embedded
++// autoTune signal analyzer has detected from the recent stream. It runs when a
++// packet-type mismatch (shouldTune) indicates the peer changed its FEC
++// configuration and the decoder must adapt.
++//
++// The autoTune detector is a pure signal analyzer: it samples the stream and
++// reports the data/parity pulse periods via FindPeriod. This decoder owns its
++// own geometry, caches and codec, so applying the detected periods and clearing
++// the tuning request happens here. When the detected pair is valid and differs
++// from the current parameters, the FEC parameters and caches are rebuilt; a
++// decoder already matching the detection is merely unblocked.
++func (dec *fecDecoder) retune() {
++	autoDS := dec.autoTune.FindPeriod(true)  // detect data shard period
++	autoPS := dec.autoTune.FindPeriod(false) // detect parity shard period
++
++	// validate the auto-tuned parameters
++	if autoDS > 0 && autoPS > 0 && autoDS+autoPS < 256 {
++		if autoDS != dec.dataShards || autoPS != dec.parityShards {
++			// apply the new FEC parameters
++			dec.dataShards = autoDS
++			dec.parityShards = autoPS
++			dec.shardSize = autoDS + autoPS
++			// recycle old shards before creating new shardSet
++			for _, shard := range dec.shardSet {
++				for _, pkt := range shard.elements {
++					defaultBufferPool.Put(pkt)
++				}
++			}
++			dec.shardSet = make(map[uint32]*shardHeap) // empty the shard set
++			codec, err := reedsolomon.New(autoDS, autoPS)
++			if err != nil {
++				return
++			}
++			dec.codec = codec
++			dec.decodeCache = make([][]byte, dec.shardSize)
++			dec.flagCache = make([]bool, dec.shardSize)
++			dec.paws = 0xffffffff / uint32(dec.shardSize) * uint32(dec.shardSize)
++		}
++		// reset shouldTune flag regardless of whether parameters changed
++		// to avoid permanent blocking when detected parameters match current ones
++		dec.shouldTune = false
++	}
++}
++
+ // decode a fec packet
+ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
+ 	// Sample the packet type for auto-tuning
+@@ -183,11 +227,11 @@ func (dec *fecDecoder) decode(in fecPacket) (recovered [][]byte) {
+ 	}
+ 
+ 	// perform auto-tuning if the decoder detects packet type mismatches.
+-	// This means the peer has changed FEC parameters and we must adapt.
+-	// The adaptation procedure belongs to the tuner: from the parameters it
+-	// has learned it reconfigures this decoder in one step.
++	// This means the peer has changed FEC parameters and we must adapt:
++	// the embedded analyzer reports the data/parity periods it observed, and
++	// this decoder reconfigures itself to match in one step.
+ 	if dec.shouldTune {
+-		dec.autoTune.retune(dec)
++		dec.retune()
+ 		return nil
+ 	}
+ 

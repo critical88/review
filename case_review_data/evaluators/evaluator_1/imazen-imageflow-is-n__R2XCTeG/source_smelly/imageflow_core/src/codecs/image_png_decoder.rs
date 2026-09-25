@@ -1,0 +1,234 @@
+use std::io::Read;
+
+use crate::codecs::Decoder;
+use crate::graphics::bitmaps::{BitmapCompositing, BitmapKey, ColorSpace};
+use crate::io::IoProxy;
+use crate::{Context, ErrorKind, FlowError, Result};
+use imageflow_helpers::preludes::from_std::*;
+use imageflow_types as s;
+//use crate::for_other_imageflow_crates::preludes::external_without_std::*;
+use crate::codecs::source_profile::SourceProfile;
+use rgb::alt::BGRA8;
+
+pub struct ImagePngDecoder {
+    reader: png::Reader<IoProxy>,
+    info: png::Info<'static>,
+    ignore_color_profile: bool,
+    ignore_color_profile_errors: bool,
+    honor_gama_chrm: bool,
+    honor_gama_only: bool,
+}
+
+impl ImagePngDecoder {
+    pub fn create(c: &Context, io: IoProxy, io_id: i32) -> Result<ImagePngDecoder> {
+        let mut decoder = png::Decoder::new(io);
+        decoder.set_transformations(png::Transformations::normalize_to_color8());
+
+        let reader = decoder.read_info().map_err(|e| FlowError::from_png_decoder(e).at(here!()))?;
+
+        let info = reader.info().clone();
+
+        // Validate dimensions against security limits BEFORE any decode allocation
+        let w = info.width;
+        let h = info.height;
+        let limit = c.security.max_decode_size.as_ref().or(c.security.max_frame_size.as_ref());
+        if let Some(limit) = limit {
+            if w > limit.w {
+                return Err(nerror!(
+                    ErrorKind::SizeLimitExceeded,
+                    "PNG width {} exceeds max_decode_size.w {}",
+                    w,
+                    limit.w
+                ));
+            }
+            if h > limit.h {
+                return Err(nerror!(
+                    ErrorKind::SizeLimitExceeded,
+                    "PNG height {} exceeds max_decode_size.h {}",
+                    h,
+                    limit.h
+                ));
+            }
+            let megapixels = w as f32 * h as f32 / 1_000_000f32;
+            if megapixels > limit.megapixels {
+                return Err(nerror!(
+                    ErrorKind::SizeLimitExceeded,
+                    "PNG megapixels {:.2} exceeds max_decode_size.megapixels {}",
+                    megapixels,
+                    limit.megapixels
+                ));
+            }
+        }
+
+        Ok(ImagePngDecoder {
+            reader,
+            info,
+            ignore_color_profile: false,
+            ignore_color_profile_errors: false,
+            honor_gama_chrm: true,
+            honor_gama_only: false,
+        })
+    }
+}
+impl Decoder for ImagePngDecoder {
+    fn initialize(&mut self, c: &Context) -> Result<()> {
+        Ok(())
+    }
+
+    fn get_unscaled_image_info(&mut self, c: &Context) -> Result<s::ImageInfo> {
+        Ok(s::ImageInfo {
+            frame_decodes_into: s::PixelFormat::Bgra32,
+            image_width: self.info.width as i32,
+            image_height: self.info.height as i32,
+            preferred_mime_type: "image/png".to_owned(),
+            preferred_extension: "png".to_owned(),
+            lossless: true,
+            multiple_frames: false,
+        })
+    }
+
+    fn get_scaled_image_info(&mut self, c: &Context) -> Result<s::ImageInfo> {
+        self.get_unscaled_image_info(c)
+    }
+
+    fn get_exif_rotation_flag(&mut self, c: &Context) -> Result<Option<i32>> {
+        Ok(None)
+    }
+
+    fn tell_decoder(&mut self, c: &Context, tell: s::DecoderCommand) -> Result<()> {
+        match tell {
+            s::DecoderCommand::DiscardColorProfile => self.ignore_color_profile = true,
+            s::DecoderCommand::IgnoreColorProfileErrors => {
+                self.ignore_color_profile_errors = true;
+            }
+            s::DecoderCommand::HonorGamaChrm(v) => self.honor_gama_chrm = v,
+            s::DecoderCommand::HonorGamaOnly(v) => self.honor_gama_only = v,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn read_frame(&mut self, c: &Context) -> Result<BitmapKey> {
+        return_if_cancelled!(c);
+
+        let mut bitmaps = c.borrow_bitmaps_mut().map_err(|e| e.at(here!()))?;
+        let info = self.reader.info();
+
+        let canvas_key = bitmaps
+            .create_bitmap_u8(
+                info.width,
+                info.height,
+                imageflow_types::PixelLayout::BGRA,
+                false,
+                true,
+                ColorSpace::StandardRGB,
+                BitmapCompositing::ReplaceSelf,
+            )
+            .map_err(|e| e.at(here!()))?;
+
+        let mut bitmap = bitmaps.try_borrow_mut(canvas_key).map_err(|e| e.at(here!()))?;
+
+        let mut canvas = bitmap.get_window_u8().unwrap();
+
+        return_if_cancelled!(c);
+
+        let buffer_size = self.reader.output_buffer_size().ok_or_else(|| {
+            nerror!(ErrorKind::ImageDecodingError, "PNG output buffer size unknown")
+        })?;
+        let mut buffer = vec![0; buffer_size];
+        let output_info = self
+            .reader
+            .next_frame(&mut buffer)
+            .map_err(|e| FlowError::from_png_decoder(e).at(here!()))?;
+
+        return_if_cancelled!(c);
+
+        let h = output_info.height as usize;
+        let stride = output_info.line_size;
+        let w = output_info.width as usize;
+        if output_info.bit_depth != png::BitDepth::Eight {
+            return Err(nerror!(
+                ErrorKind::ImageDecodingError,
+                "image/png decoder did not expand to 8-bit channels"
+            )
+            .at(here!()));
+        }
+        match output_info.color_type {
+            png::ColorType::Rgb => {
+                for row_ix in 0..h {
+                    let src = &buffer[row_ix * stride..row_ix * stride + w * 3];
+                    let dst = bytemuck::cast_slice_mut::<BGRA8, u8>(
+                        canvas.row_mut_bgra(row_ix as u32).unwrap(),
+                    );
+                    crate::graphics::swizzle::rgb_to_bgra(src, dst);
+                }
+            }
+            png::ColorType::Rgba => {
+                for row_ix in 0..h {
+                    let src = &buffer[row_ix * stride..row_ix * stride + w * 4];
+                    let dst = bytemuck::cast_slice_mut::<BGRA8, u8>(
+                        canvas.row_mut_bgra(row_ix as u32).unwrap(),
+                    );
+                    crate::graphics::swizzle::copy_swap_br(src, dst);
+                }
+            }
+            png::ColorType::Grayscale => {
+                for row_ix in 0..h {
+                    let src = &buffer[row_ix * stride..row_ix * stride + w];
+                    let dst = bytemuck::cast_slice_mut::<BGRA8, u8>(
+                        canvas.row_mut_bgra(row_ix as u32).unwrap(),
+                    );
+                    crate::graphics::swizzle::gray_to_bgra(src, dst);
+                }
+            }
+            png::ColorType::GrayscaleAlpha => {
+                for row_ix in 0..h {
+                    let src = &buffer[row_ix * stride..row_ix * stride + w * 2];
+                    let dst = bytemuck::cast_slice_mut::<BGRA8, u8>(
+                        canvas.row_mut_bgra(row_ix as u32).unwrap(),
+                    );
+                    crate::graphics::swizzle::gray_alpha_to_bgra(src, dst);
+                }
+            }
+            _ => panic!("png decoder bug: indexed image was not expanded despite flags."),
+        }
+
+        // Apply color profile transform via unified CMS dispatch
+        if !self.ignore_color_profile {
+            let mut profile = SourceProfile::from_png_info(&self.info, self.honor_gama_only);
+            if !self.honor_gama_chrm {
+                profile = profile.without_gama_chrm();
+            }
+            if !profile.is_srgb() {
+                let result = crate::codecs::cms::transform_to_srgb(&mut canvas, &profile);
+                if let Err(e) = result
+                    && !self.ignore_color_profile_errors
+                {
+                    return Err(e.at(here!()));
+                }
+            }
+        }
+
+        Ok(canvas_key)
+    }
+
+    fn has_more_frames(&mut self) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self as &dyn std::any::Any
+    }
+    fn last_frame_delay(&mut self) -> Result<Option<u16>> {
+        // Still-image decoder; no frame pacing metadata exists
+        Ok(None)
+    }
+    fn get_loop_count(&mut self) -> Result<Option<u32>> {
+        // Single-image format; looping does not apply
+        Ok(None)
+    }
+    fn estimate_decode_resources(&mut self, w: u32, h: u32) -> Result<Option<(u64, u64)>> {
+        // The png backend does not expose a memory model
+        Ok(None)
+    }
+}

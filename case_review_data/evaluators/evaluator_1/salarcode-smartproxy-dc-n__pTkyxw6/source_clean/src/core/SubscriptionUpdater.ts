@@ -1,0 +1,510 @@
+/*
+ * This file is part of SmartProxy <https://github.com/salarcode/SmartProxy>,
+ * Copyright (C) 2022 Salar Khalilzadeh <salar2k@gmail.com>
+ *
+ * SmartProxy is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 3 as
+ * published by the Free Software Foundation.
+ *
+ * SmartProxy is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with SmartProxy.  If not, see <http://www.gnu.org/licenses/>.
+ */
+import { Debug, DiagDebug } from "../lib/Debug";
+import { Settings } from "./Settings";
+import { ProxyImporter } from "../lib/ProxyImporter";
+import { SettingsOperation } from "./SettingsOperation";
+import { RuleImporter } from "../lib/RuleImporter";
+import { ProxyEngine } from "./ProxyEngine";
+import { ImportedProxyRule, ProxyRulesSubscription, ProxyServer, SubscriptionStats } from "./definitions";
+import { Utils } from "../lib/Utils";
+import { PolyFill } from "../lib/PolyFill";
+import { CountryCode } from "../lib/CountryCode";
+
+export class SubscriptionUpdater {
+	private static serverSubscriptionTimers: SubscriptionTimerType[] = [{ timerId: null, subscriptionId: null, refreshRate: null }];
+	private static rulesSubscriptionTimers: SubscriptionTimerType[] = [{ timerId: null, subscriptionId: null, refreshRate: null }];
+
+	public static async reloadEmptyServerSubscriptions() {
+		/// Read subscriptions that are enabled but have no proxy
+		/// This method is async to prevent unnecessary blocking
+
+		for (let subscription of Settings.current.proxyServerSubscriptions) {
+			if (!subscription.enabled)
+				continue;
+
+			// ignore if already have proxies
+			if (subscription.proxies != null && subscription.proxies.length)
+				continue;
+
+			SubscriptionUpdater.readServerSubscription(subscription.name);
+		}
+	}
+
+	public static setServerSubscriptionsRefreshTimers() {
+		// -------------------------
+		// Proxy Server Subscriptions
+		let serverExistingNames: string[] = [];
+		for (let subscription of Settings.current.proxyServerSubscriptions) {
+			DiagDebug?.trace("updateServerSubscriptions", `enabled:` + subscription.enabled, 'refreshRate:' + subscription.refreshRate);
+
+			// if disabled or refresh is not requested
+			if (!subscription.enabled || !(subscription.refreshRate > 0)) {
+				let existingTimerInfo = SubscriptionUpdater.getServerSubscriptionIdTimer(subscription.name);
+				if (existingTimerInfo?.timer) {
+					clearInterval(existingTimerInfo.timer.timerId);
+
+					// remove from array
+					SubscriptionUpdater.serverSubscriptionTimers.splice(existingTimerInfo.index, 1);
+				}
+				continue;
+			}
+
+			// it should be active, don't remove it
+			serverExistingNames.push(subscription.name);
+
+			let shouldCreate = false;
+			let serverTimerInfo = SubscriptionUpdater.getServerSubscriptionIdTimer(subscription.name);
+			if (serverTimerInfo == null) {
+				// should be created
+				shouldCreate = true;
+			} else {
+
+				// should be updated if rates are changed
+				if (serverTimerInfo.timer.refreshRate != subscription.refreshRate) {
+					shouldCreate = true;
+					clearInterval(serverTimerInfo.timer.timerId);
+
+					// remove from array
+					SubscriptionUpdater.serverSubscriptionTimers.splice(serverTimerInfo.index, 1);
+				}
+			}
+
+			if (shouldCreate) {
+				let interval = subscription.refreshRate * 60 * 1000;
+				let firstFetchTimeoutMs: number;
+
+				if (subscription.stats?.lastTryIsoDate) {
+					const timeSinceLastTry = Date.now() - (new Date(subscription.stats.lastTryIsoDate)).getTime();
+
+					firstFetchTimeoutMs = Math.max(0, interval - timeSinceLastTry);
+				} else {
+					firstFetchTimeoutMs = 0;
+				}
+
+				let timerId: NodeJS.Timeout;
+
+				if (firstFetchTimeoutMs) {
+					// This is like `setInterval`, but with an offset first invocation.
+					// And `clearInterval` also works on `setTimeout` IDs.
+					timerId = setTimeout(() => {
+						SubscriptionUpdater.readServerSubscription(subscription.name);
+
+						// Start using `setInterval` from now on.
+						const intervalId = setInterval(
+							SubscriptionUpdater.readServerSubscription,
+							interval,
+							subscription.name
+						);
+
+						// updating the reference
+						timerObj.timerId = intervalId;
+					}, firstFetchTimeoutMs);
+				}
+				else {
+
+					timerId = setInterval(
+						SubscriptionUpdater.readServerSubscription,
+						interval,
+						subscription.name
+					);
+				}
+
+				const timerObj = {
+					timerId: timerId,
+					subscriptionId: subscription.name,
+					refreshRate: subscription.refreshRate
+				}
+				SubscriptionUpdater.serverSubscriptionTimers.push(timerObj);
+			}
+		}
+		// remove the remaining timers
+		let remainingTimers = SubscriptionUpdater.serverSubscriptionTimers.filter(timer => {
+			// not used or removed. Just unregister it then remove it
+			if (serverExistingNames.indexOf(timer.subscriptionId) === -1) {
+				clearInterval(timer.timerId);
+				return false;
+			}
+
+			// it is created or updated, don't remove it
+			return true;
+		});
+		SubscriptionUpdater.serverSubscriptionTimers = remainingTimers;
+	}
+
+	private static readServerSubscription(subscriptionName: string) {
+		Debug.log("readServerSubscription", subscriptionName);
+		if (!subscriptionName)
+			return;
+
+		let subscription = Settings.current.proxyServerSubscriptions.find(item => item.name === subscriptionName);
+		if (!subscription) {
+			// the subscription is removed.
+			//remove the timer
+			let serverTimerInfo = SubscriptionUpdater.getServerSubscriptionIdTimer(subscriptionName);
+
+			if (!serverTimerInfo)
+				return;
+
+			clearInterval(serverTimerInfo.timer.timerId);
+			SubscriptionUpdater.serverSubscriptionTimers.splice(serverTimerInfo.index, 1);
+			return;
+		}
+		if (!subscription.stats) {
+			subscription.stats = new SubscriptionStats();
+		}
+
+		ProxyImporter.readFromServer(subscription,
+			function (response: {
+				success: boolean,
+				message: string,
+				result: ProxyServer[]
+			}) {
+				if (!response) return;
+
+				if (response.success) {
+					let count = response.result.length;
+
+					subscription.proxies = response.result;
+					subscription.totalCount = count;
+
+					SubscriptionStats.updateStats(subscription.stats, true);
+
+					SettingsOperation.saveProxyServerSubscriptions();
+					SettingsOperation.saveAllSync(false);
+
+					// Fire-and-forget: update country codes for proxy servers
+					SubscriptionUpdater.updateProxyServersCountryCode(subscription.proxies);
+
+				} else {
+					SubscriptionStats.updateStats(subscription.stats, false);
+					Debug.warn("Failed to read proxy server subscription: " + subscriptionName);
+				}
+			},
+			function (error: Error) {
+				SubscriptionStats.updateStats(subscription.stats, false, error);
+				Debug.warn("Failed to read proxy server subscription: " + subscriptionName, subscription, error);
+			});
+	}
+
+	public static async reloadEmptyRulesSubscriptions() {
+		/// Read subscriptions that are enabled but have no rules defined
+		/// This method is async to prevent unnecessary blocking
+
+		for (const profile of Settings.current.proxyProfiles) {
+			if (!profile.rulesSubscriptions)
+				continue;
+
+			for (const subscription of profile.rulesSubscriptions) {
+				if (!subscription.enabled)
+					continue;
+
+				// ignore if already have proxies
+				if ((subscription.proxyRules != null && subscription.proxyRules.length) ||
+					(subscription.whitelistRules != null && subscription.whitelistRules.length))
+					continue;
+
+				SubscriptionUpdater.readRulesSubscription(subscription);
+			}
+		}
+	}
+
+	public static setRulesSubscriptionsRefreshTimers() {
+		// -------------------------
+		// Proxy Rules Subscriptions
+		let ruleExistingIds: string[] = [];
+		for (const profile of Settings.current.proxyProfiles) {
+			if (!profile.rulesSubscriptions)
+				continue;
+
+			for (const subscription of profile.rulesSubscriptions) {
+
+				// if disabled or refresh is not requested
+				if (!subscription.enabled || !(subscription.refreshRate > 0)) {
+					// remove existing timers
+					let existingTimerInfo = SubscriptionUpdater.getRulesSubscriptionIdTimer(subscription.id);
+					if (existingTimerInfo?.timer) {
+						clearInterval(existingTimerInfo.timer.timerId);
+
+						// remove from array
+						SubscriptionUpdater.rulesSubscriptionTimers.splice(existingTimerInfo.index, 1);
+					}
+
+					continue;
+				}
+
+				// it should be active, don't remove it
+				ruleExistingIds.push(subscription.id);
+
+				let shouldCreate = false;
+				let ruleTimerInfo = SubscriptionUpdater.getRulesSubscriptionIdTimer(subscription.id);
+				if (ruleTimerInfo == null) {
+					// should be created
+					shouldCreate = true;
+				} else {
+
+					// should be updated if rates are changed
+					if (ruleTimerInfo.timer.refreshRate != subscription.refreshRate) {
+						shouldCreate = true;
+						clearInterval(ruleTimerInfo.timer.timerId);
+
+						// remove from array
+						SubscriptionUpdater.rulesSubscriptionTimers.splice(ruleTimerInfo.index, 1);
+					}
+				}
+
+				if (shouldCreate) {
+					let interval = subscription.refreshRate * 60 * 1000;
+					let firstFetchTimeoutMs: number;
+
+					if (subscription.stats?.lastTryIsoDate) {
+						const timeSinceLastTry = Date.now() - (new Date(subscription.stats.lastTryIsoDate)).getTime();
+
+						firstFetchTimeoutMs = Math.max(0, interval - timeSinceLastTry);
+					} else {
+						firstFetchTimeoutMs = 0;
+					}
+
+					let timerId: NodeJS.Timeout;
+
+					if (firstFetchTimeoutMs) {
+						// This is like `setInterval`, but with an offset first invocation.
+						// And `clearInterval` also works on `setTimeout` IDs.
+						timerId = setTimeout(() => {
+							SubscriptionUpdater.readRulesSubscription(subscription);
+
+							// Start using `setInterval` from now on.
+							const intervalId = setInterval(
+								SubscriptionUpdater.readRulesSubscription,
+								interval,
+								subscription
+							);
+
+							// updating the reference
+							timerObj.timerId = intervalId;
+						}, firstFetchTimeoutMs);
+					}
+					else {
+
+						timerId = setInterval(
+							SubscriptionUpdater.readRulesSubscription,
+							interval,
+							subscription
+						);
+					}
+
+					const timerObj = {
+						timerId: timerId,
+						subscriptionId: subscription.id,
+						refreshRate: subscription.refreshRate
+					}
+					SubscriptionUpdater.rulesSubscriptionTimers.push(timerObj);
+				}
+			}
+		}
+		// remove the remaining timers
+		let remainingTimers = SubscriptionUpdater.rulesSubscriptionTimers.filter(timer => {
+			// not used or removed. Just unregister it then remove it
+			if (ruleExistingIds.indexOf(timer.subscriptionId) === -1) {
+				clearInterval(timer.timerId);
+				return false;
+			}
+
+			// it is created or updated, don't remove it
+			return true;
+		});
+		SubscriptionUpdater.rulesSubscriptionTimers = remainingTimers;
+	}
+
+	private static readRulesSubscription(subscription: ProxyRulesSubscription) {
+		Debug.log("readRulesSubscription", subscription.name);
+		if (!subscription || !subscription.name)
+			return;
+
+		if (!subscription) {
+			// the subscription is removed.
+			//remove the timer
+			let rulesTimerInfo = SubscriptionUpdater.getRulesSubscriptionIdTimer(subscription.id);
+
+			if (!rulesTimerInfo)
+				return;
+
+			clearInterval(rulesTimerInfo.timer.timerId);
+			SubscriptionUpdater.rulesSubscriptionTimers.splice(rulesTimerInfo.index, 1);
+			return;
+		}
+		if (!subscription.stats) {
+			subscription.stats = new SubscriptionStats();
+		}
+
+		RuleImporter.readFromServerAndImport(subscription,
+			(importResult: {
+				success: boolean;
+				message: string;
+				rules: {
+					whiteList: ImportedProxyRule[];
+					blackList: ImportedProxyRule[];
+				};
+			}) => {
+				if (!importResult) return;
+
+				if (importResult.success) {
+
+					subscription.proxyRules = importResult.rules.blackList;
+					subscription.whitelistRules = importResult.rules.whiteList;
+					subscription.totalCount = importResult.rules.blackList.length + importResult.rules.whiteList.length;
+
+					SubscriptionStats.updateStats(subscription.stats, true);
+
+					SettingsOperation.saveProxyServerSubscriptions();
+					SettingsOperation.saveAllSync(false);
+
+					ProxyEngine.notifyProxyRulesChanged();
+
+				} else {
+					SubscriptionStats.updateStats(subscription.stats, false);
+					Debug.warn("Failed to read proxy rules subscription: " + subscription.name);
+				}
+			},
+			function (error: Error) {
+				SubscriptionStats.updateStats(subscription.stats, false, error);
+				Debug.warn("Failed to read proxy rules subscription: " + subscription.name, subscription, error);
+			});
+	}
+
+	private static _getSubscriptionIdTimer(timers: SubscriptionTimerType[], id: string)
+		: {
+			timer: SubscriptionTimerType,
+			index: number
+		} {
+		let index = timers.findIndex(timer => timer.subscriptionId === id);
+		if (index >= 0) {
+			return {
+				timer: timers[index],
+				index: index
+			};
+		}
+		return null;
+	}
+
+	private static getServerSubscriptionIdTimer(id: string)
+		: {
+			timer: SubscriptionTimerType,
+			index: number
+		} {
+		return SubscriptionUpdater._getSubscriptionIdTimer(SubscriptionUpdater.serverSubscriptionTimers, id);
+	}
+
+	private static getRulesSubscriptionIdTimer(id: string)
+		: {
+			timer: SubscriptionTimerType,
+			index: number
+		} {
+		return SubscriptionUpdater._getSubscriptionIdTimer(SubscriptionUpdater.rulesSubscriptionTimers, id);
+	}
+
+	public static async updateProxyServerSubscriptionsCountryCode(save: boolean = true) {
+		// Update country codes for all proxy server subscriptions
+		const proxyServerSubscriptions = Settings.current.proxyServerSubscriptions;
+
+		for (const subscription of proxyServerSubscriptions) {
+			if (!subscription.enabled || !subscription.proxies || !subscription.proxies.length) {
+				continue;
+			}
+
+			// Update country codes for this subscription's proxies (don't save yet)
+			await SubscriptionUpdater.updateProxyServersCountryCode(subscription.proxies, false);
+		}
+
+		// Save once at the end if any updates were made
+		if (save) {
+			SettingsOperation.saveProxyServerSubscriptions();
+			SettingsOperation.saveAllSync(false);
+		}
+	}
+
+	public static async updateProxyServersCountryCode(proxies: ProxyServer[], save: boolean = true) {
+		if (!proxies || !proxies.length) return;
+
+		let updated = false;
+
+		try {
+			let proxiesToUpdate: any[] = [];
+			for (const proxy of proxies) {
+				// Skip if already has country code or no host
+				if (proxy.countryCode || !proxy.host) continue;
+
+				let ipAddress = proxy.host;
+
+				// Check if host is already an IP address
+				if (!Utils.isIPRelaxed(proxy.host)) {
+					// Need to resolve hostname to IP
+					try {
+						// Use Promise wrapper for DNS resolve
+						const dnsResult = await new Promise<any>((resolve, reject) => {
+							PolyFill.dnsResolve(proxy.host, [], resolve, reject);
+						});
+
+						if (dnsResult?.addresses?.length > 0) {
+							ipAddress = dnsResult.addresses[0];
+						} else {
+							continue; // Skip if DNS resolution failed
+						}
+					} catch (dnsError) {
+						// DNS resolution not supported or failed, skip this proxy
+						continue;
+					}
+				}
+
+				// Check if IP is local/private
+				if (Utils.isLocalIP(ipAddress)) {
+					proxy.countryCode = "LOCAL";
+					updated = true;
+					continue;
+				}
+
+				proxiesToUpdate.push({
+					proxy,
+					ipAddress
+				});
+			}
+
+			if (proxiesToUpdate.length > 0) {
+				CountryCode.ensureInitialized(() => {
+					for (const item of proxiesToUpdate) {
+						// Get country code from IP
+						const countryInfo = CountryCode.getRecord(item.ipAddress);
+						if (countryInfo?.isoCode) {
+							item.proxy.countryCode = countryInfo.isoCode;
+							updated = true;
+						}
+					}
+
+					// Save if any proxy was updated
+					if (updated && save) {
+						SettingsOperation.saveProxyServerSubscriptions();
+						SettingsOperation.saveAllSync(false);
+					}
+				})
+			}
+		} catch (error) {
+			Debug.warn("Failed to update subscription servers country code", error);
+		}
+	}
+}
+
+type SubscriptionTimerType = { timerId: NodeJS.Timeout, subscriptionId: string, refreshRate: number };

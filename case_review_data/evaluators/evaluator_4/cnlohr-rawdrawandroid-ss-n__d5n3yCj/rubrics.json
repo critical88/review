@@ -1,0 +1,129 @@
+{
+  "schema_version": "smellbench.solve_rubrics.v3",
+  "execution_mode": "one_independent_call_per_rubric",
+  "aggregation": "macro_average_by_category",
+  "task_id": "cnlohr-rawdrawandroid-ss-n",
+  "procedure_note": "Each rubric is one independent semantic question about this instance, answerable from the selected task prompt (prompt_natural.md), the solver patch, and repository context. Equivalent designs count: no rubric requires a specific function name, signature, parameter order, or code shape, and any owner location reachable from all recording contexts is acceptable.",
+  "rubrics": [
+    {
+      "id": "R1",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the change, exactly one function anywhere in the repository directly mutates the activity audit record fields (the audit-prefixed fields on struct android_app: auditLastStage, auditTransitions, auditStampMs, auditSuppressed) through assignment, compound assignment, or increment/decrement in its own body; every other function that touches the record does so only by delegating to that single owner.",
+      "rationale": "This is the core semantic outcome of the task: the entry protocol of the activity audit record currently has 38 inlined owners scattered across the activity glue, the USB helper, and the WebView implementation block, and the prompt asks for the protocol to have one home. Any consolidation shape (renamed helper, different signature, different placement, header-inline owner) satisfies this as long as exactly one function performs the mutations."
+    },
+    {
+      "id": "R2",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The protocol decisions live inside that single owner: the classification of a step (the stage the caller reports), the count-versus-fold decision for entries, the timestamping, and the reset-on-fresh-launch/restore policy are made in the owner's body, so that changing any of those policies requires editing only that one function.",
+      "rationale": "The prompt's central complaint is that protocol questions ('should this count or fold?', 'should this step carry a timestamp?') currently have per-site answers spelled three different ways in the same file. A repair that merely hides writes behind one function but leaves policy branching at every call site (for example call sites pre-deciding fold versus count by choosing between two owner entry points) does not resolve the underlying issue."
+    },
+    {
+      "id": "R3",
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The sweep is complete rather than partial: no recording site keeps its old inlined mutation while others were converted. In particular the repair cannot stop at the obvious lifecycle/callback sites and leave the glue's command-pipe handling, the main-thread request/acknowledgement helpers, either side of the UI-thread handoff, the USB connection and permission-round recording, or the WebView implementation block recording in their previous inlined form.",
+      "rationale": "The case's difficulty and the prompt both emphasize that the optional helper modules record through the global app pointer rather than through glue-internal handles, which makes them easy to miss; a fix that consolidates only the glue-internal sites (or only the easily-found spellings while overlooking the `x = x + 1` and boolean-add counting variants) leaves duplicated protocol in place and the smell unresolved."
+    },
+    {
+      "id": "R4",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The recording feature itself survives the refactor: every step that filed an entry before the change still files one after it, including the low-signal entries — the empty-command-pipe condition, the window-redraw fold, the rejected-permission branch of the USB round, and the WebView progress poll.",
+      "rationale": "The prompt requires the support feature to keep working at the same recorded steps; dropping recording from 'boring' sites is the easiest way to quiet structural complaints while silently losing the feature, and in this repository the noisy low-value sites are exactly the ones a lazy sweep would drop first (a canonical repair keeps recording even at the hot progress poll, folding it inside the owner)."
+    },
+    {
+      "id": "R5",
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not dismantle the audit feature to satisfy consolidation: deleting the record fields or emptying all recording sites (recording nothing) is not an acceptable resolution, and neither is reducing the record to a stage-tag-only field by discarding the counting, folding, and timestamp semantics.",
+      "rationale": "The prompt requires the feature to survive with its field semantics intact; a solver might notice that removing the feature entirely makes structural complaints moot, which trivially 'fixes' the smell while destroying the recently added production feature the maintainer explicitly wants kept. This failure mode is specific to diagnostic-only smells whose detection also passes on removal."
+    },
+    {
+      "id": "R6",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The single owner is reachable from every recording context: code compiled through the native activity glue (app-thread command handling and main-thread callbacks), the USB device helper translation unit, and the WebView implementation block can all call it, and the whole repository builds with every previously-recording site converted.",
+      "rationale": "This instance's recording sites span three compilation scopes with different include structures (the glue, a .c helper that reaches the record through the global app pointer, and an implementation block enabled by a define in a header); an owner declared only inside the glue's .c file would not be visible to two of the three, so the refactor must include whatever declaration or placement change makes one owner serve all of them."
+    },
+    {
+      "id": "R7",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Steps that were distinguishable in the transcript before the change remain distinguishable after it: recorded focus-gain versus focus-loss, window initialization versus window teardown, cold launch versus restore-from-saved-state, input-queue changes, USB events versus WebView events versus UI-thread dispatch, and the anomalous-empty-pipe entry all still reach the record as distinct observable stages (tag values may be renumbered or renamed).",
+      "rationale": "The prompt explicitly requires that regularizing the mechanics of filing an entry must not collapse recorded steps that carry different information; support reconstructs activity behavior from these distinctions, and a repair that funnels many sites through one owner call with a constant stage argument destroys the transcript while satisfying the letter of the consolidation."
+    },
+    {
+      "id": "R8",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The record remains a per-activity record carried on struct android_app: it is not replaced by process-global bookkeeping, the fields keep their meanings (most-recent stage tag, counted-entries counter, millisecond timestamp, folded-entries counter), and a fresh launch or restore still starts a fresh record rather than accumulating entries across activity incarnations.",
+      "rationale": "The prompt's compatibility boundary makes per-activity placement explicit (two activities in one process must not share a transcript), and the reset-on-launch/restore policy is named in the prompt as part of the protocol that must move into the owner; this pins the semantic identity of the feature that the refactor is allowed to reorganize but not to redefine."
+    },
+    {
+      "id": "R9",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No dead or orphaned residue of the replaced inlined protocol is left behind: no commented-out copies of the old record writes, no unused `struct timespec`/`clock_gettime` timestamp blocks orphaned at former sites, no leftover local variables that existed only to compute record updates, and no second audit-filing function superseded but retained next to the new path.",
+      "rationale": "This case's protocol accreted in heterogeneous fragments; a faithful repair removes the fragments it replaces. Failing this cleanup leaves either future confusion (code suggesting two protocols) or, for the retained-duplicate-helper case, a second direct writer that silently reintroduces the duplicated protocol."
+    },
+    {
+      "id": "R10",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The CLOCK_MONOTONIC-to-milliseconds computation exists in exactly one place after the change (inside the consolidated owner), not as separate restated blocks at individual recording sites.",
+      "rationale": "Four verbatim copies of the timestamp computation were introduced across the glue as part of the accretion; a repair that routes entries through one owner but leaves site-local timestamp blocks in place preserves a second inlined protocol decision, when 'where we currently stamp' should be decided once."
+    },
+    {
+      "id": "R11",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Comments at converted sites no longer assert site-local protocol authority: per-site explanations of how the protocol works (why this site counts while that site folds, how the fold is keyed, when to reset) are removed or rewritten as statements of which stage the site records, rather than left describing the old inlined mechanics.",
+      "rationale": "The injected comments encode the per-site dialect ('folded here because...', 'counted here because...') that made the protocol impossible to state once; leaving them behind makes the repaired tree still document a design it no longer has, which is exactly the maintenance confusion the task targets."
+    },
+    {
+      "id": "R12",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The refactor introduces no observable behavior change into the application: the command-pipe protocol, mutex and condition-variable sequencing, saved-state handover, input-queue attach/detach ordering, window handoff, UI-thread dispatch mechanics, and the NativeActivity callback registrations behave exactly as before; nothing outside the record's bookkeeping was reordered, added, or dropped alongside the consolidation.",
+      "rationale": "The recording fields are diagnostic-only in the injected state, which is what makes this a behavior-preserving refactor by construction — but the recording sites sit interleaved with real synchronization code (wait loops that hold the mutex, pipe writes on the UI thread), so a repair that restructures them can silently break lifecycle sequencing; this guards the seams the injected diff sits next to."
+    },
+    {
+      "id": "R13",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No observable control-flow decision newly depends on record contents: the consolidated owner may branch on record values internally (fold decisions), but no code path outside the record's own bookkeeping may read the record fields to steer application behavior.",
+      "rationale": "The diagnostic-only property is the task's stated compatibility boundary ('nothing observable about the application may change'); a repair that, for example, starts gating a pipe write or a callback on a stage tag has promoted diagnostic state into functional state, which is both a behavior change and a scope escape from the requested refactor."
+    },
+    {
+      "id": "R14",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The struct android_app layout keeps its documented pre-existing fields (the callback pointers, activity/config pointers, saved state, loopers, input queue, window, content rect, activity state, destroy request and the private glue section) with unchanged types and order, so application code already compiled against this glue continues to work without source changes.",
+      "rationale": "android_native_app_glue.h is the public API of this framework and applications include it directly. A repair that reshuffles, renames, or repurposes pre-existing fields while accommodating the record is a source break that the prompt's stability boundary excludes, and it is a plausible misstep because the record fields live in the same struct."
+    },
+    {
+      "id": "R15",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repaired repository must compile and pass the same full build-and-test run that passes before the change, with no new failures.",
+      "rationale": "The framework's host harness drives the activity lifecycle, command pipe, window/input handoff and UI-thread dispatch — the exact surface where every recording site lives; if the consolidation broke lifecycle sequencing or the handoff, this full comparison catches it, whereas spot checks of a few callbacks would not."
+    }
+  ]
+}

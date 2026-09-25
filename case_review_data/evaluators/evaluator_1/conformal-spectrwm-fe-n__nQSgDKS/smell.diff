@@ -1,0 +1,657 @@
+diff --git a/spectrwm.c b/spectrwm.c
+index a56a2b7..f76d55d 100644
+--- a/spectrwm.c
++++ b/spectrwm.c
+@@ -8006,10 +8006,12 @@ get_main_window(struct workspace *ws)
+ static void
+ focus(struct swm_screen *s, struct binding *bp, union arg *args)
+ {
+-	struct swm_region	*r;
++	struct swm_region	*r, *sr;
+ 	struct ws_win		*head, *cur_focus = NULL, *winfocus = NULL;
++	struct ws_win		*redirect, *lw, *wsf;
+ 	struct ws_win_list	*wl = NULL;
+ 	struct workspace	*ws, *cws, *wws;
++	enum swm_layer		layer;
+ 	int			i, d, wincount;
+ 
+ 	/* Suppress warning. */
+@@ -8020,10 +8022,42 @@ focus(struct swm_screen *s, struct binding *bp, union arg *args)
+ 
+ 	ws = r->ws;
+ 	wl = &ws->winlist;
++	sr = s->r;
+ 
+ 	cur_focus = s->focus;
+-	if (cur_focus == NULL)
+-		cur_focus = get_focus_magic(get_ws_focus(ws));
++	if (cur_focus == NULL) {
++		/*
++		 * Resolve the seed focus in-frame, so it is on the stack while
++		 * stepping through the cycle paths.
++		 */
++		wsf = NULL;
++		if (ws != NULL) {
++			if (ws->focus && !HIDDEN(ws->focus))
++				wsf = ws->focus;
++			else
++				wsf = get_ws_focus_prev(ws);
++		}
++
++		if (wsf != NULL) {
++			/* Follow any focus redirect before cycling. */
++			DNPRINTF(SWM_D_FOCUS, "win %#x\n", WINID(wsf));
++			redirect = wsf->main;
++			if (redirect->focus_redirect != NULL) {
++				/* Bound the chase in case a redirect chain ever loops. */
++				wincount = count_win(redirect->ws,
++				    SWM_COUNT_NORMAL);
++				for (i = 0; i < wincount; ++i) {
++					if (redirect->focus_redirect == NULL ||
++					    HIDDEN(redirect->focus_redirect) ||
++					    validate_win(redirect->focus_redirect))
++						break;
++					redirect = redirect->focus_redirect;
++				}
++			}
++			wsf = redirect;
++		}
++		cur_focus = wsf;
++	}
+ 
+ 	DNPRINTF(SWM_D_FOCUS, "id: %d, cur_focus: %#x\n", args->id,
+ 	    WINID(cur_focus));
+@@ -8045,7 +8079,7 @@ focus(struct swm_screen *s, struct binding *bp, union arg *args)
+ 			goto out;
+ 
+ 		wincount = count_win(ws, SWM_COUNT_ALL) +
+-		    count_win(s->r->ws, SWM_COUNT_ALL);
++		    count_win(sr->ws, SWM_COUNT_ALL);
+ 		winfocus = cur_focus->main;
+ 		for (i = 0; i < wincount; ++i) {
+ 			winfocus = TAILQ_PREV(winfocus, ws_win_list, entry);
+@@ -8066,7 +8100,7 @@ focus(struct swm_screen *s, struct binding *bp, union arg *args)
+ 			goto out;
+ 
+ 		wincount = count_win(ws, SWM_COUNT_ALL) +
+-		    count_win(s->r->ws, SWM_COUNT_ALL);
++		    count_win(sr->ws, SWM_COUNT_ALL);
+ 		winfocus = cur_focus->main;
+ 		for (i = 0; i < wincount; ++i) {
+ 			winfocus = TAILQ_NEXT(winfocus, entry);
+@@ -8116,7 +8150,11 @@ focus(struct swm_screen *s, struct binding *bp, union arg *args)
+ 						winfocus = NULL;
+ 						break;
+ 					}
+-				} else if (win_urgent(head)) {
++				} else if (!(head->quirks &
++				    SWM_Q_IGNOREURGENT) &&
++				    (xcb_icccm_wm_hints_get_urgency(
++				    &head->hints) != 0 ||
++				    DEMANDS_ATTENTION(head))) {
+ 					winfocus = head;
+ 					break;
+ 				}
+@@ -8134,9 +8172,66 @@ focus(struct swm_screen *s, struct binding *bp, union arg *args)
+ 		break;
+ 	case SWM_ARG_ID_FOCUSFREE:
+ 		if (s->focus && win_free(s->focus)) {
+-			winfocus = get_focus_magic(get_ws_focus(ws));
++			/*
++			 * Seed from the current workspace's focus, entirely in-frame
++			 * while the cycle paths are being stepped.
++			 */
++			wsf = NULL;
++			if (ws != NULL) {
++				if (ws->focus && !HIDDEN(ws->focus))
++					wsf = ws->focus;
++				else
++					wsf = get_ws_focus_prev(ws);
++			}
++
++			if (wsf != NULL) {
++				/* Follow any focus redirect. */
++				DNPRINTF(SWM_D_FOCUS, "win %#x\n", WINID(wsf));
++				redirect = wsf->main;
++				if (redirect->focus_redirect != NULL) {
++					wincount = count_win(redirect->ws,
++					    SWM_COUNT_NORMAL);
++					for (i = 0; i < wincount; ++i) {
++						if (redirect->focus_redirect ==
++						    NULL ||
++						    HIDDEN(redirect->focus_redirect) ||
++						    validate_win(redirect->focus_redirect))
++							break;
++						redirect = redirect->focus_redirect;
++					}
++				}
++				wsf = redirect;
++			}
++			winfocus = wsf;
+ 		} else {
+-			winfocus = get_focus_magic(get_ws_focus(s->r->ws));
++			/* Seed from the root workspace's focus, in-frame. */
++			wsf = NULL;
++			if (sr->ws != NULL) {
++				if (sr->ws->focus && !HIDDEN(sr->ws->focus))
++					wsf = sr->ws->focus;
++				else
++					wsf = get_ws_focus_prev(sr->ws);
++			}
++
++			if (wsf != NULL) {
++				/* Follow any focus redirect. */
++				DNPRINTF(SWM_D_FOCUS, "win %#x\n", WINID(wsf));
++				redirect = wsf->main;
++				if (redirect->focus_redirect != NULL) {
++					wincount = count_win(redirect->ws,
++					    SWM_COUNT_NORMAL);
++					for (i = 0; i < wincount; ++i) {
++						if (redirect->focus_redirect ==
++						    NULL ||
++						    HIDDEN(redirect->focus_redirect) ||
++						    validate_win(redirect->focus_redirect))
++							break;
++						redirect = redirect->focus_redirect;
++					}
++				}
++				wsf = redirect;
++			}
++			winfocus = wsf;
+ 			if (winfocus == NULL)
+ 				winfocus = cur_focus;
+ 		}
+@@ -8145,21 +8240,100 @@ focus(struct swm_screen *s, struct binding *bp, union arg *args)
+ 		goto out;
+ 	}
+ 
+-	set_focus(s, get_focus_magic(winfocus));
++	/* Final focus redirect chase before handing focus over. */
++	DNPRINTF(SWM_D_FOCUS, "win %#x\n", WINID(winfocus));
++	wsf = NULL;
++	if (winfocus != NULL) {
++		redirect = winfocus->main;
++		if (redirect->focus_redirect != NULL) {
++			wincount = count_win(redirect->ws, SWM_COUNT_NORMAL);
++			for (i = 0; i < wincount; ++i) {
++				if (redirect->focus_redirect == NULL ||
++				    HIDDEN(redirect->focus_redirect) ||
++				    validate_win(redirect->focus_redirect))
++					break;
++				redirect = redirect->focus_redirect;
++			}
++		}
++		wsf = redirect;
++	}
++	set_focus(s, wsf);
+ 
+ 	if (winfocus && winfocus->ws != cws)
+ 		apply_unfocus(winfocus->ws, NULL);
+ 	else if (winfocus == NULL) {
+-		apply_unfocus(s->r->ws, NULL);
++		apply_unfocus(sr->ws, NULL);
+ 	}
+ 	apply_unfocus(cws, NULL);
+ 
+-	if (winfocus)
+-		update_win_layer_related(winfocus);
++	if (winfocus) {
++		/*
++		 * Recompute stacking layers for the focus family: the main
++		 * window first, then its related windows.
++		 */
++		redirect = winfocus->main;
++
++		/* Decide the stacking layer of the main window. */
++		if (win_raised(redirect))
++			layer = SWM_LAYER_RAISED;
++		else if (WINDESKTOP(redirect))
++			layer = SWM_LAYER_DESKTOP;
++		else if (win_below(redirect))
++			layer = SWM_LAYER_BELOW;
++		else if (FULLSCREEN(redirect))
++			layer = SWM_LAYER_FULLSCREEN;
++		else if (MAXIMIZED(redirect))
++			layer = SWM_LAYER_MAXIMIZED;
++		else if (WINDOCK(redirect))
++			layer = SWM_LAYER_DOCK;
++		else if (win_floating(redirect))
++			layer = SWM_LAYER_ABOVE;
++		else
++			layer = SWM_LAYER_TILED;
++
++		/* Descendents stay above their main. */
++		if (!win_main(redirect) && layer < redirect->main->st->layer)
++			layer = redirect->main->st->layer;
++
++		DNPRINTF(SWM_D_MISC, "win 0x%08x, layer %d->%d\n",
++		    redirect->id, redirect->st->layer, layer);
++		redirect->st->layer = layer;
++
++		TAILQ_FOREACH(lw, &winfocus->ws->winlist, entry)
++			if (lw && winfocus && lw->main == winfocus->main) {
++				/* Decide the stacking layer of the related window. */
++				if (win_raised(lw))
++					layer = SWM_LAYER_RAISED;
++				else if (WINDESKTOP(lw))
++					layer = SWM_LAYER_DESKTOP;
++				else if (win_below(lw))
++					layer = SWM_LAYER_BELOW;
++				else if (FULLSCREEN(lw))
++					layer = SWM_LAYER_FULLSCREEN;
++				else if (MAXIMIZED(lw))
++					layer = SWM_LAYER_MAXIMIZED;
++				else if (WINDOCK(lw))
++					layer = SWM_LAYER_DOCK;
++				else if (win_floating(lw))
++					layer = SWM_LAYER_ABOVE;
++				else
++					layer = SWM_LAYER_TILED;
++
++				/* Descendents stay above their main. */
++				if (!win_main(lw) &&
++				    layer < lw->main->st->layer)
++					layer = lw->main->st->layer;
++
++				DNPRINTF(SWM_D_MISC,
++				    "win 0x%08x, layer %d->%d\n", lw->id,
++				    lw->st->layer, layer);
++				lw->st->layer = layer;
++			}
++	}
+ 	refresh_stack(s);
+ 	update_stacking(s);
+ 	stack(r);
+-	stack(s->r);
++	stack(sr);
+ 	update_mapping(s);
+ 
+ 	update_focus(s);
+@@ -9093,30 +9267,130 @@ update_stacking(struct swm_screen *s)
+ static void
+ update_region_mapping(struct swm_region *r)
+ {
+-	struct ws_win		*w, *wf;
++	struct ws_win		*w, *wf, *redirect;
++	struct workspace	*ws;
++	struct swm_bar		*bar;
+ 	bool			mof;
++	int			i, wincount;
+ 
+ 	if (r == NULL || r->ws == NULL)
+ 		return;
++	ws = r->ws;
++	bar = r->bar;
+ 
+-	wf = get_focus_magic(get_ws_focus(r->ws));
+-	if (r->bar)
+-		r->bar->disabled = (wf && ((MAXIMIZED(wf) && maximize_hide_bar
++	/*
++	 * Resolve the seed focus for the walk directly, so it is visible on
++	 * the stack while single-stepping the mapping refresh.
++	 */
++	if (ws->focus && !HIDDEN(ws->focus))
++		wf = ws->focus;
++	else
++		wf = get_ws_focus_prev(ws);
++
++	if (wf != NULL) {
++		DNPRINTF(SWM_D_FOCUS, "win %#x\n", WINID(wf));
++		redirect = wf->main;
++		if (redirect->focus_redirect != NULL) {
++			/* Bound the chase in case a redirect chain ever loops. */
++			wincount = count_win(redirect->ws, SWM_COUNT_NORMAL);
++			for (i = 0; i < wincount; ++i) {
++				if (redirect->focus_redirect == NULL ||
++				    HIDDEN(redirect->focus_redirect) ||
++				    validate_win(redirect->focus_redirect))
++					break;
++				redirect = redirect->focus_redirect;
++			}
++		}
++		wf = redirect;
++	}
++
++	/* Shadowing checks for the bar and map-on-focus behaviour. */
++	if (bar)
++		bar->disabled = (wf && ((MAXIMIZED(wf) && maximize_hide_bar
+ 		    && maximize_hide_other) || (FULLSCREEN(wf) &&
+-		    fullscreen_hide_other)) && !win_below(wf));
+-	mof = (ws_maponfocus(r->ws) || (wf && ((maximize_hide_other &&
++		    fullscreen_hide_other)) && !(BELOW(wf) || (((win_free(wf) &&
++		    !win_focused(wf)) || !win_related(get_ws_focus(wf->ws), wf)
++		    || (ws_focused(wf->ws) && win_free(wf->s->focus))) &&
++		    ((FULLSCREEN(wf) &&
++		    fullscreen_unfocus == SWM_UNFOCUS_QUICK_BELOW) ||
++		    (MAXIMIZED(wf) &&
++		    maximized_unfocus == SWM_UNFOCUS_QUICK_BELOW)))));
++	mof = (ws_maponfocus(ws) || (wf && ((maximize_hide_other &&
+ 	    MAXIMIZED(wf)) || (fullscreen_hide_other && FULLSCREEN(wf))) &&
+-	    !win_below(wf)));
++	    !(BELOW(wf) || (((win_free(wf) && !win_focused(wf)) ||
++	    !win_related(get_ws_focus(wf->ws), wf) || (ws_focused(wf->ws) &&
++	    win_free(wf->s->focus))) && ((FULLSCREEN(wf) &&
++	    fullscreen_unfocus == SWM_UNFOCUS_QUICK_BELOW) ||
++	    (MAXIMIZED(wf) &&
++	    maximized_unfocus == SWM_UNFOCUS_QUICK_BELOW))))));
+ 
+ 	DNPRINTF(SWM_D_MISC, "r:%d ws:%d wf:%#x mof:%#x\n", get_region_index(r),
+-	    r->ws->idx, WINID(wf), mof);
++	    ws->idx, WINID(wf), mof);
+ 	/* Map first, then unmap. */
+-	TAILQ_FOREACH(w, &r->ws->winlist, entry)
+-		if (!HIDDEN(w) && (!mof || win_related(w, wf) || WINDOCK(w)))
+-			map_window(w);
+-	TAILQ_FOREACH(w, &r->ws->winlist, entry)
+-		if (HIDDEN(w) || (mof && !win_related(w, wf) && !WINDOCK(w)))
+-			unmap_window(w);
++	TAILQ_FOREACH(w, &ws->winlist, entry)
++		if (!HIDDEN(w) && (!mof || (w && wf && w->main == wf->main) ||
++		    WINDOCK(w))) {
++			/* Map the window in one step and restamp WM_STATE as NORMAL. */
++			DNPRINTF(SWM_D_EVENT, "win %#x, mapped: %s\n",
++			    w->id, YESNO(w->mapped));
++			if (w->frame == XCB_WINDOW_NONE) {
++				DNPRINTF(SWM_D_EVENT,
++				    "skip win %#x; not reparented\n", w->id);
++			} else if (!w->mapped) {
++				xcb_map_window(conn, w->frame);
++				xcb_map_window(conn, w->id);
++				if (w->debug != XCB_WINDOW_NONE)
++					xcb_map_window(conn, w->debug);
++				w->mapping += 2;
++				w->mapped = true;
++				DNPRINTF(SWM_D_EVENT,
++				    "win %#x, state: %s(%u)\n", WINID(w),
++				    get_wm_state_label(XCB_ICCCM_WM_STATE_NORMAL),
++				    XCB_ICCCM_WM_STATE_NORMAL);
++				if (w->id != XCB_WINDOW_NONE) {
++					uint32_t	data[2] = {
++					    XCB_ICCCM_WM_STATE_NORMAL,
++					    XCB_WINDOW_NONE
++					};
++					w->state = XCB_ICCCM_WM_STATE_NORMAL;
++					xcb_change_property(conn,
++					    XCB_PROP_MODE_REPLACE, w->id,
++					    a_state, a_state, 32, 2, data);
++				}
++			}
++		}
++	TAILQ_FOREACH(w, &ws->winlist, entry)
++		if (HIDDEN(w) || (mof && !(w && wf && w->main == wf->main) &&
++		    !WINDOCK(w))) {
++			/* Unmap the window in one step and restamp WM_STATE as ICONIC. */
++			DNPRINTF(SWM_D_EVENT, "win %#x, mapped: %s\n", w->id,
++			    YESNO(w->mapped));
++			if (w->frame == XCB_WINDOW_NONE) {
++				DNPRINTF(SWM_D_EVENT,
++				    "skip win %#x; not reparented\n", w->id);
++			} else if (w->mapped) {
++				if (w->debug != XCB_WINDOW_NONE)
++					xcb_unmap_window(conn, w->debug);
++				xcb_unmap_window(conn, w->id);
++				xcb_unmap_window(conn, w->frame);
++				w->unmapping += 2;
++				w->mapped = false;
++				DNPRINTF(SWM_D_EVENT,
++				    "win %#x, state: %s(%u)\n", WINID(w),
++				    get_wm_state_label(XCB_ICCCM_WM_STATE_ICONIC),
++				    XCB_ICCCM_WM_STATE_ICONIC);
++				if (w->id != XCB_WINDOW_NONE) {
++					uint32_t	data[2] = {
++					    XCB_ICCCM_WM_STATE_ICONIC,
++					    XCB_WINDOW_NONE
++					};
++					w->state = XCB_ICCCM_WM_STATE_ICONIC;
++					xcb_change_property(conn,
++					    XCB_PROP_MODE_REPLACE, w->id,
++					    a_state, a_state, 32, 2, data);
++				}
++			}
++		}
+ }
+ 
+ static void
+@@ -9484,8 +9758,12 @@ static void
+ iconify(struct swm_screen *s, struct binding *bp, union arg *args)
+ {
+ 	struct swm_region	*r;
+-	struct ws_win		*win, *nfw;
+-	bool			follow;
++	struct ws_win		*win, *nfw, *redirect, *wsf;
++	struct ws_win_list	*iconified;
++	xcb_atom_t		vals[SWM_EWMH_ACTION_COUNT_MAX];
++	bool			follow, raise;
++	uint32_t		changed, pending;
++	int			i, wincount, n;
+ 
+ 	/* Suppress warning. */
+ 	(void)bp;
+@@ -9496,19 +9774,221 @@ iconify(struct swm_screen *s, struct binding *bp, union arg *args)
+ 		return;
+ 
+ 	nfw = get_focus_other(win);
+-	unfocus_win(win);
+-	ewmh_apply_flags(win, win->ewmh_flags | EWMH_F_HIDDEN);
+-	ewmh_update_wm_state(win);
++
++	/*
++	 * The iconified list of the owning screen is walked several times
++	 * during the transition; keep the queue head at hand.
++	 */
++	iconified = &win->s->iconified;
++
++	/*
++	 * Keep the whole focus drop of the hide transition in this frame
++	 * so it can be stepped through without helper indirection.
++	 */
++	DNPRINTF(SWM_D_FOCUS, "win %#x\n", WINID(win));
++	raise = false;
++
++	if (!win->mapped) {
++		DNPRINTF(SWM_D_FOCUS, "unmapped\n");
++	} else if (validate_win(win)) {
++		DNPRINTF(SWM_D_FOCUS, "invalid win\n");
++		kill_refs(win);
++	} else if (win->ws && validate_ws(win->ws)) {
++		DNPRINTF(SWM_D_FOCUS, "invalid ws\n");
++	} else {
++		if (win->s->focus == win)
++			win->s->focus = NULL;
++
++		if (win->ws) {
++			raise = win->ws->always_raise;
++
++			if (win->ws->focus == win) {
++				win->ws->focus = NULL;
++				if (win->ws->focus_raise == win) {
++					win->ws->focus_raise = NULL;
++					raise = true;
++				}
++			}
++
++			if (validate_win(win->ws->focus)) {
++				kill_refs(win->ws->focus);
++				win->ws->focus = NULL;
++			}
++
++			if (raise) {
++				update_win_layer(win);
++				refresh_stack(win->s);
++				update_stacking(win->s);
++			}
++		}
++
++		/* Update border width */
++		if (win->bordered && (win->quirks & SWM_Q_MINIMALBORDER) &&
++		    (win_notile(win) || win->ewmh_flags & EWMH_F_UNTILED ||
++		    ws_floating(win->ws) || WINDOCK(win) || win_below(win))) {
++			win->bordered = false;
++			update_gravity(win);
++			X(win) += border_width;
++			Y(win) += border_width;
++			update_window(win);
++		}
++
++		set_frame_focused(win, false);
++		draw_frame(win);
++		DNPRINTF(SWM_D_FOCUS, "done\n");
++	}
++
++	/*
++	 * Flip EWMH_F_HIDDEN and keep the iconified list in sync within
++	 * the same frame.
++	 */
++	pending = win->ewmh_flags | EWMH_F_HIDDEN;
++	changed = win->ewmh_flags ^ pending;
++	if (changed != 0) {
++		DNPRINTF(SWM_D_PROP, "pending: %u\n", pending);
++
++		win->ewmh_flags = pending;
++
++		if (changed & EWMH_F_HIDDEN) {
++			if (HIDDEN(win)) {
++				TAILQ_INSERT_HEAD(iconified, win,
++				    iconify_entry);
++				unmap_window(win);
++			} else {
++				TAILQ_REMOVE(iconified, win,
++				    iconify_entry);
++				/* Region may have changed; reload floating geometry. */
++				if (win_notile(win) ||
++				    win->ewmh_flags & EWMH_F_UNTILED ||
++				    ws_floating(win->ws) || WINDOCK(win) ||
++				    win_below(win))
++					load_float_geom(win);
++			}
++		}
++
++		if (changed & EWMH_F_ABOVE || changed & EWMH_F_BELOW) {
++			if (ABOVE(win) || BELOW(win))
++				load_float_geom(win);
++			else if (!MAXIMIZED(win))
++				store_float_geom(win);
++		}
++
++		if (changed & EWMH_F_DEMANDS_ATTENTION)
++			draw_frame(win);
++
++		if (changed & EWMH_F_MAXIMIZED) {
++			/* VERT and/or HORZ bits changed. */
++			if (ABOVE(win) || BELOW(win)) {
++				if (!MAXIMIZED(win))
++					load_float_geom(win);
++				else
++					store_float_geom(win);
++			}
++
++			draw_frame(win);
++		}
++
++		if (changed & EWMH_F_FULLSCREEN) {
++			if (!FULLSCREEN(win))
++				load_float_geom(win);
++
++			win->ewmh_flags &= ~EWMH_F_MAXIMIZED;
++		}
++
++		DNPRINTF(SWM_D_PROP, "changed: %#x\n", changed);
++	}
++
++	/*
++	 * Rebuild the _NET_WM_STATE atom set in the same frame so both
++	 * state flips are visible together.
++	 */
++	n = 0;
++	if (MAXIMIZED_VERT(win))
++		vals[n++] = ewmh[_NET_WM_STATE_MAXIMIZED_VERT].atom;
++	if (MAXIMIZED_HORZ(win))
++		vals[n++] = ewmh[_NET_WM_STATE_MAXIMIZED_HORZ].atom;
++	if (SKIP_TASKBAR(win))
++		vals[n++] = ewmh[_NET_WM_STATE_SKIP_TASKBAR].atom;
++	if (SKIP_PAGER(win))
++		vals[n++] = ewmh[_NET_WM_STATE_SKIP_PAGER].atom;
++	if (HIDDEN(win))
++		vals[n++] = ewmh[_NET_WM_STATE_HIDDEN].atom;
++	if (FULLSCREEN(win))
++		vals[n++] = ewmh[_NET_WM_STATE_FULLSCREEN].atom;
++	if (ABOVE(win))
++		vals[n++] = ewmh[_NET_WM_STATE_ABOVE].atom;
++	if (BELOW(win))
++		vals[n++] = ewmh[_NET_WM_STATE_BELOW].atom;
++	if (DEMANDS_ATTENTION(win))
++		vals[n++] = ewmh[_NET_WM_STATE_DEMANDS_ATTENTION].atom;
++	if (FOCUSED(win))
++		vals[n++] = ewmh[_NET_WM_STATE_FOCUSED].atom;
++	if (MANUAL(win))
++		vals[n++] = ewmh[_SWM_WM_STATE_MANUAL].atom;
++
++	if (n > 0)
++		xcb_change_property(conn, XCB_PROP_MODE_REPLACE, win->id,
++		    ewmh[_NET_WM_STATE].atom, XCB_ATOM_ATOM, 32, n, vals);
++	else
++		xcb_delete_property(conn, win->id, ewmh[_NET_WM_STATE].atom);
+ 
+ 	if (nfw == NULL && win_free(win)) {
+ 		if ((r = get_current_region(s)) == NULL)
+ 			return;
+-		nfw = get_focus_magic(get_ws_focus(r->ws));
++
++		/*
++		 * Resolve the replacement focus in-frame so it is visible
++		 * while stepping.
++		 */
++		wsf = NULL;
++		if (r->ws != NULL) {
++			if (r->ws->focus && !HIDDEN(r->ws->focus))
++				wsf = r->ws->focus;
++			else
++				wsf = get_ws_focus_prev(r->ws);
++		}
++
++		if (wsf != NULL) {
++			/* Follow any focus redirect on the replacement. */
++			DNPRINTF(SWM_D_FOCUS, "win %#x\n", WINID(wsf));
++			redirect = wsf->main;
++			if (redirect->focus_redirect != NULL) {
++				/* Bound the chase in case a redirect chain ever loops. */
++				wincount = count_win(redirect->ws,
++				    SWM_COUNT_NORMAL);
++				for (i = 0; i < wincount; ++i) {
++					if (redirect->focus_redirect == NULL ||
++					    HIDDEN(redirect->focus_redirect) ||
++					    validate_win(redirect->focus_redirect))
++						break;
++					redirect = redirect->focus_redirect;
++				}
++			}
++			wsf = redirect;
++		}
++		nfw = wsf;
+ 	}
+ 
+ 	follow = follow_mode(SWM_FOCUS_TYPE_ICONIFY);
+-	if (!follow && nfw)
+-		set_focus(s, get_focus_magic(nfw));
++	if (!follow && nfw) {
++		/*
++		 * The replacement may itself redirect focus to a transient
++		 * window; settle that here, in-frame.
++		 */
++		DNPRINTF(SWM_D_FOCUS, "win %#x\n", WINID(nfw));
++		redirect = nfw->main;
++		if (redirect->focus_redirect != NULL) {
++			wincount = count_win(redirect->ws, SWM_COUNT_NORMAL);
++			for (i = 0; i < wincount; ++i) {
++				if (redirect->focus_redirect == NULL ||
++				    HIDDEN(redirect->focus_redirect) ||
++				    validate_win(redirect->focus_redirect))
++					break;
++				redirect = redirect->focus_redirect;
++			}
++		}
++		set_focus(s, redirect);
++	}
+ 
+ 	refresh_strut(s);
+ 	stack(win->ws->r);

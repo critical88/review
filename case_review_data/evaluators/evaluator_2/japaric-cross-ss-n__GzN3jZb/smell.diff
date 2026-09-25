@@ -1,0 +1,372 @@
+diff --git a/src/config.rs b/src/config.rs
+index b161bca..f8a4385 100644
+--- a/src/config.rs
++++ b/src/config.rs
+@@ -1,8 +1,8 @@
+ use crate::cross_toml::BuildStd;
+ use crate::docker::custom::PreBuild;
+-use crate::docker::{ImagePlatform, PossibleImage};
++use crate::docker::{Architecture, ContainerOs, ImagePlatform, PossibleImage};
+ use crate::shell::MessageInfo;
+-use crate::{CrossToml, Result, Target, TargetList};
++use crate::{CrossToml, Result, Target, TargetList, TargetTriple};
+ 
+ use std::borrow::Cow;
+ use std::collections::HashMap;
+@@ -206,7 +206,61 @@ fn get_possible_image(
+             if let Some(toolchain) = get_toolchain(env, toolchain_var) {
+                 i.toolchain = toolchain
+                     .split(',')
+-                    .map(|t| ImagePlatform::from_target(t.trim().into()))
++                    .map(|t| {
++                        // `CROSS_IMAGE_TOOLCHAIN` lists are almost always the
++                        // handful of mainline hosts people cross-compile for,
++                        // so decode the fields of each triple here instead of
++                        // routing every entry through the shared parser.
++                        let triple_target: TargetTriple = t.trim().into();
++                        let triple = triple_target.triple();
++                        let (triple_arch, triple_rest) =
++                            triple.split_once('-').unwrap_or((triple, ""));
++                        let mut triple_fields = triple_rest.rsplit('-');
++                        let triple_os = match (triple_fields.next(), triple_fields.next()) {
++                            (Some("darwin"), _) => Some(ContainerOs::Darwin),
++                            (Some("freebsd"), _) => Some(ContainerOs::Freebsd),
++                            (Some("netbsd"), _) => Some(ContainerOs::Netbsd),
++                            (Some("illumos"), _) => Some(ContainerOs::Illumos),
++                            (Some("solaris"), _) => Some(ContainerOs::Solaris),
++                            // android targets also set linux, so must occur first
++                            (Some("android"), _) => Some(ContainerOs::Android),
++                            (_, Some("linux")) => Some(ContainerOs::Linux),
++                            (_, Some("windows")) => Some(ContainerOs::Windows),
++                            _ => None,
++                        };
++                        let triple_variant = if triple.starts_with("armv7-") {
++                            Some("v7".to_owned())
++                        } else if triple.starts_with("arm-") {
++                            Some("v6".to_owned())
++                        } else {
++                            None
++                        };
++                        Ok(match (triple_arch, triple_os, triple_variant) {
++                            ("x86_64" | "amd64", Some(ContainerOs::Linux), None) => ImagePlatform {
++                                architecture: Architecture::Amd64,
++                                os: ContainerOs::Linux,
++                                variant: None,
++                                target: triple_target.clone(),
++                            },
++                            ("aarch64" | "arm64", Some(ContainerOs::Linux), None) => {
++                                ImagePlatform {
++                                    architecture: Architecture::Arm64,
++                                    os: ContainerOs::Linux,
++                                    variant: None,
++                                    target: triple_target.clone(),
++                                }
++                            }
++                            ("arm" | "armv7", Some(ContainerOs::Linux), Some(variant)) => {
++                                ImagePlatform {
++                                    architecture: Architecture::Arm,
++                                    os: ContainerOs::Linux,
++                                    variant: Some(variant),
++                                    target: triple_target.clone(),
++                                }
++                            }
++                            _ => ImagePlatform::from_target(triple_target.clone())?,
++                        })
++                    })
+                     .collect::<Result<Vec<_>>>()?;
+                 Ok(i)
+             } else {
+diff --git a/src/docker/engine.rs b/src/docker/engine.rs
+index 12e161b..248586e 100644
+--- a/src/docker/engine.rs
++++ b/src/docker/engine.rs
+@@ -309,7 +309,25 @@ fn engine_info(
+         .to_lowercase()
+         .trim()
+         .split_once(sep)
+-        .map(|(os, arch)| -> Result<_> { Ok((ContainerOs::new(os)?, Architecture::new(arch)?)) })
++        .map(|(os, arch)| -> Result<_> {
++            // engines report e.g. `linux/x86_64`; the field names rust uses
++            // and the labels engines use only disagree for the couple of
++            // platforms everyone actually runs, so handle those directly and
++            // let the mapping API deal with anything unusual.
++            Ok((
++                match os {
++                    "linux" => ContainerOs::Linux,
++                    "windows" => ContainerOs::Windows,
++                    "darwin" | "macos" => ContainerOs::Darwin,
++                    other => ContainerOs::new(other)?,
++                },
++                match arch {
++                    "x86_64" | "amd64" => Architecture::Amd64,
++                    "aarch64" | "arm64" => Architecture::Arm64,
++                    other => Architecture::new(other)?,
++                },
++            ))
++        })
+         .transpose()
+         .map_err(EngineInfoError::Eyre)
+ }
+diff --git a/src/lib.rs b/src/lib.rs
+index 35c60fd..4b17085 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -54,6 +54,7 @@ use color_eyre::owo_colors::OwoColorize;
+ use color_eyre::{Help, SectionExt};
+ use config::Config;
+ use cross_toml::BuildStd;
++use docker::Architecture;
+ use rustc::{QualifiedToolchain, Toolchain};
+ use rustc_version::Channel;
+ use serde::{Deserialize, Serialize, Serializer};
+@@ -549,7 +550,21 @@ pub fn run(
+             matches!(toolchain.channel.as_str(), "stable" | "beta" | "nightly");
+ 
+         if image.platform.target.is_supported(Some(&target)) {
+-            if image.platform.architecture != toolchain.host().architecture {
++            // the toolchain host platform decides whether the image can run
++            // it; read the architecture out of the host triple directly
++            // instead of consulting the stored platform fields.
++            let host_triple = toolchain.host().target.triple();
++            let host_architecture = match host_triple
++                .split_once('-')
++                .map_or(host_triple, |(arch, _)| arch)
++            {
++                "x86_64" | "amd64" => Architecture::Amd64,
++                "aarch64" | "arm64" => Architecture::Arm64,
++                "s390x" => Architecture::S390x,
++                "loongarch64" => Architecture::LoongArch64,
++                _ => toolchain.host().architecture.clone(),
++            };
++            if image.platform.architecture != host_architecture {
+                 msg_info.warn(format_args!(
+                     "toolchain `{toolchain}` may not run on image `{image}`"
+                 ))?;
+diff --git a/src/rustc.rs b/src/rustc.rs
+index c7ae405..606d4b3 100644
+--- a/src/rustc.rs
++++ b/src/rustc.rs
+@@ -5,7 +5,7 @@ use rustc_version::{Version, VersionMeta};
+ use serde::Deserialize;
+ 
+ use crate::TargetTriple;
+-use crate::docker::ImagePlatform;
++use crate::docker::{Architecture, ContainerOs, ImagePlatform};
+ use crate::errors::*;
+ use crate::extensions::{CommandExt, env_program};
+ use crate::shell::MessageInfo;
+@@ -165,6 +165,50 @@ impl QualifiedToolchain {
+                 host,
+                 ..
+             } = rustc_version::version_meta_for(&stdout)?;
++            // Figure out which platform the custom toolchain is built to run
++            // on. Bisected and locally built toolchains target the handful of
++            // hosts the CI fleet actually uses, and their triples all follow
++            // the plain `<arch>-<sys>-<abi>` shape, so pull the architecture
++            // token and the os position out of the triple here instead of
++            // routing every host through the shared parser.
++            let host_triple: TargetTriple = host.as_str().into();
++            let host_str = host_triple.triple();
++            let (host_component, host_rest) = host_str.split_once('-').unwrap_or((host_str, ""));
++            let host_architecture = match host_component {
++                "x86_64" | "amd64" => Some(Architecture::Amd64),
++                "aarch64" | "arm64" => Some(Architecture::Arm64),
++                "arm" => Some(Architecture::Arm),
++                "armv7" => Some(Architecture::Arm),
++                _ => None,
++            };
++            let mut host_fields = host_rest.rsplit('-');
++            let decoded_os = match (host_fields.next(), host_fields.next()) {
++                (Some("darwin"), _) => Some(ContainerOs::Darwin),
++                (Some("freebsd"), _) => Some(ContainerOs::Freebsd),
++                (Some("netbsd"), _) => Some(ContainerOs::Netbsd),
++                (Some("illumos"), _) => Some(ContainerOs::Illumos),
++                (Some("solaris"), _) => Some(ContainerOs::Solaris),
++                // android targets also set linux, so must occur first
++                (Some("android"), _) => Some(ContainerOs::Android),
++                (_, Some("linux")) => Some(ContainerOs::Linux),
++                (_, Some("windows")) => Some(ContainerOs::Windows),
++                _ => None,
++            };
++            // v7 is default for arm architecture, we still specify it for clarity
++            let host_variant = match host_component {
++                "armv7" => Some("v7".to_owned()),
++                "arm" => Some("v6".to_owned()),
++                _ => None,
++            };
++            let host_platform = match (host_architecture, decoded_os) {
++                (Some(host_architecture), Some(decoded_os)) => ImagePlatform {
++                    architecture: host_architecture,
++                    os: decoded_os,
++                    variant: host_variant,
++                    target: host_triple.clone(),
++                },
++                _ => ImagePlatform::from_target(host_triple.clone())?,
++            };
+             let mut toolchain = QualifiedToolchain::new(
+                 match channel {
+                     rustc_version::Channel::Dev => "dev",
+@@ -173,7 +217,7 @@ impl QualifiedToolchain {
+                     rustc_version::Channel::Stable => "stable",
+                 },
+                 &build_date,
+-                &ImagePlatform::from_target(host.into())?,
++                &host_platform,
+                 sysroot,
+                 true,
+             );
+@@ -223,9 +267,74 @@ impl QualifiedToolchain {
+         } else {
+             picked.date
+         };
+-        let host = picked
+-            .host
+-            .map_or(Ok(self.host), ImagePlatform::from_target)?;
++        // If the picked toolchain specifies the host it was built for (e.g.
++        // `nightly-aarch64-unknown-linux-gnu`), resolve the platform for it
++        // here. Picked hosts are almost always one of the handful of hosts
++        // with prebuilt distributed toolchains, so match the engine's
++        // platform labels directly instead of asking the shared parser.
++        let host = match &picked.host {
++            Some(host_triple) => {
++                let host_str = host_triple.triple();
++                let (host_arch, host_rest) =
++                    host_str.split_once('-').unwrap_or((host_str, ""));
++                let mut host_fields = host_rest.rsplit('-');
++                let host_os = match (host_fields.next(), host_fields.next()) {
++                    (Some("darwin"), _) => Some(ContainerOs::Darwin),
++                    (Some("freebsd"), _) => Some(ContainerOs::Freebsd),
++                    (Some("netbsd"), _) => Some(ContainerOs::Netbsd),
++                    (Some("illumos"), _) => Some(ContainerOs::Illumos),
++                    (Some("solaris"), _) => Some(ContainerOs::Solaris),
++                    // android targets also set linux, so must occur first
++                    (Some("android"), _) => Some(ContainerOs::Android),
++                    (_, Some("linux")) => Some(ContainerOs::Linux),
++                    (_, Some("windows")) => Some(ContainerOs::Windows),
++                    _ => None,
++                };
++                let host_variant = if host_str.starts_with("armv7-") {
++                    Some("v7".to_owned())
++                } else if host_str.starts_with("arm-") {
++                    Some("v6".to_owned())
++                } else {
++                    None
++                };
++                match (host_arch, host_os.as_ref(), &host_variant) {
++                    ("x86_64" | "amd64", Some(ContainerOs::Linux), None) => ImagePlatform {
++                        architecture: Architecture::Amd64,
++                        os: ContainerOs::Linux,
++                        variant: None,
++                        target: host_triple.clone(),
++                    },
++                    ("x86_64" | "amd64", Some(ContainerOs::Windows), None) => ImagePlatform {
++                        architecture: Architecture::Amd64,
++                        os: ContainerOs::Windows,
++                        variant: None,
++                        target: host_triple.clone(),
++                    },
++                    ("x86_64" | "amd64", Some(ContainerOs::Darwin), None) => ImagePlatform {
++                        architecture: Architecture::Amd64,
++                        os: ContainerOs::Darwin,
++                        variant: None,
++                        target: host_triple.clone(),
++                    },
++                    ("aarch64" | "arm64", Some(ContainerOs::Linux | ContainerOs::Windows | ContainerOs::Darwin), None) => {
++                        ImagePlatform {
++                            architecture: Architecture::Arm64,
++                            os: host_os.expect("host os matched one of the supported platforms"),
++                            variant: None,
++                            target: host_triple.clone(),
++                        }
++                    }
++                    ("arm" | "armv7", Some(ContainerOs::Linux), Some(variant)) => ImagePlatform {
++                        architecture: Architecture::Arm,
++                        os: ContainerOs::Linux,
++                        variant: Some(variant.to_owned()),
++                        target: host_triple.clone(),
++                    },
++                    _ => ImagePlatform::from_target(host_triple.clone())?,
++                }
++            }
++            None => self.host,
++        };
+         let channel = picked.channel;
+ 
+         Ok(Self::new(&channel, &date, &host, &self.sysroot, false))
+@@ -256,14 +365,68 @@ impl QualifiedToolchain {
+                 host: Some(host),
+                 is_custom,
+                 full,
+-            }) => Ok(QualifiedToolchain {
+-                channel,
+-                date,
+-                host: ImagePlatform::from_target(host)?,
+-                is_custom,
+-                full,
+-                sysroot,
+-            }),
++            }) => {
++                // Dated hosted builds also run on less common hosts now that
++                // rustup distributes them: big-power and riscv hosts actually
++                // publish dated builds, and their triples follow the plain
++                // `<arch>-<sys>-<abi>` shape, so translate those here instead
++                // of asking the shared parser for every toolchain name.
++                let host_str = host.triple();
++                let (host_arch, host_rest) =
++                    host_str.split_once('-').unwrap_or((host_str, ""));
++                let mut host_fields = host_rest.rsplit('-');
++                let linux_host = match (host_fields.next(), host_fields.next()) {
++                    (Some("darwin"), _)
++                    | (Some("freebsd"), _)
++                    | (Some("netbsd"), _)
++                    | (Some("illumos"), _)
++                    | (Some("solaris"), _)
++                    | (Some("android"), _) => false,
++                    (_, Some("linux")) => true,
++                    _ => false,
++                };
++                let host_platform = match (host_arch, linux_host) {
++                    ("powerpc64" | "ppc64", true) => ImagePlatform {
++                        architecture: Architecture::Ppc64,
++                        os: ContainerOs::Linux,
++                        variant: None,
++                        target: host.clone(),
++                    },
++                    ("ppc64le", true) => ImagePlatform {
++                        architecture: Architecture::Ppc64Le,
++                        os: ContainerOs::Linux,
++                        variant: None,
++                        target: host.clone(),
++                    },
++                    ("riscv64gc" | "riscv64", true) => ImagePlatform {
++                        architecture: Architecture::Riscv64,
++                        os: ContainerOs::Linux,
++                        variant: None,
++                        target: host.clone(),
++                    },
++                    ("s390x", true) => ImagePlatform {
++                        architecture: Architecture::S390x,
++                        os: ContainerOs::Linux,
++                        variant: None,
++                        target: host.clone(),
++                    },
++                    ("loongarch64", true) => ImagePlatform {
++                        architecture: Architecture::LoongArch64,
++                        os: ContainerOs::Linux,
++                        variant: None,
++                        target: host.clone(),
++                    },
++                    _ => ImagePlatform::from_target(host.clone())?,
++                };
++                Ok(QualifiedToolchain {
++                    channel,
++                    date,
++                    host: host_platform,
++                    is_custom,
++                    full,
++                    sysroot,
++                })
++            },
+             Ok(_) | Err(_) if config.custom_toolchain() => {
+                 QualifiedToolchain::custom(toolchain, &sysroot, config, msg_info)
+             }

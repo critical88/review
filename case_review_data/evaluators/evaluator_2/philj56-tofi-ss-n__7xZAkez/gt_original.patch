@@ -1,0 +1,452 @@
+diff --git a/src/config.c b/src/config.c
+index b3d7e68..52e14d8 100644
+--- a/src/config.c
++++ b/src/config.c
+@@ -555,29 +555,6 @@ bool parse_option(struct tofi *tofi, const char *filename, size_t lineno, const
+ 		struct color val = parse_color(filename, lineno, value, &err);
+ 		if (!err) {
+ 			tofi->window.entry.foreground_color = val;
+-			/*
+-			 * Any text theme that hasn't been given an explicit
+-			 * foreground colour falls back to the general text
+-			 * colour, so keep those up to date here as well.
+-			 */
+-			if (!tofi->window.entry.prompt_theme.foreground_specified) {
+-				tofi->window.entry.prompt_theme.foreground_color = val;
+-			}
+-			if (!tofi->window.entry.input_theme.foreground_specified) {
+-				tofi->window.entry.input_theme.foreground_color = val;
+-			}
+-			if (!tofi->window.entry.placeholder_theme.foreground_specified) {
+-				tofi->window.entry.placeholder_theme.foreground_color = val;
+-			}
+-			if (!tofi->window.entry.default_result_theme.foreground_specified) {
+-				tofi->window.entry.default_result_theme.foreground_color = val;
+-			}
+-			if (!tofi->window.entry.alternate_result_theme.foreground_specified) {
+-				tofi->window.entry.alternate_result_theme.foreground_color = val;
+-			}
+-			if (!tofi->window.entry.selection_theme.foreground_specified) {
+-				tofi->window.entry.selection_theme.foreground_color = val;
+-			}
+ 		}
+ 	} else if (strcasecmp(option, "selection-color") == 0) {
+ 		struct color val = parse_color(filename, lineno, value, &err);
+diff --git a/src/entry.c b/src/entry.c
+index fc16eae..c40fb9c 100644
+--- a/src/entry.c
++++ b/src/entry.c
+@@ -28,6 +28,65 @@ static void rounded_rectangle(cairo_t *cr, uint32_t width, uint32_t height, uint
+ 	cairo_close_path(cr);
+ }
+ 
++static const struct text_theme *window_default_theme(
++		const struct entry *entry,
++		struct text_theme *root_theme)
++{
++	/*
++	 * Themes with no explicit fallback of their own fall back to the
++	 * general window level values.
++	 */
++	*root_theme = (struct text_theme) {
++		.foreground_color = entry->foreground_color,
++		.background_color = (struct color) { .a = 0 },
++		.padding = (struct directional) {0},
++		.background_corner_radius = 0
++	};
++	return root_theme;
++}
++
++struct text_theme entry_resolve_theme(
++		const struct entry *entry,
++		const struct text_theme *theme,
++		const struct text_theme *fallback)
++{
++	struct text_theme root_theme;
++	if (fallback == NULL) {
++		fallback = window_default_theme(entry, &root_theme);
++	}
++
++	struct text_theme resolved = *theme;
++	if (!resolved.foreground_specified) {
++		resolved.foreground_color = fallback->foreground_color;
++	}
++	if (!resolved.background_specified) {
++		resolved.background_color = fallback->background_color;
++	}
++	if (!resolved.padding_specified) {
++		resolved.padding = fallback->padding;
++	}
++	if (!resolved.radius_specified) {
++		resolved.background_corner_radius = fallback->background_corner_radius;
++	}
++	return resolved;
++}
++
++struct cursor_theme entry_resolve_cursor_theme(const struct entry *entry)
++{
++	struct cursor_theme resolved = entry->cursor_theme;
++	if (!resolved.color_specified) {
++		struct text_theme input_theme = entry_resolve_theme(
++				entry,
++				&entry->input_theme,
++				NULL);
++		resolved.color = input_theme.foreground_color;
++	}
++	if (!resolved.text_color_specified) {
++		resolved.text_color = entry->background_color;
++	}
++	return resolved;
++}
++
+ void entry_init(struct entry *entry, uint8_t *restrict buffer, uint32_t width, uint32_t height, uint32_t fractional_scale_numerator)
+ {
+ 	double scale = fractional_scale_numerator / 120.;
+diff --git a/src/entry.h b/src/entry.h
+index e314a8a..6e773dd 100644
+--- a/src/entry.h
++++ b/src/entry.h
+@@ -144,4 +144,21 @@ void entry_init(struct entry *entry, uint8_t *restrict buffer, uint32_t width, u
+ void entry_destroy(struct entry *entry);
+ void entry_update(struct entry *entry);
+ 
++/*
++ * Return a copy of the given theme with any unspecified values filled
++ * in from the given fallback theme. If no fallback is given, the general
++ * window level values are used instead.
++ */
++struct text_theme entry_resolve_theme(
++		const struct entry *entry,
++		const struct text_theme *theme,
++		const struct text_theme *fallback);
++
++/*
++ * Return a copy of the entry's cursor theme with any unspecified
++ * colours filled in. The cursor is a special case, as its colours fall
++ * back to the input foreground colour and the window background.
++ */
++struct cursor_theme entry_resolve_cursor_theme(const struct entry *entry);
++
+ #endif /* ENTRY_H */
+diff --git a/src/entry_backend/harfbuzz.c b/src/entry_backend/harfbuzz.c
+index 9f59c65..4c05be7 100644
+--- a/src/entry_backend/harfbuzz.c
++++ b/src/entry_backend/harfbuzz.c
+@@ -226,19 +226,7 @@ static cairo_text_extents_t render_text_themed(
+ 	 * Fill in any parts of the theme that haven't been explicitly
+ 	 * specified with the values from the fallback theme.
+ 	 */
+-	struct text_theme resolved = *theme;
+-	if (!resolved.foreground_specified) {
+-		resolved.foreground_color = fallback->foreground_color;
+-	}
+-	if (!resolved.background_specified) {
+-		resolved.background_color = fallback->background_color;
+-	}
+-	if (!resolved.padding_specified) {
+-		resolved.padding = fallback->padding;
+-	}
+-	if (!resolved.radius_specified) {
+-		resolved.background_corner_radius = fallback->background_corner_radius;
+-	}
++	struct text_theme resolved = entry_resolve_theme(entry, theme, fallback);
+ 
+ 	/*
+ 	 * I previously thought rendering the text to a group, measuring it,
+@@ -295,43 +283,14 @@ static cairo_text_extents_t render_input(
+ 	 * Fill in any parts of the theme that haven't been explicitly
+ 	 * specified, using the general window level values as fallbacks.
+ 	 */
+-	const struct text_theme root_theme = {
+-		.foreground_color = entry->foreground_color,
+-		.background_color = (struct color) { .a = 0 },
+-		.padding = (struct directional) {0},
+-		.background_corner_radius = 0
+-	};
+-	struct text_theme resolved_theme = *theme;
+-	if (!resolved_theme.foreground_specified) {
+-		resolved_theme.foreground_color = root_theme.foreground_color;
+-	}
+-	if (!resolved_theme.background_specified) {
+-		resolved_theme.background_color = root_theme.background_color;
+-	}
+-	if (!resolved_theme.padding_specified) {
+-		resolved_theme.padding = root_theme.padding;
+-	}
+-	if (!resolved_theme.radius_specified) {
+-		resolved_theme.background_corner_radius = root_theme.background_corner_radius;
+-	}
++	struct text_theme resolved_theme = entry_resolve_theme(entry, theme, NULL);
+ 	theme = &resolved_theme;
+ 
+ 	/*
+-	 * The cursor is a special case, falling back to the input
+-	 * foreground colour, and the window background for highlighted
+-	 * text.
++	 * The cursor falls back to the input colours, so needs resolving
++	 * against them.
+ 	 */
+-	struct cursor_theme resolved_cursor = *cursor_theme;
+-	if (!resolved_cursor.color_specified) {
+-		if (entry->input_theme.foreground_specified) {
+-			resolved_cursor.color = entry->input_theme.foreground_color;
+-		} else {
+-			resolved_cursor.color = entry->foreground_color;
+-		}
+-	}
+-	if (!resolved_cursor.text_color_specified) {
+-		resolved_cursor.text_color = entry->background_color;
+-	}
++	struct cursor_theme resolved_cursor = entry_resolve_cursor_theme(entry);
+ 	cursor_theme = &resolved_cursor;
+ 
+ 	cairo_font_extents_t font_extents;
+@@ -731,58 +690,25 @@ void entry_backend_harfbuzz_update(struct entry *entry)
+ 	cairo_t *cr = entry->cairo[entry->index].cr;
+ 	cairo_text_extents_t extents;
+ 
+-	/*
+-	 * Any theme value that hasn't been explicitly specified falls back
+-	 * to the general window level values, so set them up here.
+-	 */
+-	const struct text_theme root_theme = {
+-		.foreground_color = entry->foreground_color,
+-		.background_color = (struct color) { .a = 0 },
+-		.padding = (struct directional) {0},
+-		.background_corner_radius = 0
+-	};
+-
+ 	/*
+ 	 * The default result theme doubles up as the fallback for the
+-	 * alternate result theme, so its unspecified values need resolving
+-	 * first.
++	 * alternate result theme, so it needs resolving up front. The
++	 * selected result's theme is also used directly below, so resolve
++	 * it here too.
+ 	 */
+-	struct text_theme resolved_default_result = entry->default_result_theme;
+-	if (!resolved_default_result.foreground_specified) {
+-		resolved_default_result.foreground_color = root_theme.foreground_color;
+-	}
+-	if (!resolved_default_result.background_specified) {
+-		resolved_default_result.background_color = root_theme.background_color;
+-	}
+-	if (!resolved_default_result.padding_specified) {
+-		resolved_default_result.padding = root_theme.padding;
+-	}
+-	if (!resolved_default_result.radius_specified) {
+-		resolved_default_result.background_corner_radius = root_theme.background_corner_radius;
+-	}
+-
+-	/*
+-	 * The selected result's theme is also used directly below, so
+-	 * resolve its unspecified values up front as well.
+-	 */
+-	struct text_theme resolved_selection = entry->selection_theme;
+-	if (!resolved_selection.foreground_specified) {
+-		resolved_selection.foreground_color = root_theme.foreground_color;
+-	}
+-	if (!resolved_selection.background_specified) {
+-		resolved_selection.background_color = root_theme.background_color;
+-	}
+-	if (!resolved_selection.padding_specified) {
+-		resolved_selection.padding = root_theme.padding;
+-	}
+-	if (!resolved_selection.radius_specified) {
+-		resolved_selection.background_corner_radius = root_theme.background_corner_radius;
+-	}
++	struct text_theme resolved_default_result = entry_resolve_theme(
++			entry,
++			&entry->default_result_theme,
++			NULL);
++	struct text_theme resolved_selection = entry_resolve_theme(
++			entry,
++			&entry->selection_theme,
++			NULL);
+ 
+ 	cairo_save(cr);
+ 
+ 	/* Render the prompt */
+-	extents = render_text_themed(cr, entry, entry->prompt_text, &entry->prompt_theme, &root_theme);
++	extents = render_text_themed(cr, entry, entry->prompt_text, &entry->prompt_theme, NULL);
+ 	{
+ 		struct entry_backend_harfbuzz *hb = &entry->harfbuzz;
+ 		hb_buffer_clear_contents(hb->hb_buffer);
+@@ -877,13 +803,13 @@ void entry_backend_harfbuzz_update(struct entry *entry)
+ 			const struct text_theme *fallback;
+ 			if (i == entry->selection) {
+ 				theme = &entry->selection_theme;
+-				fallback = &root_theme;
++				fallback = NULL;
+ 			} else if (index % 2) {
+ 				theme = &entry->alternate_result_theme;
+ 				fallback = &resolved_default_result;
+ 			} else {
+ 				theme = &entry->default_result_theme;
+-				fallback = &root_theme;
++				fallback = NULL;
+ 			}
+ 
+ 			if (entry->num_results > 0) {
+diff --git a/src/entry_backend/pango.c b/src/entry_backend/pango.c
+index c75fbc6..3d5deb6 100644
+--- a/src/entry_backend/pango.c
++++ b/src/entry_backend/pango.c
+@@ -47,19 +47,7 @@ static void render_text_themed(
+ 	 * Fill in any parts of the theme that haven't been explicitly
+ 	 * specified with the values from the fallback theme.
+ 	 */
+-	struct text_theme resolved = *theme;
+-	if (!resolved.foreground_specified) {
+-		resolved.foreground_color = fallback->foreground_color;
+-	}
+-	if (!resolved.background_specified) {
+-		resolved.background_color = fallback->background_color;
+-	}
+-	if (!resolved.padding_specified) {
+-		resolved.padding = fallback->padding;
+-	}
+-	if (!resolved.radius_specified) {
+-		resolved.background_corner_radius = fallback->background_corner_radius;
+-	}
++	struct text_theme resolved = entry_resolve_theme(entry, theme, fallback);
+ 	theme = &resolved;
+ 
+ 	struct color color = theme->foreground_color;
+@@ -138,43 +126,14 @@ static void render_input(
+ 	 * Fill in any parts of the theme that haven't been explicitly
+ 	 * specified, using the general window level values as fallbacks.
+ 	 */
+-	const struct text_theme root_theme = {
+-		.foreground_color = entry->foreground_color,
+-		.background_color = (struct color) { .a = 0 },
+-		.padding = (struct directional) {0},
+-		.background_corner_radius = 0
+-	};
+-	struct text_theme resolved_theme = *theme;
+-	if (!resolved_theme.foreground_specified) {
+-		resolved_theme.foreground_color = root_theme.foreground_color;
+-	}
+-	if (!resolved_theme.background_specified) {
+-		resolved_theme.background_color = root_theme.background_color;
+-	}
+-	if (!resolved_theme.padding_specified) {
+-		resolved_theme.padding = root_theme.padding;
+-	}
+-	if (!resolved_theme.radius_specified) {
+-		resolved_theme.background_corner_radius = root_theme.background_corner_radius;
+-	}
++	struct text_theme resolved_theme = entry_resolve_theme(entry, theme, NULL);
+ 	theme = &resolved_theme;
+ 
+ 	/*
+-	 * The cursor is a special case, falling back to the input
+-	 * foreground colour, and the window background for highlighted
+-	 * text.
++	 * The cursor falls back to the input colours, so needs resolving
++	 * against them.
+ 	 */
+-	struct cursor_theme resolved_cursor = *cursor_theme;
+-	if (!resolved_cursor.color_specified) {
+-		if (entry->input_theme.foreground_specified) {
+-			resolved_cursor.color = entry->input_theme.foreground_color;
+-		} else {
+-			resolved_cursor.color = entry->foreground_color;
+-		}
+-	}
+-	if (!resolved_cursor.text_color_specified) {
+-		resolved_cursor.text_color = entry->background_color;
+-	}
++	struct cursor_theme resolved_cursor = entry_resolve_cursor_theme(entry);
+ 	cursor_theme = &resolved_cursor;
+ 
+ 	struct directional padding = theme->padding;
+@@ -383,60 +342,27 @@ void entry_backend_pango_update(struct entry *entry)
+ 	cairo_t *cr = entry->cairo[entry->index].cr;
+ 	PangoLayout *layout = entry->pango.layout;
+ 
+-	/*
+-	 * Any theme value that hasn't been explicitly specified falls back
+-	 * to the general window level values, so set them up here.
+-	 */
+-	const struct text_theme root_theme = {
+-		.foreground_color = entry->foreground_color,
+-		.background_color = (struct color) { .a = 0 },
+-		.padding = (struct directional) {0},
+-		.background_corner_radius = 0
+-	};
+-
+ 	/*
+ 	 * The default result theme doubles up as the fallback for the
+-	 * alternate result theme, so its unspecified values need resolving
+-	 * first.
++	 * alternate result theme, so it needs resolving up front. The
++	 * selected result's theme is also used directly below, so resolve
++	 * it here too.
+ 	 */
+-	struct text_theme resolved_default_result = entry->default_result_theme;
+-	if (!resolved_default_result.foreground_specified) {
+-		resolved_default_result.foreground_color = root_theme.foreground_color;
+-	}
+-	if (!resolved_default_result.background_specified) {
+-		resolved_default_result.background_color = root_theme.background_color;
+-	}
+-	if (!resolved_default_result.padding_specified) {
+-		resolved_default_result.padding = root_theme.padding;
+-	}
+-	if (!resolved_default_result.radius_specified) {
+-		resolved_default_result.background_corner_radius = root_theme.background_corner_radius;
+-	}
+-
+-	/*
+-	 * The selected result's theme is also used directly below, so
+-	 * resolve its unspecified values up front as well.
+-	 */
+-	struct text_theme resolved_selection = entry->selection_theme;
+-	if (!resolved_selection.foreground_specified) {
+-		resolved_selection.foreground_color = root_theme.foreground_color;
+-	}
+-	if (!resolved_selection.background_specified) {
+-		resolved_selection.background_color = root_theme.background_color;
+-	}
+-	if (!resolved_selection.padding_specified) {
+-		resolved_selection.padding = root_theme.padding;
+-	}
+-	if (!resolved_selection.radius_specified) {
+-		resolved_selection.background_corner_radius = root_theme.background_corner_radius;
+-	}
++	struct text_theme resolved_default_result = entry_resolve_theme(
++			entry,
++			&entry->default_result_theme,
++			NULL);
++	struct text_theme resolved_selection = entry_resolve_theme(
++			entry,
++			&entry->selection_theme,
++			NULL);
+ 
+ 	cairo_save(cr);
+ 
+ 	/* Render the prompt */
+ 	PangoRectangle ink_rect;
+ 	PangoRectangle logical_rect;
+-	render_text_themed(cr, entry, entry->prompt_text, &entry->prompt_theme, &root_theme, &ink_rect, &logical_rect);
++	render_text_themed(cr, entry, entry->prompt_text, &entry->prompt_theme, NULL, &ink_rect, &logical_rect);
+ 
+ 	cairo_translate(cr, logical_rect.width + logical_rect.x, 0);
+ 	cairo_translate(cr, entry->prompt_padding, 0);
+@@ -536,13 +462,13 @@ void entry_backend_pango_update(struct entry *entry)
+ 			const struct text_theme *fallback;
+ 			if (i == entry->selection) {
+ 				theme = &entry->selection_theme;
+-				fallback = &root_theme;
++				fallback = NULL;
+ 			} else if (index % 2) {
+ 				theme = &entry->alternate_result_theme;
+ 				fallback = &resolved_default_result;
+ 			} else {
+ 				theme = &entry->default_result_theme;
+-				fallback = &root_theme;
++				fallback = NULL;
+ 			}
+ 
+ 			if (entry->num_results > 0) {

@@ -1,0 +1,468 @@
+diff --git a/glava/fifo.c b/glava/fifo.c
+index 4aeff08..8ba46b6 100644
+--- a/glava/fifo.c
++++ b/glava/fifo.c
+@@ -12,6 +12,7 @@
+ #include <poll.h>
+ 
+ #include "fifo.h"
++#include "render.h"
+ 
+ /* Implementation struct storage */
+ 
+@@ -20,7 +21,20 @@ size_t audio_impls_idx = 0;
+ 
+ /* FIFO backend */
+ 
+-static void init(struct audio_data* audio) {
++/* Align the session geometry with the active renderer requests at
++   instantiate time, so the FIFO chunking matches what the renderer is
++   drawing from. */
++static void fifo_bind_session(struct audio_data* audio, struct glava_renderer* r) {
++    audio->audio_buf_sz = r->bufsize_request;
++    audio->sample_sz    = r->samplesize_request;
++    if (!audio->source && r->audio_source_request &&
++        strcmp(r->audio_source_request, "auto") != 0) {
++        audio->source = strdup(r->audio_source_request);
++    }
++}
++
++static void init(struct audio_data* audio, struct glava_renderer* r) {
++    fifo_bind_session(audio, r);
+     if (!audio->source) {
+         audio->source = strdup("/tmp/mpd.fifo");
+     }
+@@ -28,20 +42,16 @@ static void init(struct audio_data* audio) {
+ 
+ static void* entry(void* data) {
+     struct audio_data* audio = (struct audio_data *) data;
+-    
+-    float* bl = (float*) audio->audio_out_l;
+-    float* br = (float*) audio->audio_out_r;
+-    size_t fsz = audio->audio_buf_sz;
++
+     size_t ssz = audio->sample_sz;
+-    
++
+     int fd;
+     int16_t buf[ssz / 2];
+-    size_t q;
+     int timeout = 50;
+-    
++
+     struct timespec tv_last = {}, tv;
+     bool measured = false;
+-    
++
+     if ((fd = open(audio->source, O_RDONLY)) == -1) {
+         fprintf(stderr, "failed to open FIFO audio source \"%s\": %s\n", audio->source, strerror(errno));
+         exit(EXIT_FAILURE);
+@@ -52,29 +62,23 @@ static void* entry(void* data) {
+         .events = POLLIN
+     };
+ 
+-    size_t buffer_offset = (fsz - (ssz / 4));
+-    
+     while (true) {
+ 
+         /* The poll timeout is set to accommodate an approximate UPS, but has little purpose except
+            for effectively setting the rate of empty samples in the event of the FIFO descriptor
+            blocking for long periods of time. */
+-        
++
+         switch (poll(&pfd, 1, timeout)) {
+             case -1:
+                 fprintf(stderr, "FIFO backend: poll() failed (%s)\n", strerror(errno));
+                 exit(EXIT_FAILURE);
+             case 0:
+                 pthread_mutex_lock(&audio->mutex);
+-                
+-                memmove(bl, &bl[ssz / 4], buffer_offset * sizeof(float));
+-                memmove(br, &br[ssz / 4], buffer_offset * sizeof(float));
+-                
+-                for (q = 0; q < (ssz / 4); ++q) bl[buffer_offset + q] = 0;
+-                for (q = 0; q < (ssz / 4); ++q) br[buffer_offset + q] = 0;
+-            
++
++                rd_audio_shift_silence(audio);
++
+                 audio->modified = true;
+-                
++
+                 pthread_mutex_unlock(&audio->mutex);
+                 break;
+             default: {
+@@ -85,44 +89,44 @@ static void* entry(void* data) {
+                     timeout = (((tv.tv_sec - tv_last.tv_sec) * 1000) + ((tv.tv_nsec - tv_last.tv_nsec) / 1000000)) + 1;
+                     tv_last = tv;
+                 } else measured = true;
+-            
+-                pthread_mutex_lock(&audio->mutex);
+-                
+-                memmove(bl, &bl[ssz / 4], buffer_offset * sizeof(float));
+-                memmove(br, &br[ssz / 4], buffer_offset * sizeof(float));
+-            
++
++                /* Decode this chunk into per-frameside frames; the shared session service
++                   rolls the window and appends them to the audio buffers. */
++                float lbuf[ssz / 4], rbuf[ssz / 4];
+                 for (size_t n = 0, q = 0; q < (ssz / 2); q += 2) {
+ 
+-                    size_t idx = (fsz - (ssz / 4)) + n;
+-                
+                     if (audio->channels == 1) {
+                         float sample = ((buf[q] + buf[q + 1]) / 2) / (float) 65535;
+-                        bl[idx] = sample;
+-                        br[idx] = sample;
++                        lbuf[n] = sample;
++                        rbuf[n] = sample;
+                     }
+-                
++
+                     if (audio->channels == 2) {
+-                        bl[idx] = buf[q] / (float) 65535;
+-                        br[idx] = buf[q + 1] / (float) 65535;
++                        lbuf[n] = buf[q] / (float) 65535;
++                        rbuf[n] = buf[q + 1] / (float) 65535;
+                     }
+-                
++
+                     n++;
+                 }
+-            
++
++                pthread_mutex_lock(&audio->mutex);
++
++                rd_audio_shift_write(audio, lbuf, rbuf);
++
+                 audio->modified = true;
+-            
++
+                 pthread_mutex_unlock(&audio->mutex);
+                 break;
+             }
+         }
+-        
++
+         if (audio->terminate == 1) {
+             close(fd);
+             break;
+         }
+-        
++
+     }
+-    
++
+     return 0;
+ }
+ 
+diff --git a/glava/fifo.h b/glava/fifo.h
+index 14e3cfa..7ad865a 100644
+--- a/glava/fifo.h
++++ b/glava/fifo.h
+@@ -6,6 +6,10 @@
+ #include <stdlib.h>
+ #include <stdbool.h>
+ 
++/* Renderer sessions are handed to the audio input layer at instantiate time,
++   so each backend can interpret the active renderer requests on its own. */
++struct glava_renderer;
++
+ struct audio_data {
+     volatile float* audio_out_r;
+     volatile float* audio_out_l;
+@@ -21,7 +25,7 @@ struct audio_data {
+ 
+ struct audio_impl {
+     const char* name;
+-    void  (*init)(struct audio_data* data);
++    void  (*init)(struct audio_data* data, struct glava_renderer* r);
+     void* (*entry)(void* data);
+ };
+ 
+diff --git a/glava/glava.c b/glava/glava.c
+index c779153..166148f 100644
+--- a/glava/glava.c
++++ b/glava/glava.c
+@@ -488,11 +488,7 @@ instantiate: {}
+     b1 = malloc(rd->bufsize_request * sizeof(float));
+     lb = malloc(rd->bufsize_request * sizeof(float));
+     rb = malloc(rd->bufsize_request * sizeof(float));
+-    for (t = 0; t < rd->bufsize_request; ++t) {
+-        b0[t] = 0.0F;
+-        b1[t] = 0.0F;
+-    }
+-    
++
+     audio = (struct audio_data) {
+         .source = ({
+                 char* src = NULL;
+@@ -512,8 +508,11 @@ instantiate: {}
+         .sample_sz    = rd->samplesize_request,
+         .modified     = false
+     };
+-    
+-    impl->init(&audio);
++
++    /* clear the session buffers through the shared session service */
++    rd_audio_zero(&audio);
++
++    impl->init(&audio, rd);
+     
+     if (verbose) printf("Using audio source: %s\n", audio.source);
+     
+@@ -521,20 +520,9 @@ instantiate: {}
+     while (__atomic_load_n(&rd->alive, __ATOMIC_SEQ_CST)) {
+ 
+         rd_time(rd); /* update timer for this frame */
+-        
+-        bool modified; /* if the audio buffer has been updated by the streaming thread */
+-
+-        /* lock the audio mutex and read our data */
+-        pthread_mutex_lock(&audio.mutex);
+-        modified = audio.modified;
+-        if (modified) {
+-            /* create our own copies of the audio buffers, so the streaming
+-               thread can continue to append to it */
+-            memcpy(lb, (void*) audio.audio_out_l, rd->bufsize_request * sizeof(float));
+-            memcpy(rb, (void*) audio.audio_out_r, rd->bufsize_request * sizeof(float));
+-            audio.modified = false; /* set this flag to false until the next time we read */
+-        }
+-        pthread_mutex_unlock(&audio.mutex);
++
++        /* if the audio buffer has been updated by the streaming thread */
++        bool modified = rd_audio_read(&audio, lb, rb, rd->bufsize_request);
+ 
+         bool ret = rd_update(rd, lb, rb, rd->bufsize_request, modified);
+         
+diff --git a/glava/pulse_input.c b/glava/pulse_input.c
+index c599454..28d1c67 100644
+--- a/glava/pulse_input.c
++++ b/glava/pulse_input.c
+@@ -8,8 +8,10 @@
+ #include <pulse/pulseaudio.h>
+ 
+ #include "fifo.h"
++#include "render.h"
+ 
+ static pa_mainloop* m_pulseaudio_mainloop;
++static struct glava_renderer* m_session_renderer;
+ 
+ static void cb(__attribute__((unused)) pa_context* pulseaudio_context,
+                const pa_server_info* i,
+@@ -54,10 +56,26 @@ static void pulseaudio_context_state_callback(pa_context* pulseaudio_context, vo
+ }
+ 
+ 
+-static void init(struct audio_data* audio) {
++/* Interpret the renderer requests for the audio session opened by this
++   backend. The renderer owns the requests that parameterize the session;
++   applying them here keeps the recording stream in step with whatever the
++   renderer was configured with at instantiate time. */
++static void pulse_apply_session_requests(struct audio_data* audio) {
++    audio->rate      = (unsigned int) m_session_renderer->rate_request;
++    audio->sample_sz = m_session_renderer->samplesize_request;
++    audio->channels = m_session_renderer->mirror_input ? 1 : 2;
++}
++
++static void init(struct audio_data* audio, struct glava_renderer* r) {
++
++    m_session_renderer = r;
++
++    /* Re-align the session parameters with the renderer driving this session,
++       so the stream spec always matches the active renderer requests. */
++    pulse_apply_session_requests(audio);
+ 
+     if (audio->source) return;
+-    
++
+ 	pa_mainloop_api* mainloop_api;
+ 	pa_context* pulseaudio_context;
+ 	int ret;
+@@ -135,57 +153,51 @@ static void* entry(void* data) {
+ 	}
+     
+ 	n = 0;
+-    
+-    float* bl = (float*) audio->audio_out_l;
+-    float* br = (float*) audio->audio_out_r;
+-    size_t fsz = audio->audio_buf_sz;
+-    
++
+ 	while (1) {
+-        
++
+         /* Record some data ... */
+         if (pa_simple_read(s, buf, sizeof(buf), &error) < 0) {
+             fprintf(stderr, __FILE__": pa_simple_read() failed: %s\n", pa_strerror(error));
+         	exit(EXIT_FAILURE);
+ 		}
+ 
+-        pthread_mutex_lock(&audio->mutex);
+-
+-        /* progressing the audio buffer, making space for new write */
+-
+-        memmove(bl, &bl[ssz / 4], (fsz - (ssz / 4)) * sizeof(float));
+-        memmove(br, &br[ssz / 4], (fsz - (ssz / 4)) * sizeof(float)); 
+-
+         /* sorting out channels */
+-        
+-        for (n = 0, i = 0; i < ssz / 2; i += 2) {
+ 
+-            /* size_t idx = (i / 2) + (at * (BUFSIZE / 2)); */
+-
+-            int idx = (fsz - (ssz / 4)) + n;
++        float lbuf[ssz / 4], rbuf[ssz / 4];
++        for (n = 0, i = 0; i < ssz / 2; i += 2) {
+ 
+             if (audio->channels == 1) {
+                 float sample = (buf[i] + buf[i + 1]) / 2;
+-                bl[idx] = sample;
+-                br[idx] = sample;
++                lbuf[n] = sample;
++                rbuf[n] = sample;
+             }
+ 
+             /* stereo storing channels in buffer */
+             if (audio->channels == 2) {
+-                bl[idx] = buf[i];
+-                br[idx] = buf[i + 1];
++                lbuf[n] = buf[i];
++                rbuf[n] = buf[i + 1];
+             }
+             ++n;
+         }
++
++        pthread_mutex_lock(&audio->mutex);
++
++        /* progressing the audio buffer and appending the new chunk through
++           the shared session service */
++
++        rd_audio_shift_write(audio, lbuf, rbuf);
++
+         audio->modified = true;
+-        
++
+         pthread_mutex_unlock(&audio->mutex);
+-        
++
+         if (audio->terminate == 1) {
+             pa_simple_free(s);
+             break;
+         }
+     }
+-    
++
+ 	return 0;
+ }
+ 
+diff --git a/glava/render.c b/glava/render.c
+index 6ce3952..e7bb0ae 100644
+--- a/glava/render.c
++++ b/glava/render.c
+@@ -20,6 +20,7 @@
+ #include "render.h"
+ #include "xwin.h"
+ #include "glsl_ext.h"
++#include "fifo.h"
+ 
+ typeof(bind_types) bind_types = {
+     [STDIN_TYPE_NONE]  = { .n = "NONE",  .i = STDIN_TYPE_NONE  },
+@@ -93,6 +94,62 @@ static inline void register_wcb(struct gl_wcb* wcb) { wcbs[wcbs_idx++] = wcb; }
+         register_wcb(&N);                       \
+     } while (0)
+ 
++/* Audio session services.
++   The audio session created for the active renderer is shared between the
++   entry point (which drives the render loop) and the audio input backends
++   (which append to it from their streaming threads). Implementing these
++   operations here keeps the entire session lifecycle next to the renderer
++   state that parameterizes it, so every consumer manipulates the session
++   through the same rd_* surface instead of duplicating buffer traversal. */
++
++void rd_audio_zero(struct audio_data* audio) {
++    for (size_t t = 0; t < audio->audio_buf_sz; ++t) {
++        audio->audio_out_l[t] = 0.0F;
++        audio->audio_out_r[t] = 0.0F;
++    }
++}
++
++void rd_audio_shift_write(struct audio_data* audio, const float* l, const float* r) {
++    size_t fsz = audio->audio_buf_sz, ssz = audio->sample_sz;
++    size_t off = fsz - (ssz / 4);
++    float* bl = (float*) audio->audio_out_l;
++    float* br = (float*) audio->audio_out_r;
++    memmove(bl, &bl[ssz / 4], off * sizeof(float));
++    memmove(br, &br[ssz / 4], off * sizeof(float));
++    for (size_t n = 0; n < (ssz / 4); ++n) {
++        bl[off + n] = l[n];
++        br[off + n] = r[n];
++    }
++}
++
++void rd_audio_shift_silence(struct audio_data* audio) {
++    size_t fsz = audio->audio_buf_sz, ssz = audio->sample_sz;
++    size_t off = fsz - (ssz / 4);
++    float* bl = (float*) audio->audio_out_l;
++    float* br = (float*) audio->audio_out_r;
++    memmove(bl, &bl[ssz / 4], off * sizeof(float));
++    memmove(br, &br[ssz / 4], off * sizeof(float));
++    for (size_t q = 0; q < (ssz / 4); ++q) {
++        bl[off + q] = 0;
++        br[off + q] = 0;
++    }
++}
++
++bool rd_audio_read(struct audio_data* audio, float* lb, float* rb, size_t bsz) {
++    bool modified;
++    pthread_mutex_lock(&audio->mutex);
++    modified = audio->modified;
++    if (modified) {
++        /* create our own copies of the audio buffers, so the streaming
++           thread can continue to append to it */
++        memcpy(lb, (void*) audio->audio_out_l, bsz * sizeof(float));
++        memcpy(rb, (void*) audio->audio_out_r, bsz * sizeof(float));
++        audio->modified = false; /* set this flag to false until the next time we read */
++    }
++    pthread_mutex_unlock(&audio->mutex);
++    return modified;
++}
++
+ /* GLSL bind source */
+  
+ struct gl_bind_src {
+diff --git a/glava/render.h b/glava/render.h
+index b96fafd..8908bcc 100644
+--- a/glava/render.h
++++ b/glava/render.h
+@@ -7,6 +7,10 @@
+ #include <pthread.h>
+ #include "glava.h"
+ 
++/* Audio session state shared with the audio input layer. The renderer drives
++   the audio session through the rd_* API below. */
++struct audio_data;
++
+ typedef struct glava_renderer {
+     volatile bool alive;
+     bool    mirror_input;
+@@ -62,6 +66,19 @@ void             rd_time           (struct glava_renderer*);
+ void*            rd_get_impl_window(struct glava_renderer*);
+ struct gl_wcb*   rd_get_wcb        (struct glava_renderer*);
+ 
++/* Audio session services exposed with the rest of the renderer API. These
++   operate on the audio session created for the active renderer, so the
++   entry point and the audio input backends can drive session state through
++   a single shared implementation instead of duplicating it.
++     - rd_audio_zero: clear the session buffers (used at instantiate time)
++     - rd_audio_shift_write: roll the session window and append one chunk
++     - rd_audio_shift_silence: roll the window and pad it with silence
++     - rd_audio_read: drain the session for one frame (lock-copy-reset)  */
++void    rd_audio_zero         (struct audio_data* audio);
++void    rd_audio_shift_write  (struct audio_data* audio, const float* l, const float* r);
++void    rd_audio_shift_silence(struct audio_data* audio);
++bool    rd_audio_read         (struct audio_data* audio, float* lb, float* rb, size_t bsz);
++
+ /* gl_wcb - OpenGL Window Creation Backend interface */
+ struct gl_wcb {
+     const char* name;

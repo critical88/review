@@ -1,0 +1,125 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent introduced src/theme.c (added to common_sources in meson.build alongside entry.c) as a new translation unit consolidating all theme-inheritance logic: theme_root() defines the window-level default (entry->foreground_color, transparent background, zero padding, zero corner radius); theme_resolve() is the single function that fills unset fields from a fallback; theme_resolve_element() dispatches per element, including the alternate-result odd-row subtlety (resolves default_result against root, then uses it as the alternate fallback); theme_resolve_cursor() handles cursor color (input foreground, else window text) and text_color (window background). The drawing backends and config loader no longer decide fallbacks: render_text_themed/render_input in harfbuzz.c and pango.c lost their fallback parameters and inline resolution blocks; entry_backend_*_update() now call theme_resolve_element()/theme_resolve_cursor() and pass fully-resolved themes; config.c just records foreground_color with a comment pointing to theme_resolve_element().",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The logic that decides what value an unset text-theme or cursor-theme field inherits — including what the window-level default theme itself is (window text colour foreground, fully transparent background, zero padding, zero corner radius) — lives in one consolidated implementation inside the entry module (src/entry.c, or a translation unit introduced as part of the entry module's side), so the inheritance rules are written down once.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch removes the duplicated inheritance fragments from both backends: in src/entry_backend/harfbuzz.c render_text_themed loses its `fallback` param and the block reading `foreground_specified`/`background_specified`/`padding_specified`/`radius_specified`; render_input loses its local `root_theme` construction and the inline `resolved_cursor`/`color_specified`/`text_color_specified` cursor re-derivation; entry_backend_harfbuzz_update replaces its local `root_theme`/`resolved_default_result`/`resolved_selection` flag-reading blocks with calls to theme_resolve_element/theme_resolve_cursor. The same removals occur in src/entry_backend/pango.c. No added code under src/entry_backend/ reads the inheritance flags, constructs the window-level default theme, or re-derives cursor colours inline.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A duplicated fragment of the inheritance decision survives in the drawing code: some function under src/entry_backend/ still reads an inheritance bookkeeping flag (foreground_specified, background_specified, padding_specified, radius_specified, color_specified or text_color_specified) to fill unset fields, or still locally constructs the window-level default theme to resolve a theme against it, or still re-derives the cursor colours inline.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Both backends call theme_resolve_element/theme_resolve_cursor once at the top of their update functions, producing resolved_prompt, resolved_input, resolved_placeholder, resolved_default_result, resolved_alternate_result, resolved_selection, and resolved_cursor. Every drawing path consumes these: harfbuzz and pango pass &resolved_prompt to render_text_themed for the prompt; pass &resolved_placeholder/&resolved_input with &resolved_cursor to render_input for placeholder, hidden-character buffer, and typed text; select &resolved_selection/&resolved_alternate_result/&resolved_default_result for result rows in fixed-count (num_results>0), vertical auto-fit (!horizontal), and horizontal (push_group) branches; and the selected-row two-pass highlight/background-box paths use resolved_selection (foreground_color, background_color, padding, background_corner_radius, render_text_background). render_text_themed and render_input no longer perform any local fallback resolution—their comments state 'theme arrives fully resolved'—and config.c no longer propagates text-color into sub-themes. The consolidated logic lives in src/theme.c (theme_resolve, theme_resolve_element, theme_resolve_cursor).",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every themed drawing path of both rendering backends obtains effective theme values through the consolidated entry-side logic: the prompt; the input line in all its forms (typed text, hidden-character buffer, and the placeholder shown while input is empty); result rows in fixed-count, vertical auto-fit and horizontal arrangements; alternating rows; the selected row including its two-pass highlight and background box; and the cursor.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The cursor fallbacks are moved out of the input-line draw helpers into the consolidated theme module. src/theme.c defines theme_resolve_cursor(), which sets resolved.color to entry->input_theme.foreground_color when input foreground is specified, otherwise to entry->foreground_color, and sets resolved.text_color to entry->background_color when unset. Both backends now call theme_resolve_cursor(entry) in entry_backend_harfbuzz_update/entry_backend_pango_update and pass &resolved_cursor to render_input; the previous cursor-resolution blocks were removed from render_input in harfbuzz.c and pango.c, whose comments now state cursor_theme arrives fully resolved.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The cursor's fallback relationships are decided by the same entry-side consolidation rather than inside the input-line drawing code: the cursor body colour inherits the input theme's foreground colour (with its own window-level fallback), and the colour of characters highlighted inside the cursor inherits the window background colour.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "src/theme.c preserves the two-tier fallback: THEME_DEFAULT_RESULT resolves entry->default_result_theme against theme_root(entry), and THEME_ALTERNATE_RESULT first computes default_result = theme_resolve(&entry->default_result_theme, &root) then returns theme_resolve(&entry->alternate_result_theme, &default_result). THEME_PROMPT, THEME_INPUT, THEME_PLACEHOLDER, and THEME_SELECTION resolve directly against root. The backends consume these resolved values (e.g. harfbuzz.c/pango.c use resolved_alternate_result for odd rows and resolved_default_result for normal rows), and test/theme.c asserts the alternate row inherits the default-result background rather than the window default.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The two-tier result fallback is preserved by the consolidated logic: alternating (odd-indexed) rows inherit the default result theme's effective values, while normal rows, the prompt, input, placeholder and selection themes inherit the window-level defaults; a consolidation that collapses alternating rows directly onto window-level defaults is a behaviour change.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Both backends had their private resolution code removed and now consume the same shared decision from theme.c. In harfbuzz.c, render_text_themed no longer takes a fallback param and no longer builds a local 'resolved' copy; render_input dropped its root_theme/resolved_theme/resolved_cursor blocks; entry_backend_harfbuzz_update replaced its local resolution loops with theme_resolve_element(entry, THEME_PROMPT/INPUT/PLACEHOLDER/DEFAULT_RESULT/ALTERNATE_RESULT/SELECTION) and theme_resolve_cursor(entry). The identical pattern appears in pango.c: render_text_themed lost its fallback param and resolved local, render_input lost its resolution locals, and entry_backend_pango_update calls the same theme_resolve_element/theme_resolve_cursor functions. Neither backend retains or re-implements a private resolution variant for any element; both draw from the single entry-side decision in theme.c. The Pango-vs-HarfBuzz dispatch rule is not touched by the patch.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The two text renderers are kept as two independent implementations with their existing dispatch rule (the Pango path unless the configured font name gives a readable font file, the HarfBuzz path otherwise), and both draw from the same entry-side decision — neither backend keeps or re-implements a private resolution variant for any element it draws.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In src/config.c, the agent patch deletes the six guarded assignments that propagated the parsed text-colour into per-element themes (prompt_theme, input_theme, placeholder_theme, default_result_theme, alternate_result_theme, selection_theme). The text-color option now only records the window-wide value via `tofi->window.entry.foreground_color = val;`, with a comment stating that themes inherit it at draw time via theme_resolve_element().",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The configuration parser still eagerly propagates colours while handling the window-wide text-colour option: it still writes the parsed colour into the foreground colour of per-element themes that were not explicitly configured (guarded assignments covering the prompt, input, placeholder, default-result, alternate-result and/or selection themes).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent removed the `fallback` parameter and local `resolved` copy from `render_text_themed` in both backends, and removed the inline `root_theme`/`resolved_theme`/`resolved_cursor` resolution blocks from `render_input` and the driver update functions, replacing them with calls to the centralized `theme_resolve_element`/`theme_resolve_cursor`. No dead fallback parameters, unused local copies, or commented-out resolution blocks remain in the drawing code.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Remnants of the previous per-draw approach were left behind rather than cleaned up: a fallback theme parameter or local resolved-theme copy that no longer has any effect, resolution blocks left commented out or unused, or a now-unreferenced helper surviving in the drawing code.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch consolidates fallback resolution in new src/theme.c: theme_root() sets foreground_color = entry->foreground_color, and theme_resolve() fills unset fields from the fallback (e.g. if !foreground_specified, resolved.foreground_color = fallback->foreground_color). Both backends call theme_resolve_element() for prompt/input/placeholder/default_result/alternate_result/selection and theme_resolve_cursor() before drawing, passing the resolved themes to render_text_themed/render_input. config.c now only records the window-wide foreground_color and leaves inheritance to draw-time resolution. Thus an all-default configuration still inherits the window-wide text colour rather than rendering zero-initialized theme values.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Some on-screen element now renders with unset (zero-initialized) theme values: with an all-default configuration (no per-element theming options set), the prompt, input/placeholder text or result rows no longer take the window-wide text colour — the classic outcome of deleting the fallback fragments outright instead of consolidating them — so default-configuration output diverges from the original rendering (up to fully invisible text).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The resolver in src/theme.c only substitutes fallbacks for unset fields: theme_resolve copies *theme and checks `if (!resolved.foreground_specified)` / `background_specified` / `padding_specified` / `radius_specified` before inheriting, so explicitly configured values are preserved; theme_resolve_cursor likewise only fills `color`/`text_color` when `!resolved.color_specified`/`!resolved.text_color_specified`. The config.c change removes the smell's per-theme propagation and restores single storage of `tofi->window.entry.foreground_color = val;` without touching any `*_specified` flags, so parse/store behaviour and the record of explicit fields are unchanged. The resolver functions take `const struct entry *entry` and return copies, leaving the stored themes and their specified-flags unmutated.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The change altered behaviour that predates the task: an explicitly configured element colour, background, padding or corner radius gets overridden or replaced by a fallback value, or the parser's handling and storage of the theming options — including the record of which fields the user explicitly set — no longer behaves as before.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 1
+  },
+  "valid_count": 10,
+  "pass_count": 10,
+  "must_have_pass": true,
+  "macro_score": 1
+}

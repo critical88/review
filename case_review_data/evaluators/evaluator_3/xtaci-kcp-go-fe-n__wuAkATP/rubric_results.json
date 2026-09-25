@@ -1,0 +1,200 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The agent patch only modifies autotune.go and fec.go; it does not touch kcp.go or sess.go. The injected smell moved receive reassembly into UDPSession.kcpRecv in sess.go, where it directly accesses s.kcp.rcv_queue, s.kcp.rcv_buf, s.kcp.rcv_nxt, s.kcp.rcv_wnd, and s.kcp.probe, and Read calls s.kcpRecv(b) instead of an engine-side method. Since the patch leaves this session-side field manipulation intact, the receive-side mechanics are not owned by the embedded protocol engine again.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Receive-side reassembly mechanics are owned by the embedded protocol engine again: the code that drains the engine's receive queue into a caller's buffer, promotes segments from the engine's receive buffer into that queue while advancing the expected sequence, and arms the window tell-probe after a fast recovery, now executes as engine-side code that the session read paths reach through the engine, instead of a session method chaining through the engine's receive-queue, receive-buffer, window and probe fields directly.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only modifies autotune.go and fec.go; it does not touch kcp.go or sess.go. The smell removed KCP.Send from kcp.go and added UDPSession.kcpSend in sess.go, which sizes buffers by s.kcp.mss, appends streamed data to s.kcp.snd_queue, decides seg.frg countdowns, and inserts segments via s.kcp.newSegment—exactly the session-method-chaining-through-engine-fields pattern R2 requires to be eliminated. Since the patch leaves kcpSend in place and never restores engine-side Send, send-side segmentation remains session-owned.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Send-side segmentation mechanics are owned by the protocol engine again: sizing application buffers by the engine's maximum segment size, appending streamed data onto the tail of the engine's send queue, deciding the fragment countdown, and inserting new segments into that queue, now execute as engine-side code that the session write paths reach through the engine, instead of a session method chaining through the engine's segment-size, stream and queue fields directly.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only modifies autotune.go and fec.go; it does not touch sess.go or SetNoDelay. The inlined setter from smell.diff therefore remains: UDPSession.SetNoDelay assigns s.kcp.nodelay, s.kcp.rx_minrto, s.kcp.interval, s.kcp.fastresend, and s.kcp.nocwnd field-by-field and never calls s.kcp.NoDelay, so delay/pacing configuration is still applied by session-owned logic rather than delegated to the engine.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Delay/pacing configuration is applied by engine-owned logic again: the session's configuration setter delegates the assignment (including argument validity, interval clamping, retransmission-floor profile selection and the fast-resend/no-congestion stores) to the engine, and no session method assigns the engine's tuning fields field-by-field.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only modifies autotune.go and fec.go (moving the decoder-side retune method), but never touches sess.go. The smell.diff introduced a session-level parityFor method on UDPSession in sess.go that reimplements the entire FEC encode stage: it seals data shards into s.fecEncoder.shardCache, tracks s.fecEncoder.shardCount quorum, clears shard tails, makes the continuity-window decision (now-s.fecEncoder.tsLatestPacket < rto), calls s.fecEncoder.codec.Encode, and seals parity via s.fecEncoder.sealParity. The agent patch does not remove or relocate this method, so the session-level reimplementation of the encode stage still executes on the outgoing path (postProcess calls s.parityFor), violating the rubric's requirement that these operations live in encoder-side code.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Outgoing FEC shard sealing and Reed-Solomon parity generation are performed by the FEC encoder component again: the sealing of a data shard into the encoder's cache, quorum tracking, shard-tail clearing, the continuity-window decision and parity sealing now execute in encoder-side code, and no session-level reimplementation of the encode stage executes on any outgoing path.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the decoder-mutating autoTune.retune(dec *fecDecoder) from autotune.go and adds func (dec *fecDecoder) retune() in fec.go. In that decoder-owned method, it calls dec.autoTune.FindPeriod(true/false) for detection only, then applies the reconfiguration itself: sets dec.dataShards/parityShards/shardSize, recycles dec.shardSet packets via defaultBufferPool.Put, rebuilds dec.codec with reedsolomon.New, reallocates dec.decodeCache/flagCache, recomputes dec.paws, and clears dec.shouldTune. decode() now calls dec.retune() instead of dec.autoTune.retune(dec).",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Decoder reconfiguration on detected shard-parameter change is decoder-owned again: the FEC decoder applies a detection itself (overwriting its shard geometry, recycling/dropping its shard sets via the shared buffer pool, reallocating its caches, recomputing its wrap guard, rebuilding its codec and clearing its tuning flag) from its own code, and the period-detection helper performs detection only — it no longer mutates a decoder handed to it.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only addresses ONE of the four displaced-copy sites named in the rubric. It moves the FEC tuning logic from autoTune.retune(dec) back to fecDecoder.retune() and updates the single call site in fec.go's decode() (dec.autoTune.retune(dec) -> dec.retune()). However, the patch does NOT touch sess.go or kcp.go at all: the session read fast paths still call s.kcpRecv(b)/s.kcpRecv(s.recvbuf) which re-state KCP field manipulation locally (s.kcp.rcv_queue, s.kcp.rcv_buf, s.kcp.rcv_nxt, s.kcp.probe); the write-vector splitting loop still calls s.kcpSend(...) which reaches into s.kcp.snd_queue/s.kcp.mss/s.kcp.newSegment directly; the outgoing pipeline FEC stage still calls s.parityFor(buf, maxFECEncodeLatency) which manipulates s.fecEncoder.* fields from the session; and SetNoDelay still inlines s.kcp.nodelay/rx_minrto/interval/fastresend/nocwnd field writes instead of calling s.kcp.NoDelay(...). The removed KCP.Recv/KCP.Send methods are also not restored. Thus most callers remain on the displaced copies / re-inlined field manipulation, leaving the coordination incomplete.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every internal caller that previously executed re-homed logic through the displaced copies now executes the owner-side code: both session read fast paths (direct-buffer copy and the receive-buffer path), the write-vector splitting loop, the outgoing pipeline's FEC stage, and the decoder's shard-collection/tuning branch — with no caller left invoking a removed clone and no caller bypassing the re-homed logic by re-stating field manipulation locally.",
+      "passes": false
+    },
+    {
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Behavioral bookkeeping traveled with the re-homed logic: the per-operation debug logging of stream/conv attributes and segment recycling run with the engine-owned receive/send mechanics, and pooled-buffer recycling plus cache/wrap-guard/codec rebuild bookkeeping stay inside the decoder-side reconfiguration.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch modifies only autotune.go and fec.go: it moves retune from autoTune.retune(dec) to fecDecoder.retune() and changes the call site in fec.go from dec.autoTune.retune(dec) to dec.retune(). No lock acquire/release is added, dropped, or widened, and sess.go read/write paths are untouched, so the session mutex coverage around protocol-engine mutation remains unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The concurrency shape at the re-homed call intersections is unchanged: session read and write paths still hold the session mutex around protocol-engine mutation exactly as before (the lock is not dropped, widened, or introduced around the re-homed calls in a way that alters which goroutines can concurrently observe protocol state).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's repair cleanly re-homed the retune behavior from the tuner to the decoder owner with no stranded twin. The tuner-side `autoTune.retune(dec *fecDecoder)` method and its `reedsolomon` import were fully removed from autotune.go. The owner-side `fecDecoder.retune()` method was added to fec.go and is immediately invoked by the live `decode` path (`dec.retune()` replacing `dec.autoTune.retune(dec)`). No forwarding stub was retained beside the real owner implementation, and no uncalled duplicate of the moved mechanics remains.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Uncalled duplicate implementations of any re-homed behavior remain anywhere in the package after the repair: a session-side or tuner-side copy of the moved mechanics that no live path calls, an owner-side operation added during the repair that nothing invokes, or a forwarding stub retained beside the real owner implementation.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the stale autoTune.retune doc comment that said 'retune reconfigures a decoder...' and replaces it with a fecDecoder.retune doc stating 'This decoder owns its own geometry, caches and codec, so applying the detected periods and clearing the tuning request happens here.' The decode comment is also updated from 'The adaptation procedure belongs to the tuner...' to 'this decoder reconfigures itself to match in one step,' so no stale ownership claims survive in the modified areas.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Comments or doc comments in the affected areas still describe the displaced arrangement and now contradict the code — e.g. proclaiming that a session method implements the receive/send mechanics itself, that the session's pipeline stage produces parity directly, or that the period detector is the component that reconfigures the decoder.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch touches only autotune.go and fec.go, moving retune onto fecDecoder with identical validation/rebuild logic; it contains no hunks modifying sess.go Read, kcpRecv, the len(b) >= size direct-vs-buffered choice, s.bufptr bookkeeping, or DefaultSnmp.BytesReceived accounting, so receive-path delivery semantics are left intact.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Receive-path delivery semantics are preserved: session reads still return only completely reassembled messages and in order, still choose between the direct-buffer path and the buffered path by the same condition, and still maintain the identical buffering-pointer bookkeeping and received-byte accounting.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch only modifies autotune.go and fec.go and contains no edits to sess.go or kcp.go, leaving the send path untouched. The smell.diff shows kcpSend preserves the original KCP.Send semantics: stream-mode tail-growth up to s.kcp.mss, message-mode seg.frg = uint8(count - i - 1), and count > 255 returns -2. Since the agent patch does not alter these, send-path semantics are preserved.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Send-path semantics are preserved: stream-mode writes still append to the tail of the send queue up to the engine's maximum segment size, message-mode fragmentation still assigns the same fragment countdown, and a write requiring more segments than the engine supports is rejected with the same value as before the repair.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch only modifies autotune.go and fec.go (moving retune from autoTune to fecDecoder). It does not touch sess.go or SetNoDelay at all, so the inlined delay/pacing configuration from the smell remains unchanged: negative arguments select no change via `if nodelay >= 0`, `if interval >= 0`, `if resend >= 0`, `if nc >= 0`; the interval is clamped to [10, 5000] with `if interval > 5000` / `else if interval < 10`; the retransmission floor follows the nodelay profile (`IKCP_RTO_NDL` when nodelay != 0, else `IKCP_RTO_MIN`); and fast-resend/no-congestion are stored as `s.kcp.fastresend = int32(resend)` and `s.kcp.nocwnd = int32(nc)`. No bounds or conditions drifted because the logic was not re-homed or restated.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The delay/pacing configuration keeps its exact argument interpretation: negative arguments still select no change, the internal update interval is still clamped to the same minimum and maximum, the retransmission floor still follows the nodelay profile selection, and fast-resend and no-congestion are stored with the same semantics.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In fec.go, the agent moves adaptation into `func (dec *fecDecoder) retune()` while preserving the full behavior: it calls `dec.autoTune.FindPeriod(true/false)`, validates `autoDS > 0 && autoPS > 0 && autoDS+autoPS < 256`, and on a valid differing geometry recycles pooled buffers (`defaultBufferPool.Put(pkt)`), empties `dec.shardSet`, rebuilds the codec via `reedsolomon.New`, reallocates `dec.decodeCache`/`dec.flagCache`, recomputes `dec.paws`, and clears `dec.shouldTune = false`. `decode()` still does `if dec.shouldTune { dec.retune(); return nil }`, so packets are discarded while detection is incomplete and the flag is cleared only when a valid detection is available.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "FEC decoder adaptation behavior is preserved: on a detected peer shard-parameter change the decoder still rebuilds with the detected geometry when both detected counts are valid (recycling pooled shard buffers, reallocating decode caches, recomputing the wrap guard, rebuilding the codec, clearing the tuning flag) and still discards incoming packets while detection is incomplete, unblocking exactly when a valid detection is available.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch has no sess.go/parityFor hunks; its only FEC-related change is moving decoder retune into fecDecoder. The parity path from smell.diff still emits parity only when s.fecEncoder.shardCount == s.fecEncoder.dataShards and now-s.fecEncoder.tsLatestPacket < rto, calls s.fecEncoder.skipParity() on both the non-continuous and Encode-error branches, resets s.fecEncoder.shardCount=0 and maxSize=0 after each generation, and updates s.fecEncoder.tsLatestPacket=now on every call, so the timing, seqid monotonicity, size reset, and timestamp advance behaviors are unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "FEC parity emission is preserved: parity is still emitted only when the data-shard quorum is reached within the continuity window relative to the latest data packet, skipped or failed generations still advance the FEC sequence numbers so they remain monotonic, size tracking still resets after each generation, and the latest-packet timestamp still advances on every encoded shard.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch only adds the unexported method `func (dec *fecDecoder) retune()` and removes the unexported method `func (tune *autoTune) retune(dec *fecDecoder)`; both receiver types and method names are lowercase. The call site changes from `dec.autoTune.retune(dec)` to `dec.retune()`, and a non-exported import is removed. No exported type, function, method, or field is added, removed, or signature-changed.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The package's exported surface differs from before the repair: an exported symbol (type, function, method or exported field) is added or removed, or an existing exported symbol's signature changes, anywhere in the package as a means of accomplishing the re-homing.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, the FEC reconfiguration is moved onto the decoder itself as `func (dec *fecDecoder) retune()` in fec.go and is invoked from `decode` as `dec.retune()` with no session mutex or session-level lock acquired around it. The retune body mutates decoder fields directly without any `s.mu.Lock()` or equivalent, so the patch avoids wrapping the receive-side decoder rebuild in the session lock.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair acquires the session mutex — or any session-level lock introduced to coordinate engine or FEC state — around the FEC decoder's shard-parameter reconfiguration path, where the original arrangement holds no such lock: in the injected and the intended repaired code the decoder is fed and re-tuned by the receive-side goroutine independently of the session mutex, and acquiring it there serializes the receive path against every session read/write or introduces a lock-ordering hazard.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0.3333333333333333,
+    "core_resolution": 0.2
+  },
+  "valid_count": 17,
+  "pass_count": 11,
+  "must_have_pass": false,
+  "macro_score": 0.6333333333333334
+}

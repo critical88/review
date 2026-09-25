@@ -1,0 +1,127 @@
+{
+  "schema_version": "smellbench.solve_rubrics.v3",
+  "execution_mode": "one_independent_call_per_rubric",
+  "aggregation": "macro_average_by_category",
+  "rubrics": [
+    {
+      "id": "R1",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The credential lifecycle is implemented in the package's authentication area (gspread/auth.py or a module dedicated to authentication), not on the client entry class: running the interactive local-server OAuth flow (google_auth_oauthlib InstalledAppFlow), loading an authorized-user credentials file, storing credentials to disk (including mkdir of the parent dir), computing the config directory, and defining the scope/file-location defaults are owned by the authentication area, and gspread.client.Client neither defines nor reimplements any of them (a visible delegating alias on Client is acceptable only if the authentication area owns all decisions and state).",
+      "rationale": "The injection copied these members verbatim from gspread/auth.py onto Client as static/class members with class-level defaults (manifest entries E3-E6); their bodies in the client are the credential-lifecycle facet of this case, so a resolution must move implementation ownership back out of the entry class."
+    },
+    {
+      "id": "R2",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every documented login method's construction logic — credential-based login (authorize), OAuth login with stored/reloaded authorized-user file (oauth), OAuth login from dicts (oauth_from_dict), service-account login from file and from dict, and API-key login (including the google-auth availability guard) — is carried out in the authentication area of the package and ends by building a client around the supplied transport class; Client does not contain the bodies of these login factories as its own class-level factories implementing credential acquisition.",
+      "rationale": "The injection turned the five-six login entry points into classmethods on Client (manifest entries E10-E15), and these are the class-level coupling cementers of this instance; keeping credential-acquisition decisions inside the entry class fails the task regardless of naming."
+    },
+    {
+      "id": "R3",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The entry class holds exactly one HTTP transport: gspread.client.Client no longer inherits from the HTTP transport class (no inherited request method, session or auth state), does not inherit from any class defined in gspread/http_client.py, and operates through the single transport instance constructed from the transport class it was given.",
+      "rationale": "The injected Client derives from gspread.http_client.HTTPClient while also constructing self.http_client, duplicating volatile transport state (manifest entry E2 and the class entry E1); both the natural and explicit prompts name this double transport state as a required cleanup, and the task's rule treats same-package inherited members as part of the effective surface."
+    },
+    {
+      "id": "R4",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Legacy oauth2client credential conversion (convert_credentials with its OAuth and service-account converters) is implemented in the package's utility/authentication area without importing or otherwise resolving gspread.client from it — no deferred/lazy import of the client module, no call into the entry class — and converting an oauth2client.service_account.ServiceAccountCredentials or oauth2client OAuth2Credentials still yields the same google.auth credentials as before.",
+      "rationale": "The injection emptied the conversion helpers in gspread/utils.py and left a shim that lazily imports the client (manifest entry E28); the reverse dependency from the utility module into the client class is one of this case's semantic manifestations and must be eliminated, not relocated under another name."
+    },
+    {
+      "id": "R5",
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The endpoint duplication is removed: the injected by-key range accessors on Client (get_spreadsheet_values / update_spreadsheet_values) no longer build Sheets values URLs themselves inside the entry class — either they are removed or they route through the single request/endpoint owner so that exactly one place in the package builds values-family URLs (including quote-ing of the range name) for these operations.",
+      "rationale": "These two accessors (manifest entries E16-E17) copy the transport layer's URL-building idiom into the client and are the duplicated endpoint knowledge facet of this instance; leaving parallel endpoint builders in the entry class keeps the coordination hub a protocol owner."
+    },
+    {
+      "id": "R6",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The public login surface keeps working with unchanged signatures and return contracts from both import locations: gspread.authorize, gspread.oauth, gspread.oauth_from_dict, gspread.service_account, gspread.service_account_from_dict and gspread.api_key at package top level, and the same names plus the local-server flow runner, credential load/store helpers and the config-dir helper in gspread.auth (the package top-level __init__ imports these from .auth and must keep working without edits). oauth_from_dict still returns the tuple of (client, authorized-user dict safe to store); oauth still reuses a stored authorized-user file when valid, otherwise runs the flow and persists the authorized-user file on first login, honoring custom credentials_filename/authorized_user_filename paths.",
+      "rationale": "This is the caller graph the untangling must preserve: the top-level gspread/__init__.py re-exports these names from the auth module, and the recorded behavior of stored-credential reuse plus token persistence is part of the library's documented promise."
+    },
+    {
+      "id": "R7",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The OAuth flow stays pluggable: the OAuth login helpers accept a user-supplied flow callable matching the documented protocol (called with client_config and scopes, returning credentials), passed as the flow argument; the default local-server strategy still works with the same argument surface (port parameter included) after the separation.",
+      "rationale": "Flow pluggability is part of the authentication responsibility the entry class absorbed (the flow-callable protocol was relocated into gspread.client by the injection); a resolution that hard-codes one strategy or loses the customization point changes public behavior."
+    },
+    {
+      "id": "R8",
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Custom transports remain first-class: every login entry point and direct Client(...) construction accept an http_client transport-class argument and an optional requests.Session, instantiate that supplied class, and after construction all spreadsheet/worksheet interactions are served through that instance (objects handed to spreadsheets/worksheets are the supplied transport instance); gspread.http_client.HTTPClient and gspread.http_client.BackOffHTTPClient remain independently constructible, importable from the package top level, and functional as standalone transports with the built-in backoff transport still selecting retry delays through gspread.http_client.time.sleep.",
+      "rationale": "The composed-transport path is what the recorded suite exercises (a custom transport subclass of the backoff transport is used for every recorded request, and the worksheet objects hold the transport instance); the untangling must not silently reroute traffic or strand those transport classes."
+    },
+    {
+      "id": "R9",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The complete recorded test suite passes on the repaired tree with the same passing set as the clean baseline (166 tests) and no test asset was weakened: no test file, conftest fixture, cassette or test requirement was edited, deleted, skipped, xfailed, or replaced by a narrower equivalent.",
+      "rationale": "Behavior preservation is the second hard constraint of this case: the injection itself kept every recorded test passing, so any behavior delta introduced by the repair shows up as a suite failure or as a testing-scope change, both of which fail this item."
+    },
+    {
+      "id": "R10",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The coordinator's public behavioral surface is unchanged: permission helpers keep their exact keyword names and semantics (value, perm_type, role, notify, email_message, with_link on the client-level insert-permission path; the same for the spreadsheet-level share/list-permissions behavior), copy() keeps copy_permissions/folder_id/copy_comments behavior including permission and comment re-creation, export/import_csv/del_spreadsheet/list/open/create signatures and effects are untouched, set_timeout applied to the client still governs subsequent API calls, and the credentials' expiry remains readable off the client.",
+      "rationale": "These contracts predate the injection on the client class and are load-bearing for downstream users; the untangling restructures ownership, not vocabulary, and a repair that changes keyword behavior regresses user code while appearing to pass unit scope."
+    },
+    {
+      "id": "R11",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Import hygiene holds after the reorganization: importing gspread (and gspread.auth, gspread.http_client, gspread.utils, gspread.client individually) succeeds in a fresh interpreter with no circular-import error and no new import-order constraint between the client, auth, transport and utility modules; none of these modules performs network or filesystem work at import time beyond what the clean tree does (the config-dir/file defaults must still be computable as import-time constants).",
+      "rationale": "The injection had to use call-time deferred imports specifically because the utility and transport modules are imported at module-scope by the client layer — the reorganization must not leave a latent cycle or push auth work into import time."
+    },
+    {
+      "id": "R12",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "API-key login still raises the documented NotImplementedError naming the required google-auth version when google.auth.api_key is unavailable (verified by behavior/branch inspection or by simulating the missing submodule), and still constructs a working client when it is available.",
+      "rationale": "The availability guard was moved onto the entry class by the injection; since the installed google-auth provides the API-key credentials the suite never exercises the failing branch, making this an easy behavior to lose silently during relocation."
+    },
+    {
+      "id": "R13",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No pass-through forwarders survive in the helper modules: the repair does not leave any module-level function in the authentication module (gspread/auth.py or its replacement) or in gspread/utils.py whose body only delegates into the client entry class (single-expression bodies of the shape `return Client.<member>(...)`), and neither module re-exports its public constants (scope lists, config directory, credential/service-account file defaults, API-key availability flag) from gspread.client.Client.",
+      "rationale": "These forwarders (manifest entries E18-E27) and the constants re-export pattern are the injected reverse dependencies — authentication decisions masquerading as an API while the entry class stays the sole implementation site; keeping them means the relocation was cosmetic on the module side."
+    },
+    {
+      "id": "R14",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No dead absorbed members or imports linger in the client module: gspread/client.py does not retain unused copies of the moved credential-flow/persistence/conversion members (the flow runner, credential file load/store, conversion helpers, credential scope/file defaults, the flow-callable protocol) nor the injection's supporting imports (InstalledAppFlow, OAuthCredentials/SACredentials, APIKeyCredentials, credential-file constants) — the client module imports only what its remaining coordinator code uses, with no leftover dead code from the moved concerns.",
+      "rationale": "Duplicating the moved logic in place while adding new owners is a concrete failure mode for this instance: the accumulated members (manifest entries E2-E15) must actually leave the entry class, not merely gain parallel implementations elsewhere."
+    },
+    {
+      "id": "R15",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair is not a re-packing of the same accumulation: the request pipeline is not handed to a new single over-tenant — e.g. the transport class does not gain the credential lifecycle or login factories alongside request sending, and no new helper class ends up owning transport plus credentials plus endpoint construction together — each separated concern lands with a cohesive, single-responsibility owner.",
+      "rationale": "A plausible-but-wrong resolution for this case is moving the pile: absorbing the login mechanics into the transport layer or a fresh god-object would reproduce the same responsibility sink under a different name and leave the package as tangled as before."
+    }
+  ]
+}

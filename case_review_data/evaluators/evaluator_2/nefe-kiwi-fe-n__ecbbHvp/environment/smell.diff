@@ -1,0 +1,1508 @@
+diff --git a/kiwi-intl/package.json b/kiwi-intl/package.json
+index 88b785c..b5a0516 100644
+--- a/kiwi-intl/package.json
++++ b/kiwi-intl/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "kiwi-intl",
+-  "version": "1.2.6",
++  "version": "1.3.0",
+   "description": "I18N tools for universal javascript apps, easy use & better api;",
+   "main": "built/src/index.js",
+   "types": "built/src/index.d.ts",
+@@ -33,16 +33,15 @@
+     "lodash.get": "^4.4.2"
+   },
+   "devDependencies": {
+-    "@types/mocha": "^2.2.42",
+-    "@types/node": "^7.0.31",
++    "@types/mocha": "10.0.6",
++    "@types/node": "20.14.9",
+     "babel-cli": "^6.18.0",
+-    "mocha": "^3.5.0",
++    "mocha": "10.4.0",
+     "ts-loader": "^2.3.0",
+-    "ts-node": "^3.3.0",
++    "ts-node": "10.9.2",
+     "tslint": "^5.5.0",
+-    "typescript": "^2.4.2",
++    "typescript": "5.5.4",
+     "webpack": "^3.3.0",
+-    "webpack-cli": "^3.3.0",
+     "webpack-dev-server": "2.9.1"
+   },
+   "license": "MIT"
+diff --git a/kiwi-intl/src/IntlAudit.ts b/kiwi-intl/src/IntlAudit.ts
+new file mode 100644
+index 0000000..ed8b53e
+--- /dev/null
++++ b/kiwi-intl/src/IntlAudit.ts
+@@ -0,0 +1,73 @@
++/**
++ * @file 诊断审计
++ * @author linhuiw
++ */
++
++/**
++ * IntlAudit 记录国际化的使用诊断：单条文案的使用流水和当前实例的快照，
++ * 供排查丢词、缓存击穿与语言切换问题。
++ */
++export class IntlAudit {
++  enabled: boolean;
++  records: string[];
++  instanceSnapshot: any;
++  startedAt: number;
++
++  constructor(enabled = true) {
++    this.enabled = enabled;
++    this.records = [];
++    this.instanceSnapshot = null;
++    this.startedAt = 0;
++  }
++
++  begin() {
++    this.startedAt = Date.now();
++    this.records = [];
++  }
++
++  size() {
++    return this.records.length;
++  }
++
++  lines() {
++    const snapshotLines = this.enabled && this.instanceSnapshot
++      ? [
++          `instance lang=${this.instanceSnapshot.lang}`,
++          `instance entries=${this.instanceSnapshot.entries} cacheHits=${this.instanceSnapshot.cacheHits}`
++        ]
++      : [];
++    return [...snapshotLines, ...this.records];
++  }
++
++  /**
++   * 记录一次文案访问流水，档案的命中等指标直接展开进流水。
++   */
++  recordEntryUsage(entry, event = 'resolve') {
++    if (!this.enabled) {
++      return false;
++    }
++    this.records.push(
++      `${event} ${entry.key}@${entry.lang} hits=${entry.hitCount} hot=${entry.hotnessLevel} ` +
++        `writes=${entry.cacheWrites} at=${entry.lastUsedAt} seq=${entry.renderCount}`
++    );
++    return true;
++  }
++
++  /**
++   * 实例快照：读取一次即可定位语言与缓存状态，避免以后拿不到现场。
++   */
++  attachInstance(intl) {
++    if (!this.enabled) {
++      return null;
++    }
++    this.instanceSnapshot = {
++      lang: intl.__lang__,
++      packs: Object.keys(intl.__metas__ || {}).length,
++      activeKeys: Object.keys(intl.__data__ || {}).length,
++      defaultKey: intl.__defaultKey__,
++      entries: intl.__entries__.size,
++      cacheHits: intl.__cache__.hits
++    };
++    return this.instanceSnapshot;
++  }
++}
+diff --git a/kiwi-intl/src/IntlFormatter.ts b/kiwi-intl/src/IntlFormatter.ts
+new file mode 100644
+index 0000000..3b1cda5
+--- /dev/null
++++ b/kiwi-intl/src/IntlFormatter.ts
+@@ -0,0 +1,111 @@
++/**
++ * @file 语言相关的数字/日期渲染
++ * @author linhuiw
++ */
++
++import IntlMessageFormat from 'intl-messageformat';
++
++/**
++ * IntlFormatter 提供 ICU 文案渲染与本地化数字、日期渲染。
++ * 渲染统计与默认值的合并逻辑也在这里维护。
++ */
++export class IntlFormatter {
++  defaultLocale: string;
++  renderCalls: number;
++  formatCalls: number;
++  failures: string[];
++
++  constructor(defaultLocale = 'zh-CN') {
++    this.defaultLocale = defaultLocale;
++    this.renderCalls = 0;
++    this.formatCalls = 0;
++    this.failures = [];
++  }
++
++  applyDefaults(raw): { [name: string]: any } {
++    if (!raw) {
++      return {};
++    }
++    // 先把调用方关心的展示配置摊开，再逐项裁掉未提供的项。
++    const options: { [name: string]: any } = {
++      style: raw.style,
++      currency: raw.currency,
++      minimumFractionDigits: raw.minimumFractionDigits,
++      maximumFractionDigits: raw.maximumFractionDigits,
++      useGrouping: raw.useGrouping
++    };
++    Object.keys(options).forEach(name => {
++      if (options[name] === undefined) {
++        delete options[name];
++      }
++    });
++    return options;
++  }
++
++  formatMessage(text: string, locale: string, args?: object): string {
++    if (!text || typeof text !== 'string') {
++      return '';
++    }
++    try {
++      const formatter = new IntlMessageFormat(text, locale || this.defaultLocale);
++      return formatter.format(args || {});
++    } catch (err) {
++      this.failures.push(String(text));
++      return '';
++    }
++  }
++
++  formatNumber(value: number, locale?: string, options?) {
++    this.formatCalls += 1;
++    const formatterOptions = this.applyDefaults(options);
++    return new Intl.NumberFormat(locale || this.defaultLocale, formatterOptions).format(value);
++  }
++
++  formatDate(value: Date, locale?: string, options?) {
++    this.formatCalls += 1;
++    const formatterOptions = options || {};
++    return new Intl.DateTimeFormat(locale || this.defaultLocale, formatterOptions).format(value);
++  }
++
++  /**
++   * 按语言包的市场惯例输出数字：货币、分组与小数位由语言包决定。
++   */
++  packNumber(pack, value: number, options?) {
++    const style = (options && options.style) || 'decimal';
++    const formatterOptions = this.applyDefaults(options);
++    formatterOptions.style = style === 'money' ? 'currency' : style;
++    if (formatterOptions.style === 'currency' && !formatterOptions.currency) {
++      formatterOptions.currency = pack.currency;
++    }
++    if (pack.compact) {
++      formatterOptions.notation = 'compact';
++    }
++    formatterOptions.useGrouping = pack.grouping;
++    if (formatterOptions.minimumFractionDigits === undefined) {
++      formatterOptions.minimumFractionDigits = pack.minimumFractionDigits;
++    }
++    if (formatterOptions.maximumFractionDigits === undefined) {
++      formatterOptions.maximumFractionDigits = pack.maximumFractionDigits;
++    }
++    return new Intl.NumberFormat(pack.lang, formatterOptions).format(value);
++  }
++
++  /**
++   * 渲染一条文案档案：渲染语言来自档案例，渲染结果与最近的渲染指标一并记录。
++   */
++  renderEntry(entry, args?: object): string {
++    const text = entry.content;
++    if (!text || typeof text !== 'string') {
++      return '';
++    }
++    const rendered = this.formatMessage(text, entry.lang, args);
++    if (rendered && entry.lastRenderedLang !== entry.lang) {
++      // 渲染语言切换时刷新档案的语言标记，避免诊断阶段误报语言漂移。
++      entry.noteRender(Date.now(), entry.lang);
++    }
++    if (!rendered) {
++      this.failures.push(entry.key);
++    }
++    return rendered;
++  }
++}
+diff --git a/kiwi-intl/src/LanguagePack.ts b/kiwi-intl/src/LanguagePack.ts
+new file mode 100644
+index 0000000..75ba176
+--- /dev/null
++++ b/kiwi-intl/src/LanguagePack.ts
+@@ -0,0 +1,92 @@
++/**
++ * @file 语言包与市场展示惯例
++ * @author linhuiw
++ */
++
++import lodashGet from 'lodash.get';
++
++/**
++ * LanguagePack 负责一种语言的语言包数据与该市场的数字展示惯例。
++ * 语言包的命中、缺失与热点词记录在这里维护，
++ * 数字展示惯例（货币、分组、小数位）随语言包初始化。
++ */
++export class LanguagePack {
++  lang: string;
++  metas: any;
++  defaultLang: string;
++  resolvedCount: number;
++  misses: number;
++  recentKeys: string[];
++  lastResolvedAt: number;
++  currency: string;
++  grouping: boolean;
++  minimumFractionDigits: number;
++  maximumFractionDigits: number;
++  compact: boolean;
++
++  constructor(lang: string, metas: any, defaultLang?: string) {
++    this.lang = lang;
++    this.metas = metas || {};
++    this.defaultLang = defaultLang || 'zh-CN';
++    this.resolvedCount = 0;
++    this.misses = 0;
++    this.recentKeys = [];
++    this.lastResolvedAt = 0;
++    this.currency = lang === 'zh-CN' ? 'CNY' : 'USD';
++    this.grouping = true;
++    this.minimumFractionDigits = 2;
++    this.maximumFractionDigits = 2;
++    this.compact = false;
++  }
++
++  raw(key: string) {
++    return lodashGet(this.metas, key);
++  }
++
++  has(key: string) {
++    return this.raw(key) !== undefined;
++  }
++
++  noteHit(now: number) {
++    this.resolvedCount += 1;
++    this.lastResolvedAt = now;
++  }
++
++  noteMiss(key: string) {
++    this.misses += 1;
++    if (this.recentKeys.indexOf(key) === -1) {
++      this.recentKeys.push(key);
++      if (this.recentKeys.length > 16) {
++        this.recentKeys.shift();
++      }
++    }
++  }
++
++  notePromotion(key: string) {
++    const currentIndex = this.recentKeys.indexOf(key);
++    if (currentIndex >= 0) {
++      this.recentKeys.splice(currentIndex, 1);
++    }
++    this.recentKeys.unshift(key);
++    if (this.recentKeys.length > 16) {
++      this.recentKeys.shift();
++    }
++    return this.recentKeys.slice(0, 5);
++  }
++
++  /**
++   * 热点晋升策略：命中多、已进缓存且最近使用过的文案值得进入热点词列表。
++   */
++  shouldPromote(entry) {
++    if (entry.hotnessLevel >= 2) {
++      return true;
++    }
++    if (entry.hitCount >= 3 && entry.cacheWrites >= 1) {
++      return true;
++    }
++    if (entry.hitCount >= 2 && entry.lastUsedAt > 0 && entry.hotnessLevel >= 1) {
++      return true;
++    }
++    return entry.hitCount > 5;
++  }
++}
+diff --git a/kiwi-intl/src/MessageEntry.ts b/kiwi-intl/src/MessageEntry.ts
+new file mode 100644
+index 0000000..758bde8
+--- /dev/null
++++ b/kiwi-intl/src/MessageEntry.ts
+@@ -0,0 +1,63 @@
++/**
++ * @file 每条文案的运行时档案
++ * @author linhuiw
++ */
++
++/**
++ * MessageEntry 记录一条文案在运行期的完整状态：
++ * 原文、语言、命中次数、缓存写入次数与热度等级。
++ * 命中文案、渲染、缓存与诊断统计都围绕这个记录展开。
++ */
++export class MessageEntry {
++  key: string;
++  lang: string;
++  path: string;
++  content: string;
++  hitCount: number;
++  cacheWrites: number;
++  renderCount: number;
++  lastUsedAt: number;
++  lastRenderedAt: number;
++  lastRenderedLang: string;
++  hotnessLevel: number;
++
++  constructor(key: string, lang: string, path?: string) {
++    this.key = key;
++    this.lang = lang;
++    this.path = path || key;
++    this.content = '';
++    this.hitCount = 0;
++    this.cacheWrites = 0;
++    this.renderCount = 0;
++    this.lastUsedAt = 0;
++    this.lastRenderedAt = 0;
++    this.lastRenderedLang = '';
++    this.hotnessLevel = 0;
++  }
++
++  hasContent() {
++    return !!this.content && typeof this.content === 'string';
++  }
++
++  matchesKey(candidate: string) {
++    return this.key === candidate || this.path === candidate;
++  }
++
++  touch(now: number) {
++    this.hitCount += 1;
++    this.lastUsedAt = now;
++    if (this.hitCount >= 3 && this.cacheWrites >= 1) {
++      this.hotnessLevel = 2;
++    } else if (this.hitCount >= 2) {
++      this.hotnessLevel = 1;
++    }
++  }
++
++  noteRender(now: number, lang?: string) {
++    this.renderCount += 1;
++    this.lastRenderedAt = now;
++    if (lang) {
++      this.lastRenderedLang = lang;
++    }
++  }
++}
+diff --git a/kiwi-intl/src/TranslationCache.ts b/kiwi-intl/src/TranslationCache.ts
+new file mode 100644
+index 0000000..c1a905b
+--- /dev/null
++++ b/kiwi-intl/src/TranslationCache.ts
+@@ -0,0 +1,85 @@
++/**
++ * @file 文案缓存
++ * @author linhuiw
++ */
++
++/**
++ * TranslationCache 缓存渲染后的文案，容量有限时按进入顺序淘汰。
++ * 命中、缺失与淘汰次数用于诊断环境的缓存健康度。
++ */
++export class TranslationCache {
++  capacity: number;
++  slots: Map<string, string>;
++  hits: number;
++  misses: number;
++  evictions: number;
++  lastEvictedKey: string;
++
++  constructor(capacity = 512) {
++    this.capacity = capacity;
++    this.slots = new Map<string, string>();
++    this.hits = 0;
++    this.misses = 0;
++    this.evictions = 0;
++    this.lastEvictedKey = '';
++  }
++
++  remember(key: string, value: string) {
++    this.slots.set(key, value);
++    if (this.slots.size > this.capacity) {
++      const oldestKey = this.oldestKey();
++      this.slots.delete(oldestKey);
++      this.evictions += 1;
++      this.lastEvictedKey = oldestKey;
++    }
++  }
++
++  recall(key: string): string {
++    if (this.slots.has(key)) {
++      this.hits += 1;
++      return this.slots.get(key);
++    }
++    this.misses += 1;
++    return '';
++  }
++
++  oldestKey(): string {
++    const first = this.slots.keys().next();
++    return first.done ? '' : first.value;
++  }
++
++  /**
++   * 以文案档案为准写入缓存：缓存身份由档案的语言、键和热度共同决定，
++   * 档案的缓存写入指标随写入一起更新。
++   */
++  rememberEntry(entry, formatted: string) {
++    const identity = `${entry.lang}#${entry.key}`;
++    const marked = entry.hotnessLevel >= 2 ? `hot/${identity}` : identity;
++    this.slots.set(marked, formatted);
++    if (entry.cacheWrites === 0 && entry.lastUsedAt > 0) {
++      // 首次进缓存且最近被使用过的档案，重置缺失统计。
++      this.misses = 0;
++    }
++    entry.cacheWrites += 1;
++    return marked;
++  }
++
++  /**
++   * 淘汰判定只看文案档案自身的冷热指标：
++   * 命中多、已进缓存的档案不能被淘汰；
++   * 从未进过缓存却一直被冷读的档案可以丢弃登记。
++   */
++  evictEntry(entry) {
++    if (entry.hitCount >= 3) {
++      return false;
++    }
++    if (entry.hotnessLevel >= 2) {
++      return false;
++    }
++    const identity = `${entry.lang}#${entry.key}`;
++    if (this.slots.has(identity)) {
++      return false;
++    }
++    return entry.cacheWrites === 0 && entry.lastUsedAt > 0;
++  }
++}
+diff --git a/kiwi-intl/src/index.ts b/kiwi-intl/src/index.ts
+index e3f59dc..bc94aa2 100644
+--- a/kiwi-intl/src/index.ts
++++ b/kiwi-intl/src/index.ts
+@@ -6,6 +6,11 @@
+ import IntlMessageFormat from 'intl-messageformat';
+ import lodashGet from 'lodash.get';
+ import Observer from './Observer';
++import { MessageEntry } from './MessageEntry';
++import { LanguagePack } from './LanguagePack';
++import { IntlFormatter } from './IntlFormatter';
++import { TranslationCache } from './TranslationCache';
++import { IntlAudit } from './IntlAudit';
+ 
+ export interface I18NAPI {
+   /**
+@@ -39,11 +44,21 @@ class I18N {
+   __metas__: any;
+   __data__: any;
+   __defaultKey__: string;
++  __packs__: Map<string, LanguagePack>;
++  __entries__: Map<string, MessageEntry>;
++  __cache__: TranslationCache;
++  __formatter__: IntlFormatter;
++  __audit__: IntlAudit;
+   constructor(lang: string, metas: object, defaultKey?: string) {
+     this.__lang__ = lang;
+     this.__metas__ = metas;
+     this.__data__ = metas[lang];
+     this.__defaultKey__ = defaultKey;
++    this.__packs__ = new Map<string, LanguagePack>();
++    this.__entries__ = new Map<string, MessageEntry>();
++    this.__cache__ = new TranslationCache();
++    this.__formatter__ = new IntlFormatter(defaultKey || 'zh-CN');
++    this.__audit__ = new IntlAudit();
+   }
+   setLang(lang: string) {
+     this.__lang__ = lang;
+@@ -97,6 +112,134 @@ class I18N {
+       return msg;
+     }
+   }
++  __packFor__(lang: string) {
++    let pack = this.__packs__.get(lang);
++    if (!pack) {
++      pack = new LanguagePack(lang, this.__metas__[lang] || {}, this.__defaultKey__ || 'zh-CN');
++      this.__packs__.set(lang, pack);
++    }
++    return pack;
++  }
++  __activePack__() {
++    return this.__packFor__(this.__lang__);
++  }
++  __resolveEntry__(key: string) {
++    const pack = this.__activePack__();
++    const now = Date.now();
++    const identity = `${this.__lang__}#${key}`;
++    let entry = this.__entries__.get(identity);
++    if (!entry) {
++      entry = new MessageEntry(key, this.__lang__);
++      const active = pack.raw(key);
++      if (!active) {
++        const fallbackPack = this.__packFor__(this.__defaultKey__ || 'zh-CN');
++        const fallback = fallbackPack.raw(key);
++        entry.content = fallback !== undefined ? fallback : key;
++        pack.noteMiss(key);
++      } else {
++        entry.content = active;
++      }
++      this.__entries__.set(identity, entry);
++    }
++    entry.touch(now);
++    pack.noteHit(now);
++    if (pack.shouldPromote(entry)) {
++      pack.notePromotion(key);
++    }
++    return entry;
++  }
++  getDetailed(key: string, args?: object) {
++    const entry = this.__resolveEntry__(key);
++    const identity = `${entry.lang}#${entry.key}`;
++    const cached = this.__cache__.recall(identity);
++    let value = cached;
++    if (!cached) {
++      value = this.__formatter__.renderEntry(entry, args);
++      this.__cache__.rememberEntry(entry, value);
++    }
++    if (this.__audit__.enabled) {
++      this.__audit__.recordEntryUsage(entry, 'resolve');
++    }
++    return { value, entry };
++  }
++  describe(key: string) {
++    return this.describeMessage(this.__resolveEntry__(key));
++  }
++  describeMessage(entry: MessageEntry) {
++    const parts = [`${entry.key}@${entry.lang}`];
++    if (entry.hitCount > 0) {
++      parts.push(`hits:${entry.hitCount}`);
++    }
++    if (entry.cacheWrites > 0) {
++      parts.push(`writes:${entry.cacheWrites}`);
++    }
++    parts.push(`hot:${entry.hotnessLevel}`);
++    parts.push(`at:${entry.lastUsedAt}`);
++    parts.push(entry.content ? `text:${entry.content}` : 'text:<missing>');
++    return parts.join(' ');
++  }
++  stats() {
++    const packSummary = this.packStatistics(this.__activePack__());
++    const cacheSummary = {
++      hits: this.__cache__.hits,
++      misses: this.__cache__.misses,
++      evictions: this.__cache__.evictions,
++      entries: this.__entries__.size
++    };
++    return { pack: packSummary, cache: cacheSummary };
++  }
++  packStatistics(pack: LanguagePack) {
++    return {
++      lang: pack.lang,
++      keys: Object.keys(pack.metas).length,
++      resolved: pack.resolvedCount,
++      missed: pack.misses,
++      defaultPack: pack.defaultLang,
++      market: `${pack.currency}/${pack.grouping ? 'grouped' : 'plain'}`,
++      hotKeys: pack.recentKeys.slice(0, 5)
++    };
++  }
++  audit() {
++    this.__audit__.begin();
++    this.__audit__.attachInstance(this);
++    this.__entries__.forEach((entry: MessageEntry) => {
++      this.__audit__.recordEntryUsage(entry, 'audit');
++    });
++    return this.__audit__.lines();
++  }
++  formatNumber(value: number, options?) {
++    return this.__formatter__.formatNumber(value, this.__lang__, options);
++  }
++  formatCurrency(value: number) {
++    return this.__formatter__.packNumber(this.__activePack__(), value, {
++      style: 'money'
++    });
++  }
++  formatDate(value: Date, options?) {
++    return this.__formatter__.formatDate(value, this.__lang__, options);
++  }
++  hotKeys(limit = 5) {
++    const pack = this.__activePack__();
++    const hot: string[] = [];
++    this.__entries__.forEach((entry: MessageEntry) => {
++      if (hot.length < limit && pack.shouldPromote(entry)) {
++        hot.push(entry.key);
++      }
++    });
++    return hot;
++  }
++  pruneTranslations() {
++    const doomed: MessageEntry[] = [];
++    this.__entries__.forEach((entry: MessageEntry) => {
++      if (this.__cache__.evictEntry(entry)) {
++        doomed.push(entry);
++      }
++    });
++    doomed.forEach((entry: MessageEntry) => {
++      this.__entries__.delete(`${entry.lang}#${entry.key}`);
++    });
++    return doomed.length;
++  }
+ }
+ 
+ const IntlFormat = {
+diff --git a/kiwi-intl/test/i18n.test.ts b/kiwi-intl/test/i18n.test.ts
+new file mode 100644
+index 0000000..e594c9d
+--- /dev/null
++++ b/kiwi-intl/test/i18n.test.ts
+@@ -0,0 +1,820 @@
++import * as assert from 'assert';
++import IntlFormat from '../src/index';
++import { getDefaultProxyString, getProxyObj } from '../src/utils';
++import { MessageEntry } from '../src/MessageEntry';
++import { LanguagePack } from '../src/LanguagePack';
++import { IntlFormatter } from '../src/IntlFormatter';
++import { TranslationCache } from '../src/TranslationCache';
++import { IntlAudit } from '../src/IntlAudit';
++
++const METAS = {
++  'zh-CN': {
++    value: '值',
++    test: '测试',
++    testTemplate: '你有{value}条未读通知',
++    multiTemplate: '{value}条来自{name}的未读通知',
++    deepTemplate: '深层值：{deep.a.b}',
++    genderTemplate: '{gender, select, male {他} female {她} other {ta}}',
++    numberTemplate: '计数：{count, number}',
++    empty: '',
++    countLiteral: 3,
++    foo: {
++      bar: 'foobar'
++    },
++    config: {
++      theme: '浅色'
++    },
++    deep: {
++      a: {
++        b: '深层的值'
++      }
++    },
++    photo: '我{num, plural, =0 {没有照片} =1 {有1张照片} other {有#张照片}}'
++  },
++  'en-US': {
++    value: 'value',
++    greeting: 'Hello {name}',
++    photo: 'You have {num, plural, =0 {no photos} =1 {one photo} other {# photos}}.',
++    quantity: 'There are {num, plural, =0 {no items} other {# items}} in the box.',
++    config: {
++      theme: 'dark'
++    }
++  },
++  'fr-FR': {
++    value: 'valeur'
++  }
++};
++
++const zhCNIntl: any = IntlFormat.init('zh-CN', METAS);
++const enUSIntl: any = IntlFormat.init('en-US', METAS);
++
++describe('IntlFormat', function() {
++  describe('init', function() {
++    it('exposes the public i18n api', function() {
++      assert.strictEqual(typeof zhCNIntl.get, 'function');
++      assert.strictEqual(typeof zhCNIntl.template, 'function');
++      assert.strictEqual(typeof zhCNIntl.setLang, 'function');
++    });
++    it('creates independent instances from separate init calls', function() {
++      const first: any = IntlFormat.init('zh-CN', {
++        'zh-CN': { value: 'firstvalue' }
++      });
++      const second: any = IntlFormat.init('zh-CN', {
++        'zh-CN': { value: 'secondvalue' }
++      });
++      assert.strictEqual(first.get('value'), 'firstvalue');
++      assert.strictEqual(second.get('value'), 'secondvalue');
++    });
++    it('starts lookups from the requested language', function() {
++      assert.strictEqual(enUSIntl.get('value'), 'value');
++      assert.strictEqual(zhCNIntl.get('value'), '值');
++    });
++    it('falls back to zh-CN when the active language lacks a key', function() {
++      assert.strictEqual(enUSIntl.get('test'), '测试');
++    });
++    it('honors an explicit defaultKey fallback pack', function() {
++      const twIntl: any = IntlFormat.init('fr-FR', METAS, 'en-US');
++      assert.strictEqual(twIntl.get('value'), 'valeur');
++      assert.strictEqual(twIntl.get('greeting'), 'Hello {name}');
++    });
++    it('supports an empty message value through the fallback chain', function() {
++      const value = zhCNIntl.get('value');
++      assert.strictEqual(zhCNIntl.get('empty'), '');
++      assert.strictEqual(value, '值');
++    });
++  });
++
++  describe('get', function() {
++    it('returns the translated value for the active language', function() {
++      assert.strictEqual(zhCNIntl.get('test'), '测试');
++      assert.strictEqual(enUSIntl.get('value'), 'value');
++    });
++    it('returns deep values with dot notation', function() {
++      assert.strictEqual(zhCNIntl.get('foo.bar'), 'foobar');
++      assert.strictEqual(zhCNIntl.get('deep.a.b'), '深层的值');
++    });
++    it('returns the key itself when no pack defines it', function() {
++      assert.strictEqual(zhCNIntl.get('noSuchKeyAnywhere'), 'noSuchKeyAnywhere');
++      assert.strictEqual(enUSIntl.get('deep.a.b.x'), 'deep.a.b.x');
++    });
++    it('returns the raw template string when no args are given', function() {
++      assert.strictEqual(zhCNIntl.get('testTemplate'), '你有{value}条未读通知');
++      assert.strictEqual(enUSIntl.get('photo'), 'You have {num, plural, =0 {no photos} =1 {one photo} other {# photos}}.');
++    });
++    it('falls back to the default pack for deep keys', function() {
++      assert.strictEqual(enUSIntl.get('foo.bar'), 'foobar');
++    });
++    it('returns non string message values untouched without args', function() {
++      assert.strictEqual(zhCNIntl.get('countLiteral'), 3);
++    });
++    it('formats an ICU plural message with zero', function() {
++      assert.strictEqual(zhCNIntl.get('photo', { num: 0 }), '我没有照片');
++    });
++    it('formats an ICU plural message with one', function() {
++      assert.strictEqual(zhCNIntl.get('photo', { num: 1 }), '我有1张照片');
++    });
++    it('formats an ICU plural message with other and grouping', function() {
++      assert.strictEqual(zhCNIntl.get('photo', { num: 1000 }), '我有1,000张照片');
++    });
++    it('formats ICU plural messages in the active language', function() {
++      assert.strictEqual(enUSIntl.get('quantity', { num: 0 }), 'There are no items in the box.');
++      assert.strictEqual(enUSIntl.get('quantity', { num: 42 }), 'There are 42 items in the box.');
++    });
++    it('formats an ICU select message', function() {
++      assert.strictEqual(zhCNIntl.get('genderTemplate', { gender: 'male' }), '他');
++      assert.strictEqual(zhCNIntl.get('genderTemplate', { gender: 'female' }), '她');
++      assert.strictEqual(zhCNIntl.get('genderTemplate', { gender: 'robot' }), 'ta');
++    });
++    it('formats an ICU number argument', function() {
++      assert.strictEqual(zhCNIntl.get('numberTemplate', { count: 1234.5 }), '计数：1,234.5');
++    });
++    it('interpolates simple placeholder args', function() {
++      assert.strictEqual(enUSIntl.get('greeting', { name: 'kiwi' }), 'Hello kiwi');
++    });
++    it('ignores extra args that the message does not reference', function() {
++      assert.strictEqual(
++        enUSIntl.get('greeting', { name: 'kiwi', unused: 'x' }),
++        'Hello kiwi'
++      );
++    });
++    it('returns an empty string when formatting a non template object value', function() {
++      assert.strictEqual(zhCNIntl.get('foo', { x: 1 }), '');
++    });
++    it('formats the key literal when a missing key gets args', function() {
++      assert.strictEqual(zhCNIntl.get('missing.everywhere', { x: 1 }), 'missing.everywhere');
++    });
++    it('lets an empty fallback-pack value win over the key literal', function() {
++      assert.strictEqual(enUSIntl.get('empty'), '');
++    });
++    it('scales an ICU number argument into the thousands', function() {
++      assert.strictEqual(zhCNIntl.get('numberTemplate', { count: 1000000 }), '计数：1,000,000');
++    });
++    it('treats an empty key lookup as missing', function() {
++      assert.strictEqual(zhCNIntl.get(''), '');
++    });
++  });
++
++  describe('template', function() {
++    it('substitutes args into the provided template', function() {
++      assert.strictEqual(
++        zhCNIntl.template('你有{value}条未读通知', { value: 3 }),
++        '你有3条未读通知'
++      );
++    });
++    it('resolves deep data keys inside placeholders', function() {
++      assert.strictEqual(
++        zhCNIntl.template('深层值：{deep.a.b}', {}),
++        '深层值：深层的值'
++      );
++      assert.strictEqual(
++        zhCNIntl.template(zhCNIntl.get('deepTemplate'), { }),
++        '深层值：深层的值'
++      );
++    });
++    it('merges active language data with the passed args', function() {
++      assert.strictEqual(
++        zhCNIntl.template('{value}条来自{name}的未读通知', { name: 'kiwi' }),
++        '值条来自kiwi的未读通知'
++      );
++    });
++    it('prefers args over message data for the same placeholder', function() {
++      assert.strictEqual(
++        zhCNIntl.template('{value}条未读', { value: 7 }),
++        '7条未读'
++      );
++    });
++    it('renders undefined for placeholders that resolve nowhere', function() {
++      assert.strictEqual(
++        zhCNIntl.template('你有{fictional}条未读通知', {}),
++        '你有undefined条未读通知'
++      );
++    });
++    it('leaves literal text without placeholders untouched', function() {
++      assert.strictEqual(zhCNIntl.template('纯文本', {}), '纯文本');
++    });
++    it('returns an empty string for empty or missing templates', function() {
++      assert.strictEqual(zhCNIntl.template('', {}), '');
++      assert.strictEqual((zhCNIntl.template as any)(), '');
++      assert.strictEqual((zhCNIntl.template as any)(null, {}), '');
++    });
++    it('replaces multiple placeholders in one template', function() {
++      assert.strictEqual(
++        zhCNIntl.template(zhCNIntl.get('multiTemplate'), { value: 2, name: 'kiwi' }),
++        '2条来自kiwi的未读通知'
++      );
++    });
++    it('only substitutes the first lazy brace group of doubled braces', function() {
++      assert.strictEqual(zhCNIntl.template('{{value}}', { value: 1 }), 'undefined}');
++    });
++    it('lets arg objects replace whole data subtrees in placeholders', function() {
++      assert.strictEqual(
++        zhCNIntl.template('深层值：{deep.a.b}', { deep: { a: { b: '替换值' } } }),
++        '深层值：替换值'
++      );
++    });
++    it('resolves placeholders against the active language after setLang', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.setLang('en-US');
++      assert.strictEqual(intl.template('{value} unread', {}), 'value unread');
++      intl.setLang('zh-CN');
++      assert.strictEqual(intl.template('{value} unread', {}), '值 unread');
++    });
++  });
++
++  describe('setLang', function() {
++    let intl: any;
++    beforeEach(function() {
++      intl = IntlFormat.init('zh-CN', METAS);
++    });
++    it('switches the active language for get', function() {
++      intl.setLang('en-US');
++      assert.strictEqual(intl.get('value'), 'value');
++    });
++    it('keeps the default pack fallback after switching', function() {
++      intl.setLang('fr-FR');
++      assert.strictEqual(intl.get('value'), 'valeur');
++      assert.strictEqual(intl.get('test'), '测试');
++      assert.strictEqual(intl.get('foo.bar'), 'foobar');
++    });
++    it('falls back to the default pack when the switch has no data', function() {
++      intl.setLang('xx-YY');
++      assert.strictEqual(intl.get('value'), '值');
++      assert.strictEqual(intl.get('photo', { num: 2 }), '我有2张照片');
++    });
++    it('supports switching back and forth', function() {
++      intl.setLang('en-US');
++      assert.strictEqual(intl.get('value'), 'value');
++      intl.setLang('zh-CN');
++      assert.strictEqual(intl.get('value'), '值');
++      assert.strictEqual(intl.get('photo', { num: 0 }), '我没有照片');
++    });
++    it('affects the language used to format ICU messages', function() {
++      intl.setLang('en-US');
++      assert.strictEqual(intl.get('photo', { num: 0 }), 'You have no photos.');
++      assert.strictEqual(intl.get('photo', { num: 5 }), 'You have 5 photos.');
++    });
++  });
++
++  describe('reactive property access', function() {
++    let intl: any;
++    beforeEach(function() {
++      intl = IntlFormat.init('zh-CN', METAS);
++    });
++    it('reads deep object values through the reactive proxy', function() {
++      assert.strictEqual(intl.foo.bar, 'foobar');
++      assert.strictEqual(intl.deep.a.b, '深层的值');
++    });
++    it('returns an empty proxy string for defined but empty keys', function() {
++      assert.strictEqual(`${intl.empty}`, '');
++      assert.strictEqual(intl.empty.valueOf(), '');
++    });
++    it('returns plain undefined for keys outside the message packs', function() {
++      assert.strictEqual(intl.absentKey, undefined);
++    });
++    it('returns an empty proxy string for missing nested keys', function() {
++      assert.strictEqual(`${intl.foo.missingNested}`, '');
++      assert.strictEqual(`${intl.deep.missing.a}`, '');
++    });
++    it('falls back to the default pack for reactive reads', function() {
++      intl.setLang('fr-FR');
++      assert.strictEqual(intl.foo.bar, 'foobar');
++    });
++    it('serves reactive object reads from the active language', function() {
++      intl.setLang('en-US');
++      assert.strictEqual(intl.config.theme, 'dark');
++    });
++    it('falls back to the default pack for reactive object reads', function() {
++      intl.setLang('fr-FR');
++      assert.strictEqual(intl.config.theme, '浅色');
++    });
++    it('keeps the message data observable per instance', function() {
++      const other: any = IntlFormat.init('zh-CN', {
++        'zh-CN': { value: '另一个值' }
++      });
++      assert.strictEqual(intl.get('value'), '值');
++      assert.strictEqual(other.get('value'), '另一个值');
++      intl.setLang('fr-FR');
++      assert.strictEqual(other.get('value'), '另一个值');
++    });
++  });
++
++  describe('proxy utils', function() {
++    it('getDefaultProxyString keeps the wrapped string value', function() {
++      const proxied = getDefaultProxyString('abc');
++      assert.strictEqual(proxied.valueOf(), 'abc');
++      assert.strictEqual(proxied.toString(), 'abc');
++      assert.strictEqual(`${proxied}`, 'abc');
++    });
++    it('getDefaultProxyString returns an empty string by default', function() {
++      const proxied = getDefaultProxyString();
++      assert.strictEqual(proxied.valueOf(), '');
++      assert.strictEqual(`${proxied}`, '');
++    });
++    it('getDefaultProxyString keeps String object methods and properties', function() {
++      const proxied = getDefaultProxyString('abcd');
++      assert.strictEqual(proxied.length, 4);
++      assert.strictEqual(proxied.toUpperCase(), 'ABCD');
++    });
++    it('getDefaultProxyString chains missing property reads', function() {
++      const proxied: any = getDefaultProxyString('abc');
++      assert.strictEqual(`${proxied.anything}`, '');
++      assert.strictEqual(`${proxied.a.b.c}`, '');
++    });
++    it('getProxyObj wraps nested object values', function() {
++      const proxied: any = getProxyObj(METAS);
++      assert.strictEqual(proxied['zh-CN'].test, '测试');
++      assert.strictEqual(proxied['zh-CN'].deep.a.b, '深层的值');
++    });
++    it('getProxyObj returns an empty proxy string for missing keys', function() {
++      const proxied: any = getProxyObj({ a: 1 });
++      assert.strictEqual(`${proxied.missing}`, '');
++      assert.strictEqual(proxied.missing.valueOf(), '');
++    });
++    it('getProxyObj preserves raw primitive values', function() {
++      const proxied: any = getProxyObj({ n: 5, s: 'text', f: false });
++      assert.strictEqual(proxied.n, 5);
++      assert.strictEqual(proxied.s, 'text');
++      assert.strictEqual(proxied.f, false);
++    });
++    it('getProxyObj follows into arrays as objects', function() {
++      const proxied: any = getProxyObj({ list: [1, 2] });
++      assert.strictEqual(proxied.list[0], 1);
++      assert.strictEqual(proxied.list[1], 2);
++    });
++    it('getProxyObj keeps array length and tools', function() {
++      const proxied: any = getProxyObj({ list: [1, 2] });
++      assert.strictEqual(proxied.list.length, 2);
++      assert.strictEqual(proxied.list.join('-'), '1-2');
++    });
++    it('getProxyObj returns empty proxy strings beyond array bounds', function() {
++      const proxied: any = getProxyObj([1, 2]);
++      assert.strictEqual(`${proxied[10]}`, '');
++      assert.strictEqual(proxied[0], 1);
++    });
++  });
++
++  describe('getDetailed pipeline', function() {
++    it('resolves the current-language message and exposes its entry', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      const detail: any = intl.getDetailed('value');
++      assert.strictEqual(detail.value, '值');
++      assert.strictEqual(detail.entry.key, 'value');
++      assert.strictEqual(detail.entry.lang, 'zh-CN');
++      assert.strictEqual(detail.entry.content, '值');
++    });
++    it('formats ICU templates through the render step', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      const detail: any = intl.getDetailed('testTemplate', { value: 7 });
++      assert.strictEqual(detail.value, '你有7条未读通知');
++    });
++    it('falls back to the default pack for content in detailed reads', function() {
++      const intl: any = IntlFormat.init('en-US', METAS, 'zh-CN');
++      const detail: any = intl.getDetailed('test');
++      assert.strictEqual(detail.entry.content, '测试');
++      assert.strictEqual(detail.value, '测试');
++    });
++    it('keeps one entry per key and reuses it across reads', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      const first: any = intl.getDetailed('value');
++      const second: any = intl.getDetailed('value');
++      assert.strictEqual(first.entry === second.entry, true);
++      assert.strictEqual(second.entry.hitCount, 2);
++      assert.strictEqual(second.entry.cacheWrites, 1);
++    });
++    it('serves repeated reads from the render cache', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.getDetailed('test');
++      const again: any = intl.getDetailed('test');
++      assert.strictEqual(again.value, '测试');
++      assert.strictEqual(again.entry.cacheWrites, 1);
++      assert.strictEqual(intl.__cache__.hits, 1);
++    });
++    it('keeps entry registries per instance', function() {
++      const a: any = IntlFormat.init('zh-CN', METAS);
++      const b: any = IntlFormat.init('zh-CN', METAS);
++      a.getDetailed('value');
++      b.getDetailed('value');
++      assert.strictEqual(a.__entries__.size, 1);
++      assert.strictEqual(b.__entries__.size, 1);
++      assert.strictEqual(
++        a.getDetailed('value').entry === b.getDetailed('value').entry,
++        false
++      );
++    });
++    it('records unusable templates as render failures', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      const detail: any = intl.getDetailed('oops{');
++      assert.strictEqual(detail.value, '');
++      assert.strictEqual(
++        intl.__formatter__.failures.indexOf('oops{') !== -1,
++        true
++      );
++    });
++  });
++
++  describe('message entry metrics', function() {
++    it('raises the hotness level with repeated use and cache writes', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.getDetailed('value');
++      assert.strictEqual(intl.getDetailed('value').entry.hotnessLevel, 1);
++      assert.strictEqual(intl.getDetailed('value').entry.hotnessLevel, 2);
++      assert.strictEqual(intl.getDetailed('value').entry.hotnessLevel, 2);
++    });
++    it('tracks render bookkeeping on the entry', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      const detail: any = intl.getDetailed('photo', { num: 2 });
++      assert.strictEqual(detail.entry.renderCount, 1);
++      assert.strictEqual(detail.entry.lastRenderedLang, 'zh-CN');
++      intl.getDetailed('photo', { num: 3 });
++      assert.strictEqual(detail.entry.renderCount, 1);
++    });
++  });
++
++  describe('describe & stats', function() {
++    it('summarises a key with its usage metrics', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.getDetailed('value');
++      intl.getDetailed('value');
++      const line = intl.describe('value');
++      assert.strictEqual(line.indexOf('value@zh-CN'), 0);
++      assert.strictEqual(line.indexOf('hits:3') !== -1, true);
++      assert.strictEqual(line.indexOf('writes:1') !== -1, true);
++      assert.strictEqual(line.indexOf('hot:2') !== -1, true);
++      assert.strictEqual(line.indexOf('text:值') !== -1, true);
++    });
++    it('describes unsupported keys by mirroring them as content', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      const line = intl.describe('no-such-key');
++      assert.strictEqual(line.indexOf('no-such-key@zh-CN'), 0);
++      assert.strictEqual(line.indexOf('text:no-such-key') !== -1, true);
++      const empty = intl.describe('empty');
++      assert.strictEqual(empty.indexOf('text:<missing>') !== -1, true);
++    });
++    it('reports pack resolution counters', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.getDetailed('value');
++      intl.getDetailed('test');
++      const s: any = intl.stats();
++      assert.strictEqual(s.pack.lang, 'zh-CN');
++      assert.strictEqual(s.pack.resolved, 2);
++      assert.strictEqual(s.pack.missed, 0);
++      assert.strictEqual(s.pack.keys, Object.keys(METAS['zh-CN']).length);
++      assert.strictEqual(s.pack.market, 'CNY/grouped');
++      assert.strictEqual(s.pack.defaultPack, 'zh-CN');
++    });
++    it('counts cache hits, misses and entries', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.getDetailed('value');
++      intl.getDetailed('value');
++      const s: any = intl.stats();
++      assert.strictEqual(s.cache.hits, 1);
++      // 第一次记缺后立即写入缓存，未清零的缺失计数由建设性写入复位。
++      assert.strictEqual(s.cache.misses, 0);
++      assert.strictEqual(s.cache.evictions, 0);
++      assert.strictEqual(s.cache.entries, 1);
++    });
++    it('labels misses for keys absent from the active pack', function() {
++      const intl: any = IntlFormat.init('en-US', METAS, 'zh-CN');
++      intl.getDetailed('greeting');
++      assert.strictEqual(intl.stats().missedWrapper === undefined, true);
++      const s: any = intl.stats();
++      assert.strictEqual(s.pack.lang, 'en-US');
++      assert.strictEqual(s.pack.missed, 0);
++      intl.getDetailed('test');
++      const after: any = intl.stats();
++      assert.strictEqual(after.pack.missed, 1);
++      assert.strictEqual(after.pack.resolved, 2);
++    });
++  });
++
++  describe('audit journal', function() {
++    it('snapshots the instance and journals each entry once', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.getDetailed('value');
++      const lines: string[] = intl.audit();
++      assert.strictEqual(lines[0], 'instance lang=zh-CN');
++      assert.strictEqual(lines[1], 'instance entries=1 cacheHits=0');
++      assert.strictEqual(lines[2].indexOf('audit value@zh-CN'), 0);
++      assert.strictEqual(lines[2].indexOf('hits=1') !== -1, true);
++      assert.strictEqual(lines[2].indexOf('writes=1') !== -1, true);
++      assert.strictEqual(lines[2].indexOf('hot=0') !== -1, true);
++    });
++    it('respawns a fresh journal per audit pass', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.getDetailed('value');
++      intl.audit();
++      const second: string[] = intl.audit();
++      assert.strictEqual(second.length, 3);
++    });
++  });
++
++  describe('locale market formatting', function() {
++    it('formats plain numbers for the active language', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      assert.strictEqual(
++        intl.formatNumber(1234.5),
++        new Intl.NumberFormat('zh-CN').format(1234.5)
++      );
++    });
++    it('honours caller overrides for number formatting', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      assert.strictEqual(
++        intl.formatNumber(1234.5, { minimumFractionDigits: 3 }),
++        new Intl.NumberFormat('zh-CN', { minimumFractionDigits: 3 }).format(
++          1234.5
++        )
++      );
++    });
++    it('renders currency in the pack market style', function() {
++      const zh: any = IntlFormat.init('zh-CN', METAS);
++      assert.strictEqual(
++        zh.formatCurrency(28.5),
++        new Intl.NumberFormat('zh-CN', {
++          style: 'currency',
++          currency: 'CNY',
++          useGrouping: true,
++          minimumFractionDigits: 2,
++          maximumFractionDigits: 2
++        }).format(28.5)
++      );
++      const en: any = IntlFormat.init('en-US', METAS, 'zh-CN');
++      assert.strictEqual(
++        en.formatCurrency(28.5),
++        new Intl.NumberFormat('en-US', {
++          style: 'currency',
++          currency: 'USD',
++          useGrouping: true,
++          minimumFractionDigits: 2,
++          maximumFractionDigits: 2
++        }).format(28.5)
++      );
++    });
++    it('formats dates for the active language', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      const d = new Date(2020, 0, 2);
++      assert.strictEqual(
++        intl.formatDate(d),
++        new Intl.DateTimeFormat('zh-CN').format(d)
++      );
++    });
++  });
++
++  describe('hot keys & pruning', function() {
++    it('lists promoted keys only', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.getDetailed('list-only-once');
++      for (let i = 0; i < 3; i++) {
++        intl.getDetailed('value');
++      }
++      const hot: string[] = intl.hotKeys(5);
++      assert.strictEqual(hot.indexOf('value') !== -1, true);
++      assert.strictEqual(hot.indexOf('list-only-once'), -1);
++    });
++    it('caps the hot key list to the requested limit', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      for (let i = 0; i < 3; i++) {
++        intl.getDetailed('value');
++        intl.getDetailed('test');
++      }
++      assert.strictEqual(intl.hotKeys(1).length, 1);
++      assert.strictEqual(intl.hotKeys(5).length, 2);
++    });
++    it('prunes cold uncached entries and keeps cached ones', function() {
++      const intl: any = IntlFormat.init('zh-CN', METAS);
++      intl.describe('sweep-me');
++      intl.getDetailed('test');
++      assert.strictEqual(intl.pruneTranslations(), 1);
++      assert.strictEqual(intl.pruneTranslations(), 0);
++      assert.strictEqual(intl.getDetailed('test').entry.cacheWrites >= 1, true);
++      const fresh: any = intl.getDetailed('sweep-me');
++      assert.strictEqual(fresh.entry.hitCount, 1);
++    });
++  });
++
++  describe('MessageEntry', function() {
++    it('escalates hotness with hits and cache writes', function() {
++      const entry = new MessageEntry('k', 'zh-CN');
++      entry.touch(1);
++      entry.touch(2);
++      assert.strictEqual(entry.hotnessLevel, 1);
++      entry.touch(3);
++      assert.strictEqual(entry.hotnessLevel, 1);
++      entry.cacheWrites = 1;
++      entry.touch(4);
++      assert.strictEqual(entry.hotnessLevel, 2);
++    });
++    it('matches keys by key or path', function() {
++      const entry = new MessageEntry('k', 'zh-CN', 'a.b.k');
++      assert.strictEqual(entry.matchesKey('k'), true);
++      assert.strictEqual(entry.matchesKey('a.b.k'), true);
++      assert.strictEqual(entry.matchesKey('nope'), false);
++    });
++    it('tracks content presence', function() {
++      const entry = new MessageEntry('k', 'zh-CN');
++      assert.strictEqual(entry.hasContent(), false);
++      entry.content = 'text';
++      assert.strictEqual(entry.hasContent(), true);
++      entry.content = '';
++      assert.strictEqual(entry.hasContent(), false);
++    });
++    it('records render timestamps and language', function() {
++      const entry = new MessageEntry('k', 'zh-CN');
++      entry.noteRender(100);
++      entry.noteRender(200, 'en-US');
++      assert.strictEqual(entry.renderCount, 2);
++      assert.strictEqual(entry.lastRenderedAt, 200);
++      assert.strictEqual(entry.lastRenderedLang, 'en-US');
++    });
++  });
++
++  describe('LanguagePack', function() {
++    it('derives market currency from the language', function() {
++      assert.strictEqual(new LanguagePack('zh-CN', {}).currency, 'CNY');
++      assert.strictEqual(new LanguagePack('en-US', {}).currency, 'USD');
++      assert.strictEqual(new LanguagePack('en-US', {}).grouping, true);
++      assert.strictEqual(new LanguagePack('en-US', {}).minimumFractionDigits, 2);
++      assert.strictEqual(new LanguagePack('en-US', {}).maximumFractionDigits, 2);
++    });
++    it('records misses without duplicating recent keys', function() {
++      const pack = new LanguagePack('zh-CN', {});
++      pack.noteMiss('b');
++      pack.noteMiss('a');
++      pack.noteMiss('b');
++      assert.strictEqual(pack.misses, 3);
++      assert.deepStrictEqual(pack.recentKeys, ['b', 'a']);
++    });
++    it('caps the recent-key window and keeps misses unique', function() {
++      const pack = new LanguagePack('zh-CN', {});
++      for (let i = 0; i < 16; i++) {
++        pack.noteMiss(`k${i}`);
++      }
++      assert.strictEqual(pack.recentKeys.length, 16);
++      pack.noteMiss('k9');
++      assert.strictEqual(pack.misses, 17);
++      assert.strictEqual(pack.recentKeys.length, 16);
++      assert.strictEqual(pack.recentKeys[0], 'k0');
++      pack.noteMiss('extra');
++      assert.strictEqual(pack.recentKeys.length, 16);
++      assert.strictEqual(pack.recentKeys[15], 'extra');
++      assert.strictEqual(pack.recentKeys[0], 'k1');
++    });
++    it('moves promoted keys to the front of the window', function() {
++      const pack = new LanguagePack('zh-CN', {});
++      pack.noteMiss('b');
++      pack.noteMiss('a');
++      pack.noteMiss('c');
++      pack.notePromotion('a');
++      assert.deepStrictEqual(pack.recentKeys, ['a', 'b', 'c']);
++      pack.notePromotion('not-there');
++      assert.strictEqual(pack.recentKeys[0], 'not-there');
++    });
++    it('resolves raw values and reports presence', function() {
++      const pack = new LanguagePack('zh-CN', { a: { b: 'v' } });
++      assert.strictEqual(pack.raw('a.b'), 'v');
++      assert.strictEqual(pack.has('a.b'), true);
++      assert.strictEqual(pack.has('missing'), false);
++    });
++    it('promotes entries that cross the hotness bar', function() {
++      const pack = new LanguagePack('zh-CN', {});
++      const cold = new MessageEntry('cold', 'zh-CN');
++      assert.strictEqual(pack.shouldPromote(cold), false);
++      const hot = new MessageEntry('hot', 'zh-CN');
++      hot.hitCount = 4;
++      hot.cacheWrites = 2;
++      hot.hotnessLevel = 2;
++      assert.strictEqual(pack.shouldPromote(hot), true);
++    });
++  });
++
++  describe('TranslationCache', function() {
++    it('counts hits and misses on recall', function() {
++      const cache = new TranslationCache();
++      cache.remember('k', 'v');
++      assert.strictEqual(cache.recall('k'), 'v');
++      assert.strictEqual(cache.recall('nope'), '');
++      assert.strictEqual(cache.hits, 1);
++      assert.strictEqual(cache.misses, 1);
++    });
++    it('evicts the oldest slot past capacity', function() {
++      const cache = new TranslationCache(2);
++      cache.remember('a', '1');
++      cache.remember('b', '2');
++      cache.remember('c', '3');
++      assert.strictEqual(cache.evictions, 1);
++      assert.strictEqual(cache.lastEvictedKey, 'a');
++      assert.strictEqual(cache.slots.size, 2);
++      assert.strictEqual(cache.recall('a'), '');
++    });
++    it('stamps hot entries into a marked slot and bumps cache writes', function() {
++      const cache = new TranslationCache();
++      const entry = new MessageEntry('k', 'zh-CN');
++      entry.hotnessLevel = 2;
++      const marked = cache.rememberEntry(entry, 'v');
++      assert.strictEqual(marked, 'hot/zh-CN#k');
++      assert.strictEqual(cache.slots.has('hot/zh-CN#k'), true);
++      assert.strictEqual(entry.cacheWrites, 1);
++    });
++    it('resets the miss counter when a used uncached entry lands in the cache', function() {
++      const cache = new TranslationCache();
++      cache.recall('ghost');
++      cache.recall('ghost');
++      const entry = new MessageEntry('k', 'zh-CN');
++      entry.lastUsedAt = 42;
++      const marked = cache.rememberEntry(entry, 'v');
++      assert.strictEqual(marked, 'zh-CN#k');
++      assert.strictEqual(cache.misses, 0);
++    });
++    it('keeps hot or cached entries alive during eviction checks', function() {
++      const cache = new TranslationCache();
++      const hot = new MessageEntry('hot', 'zh-CN');
++      hot.hitCount = 5;
++      hot.hotnessLevel = 2;
++      assert.strictEqual(cache.evictEntry(hot), false);
++      const cached = new MessageEntry('cached', 'zh-CN');
++      cache.rememberEntry(cached, 'v');
++      assert.strictEqual(cache.evictEntry(cached), false);
++      const cold = new MessageEntry('cold', 'zh-CN');
++      cold.touch(9);
++      assert.strictEqual(cache.evictEntry(cold), true);
++    });
++  });
++
++  describe('IntlFormatter', function() {
++    it('merges caller options and prunes unsupported ones', function() {
++      const formatter = new IntlFormatter('zh-CN');
++      const options = formatter.applyDefaults({
++        style: 'decimal',
++        minimumFractionDigits: 5
++      });
++      assert.strictEqual(options.style, 'decimal');
++      assert.strictEqual(options.minimumFractionDigits, 5);
++      assert.strictEqual('currency' in options, false);
++      assert.strictEqual('useGrouping' in options, false);
++      assert.deepStrictEqual(formatter.applyDefaults(undefined), {});
++    });
++    it('formats numbers with the configured default locale', function() {
++      const formatter = new IntlFormatter('fr-FR');
++      assert.strictEqual(
++        formatter.formatNumber(1234.5),
++        new Intl.NumberFormat('fr-FR').format(1234.5)
++      );
++    });
++    it('renders entry content and settles the render language once', function() {
++      const formatter = new IntlFormatter('zh-CN');
++      const entry = new MessageEntry('k', 'zh-CN');
++      entry.content = '好的';
++      assert.strictEqual(formatter.renderEntry(entry), '好的');
++      assert.strictEqual(entry.renderCount, 1);
++      assert.strictEqual(entry.lastRenderedLang, 'zh-CN');
++      assert.strictEqual(formatter.renderEntry(entry), '好的');
++      assert.strictEqual(entry.renderCount, 1);
++    });
++    it('journals unusable patterns instead of throwing', function() {
++      const formatter = new IntlFormatter('zh-CN');
++      const entry = new MessageEntry('bad', 'zh-CN');
++      entry.content = 'oops{';
++      assert.strictEqual(formatter.renderEntry(entry), '');
++      assert.deepStrictEqual(formatter.failures, ['oops{', 'bad']);
++      assert.strictEqual(entry.renderCount, 0);
++      const empty = new MessageEntry('empty', 'zh-CN');
++      assert.strictEqual(formatter.renderEntry(empty), '');
++      assert.strictEqual(formatter.failures.length, 2);
++      assert.strictEqual(formatter.failures[1], 'bad');
++    });
++  });
++
++  describe('IntlAudit', function() {
++    it('stays silent when disabled', function() {
++      const audit = new IntlAudit(false);
++      const entry = new MessageEntry('k', 'zh-CN');
++      assert.strictEqual(audit.recordEntryUsage(entry), false);
++      assert.strictEqual(audit.attachInstance({ __lang__: 'zh-CN' }), null);
++      assert.deepStrictEqual(audit.lines(), []);
++    });
++    it('journals usage lines and instance snapshots', function() {
++      const audit = new IntlAudit(true);
++      const entry = new MessageEntry('k', 'zh-CN');
++      entry.touch(7);
++      audit.begin();
++      assert.strictEqual(audit.recordEntryUsage(entry), true);
++      assert.strictEqual(audit.size(), 1);
++      assert.strictEqual(audit.lines()[0].indexOf('resolve k@zh-CN'), 0);
++      assert.strictEqual(audit.lines()[0].indexOf('hits=1') !== -1, true);
++      audit.attachInstance({
++        __lang__: 'zh-CN',
++        __metas__: METAS,
++        __data__: METAS['zh-CN'],
++        __defaultKey__: 'zh-CN',
++        __entries__: { size: 0 },
++        __cache__: { hits: 4 },
++        auditSnapshot() {
++          return { lang: 'zh-CN', entries: 0, cacheHits: 4 };
++        }
++      });
++      assert.deepStrictEqual(audit.lines().slice(0, 2), [
++        'instance lang=zh-CN',
++        'instance entries=0 cacheHits=4'
++      ]);
++    });
++  });
++});
+diff --git a/kiwi-intl/tsconfig.json b/kiwi-intl/tsconfig.json
+index 8a46582..c95e7a1 100644
+--- a/kiwi-intl/tsconfig.json
++++ b/kiwi-intl/tsconfig.json
+@@ -14,8 +14,14 @@
+     "emitDecoratorMetadata": true,
+     "baseUrl": "./src/",
+     "allowSyntheticDefaultImports": true,
++    "esModuleInterop": true,
+     "lib": ["dom", "es2015", "es2016", "es2017"],
+     "types": ["node", "mocha"]
+   },
+-  "exclude": ["node_modules", "packages", "built"]
++  "exclude": ["node_modules", "packages", "built"],
++  "ts-node": {
++    "compilerOptions": {
++      "module": "commonjs"
++    }
++  }
+ }
+\ No newline at end of file

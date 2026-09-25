@@ -1,0 +1,131 @@
+diff --git a/packages/cli-utils/src/commands/scan/rules/cross-feature-fragments.ts b/packages/cli-utils/src/commands/scan/rules/cross-feature-fragments.ts
+index 0468cf0..203a7a7 100644
+--- a/packages/cli-utils/src/commands/scan/rules/cross-feature-fragments.ts
++++ b/packages/cli-utils/src/commands/scan/rules/cross-feature-fragments.ts
+@@ -18,6 +18,15 @@ export const crossFeatureFragments: ScanRule<CrossFeatureData> = {
+ 
+     const graph = context.getModuleGraph();
+     const fragments = context.getFragmentGraph();
++    // Resolve the area of every module the graph knows about up front, so
++    // spread sites and defining modules can be labelled from one table.
++    const moduleAreas = new Map<string, string>();
++    for (const [module, imports] of graph.importMap()) {
++      if (!moduleAreas.has(module)) moduleAreas.set(module, graph.areaOf(module));
++      for (const target of imports) {
++        if (!moduleAreas.has(target)) moduleAreas.set(target, graph.areaOf(target));
++      }
++    }
+ 
+     return {
+       visitor: {
+@@ -29,7 +38,7 @@ export const crossFeatureFragments: ScanRule<CrossFeatureData> = {
+             if (!id) return;
+             let areas = consumerAreas.get(id);
+             if (!areas) consumerAreas.set(id, (areas = new Set()));
+-            areas.add(graph.areaOf(definition.module));
++            areas.add(moduleAreas.get(definition.module) ?? graph.areaOf(definition.module));
+             spreadCount.set(id, (spreadCount.get(id) || 0) + 1);
+           },
+         },
+@@ -41,7 +50,7 @@ export const crossFeatureFragments: ScanRule<CrossFeatureData> = {
+         for (const [id, areas] of consumerAreas) {
+           const fragment = byId.get(id);
+           if (!fragment) continue;
+-          const definingArea = graph.areaOf(fragment.module);
++          const definingArea = moduleAreas.get(fragment.module) ?? graph.areaOf(fragment.module);
+           // Areas other than where the fragment itself lives.
+           const externalAreas = [...areas].filter((area) => area !== definingArea).sort();
+           if (!externalAreas.length) continue;
+diff --git a/packages/cli-utils/src/commands/scan/rules/fetch-depth.ts b/packages/cli-utils/src/commands/scan/rules/fetch-depth.ts
+index ed479eb..43602ea 100644
+--- a/packages/cli-utils/src/commands/scan/rules/fetch-depth.ts
++++ b/packages/cli-utils/src/commands/scan/rules/fetch-depth.ts
+@@ -1,4 +1,4 @@
+-import type { ScanRule } from '../types';
++import type { ScanRule, RuleDatapoint } from '../types';
+ 
+ export interface FetchDepthData {
+   /** Shortest import-distance from an entry point to the defining module. */
+@@ -22,23 +22,42 @@ export const fetchDepth: ScanRule<FetchDepthData> = {
+       visitor: {},
+       collect() {
+         const graph = context.getModuleGraph();
+-        return context.operations
+-          .filter((op) => op.kind === 'query')
+-          .map((op) => {
+-            const depth = graph.distanceFromEntry(op.module);
+-            return { op, depth: depth ?? null };
+-          })
+-          .sort((a, b) => (b.depth ?? -1) - (a.depth ?? -1))
+-          .map(({ op, depth }) => ({
++        // Walk the import graph outwards from the entry points, recording how
++        // far each module sits, then place each query by that distance.
++        const distance = new Map<string, number>();
++        let frontier = [...graph.entryPoints()];
++        let depth = 0;
++        while (frontier.length) {
++          const next: string[] = [];
++          for (const node of frontier) {
++            if (distance.has(node)) continue;
++            distance.set(node, depth);
++            for (const to of graph.importMap().get(node) || []) {
++              if (!distance.has(to)) next.push(to);
++            }
++          }
++          frontier = next;
++          depth++;
++        }
++        // Place each query by the distance recorded above, labelling it with
++        // the area of its defining module as we go.
++        const datapoints: RuleDatapoint<FetchDepthData>[] = [];
++        for (const op of context.operations) {
++          if (op.kind !== 'query') continue;
++          const entryDistance = distance.get(op.module);
++          const moduleArea = graph.areaOf(op.module);
++          datapoints.push({
+             ref: { kind: 'operation' as const, id: op.id },
+             message: `${op.name || '(anonymous)'} is ${
+-              depth == null
++              entryDistance == null
+                 ? 'unreachable from any entry point'
+-                : `${depth} hop(s) from an entry point`
++                : `${entryDistance} hop(s) from an entry point`
+             }`,
+-            weight: depth ?? undefined,
+-            data: { depth, area: graph.areaOf(op.module), module: op.module },
+-          }));
++            weight: entryDistance ?? undefined,
++            data: { depth: entryDistance ?? null, area: moduleArea, module: op.module },
++          });
++        }
++        return datapoints.sort((a, b) => (b.data.depth ?? -1) - (a.data.depth ?? -1));
+       },
+     };
+   },
+diff --git a/packages/cli-utils/src/commands/scan/rules/field-usage.ts b/packages/cli-utils/src/commands/scan/rules/field-usage.ts
+index d224abf..5642dd3 100644
+--- a/packages/cli-utils/src/commands/scan/rules/field-usage.ts
++++ b/packages/cli-utils/src/commands/scan/rules/field-usage.ts
+@@ -89,14 +89,18 @@ export const fieldUsage: ScanRule<FieldUsageData> = {
+             const module = moduleById.get(id);
+             if (module) sourceModules.add(module);
+           }
++          // Everything that transitively depends on the selected modules, the
++          // areas they cover, and the entry points among them.
+           const reachModules = new Set<string>();
+           const reachAreas = new Set<string>();
+           const reachEntries = new Set<string>();
+           for (const module of sourceModules) {
+-            const reach = graph.reach(module);
+-            for (const m of reach.modules) reachModules.add(m);
+-            for (const a of reach.areas) reachAreas.add(a);
+-            for (const e of reach.entryPoints) reachEntries.add(e);
++            for (const dependent of graph.dependents(module)) reachModules.add(dependent);
++            reachModules.add(module);
++          }
++          for (const module of reachModules) {
++            reachAreas.add(graph.areaOf(module));
++            if (graph.entryPoints().has(module)) reachEntries.add(module);
+           }
+ 
+           datapoints.push({

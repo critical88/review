@@ -1,0 +1,386 @@
+diff --git a/src/raw/build.rs b/src/raw/build.rs
+index 742845d..178d553 100644
+--- a/src/raw/build.rs
++++ b/src/raw/build.rs
+@@ -308,8 +308,8 @@ impl<W: io::Write> Builder<W> {
+ }
+ 
+ /// Compile steps shared by every `Builder` entry point. They thread the writer,
+-/// node registry and last compiled address explicitly, together with the pieces
+-/// of the node being compiled.
++/// node registry and last compiled address explicitly, together with the node
++/// being compiled (`BuilderNode`).
+ ///
+ /// Serializes one node and records it in the registry, returning the address
+ /// at which it was written.
+@@ -317,19 +317,17 @@ fn builder_compile_node<W: io::Write>(
+     wtr: &mut CountingWriter<W>,
+     registry: &mut Registry,
+     last_addr: &mut CompiledAddr,
+-    is_final: bool,
+-    final_output: Output,
+-    trans: &[Transition],
++    bnode: &BuilderNode,
+ ) -> Result<CompiledAddr> {
+-    if is_final && trans.is_empty() && final_output.is_zero() {
++    if bnode.is_final && bnode.trans.is_empty() && bnode.final_output.is_zero() {
+         return Ok(EMPTY_ADDRESS);
+     }
+-    let entry = registry.entry(is_final, final_output, trans);
++    let entry = registry.entry(bnode);
+     if let RegistryEntry::Found(ref addr) = entry {
+         return Ok(*addr);
+     }
+     let start_addr = wtr.count() as CompiledAddr;
+-    Node::compile(&mut *wtr, *last_addr, start_addr, is_final, final_output, trans)?;
++    Node::compile(&mut *wtr, *last_addr, start_addr, bnode)?;
+     *last_addr = wtr.count() as CompiledAddr - 1;
+     if let RegistryEntry::NotFound(cell) = entry {
+         cell.insert(*last_addr);
+@@ -353,14 +351,7 @@ fn builder_compile_from<W: io::Write>(
+         } else {
+             unfinished.pop_freeze(addr)
+         };
+-        addr = builder_compile_node(
+-            wtr,
+-            registry,
+-            last_addr,
+-            node.is_final,
+-            node.final_output,
+-            &node.trans,
+-        )?;
++        addr = builder_compile_node(wtr, registry, last_addr, &node)?;
+         assert!(addr != NONE_ADDRESS);
+     }
+     unfinished.top_last_freeze(addr);
+@@ -375,14 +366,7 @@ fn builder_compile_root<W: io::Write>(
+     unfinished: &mut UnfinishedNodes,
+ ) -> Result<CompiledAddr> {
+     let root_node = unfinished.pop_root();
+-    builder_compile_node(
+-        wtr,
+-        registry,
+-        last_addr,
+-        root_node.is_final,
+-        root_node.final_output,
+-        &root_node.trans,
+-    )
++    builder_compile_node(wtr, registry, last_addr, &root_node)
+ }
+ 
+ impl UnfinishedNodes {
+diff --git a/src/raw/node.rs b/src/raw/node.rs
+index db798e9..44def0d 100644
+--- a/src/raw/node.rs
++++ b/src/raw/node.rs
+@@ -4,6 +4,7 @@ use std::io;
+ use std::ops::Range;
+ 
+ use crate::bytes;
++use crate::raw::build::BuilderNode;
+ use crate::raw::common_inputs::{COMMON_INPUTS, COMMON_INPUTS_INV};
+ use crate::raw::{
+     u64_to_usize, CompiledAddr, Output, Transition, EMPTY_ADDRESS,
+@@ -296,20 +297,18 @@ impl<'f> Node<'f> {
+         wtr: W,
+         last_addr: CompiledAddr,
+         addr: CompiledAddr,
+-        is_final: bool,
+-        final_output: Output,
+-        trans: &[Transition],
++        bnode: &BuilderNode,
+     ) -> io::Result<()> {
+-        assert!(trans.len() <= 256);
+-        if trans.is_empty() && is_final && final_output.is_zero() {
++        assert!(bnode.trans.len() <= 256);
++        if bnode.trans.is_empty() && bnode.is_final && bnode.final_output.is_zero() {
+             return Ok(());
+-        } else if trans.len() != 1 || is_final {
+-            StateAnyTrans::compile(wtr, addr, is_final, final_output, trans)
++        } else if bnode.trans.len() != 1 || bnode.is_final {
++            StateAnyTrans::compile(wtr, addr, bnode)
+         } else {
+-            if trans[0].addr == last_addr && trans[0].out.is_zero() {
+-                StateOneTransNext::compile(wtr, addr, trans[0].inp)
++            if bnode.trans[0].addr == last_addr && bnode.trans[0].out.is_zero() {
++                StateOneTransNext::compile(wtr, addr, bnode.trans[0].inp)
+             } else {
+-                StateOneTrans::compile(wtr, addr, trans[0])
++                StateOneTrans::compile(wtr, addr, bnode.trans[0])
+             }
+         }
+     }
+@@ -521,10 +520,11 @@ impl StateAnyTrans {
+     fn compile<W: io::Write>(
+         mut wtr: W,
+         addr: CompiledAddr,
+-        is_final: bool,
+-        final_output: Output,
+-        trans: &[Transition],
++        bnode: &BuilderNode,
+     ) -> io::Result<()> {
++        let is_final = bnode.is_final;
++        let final_output = bnode.final_output;
++        let trans = &bnode.trans;
+         assert!(trans.len() <= 256);
+ 
+         let mut tsize = 0;
+@@ -1079,15 +1079,7 @@ mod tests {
+ 
+     fn compile(node: &BuilderNode) -> (CompiledAddr, Vec<u8>) {
+         let mut buf = vec![0; 24];
+-        Node::compile(
+-            &mut buf,
+-            NEVER_LAST,
+-            24,
+-            node.is_final,
+-            node.final_output,
+-            &node.trans,
+-        )
+-        .unwrap();
++        Node::compile(&mut buf, NEVER_LAST, 24, node).unwrap();
+         (buf.len() as CompiledAddr - 1, buf)
+     }
+ 
+diff --git a/src/raw/registry.rs b/src/raw/registry.rs
+index 9eb90cb..8ae0e47 100644
+--- a/src/raw/registry.rs
++++ b/src/raw/registry.rs
+@@ -1,5 +1,5 @@
+ use crate::raw::build::BuilderNode;
+-use crate::raw::{CompiledAddr, Output, Transition, NONE_ADDRESS};
++use crate::raw::{CompiledAddr, NONE_ADDRESS};
+ 
+ #[derive(Debug)]
+ pub struct Registry {
+@@ -33,28 +33,17 @@ impl Registry {
+         Registry { table: vec![empty_cell; ncells], table_size, mru_size }
+     }
+ 
+-    pub fn entry<'a>(
+-        &'a mut self,
+-        is_final: bool,
+-        final_output: Output,
+-        trans: &[Transition],
+-    ) -> RegistryEntry<'a> {
++    pub fn entry<'a>(&'a mut self, bnode: &BuilderNode) -> RegistryEntry<'a> {
+         if self.table.is_empty() {
+             return RegistryEntry::Rejected;
+         }
+-        let bucket = self.hash(is_final, final_output, trans);
++        let bucket = self.hash(bnode);
+         let start = self.mru_size * bucket;
+         let end = start + self.mru_size;
+-        RegistryCache { cells: &mut self.table[start..end] }
+-            .entry(is_final, final_output, trans)
++        RegistryCache { cells: &mut self.table[start..end] }.entry(bnode)
+     }
+ 
+-    fn hash(
+-        &self,
+-        is_final: bool,
+-        final_output: Output,
+-        trans: &[Transition],
+-    ) -> usize {
++    fn hash(&self, bnode: &BuilderNode) -> usize {
+         // Basic FNV-1a hash as described:
+         // https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
+         //
+@@ -62,9 +51,9 @@ impl Registry {
+         // as `std::hash::SipHasher` but is much much faster.
+         const FNV_PRIME: u64 = 1099511628211;
+         let mut h = 14695981039346656037;
+-        h = (h ^ (is_final as u64)).wrapping_mul(FNV_PRIME);
+-        h = (h ^ final_output.value()).wrapping_mul(FNV_PRIME);
+-        for t in trans {
++        h = (h ^ (bnode.is_final as u64)).wrapping_mul(FNV_PRIME);
++        h = (h ^ bnode.final_output.value()).wrapping_mul(FNV_PRIME);
++        for t in &bnode.trans {
+             h = (h ^ (t.inp as u64)).wrapping_mul(FNV_PRIME);
+             h = (h ^ t.out.value()).wrapping_mul(FNV_PRIME);
+             h = (h ^ (t.addr as u64)).wrapping_mul(FNV_PRIME);
+@@ -74,44 +63,33 @@ impl Registry {
+ }
+ 
+ impl<'a> RegistryCache<'a> {
+-    fn entry(
+-        mut self,
+-        is_final: bool,
+-        final_output: Output,
+-        trans: &[Transition],
+-    ) -> RegistryEntry<'a> {
++    fn entry(mut self, bnode: &BuilderNode) -> RegistryEntry<'a> {
+         if self.cells.len() == 1 {
+             let cell = &mut self.cells[0];
+-            if !cell.is_none() && reg_node_eq(&cell.node, is_final, final_output, trans) {
++            if !cell.is_none() && cell.node == *bnode {
+                 RegistryEntry::Found(cell.addr)
+             } else {
+-                reg_node_store(&mut cell.node, is_final, final_output, trans);
++                cell.node.clone_from(bnode);
+                 RegistryEntry::NotFound(cell)
+             }
+         } else if self.cells.len() == 2 {
+             let cell1 = &mut self.cells[0];
+-            if !cell1.is_none()
+-                && reg_node_eq(&cell1.node, is_final, final_output, trans)
+-            {
++            if !cell1.is_none() && cell1.node == *bnode {
+                 return RegistryEntry::Found(cell1.addr);
+             }
+ 
+             let cell2 = &mut self.cells[1];
+-            if !cell2.is_none()
+-                && reg_node_eq(&cell2.node, is_final, final_output, trans)
+-            {
++            if !cell2.is_none() && cell2.node == *bnode {
+                 let addr = cell2.addr;
+                 self.cells.swap(0, 1);
+                 return RegistryEntry::Found(addr);
+             }
+ 
+-            reg_node_store(&mut self.cells[1].node, is_final, final_output, trans);
++            self.cells[1].node.clone_from(bnode);
+             self.cells.swap(0, 1);
+             RegistryEntry::NotFound(&mut self.cells[0])
+         } else {
+-            let find = |c: &RegistryCell| {
+-                !c.is_none() && reg_node_eq(&c.node, is_final, final_output, trans)
+-            };
++            let find = |c: &RegistryCell| !c.is_none() && c.node == *bnode;
+             if let Some(i) = self.cells.iter().position(find) {
+                 let addr = self.cells[i].addr;
+                 self.promote(i); // most recently used
+@@ -119,7 +97,7 @@ impl<'a> RegistryCache<'a> {
+             } else {
+                 let last = self.cells.len() - 1;
+                 // discard LRU
+-                reg_node_store(&mut self.cells[last].node, is_final, final_output, trans);
++                self.cells[last].node.clone_from(bnode);
+                 self.promote(last);
+                 RegistryEntry::NotFound(&mut self.cells[0])
+             }
+@@ -149,33 +127,6 @@ impl RegistryCell {
+     }
+ }
+ 
+-/// Compares a cached node with the pieces of a builder node supplied by the
+-/// caller of the registry.
+-fn reg_node_eq(
+-    node: &BuilderNode,
+-    is_final: bool,
+-    final_output: Output,
+-    trans: &[Transition],
+-) -> bool {
+-    node.is_final == is_final
+-        && node.final_output == final_output
+-        && node.trans == trans
+-}
+-
+-/// Overwrites a cached node with the pieces of a builder node supplied by the
+-/// caller of the registry.
+-fn reg_node_store(
+-    node: &mut BuilderNode,
+-    is_final: bool,
+-    final_output: Output,
+-    trans: &[Transition],
+-) {
+-    node.is_final = is_final;
+-    node.final_output = final_output;
+-    node.trans.clear();
+-    node.trans.extend(trans.iter());
+-}
+-
+ #[cfg(test)]
+ mod tests {
+     use super::{Registry, RegistryCache, RegistryCell, RegistryEntry};
+@@ -197,11 +148,11 @@ mod tests {
+     }
+ 
+     fn assert_insert_and_found(reg: &mut Registry, bnode: &BuilderNode) {
+-        match reg.entry(bnode.is_final, bnode.final_output, &bnode.trans) {
++        match reg.entry(bnode) {
+             RegistryEntry::NotFound(cell) => cell.insert(1234),
+             entry => panic!("unexpected not found entry, got: {:?}", entry),
+         }
+-        match reg.entry(bnode.is_final, bnode.final_output, &bnode.trans) {
++        match reg.entry(bnode) {
+             RegistryEntry::Found(addr) => assert_eq!(addr, 1234),
+             entry => panic!("unexpected found entry, got: {:?}", entry),
+         }
+@@ -215,7 +166,7 @@ mod tests {
+             final_output: Output::zero(),
+             trans: vec![],
+         };
+-        assert_rejected(reg.entry(bnode.is_final, bnode.final_output, &bnode.trans));
++        assert_rejected(reg.entry(&bnode));
+     }
+ 
+     #[test]
+@@ -243,7 +194,7 @@ mod tests {
+         };
+         assert_insert_and_found(&mut reg, &bnode);
+         let is_final = BuilderNode { is_final: true, ..bnode.clone() };
+-        assert_not_found(reg.entry(is_final.is_final, is_final.final_output, &is_final.trans));
++        assert_not_found(reg.entry(&is_final));
+         let other_inp = BuilderNode {
+             trans: vec![Transition {
+                 addr: 0,
+@@ -252,7 +203,7 @@ mod tests {
+             }],
+             ..bnode.clone()
+         };
+-        assert_not_found(reg.entry(other_inp.is_final, other_inp.final_output, &other_inp.trans));
++        assert_not_found(reg.entry(&other_inp));
+         let other_out = BuilderNode {
+             trans: vec![Transition {
+                 addr: 0,
+@@ -261,7 +212,7 @@ mod tests {
+             }],
+             ..bnode.clone()
+         };
+-        assert_not_found(reg.entry(other_out.is_final, other_out.final_output, &other_out.trans));
++        assert_not_found(reg.entry(&other_out));
+     }
+ 
+     #[test]
+@@ -274,7 +225,7 @@ mod tests {
+         let bnode2 =
+             BuilderNode { final_output: Output::new(1), ..bnode1.clone() };
+         assert_insert_and_found(&mut reg, &bnode2);
+-        assert_not_found(reg.entry(bnode1.is_final, bnode1.final_output, &bnode1.trans));
++        assert_not_found(reg.entry(&bnode1));
+     }
+ 
+     #[test]
+diff --git a/src/raw/registry_minimal.rs b/src/raw/registry_minimal.rs
+index dc1acdc..663b012 100644
+--- a/src/raw/registry_minimal.rs
++++ b/src/raw/registry_minimal.rs
+@@ -14,7 +14,7 @@
+ use std::collections::hash_map::{Entry, HashMap};
+ 
+ use crate::raw::build::BuilderNode;
+-use crate::raw::{CompiledAddr, Output, Transition};
++use crate::raw::CompiledAddr;
+ 
+ #[derive(Debug)]
+ pub struct Registry {
+@@ -36,15 +36,8 @@ impl Registry {
+         Registry { table: HashMap::with_capacity(table_size) }
+     }
+ 
+-    pub fn entry<'a>(
+-        &'a mut self,
+-        is_final: bool,
+-        final_output: Output,
+-        trans: &[Transition],
+-    ) -> RegistryEntry<'a> {
+-        let bnode =
+-            BuilderNode { is_final, final_output, trans: trans.to_vec() };
+-        match self.table.entry(bnode) {
++    pub fn entry<'a>(&'a mut self, bnode: &BuilderNode) -> RegistryEntry<'a> {
++        match self.table.entry(bnode.clone()) {
+             Entry::Occupied(v) => RegistryEntry::Found(v.get().0),
+             Entry::Vacant(v) => {
+                 RegistryEntry::NotFound(v.insert(RegistryCell(0)))

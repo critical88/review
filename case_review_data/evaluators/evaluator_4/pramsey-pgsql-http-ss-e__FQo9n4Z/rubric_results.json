@@ -1,0 +1,158 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent introduces a single function http_set_conn_reuse(CURL *handle) containing the only derivation: g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE); followed by curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, ...). All four previously-scattered sites (_PG_init, http_get_handle, http_reset_curlopt, http_set_curlopt) and the http_request site now call http_set_conn_reuse(handle) instead of inlining their own g_conn_reuse assignment / FORBID_REUSE setopt. No remaining site independently writes g_conn_reuse = curlopt_is_set(...); the only other CURLOPT_FORBID_REUSE occurrence is inside http_set_conn_reuse itself, and the http_request tail still reads the cached g_conn_reuse flag rather than re-deriving.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Exactly one authoritative location computes the session connection policy from session state (the TCP keepalive opt-in), and no code retains a second independently written derivation of that decision: each site that used to re-derive the policy itself either delegates to that location or has been removed.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch introduces a single shared implementation, http_set_conn_reuse(CURL *handle), which owns both the decision (g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE)) and the application (curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, ...)). It replaces the previously duplicated inline stamping at each lifecycle site — _PG_init, http_get_handle, http_reset_curlopt, http_set_curlopt, and http_request — with calls to that function, so no independently maintained copy of the connection-policy stamping remains spread across the handle lifecycle.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Applying the connection policy to the handle is no longer repeated as independently maintained stamping code spread over the handle lifecycle (module initialization, handle preparation, option reset, option application): any remaining stamping of connection-policy attributes happens in one place, or is executed through the same single shared implementation of both the decision and its application.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch adds a single shared helper, http_set_conn_reuse(CURL *handle), which is the only place that derives the policy via g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE) and applies CURLOPT_FORBID_REUSE. Each previously scattered site (_PG_init, http_get_handle, http_reset_curlopt, http_set_curlopt, and http_request) now calls that one helper instead of re-deriving the policy inline, so the responsibility is centralized rather than merely re-expressed or routed through per-site copies.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A repair does not count if the connection-policy code at the scattered sites is kept in place and merely re-expressed — for example by converting the in-place calls into a different call form (error-checked, wrapped, renamed or re-indented) while each site still derives or applies the policy itself, or by routing the sites through per-site copies of a helper rather than through one implementation.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The refactor asked for the session connection policy to be driven from one location. The patch adds http_set_conn_reuse() as that owner and, in http_reset_curlopt, removes the reset-specific `g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE); curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, ...)` lines, replacing them with `http_set_conn_reuse(handle);` — the same function used by http_get_handle and http_request, so the reset path no longer keeps a separate derivation of the connection-reuse policy.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Handling of the option-reset path is adapted to the consolidation: after a session resets its curl options, the shared handle and the next request are left in the same connection state as after handle preparation — no reset-specific policy stamp or re-derivation remains as separate logic, and a reset cannot leave the handle serving different connection behavior than first use.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent introduces a single consolidated function http_set_conn_reuse(CURL *handle) that owns the g_conn_reuse decision and the CURLOPT_FORBID_REUSE stamp. In http_set_curlopt (the option-set site), the previous inline separate logic (g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE); curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, ...)) is removed and replaced with a call to http_set_conn_reuse(handle), so no option-set-site policy refresh or stamp remains as separate logic. The user-chosen option is still applied via the unchanged set_curlopt(handle, opt) call, which executes after the policy stamp, preserving existing effect and precedence. The next request's policy is re-derived through http_set_conn_reuse in http_request, routing through the same consolidated source.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The option-application path keeps applying a user-chosen curl option value with its existing effect and precedence, and the connection policy for the next request after an option change comes from the consolidated source; no option-set-site policy refresh or stamp remains as separate logic.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent introduces http_set_conn_reuse() as the single owner of the g_conn_reuse decision and routes all request-path consumers through it. In http_request, the per-request FORBID_REUSE enforcement now calls http_set_conn_reuse(g_http_handle) directly (replacing the raw curl_easy_setopt with g_conn_reuse). The connection-header selection (if (g_conn_reuse) → curl_slist_append Connection: Keep-Alive) and the post-request handle release (if (!g_conn_reuse) → curl_easy_cleanup) both read g_conn_reuse, which was just refreshed by the http_set_conn_reuse() call at the top of the request path, so neither can hold a value the consolidated source would not produce for the current session state. All three consumers are driven transitively by the one policy owner.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The request-time consumers of the connection policy — per-request socket re-use enforcement, connection-header selection, and post-request handle release — are all driven (directly or transitively) by the consolidated policy source, so no request-path consumer can hold a policy value that the consolidated location would not produce for the current session state.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In _PG_init, the patch replaces the load-time refresh-and-stamp sequence `g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE); curl_easy_setopt(g_http_handle, CURLOPT_FORBID_REUSE, g_conn_reuse ? 0L : 1L);` with a call to the consolidated `http_set_conn_reuse(g_http_handle);`. The same `http_set_conn_reuse()` function is used by the live session paths (`http_get_handle`, `http_reset_curlopt`, `http_set_curlopt`, and `http_request`), so module initialization uses the same policy source/application code rather than a self-contained derivation.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Whatever the repair does at module initialization is drawn inside the consolidated design: the module-load path either no longer performs connection-related setup at load time, or uses the same policy source and application code a live session would use, rather than staging a policy refresh-and-stamp sequence of its own.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent does not remove the module-scope flag `g_conn_reuse`; it keeps it and adds `http_set_conn_reuse()` as the consolidated writer, but leaves reads of the cached flag outside that function. In `http_get_handle()` the patch still consults the shared state directly: `curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, g_conn_reuse ? 1L : 0L);`. In `http_request()` the later reads are untouched by the patch and remain `if ( g_conn_reuse )` (Connection: Keep-Alive header) and `if ( ! g_conn_reuse )` (cleanup decision), consulting the cached flag rather than routing through the single policy source. Because the flag is neither removed nor fully contained within `http_set_conn_reuse()`'s scope, the criterion fails.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The module-scope cached connection-policy flag introduced by the maintenance change is removed, unless all of its reads and writes are contained within the consolidated policy source's own scope; nothing outside that location keeps refreshing that shared state or consulting it.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "Each former inline refresh/stamp site (g_conn_reuse = curlopt_is_set(...); curl_easy_setopt(..., CURLOPT_FORBID_REUSE, ...)) is replaced by a call to the new http_set_conn_reuse() helper in _PG_init, http_get_handle, http_reset_curlopt, http_set_curlopt, and http_request. The curlopt_is_set forward declaration and g_conn_reuse global remain but are still actively used (by http_set_conn_reuse and the keep-alive header/cleanup branches in http_request). Comments at each site were rewritten to describe the consolidated owner rather than the old scattered refresh. No dead helpers, empty branches, or orphaned scaffolding remain; the kept CURLOPT_TCP_KEEPALIVE/protocol-restriction lines are functional, not refresh remnants.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The patch leaves no remnants of the scattered form behind: no dead or unused declarations (for example a forward declaration needed only by the removed refresh sites), no unused helper definitions, and no orphaned comments, empty branches or preprocessor scaffolding left where the refresh and stamping code used to be.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch consolidates only the connection-reuse decision into http_set_conn_reuse() and does not touch the settable-option machinery: the per-option loop and set_curlopt(handle, opt) call in http_set_curlopt remain, and the option table/GUC handling is unchanged. The request-path protocol restriction with version guards stays intact (CURL_SETOPT(g_http_handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS) appears as unchanged context), and the transfer callback CURLOPT_WRITEFUNCTION, http_writeback is preserved. Policy application is not removed from the request path: the inline curl_easy_setopt(... CURLOPT_FORBID_REUSE ...) is replaced by http_set_conn_reuse(g_http_handle), so the re-use decision remains enforced at transfer time. The later g_conn_reuse checks for keep-alive headers and cleanup are left in place.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Cleanup must not overreach: the settable-option machinery (definition table, per-option application loop, custom GUC handling), the request-path protocol restriction with its version guards, and the libcurl transfer callbacks stay intact and functional, and the repair does not remove policy application from the request path entirely (which would leave the re-use decision unenforced at transfer time).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch preserves keepalive semantics by centralizing the decision in http_set_conn_reuse(), which still derives g_conn_reuse from curlopt_is_set(CURLOPT_TCP_KEEPALIVE) and sets CURLOPT_FORBID_REUSE accordingly (0L when keepalive is set, 1L when not). This function is called at every relevant point: _PG_init, http_get_handle, http_reset_curlopt, http_set_curlopt, and http_request. The keep-alive request header logic (if (g_conn_reuse) append \"Connection: Keep-Alive\") and the handle cleanup logic (if (!g_conn_reuse) curl_easy_cleanup) are left unchanged from the smell version, so sockets are held open and the handle retained when keepalive is set, and connections forced closed and handle released when not. Mid-session changes take effect on the next request because http_request() calls http_set_conn_reuse(g_http_handle) before issuing each request, re-deriving the flag from the current option state.",
+      "valid": true,
+      "attempts": 4,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Keepalive semantics survive intact and live: a session that opts into TCP keepalive gets sockets held open and re-used across requests (keep-alive request header, handle retained after transfer), a session that has not gets connections forced closed (close-connection request header, handle released after transfer), and switching the opt-in on or off mid-session through any supported path changes the next request accordingly.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch consolidates only CURLOPT_FORBID_REUSE via http_set_conn_reuse and leaves the http/https protocol restriction with its libcurl version guard intact: in http_reset_curlopt the hunk still shows `#if LIBCURL_VERSION_NUM >= 0x075400 ... CURLOPT_PROTOCOLS_STR, \"http,https\" #else CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS #endif`, and http_get_handle retains the same guarded block. The http_request hunk begins after the matching `#endif`, indicating the request path still applies the guarded protocol restriction. The older pre-7.84 protocol-option form is not dropped or loosened.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Requests stay restricted to the http and https protocols across the supported libcurl range: the consolidation keeps that restriction in force for every request, including the pre-7.84 handling that used the older protocol-option form, rather than assuming the one libcurl version present in the build environment.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch centralizes the decision in http_set_conn_reuse(), which recomputes g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE) on every call and applies CURLOPT_FORBID_REUSE accordingly. It is invoked at live session paths including http_set_curlopt() and http_request(), so mid-session SET/RESET or option changes are re-evaluated before the next request rather than being frozen at load or first use.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair must not freeze or disconnect the decision from its input; a repair does not count if the policy is baked to a constant, or sourced from state that no longer tracks the current session (for example a snapshot taken once at load or at first use that later session-option changes cannot touch), because then mid-session SET/RESET and option changes silently stop affecting connection behavior.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.6666666666666666,
+    "associated_changes": 1,
+    "core_resolution": 1
+  },
+  "valid_count": 13,
+  "pass_count": 12,
+  "must_have_pass": false,
+  "macro_score": 0.9166666666666666
+}

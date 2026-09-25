@@ -1,0 +1,274 @@
+diff --git a/8cc.h b/8cc.h
+index 6a8bd2e..b9bcee9 100644
+--- a/8cc.h
++++ b/8cc.h
+@@ -65,17 +65,16 @@ typedef struct {
+     int len;
+ } Buffer;
+ 
+-typedef struct StreamOps StreamOps;
+ typedef struct Stream Stream;
+ 
+-// A polymorphic I/O handle. Concrete I/O backends (the character source
+-// streams in file.c and the text output sinks in gen.c and error.c) attach a
+-// StreamOps table (see stream.h) describing their backend; the rest of the
+-// fields on the concrete owner's struct hold backend-specific state. A File
+-// input source embeds this as its first member, so a pointer to a File can be
+-// used wherever a Stream * is expected.
++// A polymorphic I/O handle. Each concrete I/O backend attaches a focused ops
++// table (see stream.h) describing only the operations of its role; the rest of
++// the fields on the concrete owner's struct hold backend-specific state. The
++// ops field is a generic pointer the concrete owner casts to its own focused
++// ops table type. A File input source embeds this as its first member, so a
++// pointer to a File can be used wherever a Stream * is expected.
+ struct Stream {
+-    const StreamOps *ops;
++    const void *ops;
+ };
+ 
+ typedef struct File {
+diff --git a/error.c b/error.c
+index ca8c7b6..18d5de9 100644
+--- a/error.c
++++ b/error.c
+@@ -24,9 +24,8 @@ static void err_flush(Stream *self) {
+     fflush(o->fp);
+ }
+ 
+-static const StreamOps err_stream_ops = {
+-    noop_read, noop_unread, noop_eof, err_emitv, err_putstr,
+-    err_flush, noop_tell, noop_seek, noop_close,
++static const DiagStreamOps err_stream_ops = {
++    err_emitv, err_putstr, err_flush,
+ };
+ 
+ static OutStream err = { { &err_stream_ops }, NULL };
+@@ -38,11 +37,11 @@ static void __attribute__((constructor)) err_stream_init(void) {
+ static void print_error(char *line, char *pos, char *label, char *fmt, va_list args) {
+     char *hdr = format(isatty(fileno(err.fp)) ? "\e[1;31m[%s]\e[0m " : "[%s] ", label);
+     char *loc = format("%s: %s: ", line, pos);
+-    err.stream.ops->putstr((Stream *)&err, hdr);
+-    err.stream.ops->putstr((Stream *)&err, loc);
+-    err.stream.ops->emitv((Stream *)&err, fmt, args);
+-    err.stream.ops->putstr((Stream *)&err, "\n");
+-    err.stream.ops->flush((Stream *)&err);
++    ((const DiagStreamOps *)err.stream.ops)->putstr((Stream *)&err, hdr);
++    ((const DiagStreamOps *)err.stream.ops)->putstr((Stream *)&err, loc);
++    ((const DiagStreamOps *)err.stream.ops)->emitv((Stream *)&err, fmt, args);
++    ((const DiagStreamOps *)err.stream.ops)->putstr((Stream *)&err, "\n");
++    ((const DiagStreamOps *)err.stream.ops)->flush((Stream *)&err);
+ }
+ 
+ void errorf(char *line, char *pos, char *fmt, ...) {
+diff --git a/file.c b/file.c
+index b437d4c..ac19be4 100644
+--- a/file.c
++++ b/file.c
+@@ -28,8 +28,8 @@
+ static Vector *files = &EMPTY_VECTOR;
+ static Vector *stashed = &EMPTY_VECTOR;
+ 
+-static const StreamOps file_stream_ops;
+-static const StreamOps string_stream_ops;
++static const InputStreamOps file_stream_ops;
++static const InputStreamOps string_stream_ops;
+ 
+ File *make_file(FILE *file, char *name) {
+     File *r = calloc(1, sizeof(File));
+@@ -114,14 +114,12 @@ static bool string_eof(Stream *self) {
+     return *f->p == '\0' && f->buflen == 0;
+ }
+ 
+-static const StreamOps file_stream_ops = {
+-    file_read, stream_unread, file_eof, noop_emitv, noop_putstr,
+-    noop_flush, noop_tell, noop_seek, file_close,
++static const InputStreamOps file_stream_ops = {
++    file_read, stream_unread, file_eof, file_close,
+ };
+ 
+-static const StreamOps string_stream_ops = {
+-    string_read, stream_unread, string_eof, noop_emitv, noop_putstr,
+-    noop_flush, noop_tell, noop_seek, file_close,
++static const InputStreamOps string_stream_ops = {
++    string_read, stream_unread, string_eof, file_close,
+ };
+ 
+ static int get() {
+@@ -130,7 +128,7 @@ static int get() {
+     if (f->buflen > 0) {
+         c = f->buf[--f->buflen];
+     } else {
+-        c = f->stream.ops->read((Stream *)f);
++        c = ((const InputStreamOps *)f->stream.ops)->read((Stream *)f);
+     }
+     if (c == '\n') {
+         f->line++;
+@@ -148,7 +146,7 @@ int readc() {
+             if (vec_len(files) == 1)
+                 return c;
+             File *g = vec_pop(files);
+-            g->stream.ops->close((Stream *)g);
++            ((const InputStreamOps *)g->stream.ops)->close((Stream *)g);
+             continue;
+         }
+         if (c != '\\')
+@@ -165,7 +163,7 @@ void unreadc(int c) {
+     if (c == EOF)
+         return;
+     File *f = vec_tail(files);
+-    f->stream.ops->unread((Stream *)f, c);
++    ((const InputStreamOps *)f->stream.ops)->unread((Stream *)f, c);
+ }
+ 
+ File *current_file() {
+diff --git a/gen.c b/gen.c
+index 64ae2d4..8273d08 100644
+--- a/gen.c
++++ b/gen.c
+@@ -80,9 +80,8 @@ static void output_close(Stream *self) {
+     fclose(o->fp);
+ }
+ 
+-static const StreamOps output_stream_ops = {
+-    noop_read, noop_unread, noop_eof, output_emitv, output_putstr,
+-    output_flush, noop_tell, noop_seek, output_close,
++static const OutputStreamOps output_stream_ops = {
++    output_emitv, output_putstr, output_flush, output_close,
+ };
+ 
+ static OutStream output = { { &output_stream_ops }, NULL };
+@@ -92,7 +91,7 @@ void set_output_file(FILE *fp) {
+ }
+ 
+ void close_output_file() {
+-    output.stream.ops->close((Stream *)&output);
++    ((const OutputStreamOps *)output.stream.ops)->close((Stream *)&output);
+ }
+ 
+ static void emitf(int line, char *fmt, ...) {
+@@ -112,7 +111,7 @@ static void emitf(int line, char *fmt, ...) {
+ 
+     va_list args;
+     va_start(args, fmt);
+-    int col = output.stream.ops->emitv((Stream *)&output, buf, args);
++    int col = ((const OutputStreamOps *)output.stream.ops)->emitv((Stream *)&output, buf, args);
+     va_end(args);
+ 
+     if (dumpstack) {
+@@ -121,18 +120,18 @@ static void emitf(int line, char *fmt, ...) {
+                 col += TAB - 1;
+         int space = (28 - col) > 0 ? (30 - col) : 2;
+         char *anno = format("%*c %s:%d", space, '#', get_caller_list(), line);
+-        output.stream.ops->putstr((Stream *)&output, anno);
++        ((const OutputStreamOps *)output.stream.ops)->putstr((Stream *)&output, anno);
+     }
+-    output.stream.ops->putstr((Stream *)&output, "\n");
++    ((const OutputStreamOps *)output.stream.ops)->putstr((Stream *)&output, "\n");
+ }
+ 
+ static void emit_nostack(char *fmt, ...) {
+-    output.stream.ops->putstr((Stream *)&output, "\t");
++    ((const OutputStreamOps *)output.stream.ops)->putstr((Stream *)&output, "\t");
+     va_list args;
+     va_start(args, fmt);
+-    output.stream.ops->emitv((Stream *)&output, fmt, args);
++    ((const OutputStreamOps *)output.stream.ops)->emitv((Stream *)&output, fmt, args);
+     va_end(args);
+-    output.stream.ops->putstr((Stream *)&output, "\n");
++    ((const OutputStreamOps *)output.stream.ops)->putstr((Stream *)&output, "\n");
+ }
+ 
+ static char *get_int_reg(Type *ty, char r) {
+diff --git a/stream.h b/stream.h
+index dde058f..89e5076 100644
+--- a/stream.h
++++ b/stream.h
+@@ -1,15 +1,12 @@
+ // Copyright 2012 Rui Ueyama. Released under the MIT license.
+ //
+-// Stream is a unified polymorphic I/O layer for the compiler. A single
+-// StreamOps table describes every capability any I/O backend can expose, and a
+-// Stream handle carries the table pointer plus whatever backend state the
+-// concrete owner needs. Both the character input sources in file.c (a FILE *
+-// stream and an in-memory string) and the text output sinks in gen.c (the
+-// assembly emitter) and error.c (the diagnostic reporter) are wired through
+-// this one interface, so a Stream * can stand in for any of them. The table is
+-// intentionally broad: it groups reading, writing, positioning and lifecycle
+-// operations in one place so the same handle keeps working as new backends are
+-// added that reuse only some of the slots.
++// Input and output in the compiler go through small, focused interfaces rather
++// than one broad table. A character source (the input streams in file.c) needs
++// read/unread/eof/close; the assembly emitter (gen.c) is an owned text sink that
++// needs write/flush/close on a FILE * it controls; the diagnostic reporter
++// (error.c) is an unowned text sink that writes to stderr and must not close it.
++// Each backend installs a table carrying only the operations of its role, so a
++// backend is never forced to stub out a capability it does not use.
+ 
+ #ifndef EIGHTCC_STREAM_H
+ #define EIGHTCC_STREAM_H
+@@ -17,42 +14,36 @@
+ #include <stdarg.h>
+ #include "8cc.h"
+ 
+-struct StreamOps {
+-    // Input (character source).
+-    int  (*read)(Stream *self);            // next character or EOF
++// Character source: the input streams in file.c (a stdio FILE * stream and an
++// in-memory string).
++typedef struct InputStreamOps {
++    int  (*read)(Stream *self);            // next character, or EOF
+     void (*unread)(Stream *self, int c);   // push a character back into the stream
+-    bool (*eof)(Stream *self);              // true once the source is exhausted
+-    // Output (text sink).
++    bool (*eof)(Stream *self);            // true once the source is exhausted
++    void (*close)(Stream *self);          // release the underlying resource
++} InputStreamOps;
++
++// Owned text sink: the assembly emitter in gen.c, which writes a FILE * it is
++// responsible for closing.
++typedef struct OutputStreamOps {
+     int  (*emitv)(Stream *self, const char *fmt, va_list ap);  // formatted write, returns bytes written
+     void (*putstr)(Stream *self, const char *s);             // literal write
+-    void (*flush)(Stream *self);            // flush buffered output
+-    // Positioning.
+-    long (*tell)(Stream *self);            // current offset, -1 if unsupported
+-    int  (*seek)(Stream *self, long off);   // reposition, -1 if unsupported
+-    // Lifecycle.
+-    void (*close)(Stream *self);           // release the underlying resource
+-};
++    void (*flush)(Stream *self);             // flush buffered output
++    void (*close)(Stream *self);           // release the backing file
++} OutputStreamOps;
++
++// Unowned text sink: the diagnostic reporter in error.c, which writes to the
++// process's stderr and must not close it.
++typedef struct DiagStreamOps {
++    int  (*emitv)(Stream *self, const char *fmt, va_list ap);
++    void (*putstr)(Stream *self, const char *s);
++    void (*flush)(Stream *self);
++} DiagStreamOps;
+ 
+-// A FILE *-backed output sink. The code generator and the diagnostic reporter
+-// share this shape; both point their StreamOps table at one of these.
++// A FILE * backing store shared by the owned and unowned output sinks.
+ typedef struct OutStream {
+     Stream stream;
+     FILE *fp;
+ } OutStream;
+ 
+-// No-op stubs backends install for the StreamOps capabilities they do not
+-// implement. A read-only source fills in the output/positioning slots with these
+-// and a write-only sink fills in the input/positioning slots with these. They
+-// never produce any effect; they exist only to satisfy the shape of the StreamOps
+-// table.
+-static inline __attribute__((unused)) int noop_read(Stream *self) { (void)self; return EOF; }
+-static inline __attribute__((unused)) void noop_unread(Stream *self, int c) { (void)self; (void)c; }
+-static inline __attribute__((unused)) bool noop_eof(Stream *self) { (void)self; return false; }
+-static inline __attribute__((unused)) int noop_emitv(Stream *self, const char *fmt, va_list ap) { (void)self; (void)fmt; (void)ap; return 0; }
+-static inline __attribute__((unused)) void noop_putstr(Stream *self, const char *s) { (void)self; (void)s; }
+-static inline __attribute__((unused)) void noop_flush(Stream *self) { (void)self; }
+-static inline __attribute__((unused)) long noop_tell(Stream *self) { (void)self; return -1; }
+-static inline __attribute__((unused)) int noop_seek(Stream *self, long off) { (void)self; (void)off; return -1; }
+-static inline __attribute__((unused)) void noop_close(Stream *self) { (void)self; }
+-
+ #endif

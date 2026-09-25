@@ -1,0 +1,114 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "Patch keeps the whole carrier at every stage: fiche_service_boot(Fiche_Service *service), start_server(Fiche_Service *service), dispatch_connection(int socket, Fiche_Service *service), and struct fiche_connection's Fiche_Service *service remain unchanged. It only adds local pointers resolved from service_audit/service_identity/service_storage/service_admission, so each stage still receives all capability groups rather than taking only the ones it exercises.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Each engine stage now takes only the capability groups it exercises: the startup sequence needs startup-time setup and reporting only, the socket and connection-accept stages need reporting only, and the per-connection walk needs reporting, persistence and connection policy only.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch makes capability groups independently selectable: Fiche_Provider now holds nullable const pointers per family (const Fiche_Storage_Hooks *storage, const Fiche_Audit_Hooks *audit, etc.) instead of embedded structs. fiche_provider_init sets all four seams to NULL ('Start from an empty table: every seam left NULL is served by the engine's built-in hooks, so a host only fills in the capabilities it actually wants to change'). The engine resolves each family independently via service_storage/service_audit/service_identity/service_admission helpers that fall back to builtin_storage/builtin_audit/builtin_identity/builtin_admission when a seam is NULL. Header docs confirm: 'Each host registers only the seams it has a reason to change; every NULL seam is served by the engine's built-in default... no participant is forced to supply a capability it cannot meaningfully support.' Thus a host customizing only reporting can set provider.audit alone without constructing or filling the other families.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Capability groups are independently selectable by hosts and callers: built-in behavior is available per family, and a host that customizes exactly one group (for example reporting) supplies that one group without constructing, filling or naming the other families.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent changes Fiche_Provider to per-family pointers and rewrites fiche_provider_init to clear every seam to NULL instead of filling it with built-in hooks (fiche.c: ops->storage = NULL; ops->audit = NULL; ops->identity = NULL; ops->admission = NULL). It adds builtin_* hook tables and service_* resolvers that fall back to those built-ins when a seam or ops is NULL (fiche.c: service_storage returns &builtin_storage when s->ops->storage is NULL). main.c and fiche_run now register an empty provider for stock behavior (main.c: 'registers an empty provider: every seam left NULL is served by the engine's built-in hooks'; fiche_run: 'serves the built-in behavior by registering an empty provider'). Thus the default path no longer assembles a complete multi-family registration; stock behavior depends on no capability family.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The command-line host and any embedder-facing entry obtain default behavior without assembling a complete multi-family registration object (directly or through a one-stop fill helper), so requesting stock behavior depends on no capability family at all.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The per-connection payload `struct fiche_connection` still carries `Fiche_Service *service` (a whole-engine object), unchanged from the smell. In `dispatch_connection`, the payload is populated with `c->service = service;` — the entire service handle. In `handle_connection`, the walk reaches through that whole-engine object and its inner registration member: `service_audit(c->service)`, `service_storage(c->service)`, `service_admission(c->service)`, each of which dereferences `s->ops->audit`/`s->ops->storage`/`s->ops->admission`. The payload does not carry only the capability groups the walk uses (e.g., resolved `const Fiche_Audit_Hooks *`, `const Fiche_Storage_Hooks *`, `const Fiche_Admission_Hooks *`), and the walk does not read capabilities directly — it opens the whole-service handle to reach each family, which is exactly the coupling R4 targets.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The per-connection thread payload carries only the connection state plus the capability groups the connection walk uses, and the walk reads each capability it needs directly rather than reaching through a whole-engine object and an inner registration member.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch keeps Fiche_Service *service as the parameter for start_server and dispatch_connection and stores c->service = service for handle_connection, forwarding the entire service object (all four capability groups: storage, audit, identity, admission) through the whole accept-to-walk chain. start_server resolves only audit locally yet passes the complete service to dispatch_connection; dispatch_connection resolves only audit yet forwards the complete service to handle_connection via c->service. The identity capability group in particular is forwarded through start_server and dispatch_connection but is not needed by either function or by any of their callees (only fiche_service_boot uses identity). No intermediate signature was narrowed to carry only the behavior families that step uses; the agent added local seam resolution but left the same whole-service pass-through that the smell introduced.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The internal call chain from startup through the socket loop and dispatch to the worker was updated coherently: no intermediate function keeps forwarding a capability group that none of its callees needs.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent repurposed fiche_provider_init so it no longer fills a complete merged table — it now sets every seam to NULL (ops->storage = NULL; ops->audit = NULL; ops->identity = NULL; ops->admission = NULL), and its header comment was rewritten from 'Fills a provider table with the built-in hooks' to 'Prepares a provider table for selective registration.' The Fiche_Provider construction blocks in fiche_run and main.c are retained but are actively used (passed to fiche_service_boot), not left sitting unused. The old comment blocks describing the retired 'complete provider table' scheme — e.g. 'every host registers a single complete provider table. The engine never falls back to built-in hooks on its own' and 'Registering a complete table is part of the hosting contract' — were removed and replaced with selective-registration wording ('every NULL seam is served by the engine's built-in default'). No vestigial merged-registration helper, unused construction path, or retired-scheme comment block survives.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No dead registration machinery survives: no leftover helper whose only purpose was filling the complete merged table, no code path that still constructs a merged registration object that then merely sits unused, and no removed-facing comment blocks describing the retired registration scheme.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch replaces the smell's embedded-struct Fiche_Provider with pointer members (e.g., `const Fiche_Storage_Hooks *storage`) and rewrites `fiche_provider_init` to NULL every seam, eliminating the complete-registration requirement. The new `builtin_*` tables and `service_*()` resolver functions implement fallback logic and are the new access mechanism, not thin wrappers translating the old `service->ops->audit.report_status(...)` pattern. No macros or renamed typedefs are introduced. Every engine seam taking `Fiche_Service *` (`fiche_service_boot`, `start_server`, `dispatch_connection`, `handle_connection`) uses the parameter, so no unused whole-contract parameter remains.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "No transitional compatibility shims remain: no macro, renamed typedef or forwarding wrapper kept only to translate the old merged-registration access pattern, and no engine seam still carries an unused whole-contract parameter.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent preserves per-family function-pointer dispatch: it adds static const built-in hook tables (builtin_storage, builtin_audit, builtin_identity, builtin_admission) and resolver helpers (service_storage, service_audit, service_identity, service_admission) that return the host-registered table when non-NULL or the built-in table otherwise. Engine code calls only through these resolved tables (e.g., audit->report_status(...), storage->make_slug(...), admission->admit_connection(...), identity->adopt_user(...)) and never calls the built-in functions (print_status, generate_slug, save_to_file, etc.) directly. Fiche_Provider members are now per-family pointers a host can set selectively, so swapping callbacks behind a seam remains possible and built-ins remain the default when a host supplies nothing.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The refactor does not remove the customization ability itself: behavior families remain pluggable (engine seams still dispatch through per-family function-pointer tables with built-in defaults) rather than hard-wiring the built-in implementations into the seams.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch preserves all externally observable behavior. All status/error message strings are unchanged: 'Starting fiche on %s...', 'Was not able to change the user!', 'Output directory not writable!', 'Log file not writable!', 'Was not able to set domain name!', 'Couldn't create a socket!', 'Couldn't bind to the port: %d!', 'Server started listening on: %s:%d.', 'Incoming connection from: %s (%s).', 'No data received from the client!', 'Couldn't generate a valid slug!', 'Couldn't save a file!', 'Received %d bytes, saved to: %s.' — all carried through the resolved `audit`/`storage`/`identity`/`admission` pointers which fall back to the same built-in functions (print_status, print_error, print_separator, log_entry, generate_slug, create_directory, save_to_file, set_domain_name, perform_user_change, default_admit_connection). Failure exits (return -1) for user change, output dir, log file, and domain setup are all retained. The successful paste round trip is unchanged: URL is still snprintf(url, len, \"%s%s%s%s\", c->service->settings.domain, \"/\", slug, \"\\n\"), slug retry loop still calls make_directory in a while loop, and store_paste still writes via save_to_file. The admission hook default_admit_connection still returns 1 (admit all), preserving prior behavior where whitelist/banlist checks were TODO/skipped.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Externally observable behavior is unchanged: the status/error prefixes and message wording, the failure exits for user change, writable output directory, writable log file and domain setup, and the successful paste round trip (url response of domain + '/' + slug + newline, per-paste directory with index.txt, slug retry behavior) all behave exactly as before.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0,
+    "core_resolution": 0.6666666666666666
+  },
+  "valid_count": 9,
+  "pass_count": 6,
+  "must_have_pass": false,
+  "macro_score": 0.6666666666666666
+}

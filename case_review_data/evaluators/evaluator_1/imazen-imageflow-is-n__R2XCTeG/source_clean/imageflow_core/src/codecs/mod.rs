@@ -1,0 +1,821 @@
+use crate::for_other_imageflow_crates::preludes::external_without_std::*;
+use crate::{Context, ErrorCategory, ErrorKind, FlowError, JsonResponse, Result};
+use std::sync::*;
+
+use crate::io::IoProxy;
+use imageflow_types::collections::AddRemoveSet;
+use imageflow_types::IoDirection;
+use std::any::Any;
+use std::borrow::BorrowMut;
+use std::ops::DerefMut;
+use uuid::Uuid;
+mod gif;
+mod lode;
+mod pngquant;
+pub use lode::write_png;
+
+mod auto;
+pub(crate) mod cms;
+mod image_png_decoder;
+pub(crate) mod moxcms_transform;
+pub(crate) mod source_profile;
+mod tiny_lru;
+
+// C codec modules — require c-codecs feature
+#[cfg(feature = "c-codecs")]
+mod jpeg_decoder;
+#[cfg(feature = "c-codecs")]
+pub(crate) mod lcms2_transform;
+#[cfg(feature = "c-codecs")]
+mod libpng_decoder;
+#[cfg(feature = "c-codecs")]
+mod libpng_encoder;
+#[cfg(feature = "c-codecs")]
+mod mozjpeg;
+#[cfg(feature = "c-codecs")]
+mod mozjpeg_decoder;
+#[cfg(feature = "c-codecs")]
+mod mozjpeg_decoder_helpers;
+#[cfg(feature = "c-codecs")]
+mod webp;
+
+// Zen codec adapters (zencodec dyn dispatch). The decoder bridge is also
+// needed by the `bmp` feature (implied by `zen-codecs`).
+#[cfg(feature = "bmp")]
+pub(crate) mod zen_decoder;
+#[cfg(feature = "zen-codecs")]
+pub(crate) mod zen_encoder;
+
+use crate::graphics::bitmaps::BitmapKey;
+
+pub trait DecoderFactory {
+    fn create(c: &Context, io: &mut IoProxy, io_id: i32) -> Option<Result<Box<dyn Decoder>>>;
+}
+pub trait Decoder: Any {
+    fn initialize(&mut self, c: &Context) -> Result<()>;
+    fn get_unscaled_image_info(&mut self, c: &Context) -> Result<s::ImageInfo>;
+    fn get_scaled_image_info(&mut self, c: &Context) -> Result<s::ImageInfo>;
+    fn get_exif_rotation_flag(&mut self, c: &Context) -> Result<Option<i32>>;
+    fn tell_decoder(&mut self, c: &Context, tell: s::DecoderCommand) -> Result<()>;
+    fn read_frame(&mut self, c: &Context) -> Result<BitmapKey>;
+    fn has_more_frames(&mut self) -> Result<bool>;
+    fn as_any(&self) -> &dyn Any;
+}
+pub trait Encoder {
+    // GIF encoder will need to know if transparency is required (we could guess based on first input frame)
+    // If not required, we can do frame shrinking and delta encoding. Otherwise we have to
+    // encode entire frames and enable transparency (default)
+    fn write_frame(
+        &mut self,
+        c: &Context,
+        preset: &s::EncoderPreset,
+        frame: BitmapKey,
+        decoder_io_ids: &[i32],
+    ) -> Result<s::EncodeResult>;
+
+    fn into_io(self: Box<Self>) -> Result<IoProxy>;
+}
+
+enum CodecKind {
+    EncoderPlaceholder,
+    Encoder(Box<dyn Encoder>),
+    EncoderFinished,
+    Decoder(Box<dyn Decoder>),
+}
+
+#[derive(PartialEq, Copy, Clone)]
+pub enum NamedDecoders {
+    #[cfg(feature = "c-codecs")]
+    MozJpegRsDecoder,
+    #[cfg(feature = "c-codecs")]
+    ImageRsJpegDecoder,
+    ImageRsPngDecoder,
+    #[cfg(feature = "c-codecs")]
+    LibPngRsDecoder,
+    GifRsDecoder,
+    #[cfg(feature = "c-codecs")]
+    WebPDecoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenJpegDecoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenWebPDecoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenGifDecoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenPngDecoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenAvifDecoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenJxlDecoder,
+    #[cfg(feature = "bmp")]
+    ZenBmpDecoder,
+}
+impl NamedDecoders {
+    pub fn works_for_magic_bytes(&self, bytes: &[u8]) -> bool {
+        match self {
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::ImageRsJpegDecoder | NamedDecoders::MozJpegRsDecoder => {
+                bytes.starts_with(b"\xFF\xD8\xFF")
+            }
+            NamedDecoders::GifRsDecoder => {
+                bytes.starts_with(b"GIF89a") || bytes.starts_with(b"GIF87a")
+            }
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::LibPngRsDecoder => {
+                bytes.starts_with(b"\x89\x50\x4E\x47\x0D\x0A\x1A\x0A")
+            }
+            NamedDecoders::ImageRsPngDecoder => {
+                bytes.starts_with(b"\x89\x50\x4E\x47\x0D\x0A\x1A\x0A")
+            }
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::WebPDecoder => {
+                bytes.starts_with(b"RIFF") && bytes.len() >= 12 && bytes[8..12].starts_with(b"WEBP")
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJpegDecoder => bytes.starts_with(b"\xFF\xD8\xFF"),
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenWebPDecoder => {
+                bytes.starts_with(b"RIFF") && bytes.len() >= 12 && bytes[8..12].starts_with(b"WEBP")
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenGifDecoder => {
+                bytes.starts_with(b"GIF89a") || bytes.starts_with(b"GIF87a")
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenPngDecoder => bytes.starts_with(b"\x89\x50\x4E\x47\x0D\x0A\x1A\x0A"),
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenAvifDecoder => {
+                bytes.len() >= 12
+                    && &bytes[4..8] == b"ftyp"
+                    && (bytes[8..12].starts_with(b"avif")
+                        || bytes[8..12].starts_with(b"avis")
+                        || bytes[8..12].starts_with(b"mif1"))
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJxlDecoder => {
+                // JXL bare codestream: FF 0A; container: 00 00 00 0C 4A 58 4C 20 0D 0A 87 0A
+                bytes.starts_with(&[0xFF, 0x0A])
+                    || (bytes.len() >= 12
+                        && bytes.starts_with(&[0x00, 0x00, 0x00, 0x0C, 0x4A, 0x58, 0x4C, 0x20]))
+            }
+            #[cfg(feature = "bmp")]
+            NamedDecoders::ZenBmpDecoder => bytes.starts_with(b"BM"),
+        }
+    }
+
+    /// Lower-case name of the format this decoder reads (`jpeg`, `png`, ...).
+    pub fn format_name(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::MozJpegRsDecoder | NamedDecoders::ImageRsJpegDecoder => "jpeg",
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::LibPngRsDecoder => "png",
+            NamedDecoders::ImageRsPngDecoder => "png",
+            NamedDecoders::GifRsDecoder => "gif",
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::WebPDecoder => "webp",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJpegDecoder => "jpeg",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenWebPDecoder => "webp",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenGifDecoder => "gif",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenPngDecoder => "png",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenAvifDecoder => "avif",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJxlDecoder => "jxl",
+            #[cfg(feature = "bmp")]
+            NamedDecoders::ZenBmpDecoder => "bmp",
+        }
+    }
+
+    /// Name of the implementation behind this decoder (`mozjpeg`, `zenjpeg`, ...).
+    pub fn implementation_name(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::MozJpegRsDecoder => "mozjpeg",
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::ImageRsJpegDecoder => "jpeg-decoder",
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::LibPngRsDecoder => "libpng",
+            NamedDecoders::ImageRsPngDecoder => "png-rs",
+            NamedDecoders::GifRsDecoder => "gif-rs",
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::WebPDecoder => "libwebp",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJpegDecoder => "zenjpeg",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenWebPDecoder => "zenwebp",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenGifDecoder => "zengif",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenPngDecoder => "zenpng",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenAvifDecoder => "zenavif",
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJxlDecoder => "zenjxl",
+            #[cfg(feature = "bmp")]
+            NamedDecoders::ZenBmpDecoder => "zenbitmaps",
+        }
+    }
+
+    /// `v2` for the C / classic pipeline decoders, `zen` for the pure-Rust zen codecs.
+    pub fn backend_name(&self) -> &'static str {
+        match self {
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJpegDecoder
+            | NamedDecoders::ZenWebPDecoder
+            | NamedDecoders::ZenGifDecoder
+            | NamedDecoders::ZenPngDecoder
+            | NamedDecoders::ZenAvifDecoder
+            | NamedDecoders::ZenJxlDecoder => "zen",
+            #[cfg(feature = "bmp")]
+            NamedDecoders::ZenBmpDecoder => "zen",
+            _ => "v2",
+        }
+    }
+
+    pub fn create(&self, c: &Context, io: IoProxy, io_id: i32) -> Result<Box<dyn Decoder>> {
+        return_if_cancelled!(c);
+        match self {
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::MozJpegRsDecoder => {
+                Ok(Box::new(mozjpeg_decoder::MozJpegDecoder::create(c, io, io_id)?))
+            }
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::LibPngRsDecoder => {
+                Ok(Box::new(libpng_decoder::LibPngDecoder::create(c, io, io_id)?))
+            }
+            NamedDecoders::GifRsDecoder => Ok(Box::new(gif::GifDecoder::create(c, io, io_id)?)),
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::ImageRsJpegDecoder => {
+                Ok(Box::new(jpeg_decoder::JpegDecoder::create(c, io, io_id)?))
+            }
+            NamedDecoders::ImageRsPngDecoder => {
+                Ok(Box::new(image_png_decoder::ImagePngDecoder::create(c, io, io_id)?))
+            }
+            #[cfg(feature = "c-codecs")]
+            NamedDecoders::WebPDecoder => Ok(Box::new(webp::WebPDecoder::create(c, io, io_id)?)),
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJpegDecoder => {
+                Ok(Box::new(zen_decoder::ZenDecoder::create_jpeg(c, io, io_id)?))
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenWebPDecoder => {
+                Ok(Box::new(zen_decoder::ZenDecoder::create_webp(c, io, io_id)?))
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenGifDecoder => {
+                Ok(Box::new(zen_decoder::ZenDecoder::create_gif(c, io, io_id)?))
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenPngDecoder => {
+                Ok(Box::new(zen_decoder::ZenDecoder::create_png(c, io, io_id)?))
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenAvifDecoder => {
+                Ok(Box::new(zen_decoder::ZenDecoder::create_avif(c, io, io_id)?))
+            }
+            #[cfg(feature = "zen-codecs")]
+            NamedDecoders::ZenJxlDecoder => {
+                Ok(Box::new(zen_decoder::ZenDecoder::create_jxl(c, io, io_id)?))
+            }
+            #[cfg(feature = "bmp")]
+            NamedDecoders::ZenBmpDecoder => {
+                Ok(Box::new(zen_decoder::ZenDecoder::create_bmp(c, io, io_id)?))
+            }
+        }
+    }
+}
+#[derive(PartialEq, Copy, Clone, Debug)]
+#[allow(clippy::enum_variant_names)]
+pub enum NamedEncoders {
+    GifEncoder,
+    #[cfg(feature = "c-codecs")]
+    MozJpegEncoder,
+    PngQuantEncoder,
+    LodePngEncoder,
+    #[cfg(feature = "c-codecs")]
+    WebPEncoder,
+    #[cfg(feature = "c-codecs")]
+    LibPngRsEncoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenJpegEncoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenWebPEncoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenGifEncoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenPngEncoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenAvifEncoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenJxlEncoder,
+    #[cfg(feature = "zen-codecs")]
+    ZenBmpEncoder,
+    #[cfg(feature = "zen-codecs")]
+    MozjpegRsEncoder,
+}
+
+impl NamedEncoders {
+    /// Returns true if this encoder writes JPEG.
+    pub fn is_jpeg(&self) -> bool {
+        match self {
+            #[cfg(feature = "c-codecs")]
+            NamedEncoders::MozJpegEncoder => true,
+            #[cfg(feature = "zen-codecs")]
+            NamedEncoders::ZenJpegEncoder | NamedEncoders::MozjpegRsEncoder => true,
+            _ => false,
+        }
+    }
+    /// Returns true if this encoder writes PNG.
+    pub fn is_png(&self) -> bool {
+        match self {
+            NamedEncoders::PngQuantEncoder | NamedEncoders::LodePngEncoder => true,
+            #[cfg(feature = "c-codecs")]
+            NamedEncoders::LibPngRsEncoder => true,
+            #[cfg(feature = "zen-codecs")]
+            NamedEncoders::ZenPngEncoder => true,
+            _ => false,
+        }
+    }
+    /// Returns true if this encoder writes WebP.
+    pub fn is_webp(&self) -> bool {
+        match self {
+            #[cfg(feature = "c-codecs")]
+            NamedEncoders::WebPEncoder => true,
+            #[cfg(feature = "zen-codecs")]
+            NamedEncoders::ZenWebPEncoder => true,
+            _ => false,
+        }
+    }
+    /// Returns true if this encoder writes GIF.
+    pub fn is_gif(&self) -> bool {
+        match self {
+            NamedEncoders::GifEncoder => true,
+            #[cfg(feature = "zen-codecs")]
+            NamedEncoders::ZenGifEncoder => true,
+            _ => false,
+        }
+    }
+}
+
+/// Inline capacity of both codec lists in [`EnabledCodecs`].
+///
+/// `EnabledCodecs` is stored inline in every `Context`, so the lists spilling to
+/// the heap costs an allocation per context. The default build (`c-codecs` +
+/// `bmp`) registers five decoders, which did not fit the previous inline
+/// capacity of four.
+///
+/// Eight is the largest capacity that is free here. Measured with smallvec
+/// 1.15.2, `size_of::<SmallVec<[u8; N]>>()` is:
+///
+/// | N          | 1  | 4  | 6  | 8  | 9  | 12 | 16 |
+/// |------------|----|----|----|----|----|----|----|
+/// | 64-bit     | 24 | 24 | 24 | 24 | 32 | 32 | 32 |
+/// | i686       | 12 | 12 | 16 | 16 | 16 | 20 | 24 |
+///
+/// So on a 64-bit target every capacity through 8 is the same 24 bytes and 9
+/// starts costing 8 more — the free capacity is `size_of::<usize>()`, not 16.
+///
+/// A `zen-codecs` build registers eleven decoders and fourteen encoders and so
+/// still spills both lists, exactly as it did before. Holding those inline needs
+/// capacity 16, and that is not free: measured, it puts `ThreadSafeContext` at
+/// 568 bytes against its `<= 560` assertion. Raising this therefore has to wait
+/// for room in the `Context` size budget; see
+/// `enabled_codecs_size_tests::enabled_codecs_fit_inline_unless_zen_codecs`.
+const CODEC_LIST_INLINE: usize = 8;
+
+pub struct EnabledCodecs {
+    pub decoders: ::smallvec::SmallVec<[NamedDecoders; CODEC_LIST_INLINE]>,
+    pub encoders: ::smallvec::SmallVec<[NamedEncoders; CODEC_LIST_INLINE]>,
+}
+impl Default for EnabledCodecs {
+    fn default() -> Self {
+        EnabledCodecs {
+            decoders: smallvec::SmallVec::from_slice(&[
+                // JPEG: C mozjpeg preferred when available (stable baseline)
+                #[cfg(feature = "c-codecs")]
+                NamedDecoders::MozJpegRsDecoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedDecoders::ZenJpegDecoder,
+                // PNG: libpng (C) first, else zenpng, else image-rs
+                #[cfg(feature = "c-codecs")]
+                NamedDecoders::LibPngRsDecoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedDecoders::ZenPngDecoder,
+                #[cfg(all(not(feature = "zen-codecs"), not(feature = "c-codecs")))]
+                NamedDecoders::ImageRsPngDecoder,
+                // WebP: libwebp (C) first, else zenwebp
+                #[cfg(feature = "c-codecs")]
+                NamedDecoders::WebPDecoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedDecoders::ZenWebPDecoder,
+                // GIF: gif-rs baseline, zen as alternative
+                NamedDecoders::GifRsDecoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedDecoders::ZenGifDecoder,
+                // Zen-only formats
+                #[cfg(feature = "zen-codecs")]
+                NamedDecoders::ZenAvifDecoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedDecoders::ZenJxlDecoder,
+                #[cfg(feature = "bmp")]
+                NamedDecoders::ZenBmpDecoder,
+            ]),
+            encoders: smallvec::SmallVec::from_slice(&[
+                // GIF: use built-in gif crate first (zen as alternative)
+                NamedEncoders::GifEncoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedEncoders::ZenGifEncoder,
+                // JPEG: C mozjpeg preferred when available (stable output)
+                #[cfg(feature = "c-codecs")]
+                NamedEncoders::MozJpegEncoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedEncoders::ZenJpegEncoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedEncoders::MozjpegRsEncoder,
+                // WebP: C libwebp preferred when available
+                #[cfg(feature = "c-codecs")]
+                NamedEncoders::WebPEncoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedEncoders::ZenWebPEncoder,
+                // PNG: pngquant/lodepng baseline, libpng (C) or zenpng as alternatives
+                NamedEncoders::PngQuantEncoder,
+                NamedEncoders::LodePngEncoder,
+                #[cfg(feature = "c-codecs")]
+                NamedEncoders::LibPngRsEncoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedEncoders::ZenPngEncoder,
+                // Zen-only formats
+                #[cfg(feature = "zen-codecs")]
+                NamedEncoders::ZenAvifEncoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedEncoders::ZenJxlEncoder,
+                #[cfg(feature = "zen-codecs")]
+                NamedEncoders::ZenBmpEncoder,
+            ]),
+        }
+    }
+}
+
+impl EnabledCodecs {
+    /// The formats this codec set can decode, in decoder-preference order, with
+    /// every enabled decoder per format. The first decoder listed for a format
+    /// is the one `create_decoder_for_magic_bytes` will pick. Backs the
+    /// `v1/schema/formats/v1/decodable` endpoint (issue #700).
+    pub fn decodable_formats(&self) -> Vec<s::json_messages::DecodableFormat> {
+        let mut formats: Vec<s::json_messages::DecodableFormat> = Vec::new();
+        for decoder in self.decoders.iter() {
+            let format = decoder.format_name();
+            let entry = match formats.iter_mut().find(|f| f.format == format) {
+                Some(existing) => existing,
+                None => {
+                    formats.push(s::json_messages::DecodableFormat {
+                        format: format.to_owned(),
+                        decoders: Vec::new(),
+                    });
+                    formats.last_mut().unwrap()
+                }
+            };
+            entry.decoders.push(s::json_messages::FormatDecoder {
+                name: decoder.implementation_name().to_owned(),
+                backend: decoder.backend_name().to_owned(),
+                preferred: entry.decoders.is_empty(),
+            });
+        }
+        formats
+    }
+
+    pub fn prefer_decoder(&mut self, decoder: NamedDecoders) {
+        self.decoders.retain(|item| item != &decoder);
+        self.decoders.insert(0, decoder);
+    }
+    pub fn disable_decoder(&mut self, decoder: NamedDecoders) {
+        self.decoders.retain(|item| item != &decoder);
+    }
+    pub fn prefer_encoder(&mut self, encoder: NamedEncoders) {
+        self.encoders.retain(|item| item != &encoder);
+        self.encoders.insert(0, encoder);
+    }
+    pub fn disable_encoder(&mut self, encoder: NamedEncoders) {
+        self.encoders.retain(|item| item != &encoder);
+    }
+    /// Find the first enabled encoder matching a predicate on NamedEncoders.
+    pub fn first_encoder<F>(&self, pred: F) -> Option<NamedEncoders>
+    where
+        F: Fn(NamedEncoders) -> bool,
+    {
+        self.encoders.iter().copied().find(|&e| pred(e))
+    }
+
+    /// Find a preferred encoder if enabled, else fall back to the first
+    /// enabled encoder matching a predicate.
+    pub fn preferred_or_first<F>(&self, preferred: NamedEncoders, pred: F) -> Option<NamedEncoders>
+    where
+        F: Fn(NamedEncoders) -> bool,
+    {
+        if self.encoders.contains(&preferred) {
+            Some(preferred)
+        } else {
+            self.first_encoder(pred)
+        }
+    }
+    pub fn create_decoder_for_magic_bytes(
+        &self,
+        bytes: &[u8],
+        c: &Context,
+        io: IoProxy,
+        io_id: i32,
+    ) -> Result<Box<dyn Decoder>> {
+        for &decoder in self.decoders.iter() {
+            if decoder.works_for_magic_bytes(bytes) {
+                return decoder.create(c, io, io_id);
+            }
+        }
+        Err(nerror!(
+            ErrorKind::NoEnabledDecoderFound,
+            "No ENABLED decoder found for file starting in {:X?}",
+            bytes
+        ))
+    }
+}
+
+/// Tracks the lifecycle of an encoder's output buffer.
+///
+/// ```text
+/// Ready(IoProxy) ──get_ptr()──→ Lent(IoProxy) ──get_ptr()──→ Lent (idempotent)
+///        │                            │
+///        │ take()                     │ take() → ERROR
+///        ▼                            ▼
+///      Taken                    "pointer was lent"
+/// ```
+enum OutputBufferState {
+    /// No output buffer (decoder, or IoProxy loaned to an active encoder).
+    None,
+    /// Buffer is available for reading or taking.
+    Ready(IoProxy),
+    /// A raw pointer to the buffer was given out via C ABI.
+    /// The IoProxy is kept alive; `take()` is blocked.
+    Lent(IoProxy),
+    /// The buffer Vec was moved out. All further access errors.
+    Taken,
+}
+
+// We need a rust-friendly codec instance, codec definition, and a way to wrap C codecs
+pub struct CodecInstanceContainer {
+    pub io_id: i32,
+    codec: CodecKind,
+    output_state: OutputBufferState,
+}
+
+impl CodecInstanceContainer {
+    pub fn get_decoder(&mut self) -> Result<&mut dyn Decoder> {
+        if let CodecKind::Decoder(ref mut d) = self.codec {
+            Ok(&mut **d)
+        } else {
+            Err(nerror!(ErrorKind::InvalidArgument, "Not a decoder"))
+        }
+    }
+
+    pub fn create(
+        c: &Context,
+        mut io: IoProxy,
+        io_id: i32,
+        direction: IoDirection,
+    ) -> Result<CodecInstanceContainer> {
+        if direction == IoDirection::Out {
+            Ok(CodecInstanceContainer {
+                io_id,
+                codec: CodecKind::EncoderPlaceholder,
+                output_state: OutputBufferState::Ready(io),
+            })
+        } else {
+            let mut buffer = [0u8; 12];
+            let result =
+                io.read(&mut buffer).map_err(|e| FlowError::from_decoder(e).at(here!()))?;
+
+            io.seek(io::SeekFrom::Start(0)).map_err(|e| FlowError::from_decoder(e).at(here!()))?;
+
+            Ok(CodecInstanceContainer {
+                io_id,
+                codec: CodecKind::Decoder(
+                    c.enabled_codecs.create_decoder_for_magic_bytes(&buffer, c, io, io_id)?,
+                ),
+                output_state: OutputBufferState::None,
+            })
+        }
+    }
+}
+
+impl CodecInstanceContainer {
+    pub fn write_frame(
+        &mut self,
+        c: &Context,
+        preset: &s::EncoderPreset,
+        bitmap_key: BitmapKey,
+        decoder_io_ids: &[i32],
+    ) -> Result<s::EncodeResult> {
+        // Pick encoder
+        if let CodecKind::EncoderPlaceholder = self.codec {
+            let io = match std::mem::replace(&mut self.output_state, OutputBufferState::None) {
+                OutputBufferState::Ready(io) => io,
+                _ => {
+                    return Err(nerror!(
+                        ErrorKind::InvalidState,
+                        "Encoder {} output buffer not in Ready state for write_frame",
+                        self.io_id
+                    ))
+                }
+            };
+            let encoder = auto::create_encoder(c, io, preset, bitmap_key, decoder_io_ids)
+                .map_err(|e| e.at(here!()))?;
+
+            self.codec = CodecKind::Encoder(encoder);
+        };
+
+        match self.codec {
+            CodecKind::Encoder(ref mut e) => {
+                match e
+                    .write_frame(c, preset, bitmap_key, decoder_io_ids)
+                    .map_err(|e| e.at(here!()))
+                {
+                    Err(e) => Err(e),
+                    Ok(result) => match result.bytes {
+                        s::ResultBytes::Elsewhere => Ok(result),
+                        other => Err(nerror!(
+                            ErrorKind::InternalError,
+                            "Encoders must return s::ResultBytes::Elsewhere and write to their owned IO. Found {:?}",
+                            other
+                        )),
+                    },
+                }
+            }
+            CodecKind::EncoderPlaceholder => Err(nerror!(
+                ErrorKind::InvalidState,
+                "Encoder {} wasn't created somehow",
+                self.io_id
+            )),
+            CodecKind::EncoderFinished => Err(nerror!(
+                ErrorKind::InvalidState,
+                "Encoder {} has already been finalized",
+                self.io_id
+            )),
+            CodecKind::Decoder(_) => Err(unimpl!()),
+        }
+    }
+
+    /// Finalize the encoder (if active), reclaiming the IoProxy into `output_state`.
+    /// After this call, the encoder is consumed and no more frames can be written.
+    /// This must be called before reading the output buffer, since some encoders
+    /// (e.g., GIF) write trailing data when finalized.
+    fn finalize_encoder(&mut self) -> Result<()> {
+        if matches!(self.codec, CodecKind::Encoder(_))
+            && let CodecKind::Encoder(encoder) =
+                std::mem::replace(&mut self.codec, CodecKind::EncoderFinished)
+        {
+            let io = encoder.into_io().map_err(|e| e.at(here!()))?;
+            self.output_state = OutputBufferState::Ready(io);
+        }
+        Ok(())
+    }
+
+    /// Finalize the encoder and move the output buffer out as an owned `Vec<u8>`.
+    /// After this call, the buffer is gone — further access will error.
+    pub fn take_output_buffer(&mut self) -> Result<Vec<u8>> {
+        self.finalize_encoder().map_err(|e| e.at(here!()))?;
+        // Check for forbidden states before committing the replace,
+        // so we don't destroy a Lent IoProxy (which would dangle the raw pointer).
+        match self.output_state {
+            OutputBufferState::Lent(_) => {
+                return Err(nerror!(
+                    ErrorKind::InvalidArgument,
+                    "Cannot take output buffer for io_id {}: a raw pointer was already lent out",
+                    self.io_id
+                ))
+            }
+            OutputBufferState::Taken => {
+                return Err(nerror!(
+                    ErrorKind::InvalidArgument,
+                    "Output buffer for io_id {} has already been taken",
+                    self.io_id
+                ))
+            }
+            OutputBufferState::None => {
+                return Err(nerror!(
+                    ErrorKind::InvalidArgument,
+                    "io_id {} is not an output buffer",
+                    self.io_id
+                ))
+            }
+            OutputBufferState::Ready(_) => {} // proceed below
+        }
+        // Only Ready reaches here — safe to replace with Taken.
+        match std::mem::replace(&mut self.output_state, OutputBufferState::Taken) {
+            OutputBufferState::Ready(io) => io.into_output_vec().map_err(|e| e.at(here!())),
+            _ => unreachable!(),
+        }
+    }
+
+    /// Finalize the encoder and return raw pointer + length to the output buffer.
+    /// Transitions to `Lent` state — the IoProxy is kept alive but `take()` is blocked.
+    /// Idempotent: calling again on a `Lent` buffer returns the same pointer.
+    ///
+    /// The returned pointer is valid as long as this `CodecInstanceContainer` is alive
+    /// and the buffer is not taken. Caller must ensure no mutable access occurs
+    /// when dereferencing the pointer.
+    pub fn output_buffer_raw_parts(&mut self) -> Result<(*const u8, usize)> {
+        self.finalize_encoder().map_err(|e| e.at(here!()))?;
+        match self.output_state {
+            OutputBufferState::Ready(_) => {
+                // Transition to Lent
+                let io = match std::mem::replace(&mut self.output_state, OutputBufferState::None) {
+                    OutputBufferState::Ready(io) => io,
+                    _ => unreachable!(),
+                };
+                let (ptr, len) = io.output_buffer_raw_parts().map_err(|e| e.at(here!()))?;
+                self.output_state = OutputBufferState::Lent(io);
+                Ok((ptr, len))
+            }
+            OutputBufferState::Lent(ref io) => {
+                io.output_buffer_raw_parts().map_err(|e| e.at(here!()))
+            }
+            OutputBufferState::Taken => Err(nerror!(
+                ErrorKind::InvalidArgument,
+                "Output buffer for io_id {} has already been taken",
+                self.io_id
+            )),
+            OutputBufferState::None => Err(nerror!(
+                ErrorKind::InvalidArgument,
+                "io_id {} is not an output buffer",
+                self.io_id
+            )),
+        }
+    }
+}
+
+#[cfg(test)]
+mod enabled_codecs_size_tests {
+    use super::*;
+    use std::mem::size_of;
+
+    /// `EnabledCodecs` lives inline in `Context`, and every context builds one,
+    /// so a list that spills costs a heap allocation per context that
+    /// `Context::calculate_heap_allocations` does not model. The default build
+    /// (`c-codecs` + `bmp`) registers five decoders and six encoders; the
+    /// previous decoder inline capacity of four spilled on every context.
+    ///
+    /// A `zen-codecs` build registers eleven and fourteen, which do not fit
+    /// [`CODEC_LIST_INLINE`] and cannot be made to without 16 bytes the
+    /// `Context` size budget does not have (see the constant's docs). This
+    /// asserts the exact expected state per configuration rather than skipping,
+    /// so it fails both if a default build starts spilling and if a `zen-codecs`
+    /// build stops — the latter meaning the capacity was raised and the sizes
+    /// need re-checking.
+    #[test]
+    fn enabled_codecs_fit_inline_unless_zen_codecs() {
+        let codecs = EnabledCodecs::default();
+        let expect_inline = !cfg!(feature = "zen-codecs");
+        assert_eq!(
+            expect_inline,
+            !codecs.decoders.spilled(),
+            "{} decoders against an inline capacity of {}",
+            codecs.decoders.len(),
+            CODEC_LIST_INLINE
+        );
+        assert_eq!(
+            expect_inline,
+            !codecs.encoders.spilled(),
+            "{} encoders against an inline capacity of {}",
+            codecs.encoders.len(),
+            CODEC_LIST_INLINE
+        );
+    }
+
+    /// Pins the measured smallvec layout that [`CODEC_LIST_INLINE`] is picked
+    /// from. On a 64-bit target every inline capacity through 8 costs the same
+    /// 24 bytes and 9 costs 32, so the decoder list's 4 -> 8 widening was free
+    /// and the 16 a `zen-codecs` build would need is not.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn smallvec_inline_capacity_is_free_through_eight() {
+        assert_eq!(1, size_of::<NamedDecoders>());
+        assert_eq!(1, size_of::<NamedEncoders>());
+
+        assert_eq!(24, size_of::<::smallvec::SmallVec<[NamedDecoders; 1]>>());
+        assert_eq!(24, size_of::<::smallvec::SmallVec<[NamedDecoders; 4]>>());
+        assert_eq!(24, size_of::<::smallvec::SmallVec<[NamedDecoders; 8]>>());
+        assert_eq!(32, size_of::<::smallvec::SmallVec<[NamedDecoders; 9]>>());
+        assert_eq!(32, size_of::<::smallvec::SmallVec<[NamedDecoders; 16]>>());
+
+        // `EnabledCodecs` is exactly two of those lists and nothing else, so
+        // widening the decoder list from 4 to 8 left its size unchanged.
+        assert_eq!(
+            2 * size_of::<::smallvec::SmallVec<[NamedDecoders; CODEC_LIST_INLINE]>>(),
+            size_of::<EnabledCodecs>()
+        );
+        assert_eq!(48, size_of::<EnabledCodecs>());
+    }
+}

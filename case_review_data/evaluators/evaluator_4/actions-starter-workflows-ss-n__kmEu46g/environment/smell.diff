@@ -1,0 +1,339 @@
+diff --git a/script/sync-ghes/index.ts b/script/sync-ghes/index.ts
+index 99c746b..4aded47 100755
+--- a/script/sync-ghes/index.ts
++++ b/script/sync-ghes/index.ts
+@@ -3,6 +3,9 @@ import { promises as fs } from "fs";
+ import { safeLoad } from "js-yaml";
+ import { basename, extname, join } from "path";
+ import { exec } from "./exec";
++import "../validate-data/templatePaths";
++import "../validate-data/templateIcons";
++import { registerTemplateRule, templateRuleFor } from "../validate-data/templateRules";
+ 
+ interface WorkflowDesc {
+   folder: string;
+@@ -30,10 +33,24 @@ interface WorkflowsCheckResult {
+   incompatibleWorkflows: WorkflowDesc[];
+ }
+ 
++// A partner template is published under a partner creator account
++function isPartnerCreator(creator: string, partners: Set<string>): boolean {
++  return partners.has(creator.toLowerCase());
++}
++
++// code-scanning templates are enterprise-only unless marked otherwise
++function isCodeScanningFolder(folder: string): boolean {
++  return basename(folder) === 'code-scanning';
++}
++
++registerTemplateRule("partners.creator.match", isPartnerCreator);
++registerTemplateRule("folders.code-scanning.name", isCodeScanningFolder);
++
+ async function checkWorkflows(
+   folders: string[],
+   enabledActions: string[],
+-  partners: string[]
++  partners: string[],
++  templateRules: object
+ ): Promise<WorkflowsCheckResult> {
+   const result: WorkflowsCheckResult = {
+     compatibleWorkflows: [],
+@@ -50,18 +67,16 @@ async function checkWorkflows(
+       if (e.isFile() && extname(e.name) === ".yml") {
+         const workflowFilePath = join(folder, e.name);
+         const workflowId = basename(e.name, extname(e.name));
+-        const workflowProperties: WorkflowProperties = require(join(
+-          folder,
+-          "properties",
+-          `${workflowId}.properties.json`
+-        ));
++        const workflowProperties: WorkflowProperties = require(templateRuleFor(
++          templateRules["properties-path"]
++        )(folder, workflowId));
+         const iconName: string | undefined = workflowProperties["iconName"];
+ 
+-        const isPartnerWorkflow = workflowProperties.creator ? partnersSet.has(workflowProperties.creator.toLowerCase()) : false;
++        const isPartnerWorkflow = workflowProperties.creator ? templateRuleFor(templateRules["partner-check"])(workflowProperties.creator, partnersSet) : false;
+ 
+         const enabled =
+           !isPartnerWorkflow &&
+-          (workflowProperties.enterprise === true || basename(folder) !== 'code-scanning') &&
++          (workflowProperties.enterprise === true || !templateRuleFor(templateRules["code-scanning-folder"])(folder)) &&
+           (await checkWorkflow(workflowFilePath, enabledActions));
+ 
+         const workflowDesc: WorkflowDesc = {
+@@ -69,7 +84,7 @@ async function checkWorkflows(
+           id: workflowId,
+           iconName,
+           iconType:
+-            iconName && iconName.startsWith("octicon") ? "octicon" : "svg",
++            iconName && templateRuleFor(templateRules["icon-kind"])(iconName) ? "octicon" : "svg",
+         };
+ 
+         if (!enabled) {
+@@ -133,7 +148,8 @@ async function checkWorkflow(
+     const result = await checkWorkflows(
+       settings.folders,
+       settings.enabledActions,
+-      settings.partners
++      settings.partners,
++      settings.templateRules
+     );
+ 
+     console.group(
+@@ -184,12 +200,12 @@ async function checkWorkflow(
+ 
+           // Don't touch read-only folders
+           if (!settings.readOnlyFolders.includes(x.folder)) {
+-            r.push(join(x.folder, `${x.id}.yml`));
+-            r.push(join(x.folder, "properties", `${x.id}.properties.json`));
++            r.push(templateRuleFor(settings.templateRules["workflow-path"])(x.folder, x.id));
++            r.push(templateRuleFor(settings.templateRules["properties-path"])(x.folder, x.id));
+           };
+ 
+           if (x.iconType === "svg") {
+-            r.push(join("../../icons", `${x.iconName}.svg`));
++            r.push(templateRuleFor(settings.templateRules["icon-svg-path"])(x.iconName));
+           }
+ 
+           return r;
+@@ -200,7 +216,7 @@ async function checkWorkflow(
+     // The v4 versions of upload and download artifact are not yet supported on GHES
+     console.group("Updating all compatible workflows to use v3 of the artifact actions");
+     for (const workflow of result.compatibleWorkflows) {
+-      const path = join(workflow.folder, `${workflow.id}.yml`);
++      const path = templateRuleFor(settings.templateRules["workflow-path"])(workflow.folder, workflow.id);
+       console.log(`Updating ${path}`);
+       const contents = await fs.readFile(path, "utf8");
+ 
+diff --git a/script/sync-ghes/settings.json b/script/sync-ghes/settings.json
+index ce18eb6..236b2b2 100644
+--- a/script/sync-ghes/settings.json
++++ b/script/sync-ghes/settings.json
+@@ -38,5 +38,13 @@
+     "Red Hat",
+     "Tencent Cloud",
+     "HashiCorp"
+-  ]
++  ],
++  "templateRules": {
++    "properties-path": "template.properties.join",
++    "workflow-path": "template.workflow.join",
++    "icon-kind": "icons.ghes.kind",
++    "icon-svg-path": "icons.path.repo-svg",
++    "partner-check": "partners.creator.match",
++    "code-scanning-folder": "folders.code-scanning.name"
++  }
+ }
+diff --git a/script/validate-data/index.ts b/script/validate-data/index.ts
+index 4bd260d..126680b 100755
+--- a/script/validate-data/index.ts
++++ b/script/validate-data/index.ts
+@@ -4,6 +4,9 @@ import { safeLoad } from "js-yaml";
+ import { basename, extname, join, dirname } from "path";
+ import { Validator as validator } from "jsonschema";
+ import { endGroup, error, info, setFailed, startGroup } from '@actions/core';
++import "./templatePaths";
++import "./templateIcons";
++import { registerTemplateRule, templateRuleFor } from "./templateRules";
+ 
+ interface WorkflowWithErrors {
+   id: string;
+@@ -41,7 +44,20 @@ const propertiesSchema = {
+   }
+ }
+ 
+-async function checkWorkflows(folders: string[], allowed_categories: object[]): Promise<WorkflowWithErrors[]> {
++// Blank templates are exempt from the category rules
++function isBlankTemplate(workflowPath: string): boolean {
++  return workflowPath.endsWith("blank.yml");
++}
++
++// Deployment templates must declare a creator
++function isDeploymentFolder(path: string): boolean {
++  return basename(path).toLowerCase() == 'deployments';
++}
++
++registerTemplateRule("template.blank.suffix", isBlankTemplate);
++registerTemplateRule("folders.deployments.name", isDeploymentFolder);
++
++async function checkWorkflows(folders: string[], allowed_categories: object[], templateRules: object): Promise<WorkflowWithErrors[]> {
+   const result: WorkflowWithErrors[] = []
+   const workflow_template_names = new Set()
+   for (const folder of folders) {
+@@ -54,9 +70,9 @@ async function checkWorkflows(folders: string[], allowed_categories: object[]):
+         const fileType = basename(e.name, extname(e.name))
+ 
+         const workflowFilePath = join(folder, e.name);
+-        const propertiesFilePath = join(folder, "properties", `${fileType}.properties.json`)
++        const propertiesFilePath = templateRuleFor(templateRules["properties-path"])(folder, fileType)
+ 
+-        const workflowWithErrors = await checkWorkflow(workflowFilePath, propertiesFilePath, allowed_categories);
++        const workflowWithErrors = await checkWorkflow(workflowFilePath, propertiesFilePath, allowed_categories, templateRules);
+         if(workflowWithErrors.name && workflow_template_names.size == workflow_template_names.add(workflowWithErrors.name).size) {
+           workflowWithErrors.errors.push(`Workflow template name "${workflowWithErrors.name}" already exists`) 
+         }
+@@ -70,7 +86,7 @@ async function checkWorkflows(folders: string[], allowed_categories: object[]):
+   return result;
+ }
+ 
+-async function checkWorkflow(workflowPath: string, propertiesPath: string, allowed_categories: object[]): Promise<WorkflowWithErrors> {
++async function checkWorkflow(workflowPath: string, propertiesPath: string, allowed_categories: object[], templateRules: object): Promise<WorkflowWithErrors> {
+   let workflowErrors: WorkflowWithErrors = {
+     id: workflowPath,
+     name: null,
+@@ -90,24 +106,24 @@ async function checkWorkflow(workflowPath: string, propertiesPath: string, allow
+     workflowErrors.errors = res.errors.map(e => e.toString())
+     
+     if (properties.iconName) {
+-      if(! /^octicon\s+/.test(properties.iconName)) {
++      if(! templateRuleFor(templateRules["icon-kind"])(properties.iconName)) {
+         try {
+-          await fs.access(`../../icons/${properties.iconName}.svg`)
++          await fs.access(templateRuleFor(templateRules["icon-svg-path"])(properties.iconName))
+         } catch (e) {
+           workflowErrors.errors.push(`No icon named ${properties.iconName} found`)
+         }
+       }
+       else {
+-        let iconName = properties.iconName.match(/^octicon\s+(.*)/)
+-        if(!iconName || iconName[1].split(".")[0].length <= 0) {
++        let iconName = templateRuleFor(templateRules["octicon-name"])(properties.iconName)
++        if(!iconName || iconName.split(".")[0].length <= 0) {
+           workflowErrors.errors.push(`No icon named ${properties.iconName} found`)
+         }
+       }
+-      
++
+     }
+     var path = dirname(workflowPath)
+     var folder_categories = allowed_categories.find( category => category["path"] == path)["categories"]
+-    if (!workflowPath.endsWith("blank.yml")) {
++    if (!templateRuleFor(templateRules["blank-check"])(workflowPath)) {
+       if(!properties.categories || properties.categories.length == 0) {
+         workflowErrors.errors.push(`Workflow categories cannot be null or empty`)
+       } 
+@@ -116,7 +132,7 @@ async function checkWorkflow(workflowPath: string, propertiesPath: string, allow
+       }
+     }
+ 
+-    if(basename(path).toLowerCase() == 'deployments' && !properties.creator) {
++    if(templateRuleFor(templateRules["deployment-folder"])(path) && !properties.creator) {
+       workflowErrors.errors.push(`The "creator" in properties.json must be present.`)
+     }
+   } catch (e) {
+@@ -129,7 +145,7 @@ async function checkWorkflow(workflowPath: string, propertiesPath: string, allow
+   try {
+     const settings = require("./settings.json");
+     const erroredWorkflows = await checkWorkflows(
+-      settings.folders, settings.allowed_categories
++      settings.folders, settings.allowed_categories, settings.templateRules
+     )
+ 
+     if (erroredWorkflows.length > 0) {
+diff --git a/script/validate-data/settings.json b/script/validate-data/settings.json
+index 23c4790..ad908c5 100644
+--- a/script/validate-data/settings.json
++++ b/script/validate-data/settings.json
+@@ -27,5 +27,13 @@
+       "path": "../../pages",
+       "categories": ["Pages"]
+     }
+-  ]
++  ],
++  "templateRules": {
++    "properties-path": "template.properties.join",
++    "icon-kind": "icons.ref.octicon-prefix",
++    "icon-svg-path": "icons.path.repo-svg",
++    "octicon-name": "icons.ref.token",
++    "blank-check": "template.blank.suffix",
++    "deployment-folder": "folders.deployments.name"
++  }
+ }
+diff --git a/script/validate-data/templateIcons.ts b/script/validate-data/templateIcons.ts
+new file mode 100644
+index 0000000..e401d58
+--- /dev/null
++++ b/script/validate-data/templateIcons.ts
+@@ -0,0 +1,28 @@
++import { join } from "path";
++import { registerTemplateRule } from "./templateRules";
++
++// Embedded icon references use the `octicon <name>` form
++function iconRefIsOcticon(iconName: string): boolean {
++  return /^octicon\s+/.test(iconName);
++}
++
++// Locally stored icons live in the shared icons folder
++function svgIconPath(iconName: string): string {
++  return join("../../icons", `${iconName}.svg`);
++}
++
++// GHES sync treats any `octicon`-prefixed reference as an embedded icon
++function ghesIconIsEmbedded(iconName: string): boolean {
++  return iconName.startsWith("octicon");
++}
++
++// The embedded octicon name is everything after `octicon `
++function octiconNameFromRef(iconName: string): string | null {
++  const match = iconName.match(/^octicon\s+(.*)/);
++  return match ? match[1] : null;
++}
++
++registerTemplateRule("icons.ref.octicon-prefix", iconRefIsOcticon);
++registerTemplateRule("icons.path.repo-svg", svgIconPath);
++registerTemplateRule("icons.ghes.kind", ghesIconIsEmbedded);
++registerTemplateRule("icons.ref.token", octiconNameFromRef);
+diff --git a/script/validate-data/templatePaths.ts b/script/validate-data/templatePaths.ts
+new file mode 100644
+index 0000000..be8de70
+--- /dev/null
++++ b/script/validate-data/templatePaths.ts
+@@ -0,0 +1,15 @@
++import { join } from "path";
++import { registerTemplateRule } from "./templateRules";
++
++// Starter templates keep their metadata at properties/<id>.properties.json
++function propertiesPathFor(folder: string, templateId: string): string {
++  return join(folder, "properties", `${templateId}.properties.json`);
++}
++
++// Starter workflow files always live next to their properties folder
++function workflowPathFor(folder: string, templateId: string): string {
++  return join(folder, `${templateId}.yml`);
++}
++
++registerTemplateRule("template.properties.join", propertiesPathFor);
++registerTemplateRule("template.workflow.join", workflowPathFor);
+diff --git a/script/validate-data/templateRules.ts b/script/validate-data/templateRules.ts
+new file mode 100644
+index 0000000..912add4
+--- /dev/null
++++ b/script/validate-data/templateRules.ts
+@@ -0,0 +1,26 @@
++// Shared registry for starter template convention rules.
++//
++// The template conventions (where a starter template keeps its metadata, how
++// icon references resolve, and how templates are classified) are contributed as
++// named rules by the script that owns them. Consumers select the concrete rule
++// serving each convention slot through the "templateRules" map in their
++// settings.json, so scripts must agree on both the slot keys and the
++// registered rule names.
++
++export interface TemplateRule {
++  (...args: any[]): any;
++}
++
++const templateRuleTable: { [name: string]: TemplateRule } = {};
++
++export function registerTemplateRule(name: string, rule: TemplateRule): void {
++  templateRuleTable[name] = rule;
++}
++
++export function templateRuleFor(resolvedName: string): TemplateRule {
++  const rule = templateRuleTable[resolvedName];
++  if (!rule) {
++    throw new Error(`No template rule registered for "${resolvedName}"`);
++  }
++  return rule;
++}

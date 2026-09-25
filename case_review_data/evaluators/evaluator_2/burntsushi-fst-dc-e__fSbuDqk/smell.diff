@@ -1,0 +1,1195 @@
+diff --git a/src/raw/build.rs b/src/raw/build.rs
+index e93626b..742845d 100644
+--- a/src/raw/build.rs
++++ b/src/raw/build.rs
+@@ -4,6 +4,7 @@ use crate::bytes;
+ use crate::error::Result;
+ use crate::raw::counting_writer::CountingWriter;
+ use crate::raw::error::Error;
++use crate::raw::node::Node;
+ use crate::raw::registry::{Registry, RegistryEntry};
+ use crate::raw::{
+     CompiledAddr, Fst, FstType, Output, Transition, EMPTY_ADDRESS,
+@@ -214,8 +215,12 @@ impl<W: io::Write> Builder<W> {
+     /// flushing it.
+     pub fn into_inner(mut self) -> Result<W> {
+         self.compile_from(0)?;
+-        let root_node = self.unfinished.pop_root();
+-        let root_addr = self.compile(&root_node)?;
++        let root_addr = builder_compile_root(
++            &mut self.wtr,
++            &mut self.registry,
++            &mut self.last_addr,
++            &mut self.unfinished,
++        )?;
+         bytes::io_write_u64_le(self.len as u64, &mut self.wtr)?;
+         bytes::io_write_u64_le(root_addr as u64, &mut self.wtr)?;
+ 
+@@ -257,39 +262,16 @@ impl<W: io::Write> Builder<W> {
+         Ok(())
+     }
+ 
++    /// Finishes every state below `istate`, freezing their transitions as their
++    /// addresses become known.
+     fn compile_from(&mut self, istate: usize) -> Result<()> {
+-        let mut addr = NONE_ADDRESS;
+-        while istate + 1 < self.unfinished.len() {
+-            let node = if addr == NONE_ADDRESS {
+-                self.unfinished.pop_empty()
+-            } else {
+-                self.unfinished.pop_freeze(addr)
+-            };
+-            addr = self.compile(&node)?;
+-            assert!(addr != NONE_ADDRESS);
+-        }
+-        self.unfinished.top_last_freeze(addr);
+-        Ok(())
+-    }
+-
+-    fn compile(&mut self, node: &BuilderNode) -> Result<CompiledAddr> {
+-        if node.is_final
+-            && node.trans.is_empty()
+-            && node.final_output.is_zero()
+-        {
+-            return Ok(EMPTY_ADDRESS);
+-        }
+-        let entry = self.registry.entry(&node);
+-        if let RegistryEntry::Found(ref addr) = entry {
+-            return Ok(*addr);
+-        }
+-        let start_addr = self.wtr.count() as CompiledAddr;
+-        node.compile_to(&mut self.wtr, self.last_addr, start_addr)?;
+-        self.last_addr = self.wtr.count() as CompiledAddr - 1;
+-        if let RegistryEntry::NotFound(cell) = entry {
+-            cell.insert(self.last_addr);
+-        }
+-        Ok(self.last_addr)
++        builder_compile_from(
++            &mut self.wtr,
++            &mut self.registry,
++            &mut self.last_addr,
++            &mut self.unfinished,
++            istate,
++        )
+     }
+ 
+     fn check_last_key(&mut self, bs: &[u8], check_dupe: bool) -> Result<()> {
+@@ -325,6 +307,84 @@ impl<W: io::Write> Builder<W> {
+     }
+ }
+ 
++/// Compile steps shared by every `Builder` entry point. They thread the writer,
++/// node registry and last compiled address explicitly, together with the pieces
++/// of the node being compiled.
++///
++/// Serializes one node and records it in the registry, returning the address
++/// at which it was written.
++fn builder_compile_node<W: io::Write>(
++    wtr: &mut CountingWriter<W>,
++    registry: &mut Registry,
++    last_addr: &mut CompiledAddr,
++    is_final: bool,
++    final_output: Output,
++    trans: &[Transition],
++) -> Result<CompiledAddr> {
++    if is_final && trans.is_empty() && final_output.is_zero() {
++        return Ok(EMPTY_ADDRESS);
++    }
++    let entry = registry.entry(is_final, final_output, trans);
++    if let RegistryEntry::Found(ref addr) = entry {
++        return Ok(*addr);
++    }
++    let start_addr = wtr.count() as CompiledAddr;
++    Node::compile(&mut *wtr, *last_addr, start_addr, is_final, final_output, trans)?;
++    *last_addr = wtr.count() as CompiledAddr - 1;
++    if let RegistryEntry::NotFound(cell) = entry {
++        cell.insert(*last_addr);
++    }
++    Ok(*last_addr)
++}
++
++/// Compiles and drains every unfinished node below `istate`, from the deepest
++/// to the shallowest.
++fn builder_compile_from<W: io::Write>(
++    wtr: &mut CountingWriter<W>,
++    registry: &mut Registry,
++    last_addr: &mut CompiledAddr,
++    unfinished: &mut UnfinishedNodes,
++    istate: usize,
++) -> Result<()> {
++    let mut addr = NONE_ADDRESS;
++    while istate + 1 < unfinished.len() {
++        let node = if addr == NONE_ADDRESS {
++            unfinished.pop_empty()
++        } else {
++            unfinished.pop_freeze(addr)
++        };
++        addr = builder_compile_node(
++            wtr,
++            registry,
++            last_addr,
++            node.is_final,
++            node.final_output,
++            &node.trans,
++        )?;
++        assert!(addr != NONE_ADDRESS);
++    }
++    unfinished.top_last_freeze(addr);
++    Ok(())
++}
++
++/// Compiles the final root node and returns its address.
++fn builder_compile_root<W: io::Write>(
++    wtr: &mut CountingWriter<W>,
++    registry: &mut Registry,
++    last_addr: &mut CompiledAddr,
++    unfinished: &mut UnfinishedNodes,
++) -> Result<CompiledAddr> {
++    let root_node = unfinished.pop_root();
++    builder_compile_node(
++        wtr,
++        registry,
++        last_addr,
++        root_node.is_final,
++        root_node.final_output,
++        &root_node.trans,
++    )
++}
++
+ impl UnfinishedNodes {
+     fn new() -> UnfinishedNodes {
+         let mut unfinished = UnfinishedNodes { stack: Vec::with_capacity(64) };
+diff --git a/src/raw/mod.rs b/src/raw/mod.rs
+index 6cc0eeb..dc4cace 100644
+--- a/src/raw/mod.rs
++++ b/src/raw/mod.rs
+@@ -34,6 +34,11 @@ pub use crate::raw::ops::{
+     Union,
+ };
+ 
++use crate::raw::node::{
++    node_find_input, node_final_output, node_is_final, node_transition,
++    node_transition_addr, node_transition_count,
++};
++
+ mod build;
+ mod common_inputs;
+ mod counting_writer;
+@@ -677,58 +682,137 @@ struct FstRef<'f> {
+     data: &'f [u8],
+ }
+ 
+-impl<'f> FstRef<'f> {
+-    #[inline]
+-    fn get(&self, key: &[u8]) -> Option<Output> {
+-        let mut node = self.root();
+-        let mut out = Output::zero();
+-        for &b in key {
+-            node = match node.find_input(b) {
+-                None => return None,
+-                Some(i) => {
+-                    let t = node.transition(i);
+-                    out = out.cat(t.out);
+-                    self.node(t.addr)
+-                }
++/// Raw lookups over an FST's backing bytes. Each walker carries the format
++/// `version`, the byte slice and the `CompiledAddr` of the node it is currently
++/// visiting, threading the addressing context explicitly between steps.
++///
++/// Returns the output value for `key`, if it exists in the transducer rooted
++/// at `root_addr`.
++#[inline]
++fn fst_get(
++    version: u64,
++    data: &[u8],
++    root_addr: CompiledAddr,
++    key: &[u8],
++) -> Option<Output> {
++    let mut addr = root_addr;
++    let mut out = Output::zero();
++    for &b in key {
++        addr = match node_find_input(version, data, addr, b) {
++            None => return None,
++            Some(i) => {
++                let t = node_transition(version, data, addr, i);
++                out = out.cat(t.out);
++                t.addr
+             }
+         }
+-        if !node.is_final() {
+-            None
+-        } else {
+-            Some(out.cat(node.final_output()))
++    }
++    if !node_is_final(version, data, addr) {
++        None
++    } else {
++        Some(out.cat(node_final_output(version, data, addr)))
++    }
++}
++
++/// Returns true if and only if `key` exists in the transducer rooted at
++/// `root_addr`.
++#[inline]
++fn fst_contains_key(
++    version: u64,
++    data: &[u8],
++    root_addr: CompiledAddr,
++    key: &[u8],
++) -> bool {
++    let mut addr = root_addr;
++    for &b in key {
++        addr = match node_find_input(version, data, addr, b) {
++            None => return false,
++            Some(i) => node_transition_addr(version, data, addr, i),
++        };
++    }
++    node_is_final(version, data, addr)
++}
++
++/// Finds the largest key in the transducer rooted at `root_addr` whose
++/// accumulated output value is `value`, pushing it into `key`.
++///
++/// Returns false if no such key exists.
++#[inline]
++fn fst_get_key_into(
++    version: u64,
++    data: &[u8],
++    root_addr: CompiledAddr,
++    mut value: u64,
++    key: &mut Vec<u8>,
++) -> bool {
++    let mut addr = root_addr;
++    while value != 0 || !node_is_final(version, data, addr) {
++        let ntrans = node_transition_count(version, data, addr);
++        let mut chosen = None;
++        for i in 0..ntrans {
++            let t = node_transition(version, data, addr, i);
++            if t.out.value() > value {
++                break;
++            }
++            chosen = Some(t);
+         }
++        addr = match chosen {
++            None => return false,
++            Some(t) => {
++                value -= t.out.value();
++                key.push(t.inp);
++                t.addr
++            }
++        };
++    }
++    true
++}
++
++/// Returns the final output of the root node when the empty key is a member of
++/// the transducer rooted at `root_addr`.
++#[inline]
++fn fst_empty_final_output(
++    version: u64,
++    data: &[u8],
++    root_addr: CompiledAddr,
++) -> Option<Output> {
++    if node_is_final(version, data, root_addr) {
++        Some(node_final_output(version, data, root_addr))
++    } else {
++        None
++    }
++}
++
++impl<'f> FstRef<'f> {
++    #[inline]
++    fn get(&self, key: &[u8]) -> Option<Output> {
++        fst_get(
++            self.meta.version,
++            self.data,
++            self.meta.root_addr,
++            key,
++        )
+     }
+ 
+     #[inline]
+     fn contains_key(&self, key: &[u8]) -> bool {
+-        let mut node = self.root();
+-        for &b in key {
+-            node = match node.find_input(b) {
+-                None => return false,
+-                Some(i) => self.node(node.transition_addr(i)),
+-            }
+-        }
+-        node.is_final()
++        fst_contains_key(
++            self.meta.version,
++            self.data,
++            self.meta.root_addr,
++            key,
++        )
+     }
+ 
+     #[inline]
+-    fn get_key_into(&self, mut value: u64, key: &mut Vec<u8>) -> bool {
+-        let mut node = self.root();
+-        while value != 0 || !node.is_final() {
+-            let trans = node
+-                .transitions()
+-                .take_while(|t| t.out.value() <= value)
+-                .last();
+-            node = match trans {
+-                None => return false,
+-                Some(t) => {
+-                    value -= t.out.value();
+-                    key.push(t.inp);
+-                    self.node(t.addr)
+-                }
+-            };
+-        }
+-        true
++    fn get_key_into(&self, value: u64, key: &mut Vec<u8>) -> bool {
++        fst_get_key_into(
++            self.meta.version,
++            self.data,
++            self.meta.root_addr,
++            value,
++            key,
++        )
+     }
+ 
+     #[inline]
+@@ -778,12 +862,11 @@ impl<'f> FstRef<'f> {
+ 
+     #[inline]
+     fn empty_final_output(&self) -> Option<Output> {
+-        let root = self.root();
+-        if root.is_final() {
+-            Some(root.final_output())
+-        } else {
+-            None
+-        }
++        fst_empty_final_output(
++            self.meta.version,
++            self.data,
++            self.meta.root_addr,
++        )
+     }
+ }
+ 
+diff --git a/src/raw/node.rs b/src/raw/node.rs
+index 820b29e..db798e9 100644
+--- a/src/raw/node.rs
++++ b/src/raw/node.rs
+@@ -4,7 +4,6 @@ use std::io;
+ use std::ops::Range;
+ 
+ use crate::bytes;
+-use crate::raw::build::BuilderNode;
+ use crate::raw::common_inputs::{COMMON_INPUTS, COMMON_INPUTS_INV};
+ use crate::raw::{
+     u64_to_usize, CompiledAddr, Output, Transition, EMPTY_ADDRESS,
+@@ -136,23 +135,53 @@ impl<'f> Node<'f> {
+             State::OneTransNext(s) => {
+                 assert!(i == 0);
+                 Transition {
+-                    inp: s.input(self),
++                    inp: s.input(self.version, self.data, self.start),
+                     out: Output::zero(),
+-                    addr: s.trans_addr(self),
++                    addr: s.trans_addr(self.version, self.data, self.end),
+                 }
+             }
+             State::OneTrans(s) => {
+                 assert!(i == 0);
+                 Transition {
+-                    inp: s.input(self),
+-                    out: s.output(self),
+-                    addr: s.trans_addr(self),
++                    inp: s.input(self.version, self.data, self.start),
++                    out: s.output(self.version, self.data, self.start, self.sizes),
++                    addr: s.trans_addr(
++                        self.version,
++                        self.data,
++                        self.start,
++                        self.end,
++                        self.sizes,
++                    ),
+                 }
+             }
+             State::AnyTrans(s) => Transition {
+-                inp: s.input(self, i),
+-                out: s.output(self, i),
+-                addr: s.trans_addr(self, i),
++                inp: s.input(
++                    self.version,
++                    self.data,
++                    self.start,
++                    self.end,
++                    self.sizes,
++                    self.ntrans,
++                    i,
++                ),
++                out: s.output(
++                    self.version,
++                    self.data,
++                    self.start,
++                    self.end,
++                    self.sizes,
++                    self.ntrans,
++                    i,
++                ),
++                addr: s.trans_addr(
++                    self.version,
++                    self.data,
++                    self.start,
++                    self.end,
++                    self.sizes,
++                    self.ntrans,
++                    i,
++                ),
+             },
+             State::EmptyFinal => panic!("out of bounds"),
+         }
+@@ -164,13 +193,21 @@ impl<'f> Node<'f> {
+         match self.state {
+             State::OneTransNext(s) => {
+                 assert!(i == 0);
+-                s.trans_addr(self)
++                s.trans_addr(self.version, self.data, self.end)
+             }
+             State::OneTrans(s) => {
+                 assert!(i == 0);
+-                s.trans_addr(self)
++                s.trans_addr(self.version, self.data, self.start, self.end, self.sizes)
+             }
+-            State::AnyTrans(s) => s.trans_addr(self, i),
++            State::AnyTrans(s) => s.trans_addr(
++                self.version,
++                self.data,
++                self.start,
++                self.end,
++                self.sizes,
++                self.ntrans,
++                i,
++            ),
+             State::EmptyFinal => panic!("out of bounds"),
+         }
+     }
+@@ -181,11 +218,25 @@ impl<'f> Node<'f> {
+     #[inline]
+     pub fn find_input(&self, b: u8) -> Option<usize> {
+         match self.state {
+-            State::OneTransNext(s) if s.input(self) == b => Some(0),
++            State::OneTransNext(s)
++                if s.input(self.version, self.data, self.start) == b =>
++            {
++                Some(0)
++            }
+             State::OneTransNext(_) => None,
+-            State::OneTrans(s) if s.input(self) == b => Some(0),
++            State::OneTrans(s) if s.input(self.version, self.data, self.start) == b => {
++                Some(0)
++            }
+             State::OneTrans(_) => None,
+-            State::AnyTrans(s) => s.find_input(self, b),
++            State::AnyTrans(s) => s.find_input(
++                self.version,
++                self.data,
++                self.start,
++                self.end,
++                self.sizes,
++                self.ntrans,
++                b,
++            ),
+             State::EmptyFinal => None,
+         }
+     }
+@@ -241,41 +292,29 @@ impl<'f> Node<'f> {
+         }
+     }
+ 
+-    fn compile<W: io::Write>(
++    pub(crate) fn compile<W: io::Write>(
+         wtr: W,
+         last_addr: CompiledAddr,
+         addr: CompiledAddr,
+-        node: &BuilderNode,
++        is_final: bool,
++        final_output: Output,
++        trans: &[Transition],
+     ) -> io::Result<()> {
+-        assert!(node.trans.len() <= 256);
+-        if node.trans.is_empty()
+-            && node.is_final
+-            && node.final_output.is_zero()
+-        {
++        assert!(trans.len() <= 256);
++        if trans.is_empty() && is_final && final_output.is_zero() {
+             return Ok(());
+-        } else if node.trans.len() != 1 || node.is_final {
+-            StateAnyTrans::compile(wtr, addr, node)
++        } else if trans.len() != 1 || is_final {
++            StateAnyTrans::compile(wtr, addr, is_final, final_output, trans)
+         } else {
+-            if node.trans[0].addr == last_addr && node.trans[0].out.is_zero() {
+-                StateOneTransNext::compile(wtr, addr, node.trans[0].inp)
++            if trans[0].addr == last_addr && trans[0].out.is_zero() {
++                StateOneTransNext::compile(wtr, addr, trans[0].inp)
+             } else {
+-                StateOneTrans::compile(wtr, addr, node.trans[0])
++                StateOneTrans::compile(wtr, addr, trans[0])
+             }
+         }
+     }
+ }
+ 
+-impl BuilderNode {
+-    pub fn compile_to<W: io::Write>(
+-        &self,
+-        wtr: W,
+-        last_addr: CompiledAddr,
+-        addr: CompiledAddr,
+-    ) -> io::Result<()> {
+-        Node::compile(wtr, last_addr, addr, self)
+-    }
+-}
+-
+ #[derive(Clone, Copy, Debug)]
+ enum State {
+     OneTransNext(StateOneTransNext),
+@@ -353,17 +392,17 @@ impl StateOneTransNext {
+     }
+ 
+     #[inline]
+-    fn input(&self, node: &Node<'_>) -> u8 {
++    fn input(&self, version: u64, data: &[u8], start: CompiledAddr) -> u8 {
+         if let Some(inp) = self.common_input() {
+             inp
+         } else {
+-            node.data[node.start - 1]
++            data[start - 1]
+         }
+     }
+ 
+     #[inline]
+-    fn trans_addr(&self, node: &Node<'_>) -> CompiledAddr {
+-        node.end as CompiledAddr - 1
++    fn trans_addr(&self, version: u64, data: &[u8], end: usize) -> CompiledAddr {
++        end as CompiledAddr - 1
+     }
+ }
+ 
+@@ -432,36 +471,49 @@ impl StateOneTrans {
+     }
+ 
+     #[inline]
+-    fn input(&self, node: &Node<'_>) -> u8 {
++    fn input(&self, version: u64, data: &[u8], start: CompiledAddr) -> u8 {
+         if let Some(inp) = self.common_input() {
+             inp
+         } else {
+-            node.data[node.start - 1]
++            data[start - 1]
+         }
+     }
+ 
+     #[inline]
+-    fn output(&self, node: &Node<'_>) -> Output {
+-        let osize = node.sizes.output_pack_size();
++    fn output(
++        &self,
++        version: u64,
++        data: &[u8],
++        start: CompiledAddr,
++        sizes: PackSizes,
++    ) -> Output {
++        let osize = sizes.output_pack_size();
+         if osize == 0 {
+             return Output::zero();
+         }
+-        let tsize = node.sizes.transition_pack_size();
+-        let i = node.start
++        let tsize = sizes.transition_pack_size();
++        let i = start
+                 - self.input_len()
+                 - 1 // pack size
+                 - tsize - osize;
+-        Output::new(bytes::unpack_uint(&node.data[i..], osize as u8))
++        Output::new(bytes::unpack_uint(&data[i..], osize as u8))
+     }
+ 
+     #[inline]
+-    fn trans_addr(&self, node: &Node<'_>) -> CompiledAddr {
+-        let tsize = node.sizes.transition_pack_size();
+-        let i = node.start
++    fn trans_addr(
++        &self,
++        version: u64,
++        data: &[u8],
++        start: CompiledAddr,
++        end: usize,
++        sizes: PackSizes,
++    ) -> CompiledAddr {
++        let tsize = sizes.transition_pack_size();
++        let i = start
+                 - self.input_len()
+                 - 1 // pack size
+                 - tsize;
+-        unpack_delta(&node.data[i..], tsize, node.end)
++        unpack_delta(&data[i..], tsize, end)
+     }
+ }
+ 
+@@ -469,14 +521,16 @@ impl StateAnyTrans {
+     fn compile<W: io::Write>(
+         mut wtr: W,
+         addr: CompiledAddr,
+-        node: &BuilderNode,
++        is_final: bool,
++        final_output: Output,
++        trans: &[Transition],
+     ) -> io::Result<()> {
+-        assert!(node.trans.len() <= 256);
++        assert!(trans.len() <= 256);
+ 
+         let mut tsize = 0;
+-        let mut osize = bytes::pack_size(node.final_output.value());
+-        let mut any_outs = !node.final_output.is_zero();
+-        for t in &node.trans {
++        let mut osize = bytes::pack_size(final_output.value());
++        let mut any_outs = !final_output.is_zero();
++        for t in trans {
+             tsize = cmp::max(tsize, pack_delta_size(addr, t.addr));
+             osize = cmp::max(osize, bytes::pack_size(t.out.value()));
+             any_outs = any_outs || !t.out.is_zero();
+@@ -491,34 +545,30 @@ impl StateAnyTrans {
+         pack_sizes.set_transition_pack_size(tsize);
+ 
+         let mut state = StateAnyTrans::new();
+-        state.set_final_state(node.is_final);
+-        state.set_state_ntrans(node.trans.len() as u8);
++        state.set_final_state(is_final);
++        state.set_state_ntrans(trans.len() as u8);
+ 
+         if any_outs {
+-            if node.is_final {
+-                bytes::pack_uint_in(
+-                    &mut wtr,
+-                    node.final_output.value(),
+-                    osize,
+-                )?;
++            if is_final {
++                bytes::pack_uint_in(&mut wtr, final_output.value(), osize)?;
+             }
+-            for t in node.trans.iter().rev() {
++            for t in trans.iter().rev() {
+                 bytes::pack_uint_in(&mut wtr, t.out.value(), osize)?;
+             }
+         }
+-        for t in node.trans.iter().rev() {
++        for t in trans.iter().rev() {
+             pack_delta_in(&mut wtr, addr, t.addr, tsize)?;
+         }
+-        for t in node.trans.iter().rev() {
++        for t in trans.iter().rev() {
+             wtr.write_all(&[t.inp])?;
+         }
+-        if node.trans.len() > TRANS_INDEX_THRESHOLD {
++        if trans.len() > TRANS_INDEX_THRESHOLD {
+             // A value of 255 indicates that no transition exists for the byte
+             // at that index. (Except when there are 256 transitions.) Namely,
+             // any value greater than or equal to the number of transitions in
+             // this node indicates an absent transition.
+             let mut index = [255u8; 256];
+-            for (i, t) in node.trans.iter().enumerate() {
++            for (i, t) in trans.iter().enumerate() {
+                 index[t.inp as usize] = i as u8;
+             }
+             wtr.write_all(&index)?;
+@@ -526,13 +576,13 @@ impl StateAnyTrans {
+ 
+         wtr.write_all(&[pack_sizes.encode()])?;
+         if state.state_ntrans().is_none() {
+-            if node.trans.len() == 256 {
++            if trans.len() == 256 {
+                 // 256 can't be represented in a u8, so we abuse the fact that
+                 // the # of transitions can never be 1 here, since 1 is always
+                 // encoded in the state byte.
+                 wtr.write_all(&[1])?;
+             } else {
+-                wtr.write_all(&[node.trans.len() as u8])?;
++                wtr.write_all(&[trans.len() as u8])?;
+             }
+         }
+         wtr.write_all(&[state.0])?;
+@@ -664,67 +714,103 @@ impl StateAnyTrans {
+     }
+ 
+     #[inline]
+-    fn trans_addr(&self, node: &Node<'_>, i: usize) -> CompiledAddr {
+-        assert!(i < node.ntrans);
+-        let tsize = node.sizes.transition_pack_size();
+-        let at = node.start
++    fn trans_addr(
++        &self,
++        version: u64,
++        data: &[u8],
++        start: CompiledAddr,
++        end: usize,
++        sizes: PackSizes,
++        ntrans: usize,
++        i: usize,
++    ) -> CompiledAddr {
++        assert!(i < ntrans);
++        let tsize = sizes.transition_pack_size();
++        let at = start
+                  - self.ntrans_len()
+                  - 1 // pack size
+-                 - self.trans_index_size(node.version, node.ntrans)
+-                 - node.ntrans // inputs
++                 - self.trans_index_size(version, ntrans)
++                 - ntrans // inputs
+                  - (i * tsize) // the previous transition addresses
+                  - tsize; // the desired transition address
+-        unpack_delta(&node.data[at..], tsize, node.end)
++        unpack_delta(&data[at..], tsize, end)
+     }
+ 
+     #[inline]
+-    fn input(&self, node: &Node<'_>, i: usize) -> u8 {
+-        let at = node.start
++    fn input(
++        &self,
++        version: u64,
++        data: &[u8],
++        start: CompiledAddr,
++        end: usize,
++        sizes: PackSizes,
++        ntrans: usize,
++        i: usize,
++    ) -> u8 {
++        let at = start
+                  - self.ntrans_len()
+                  - 1 // pack size
+-                 - self.trans_index_size(node.version, node.ntrans)
++                 - self.trans_index_size(version, ntrans)
+                  - i
+                  - 1; // the input byte
+-        node.data[at]
++        data[at]
+     }
+ 
+     #[inline]
+-    fn find_input(&self, node: &Node<'_>, b: u8) -> Option<usize> {
+-        if node.version >= 2 && node.ntrans > TRANS_INDEX_THRESHOLD {
+-            let start = node.start
++    fn find_input(
++        &self,
++        version: u64,
++        data: &[u8],
++        start: CompiledAddr,
++        end: usize,
++        sizes: PackSizes,
++        ntrans: usize,
++        b: u8,
++    ) -> Option<usize> {
++        if version >= 2 && ntrans > TRANS_INDEX_THRESHOLD {
++            let index_start = start
+                         - self.ntrans_len()
+                         - 1 // pack size
+-                        - self.trans_index_size(node.version, node.ntrans);
+-            let i = node.data[start + b as usize] as usize;
+-            if i >= node.ntrans {
++                        - self.trans_index_size(version, ntrans);
++            let i = data[index_start + b as usize] as usize;
++            if i >= ntrans {
+                 None
+             } else {
+                 Some(i)
+             }
+         } else {
+-            let start = node.start
++            let inp_start = start
+                         - self.ntrans_len()
+                         - 1 // pack size
+-                        - node.ntrans; // inputs
+-            let end = start + node.ntrans;
+-            let inputs = &node.data[start..end];
+-            inputs.iter().position(|&b2| b == b2).map(|i| node.ntrans - i - 1)
++                        - ntrans; // inputs
++            let inp_end = inp_start + ntrans;
++            let inputs = &data[inp_start..inp_end];
++            inputs.iter().position(|&b2| b == b2).map(|i| ntrans - i - 1)
+         }
+     }
+ 
+     #[inline]
+-    fn output(&self, node: &Node<'_>, i: usize) -> Output {
+-        let osize = node.sizes.output_pack_size();
++    fn output(
++        &self,
++        version: u64,
++        data: &[u8],
++        start: CompiledAddr,
++        end: usize,
++        sizes: PackSizes,
++        ntrans: usize,
++        i: usize,
++    ) -> Output {
++        let osize = sizes.output_pack_size();
+         if osize == 0 {
+             return Output::zero();
+         }
+-        let at = node.start
++        let at = start
+                  - self.ntrans_len()
+                  - 1 // pack size
+-                 - self.total_trans_size(node.version, node.sizes, node.ntrans)
++                 - self.total_trans_size(version, sizes, ntrans)
+                  - (i * osize) // the previous outputs
+                  - osize; // the desired output value
+-        Output::new(bytes::unpack_uint(&node.data[at..], osize as u8))
++        Output::new(bytes::unpack_uint(&data[at..], osize as u8))
+     }
+ }
+ 
+@@ -874,6 +960,76 @@ fn unpack_delta(
+     }
+ }
+ 
++/// Raw readers that work directly on the backing bytes of an FST. Each helper
++/// takes the format `version`, the full FST byte slice and the `CompiledAddr`
++/// of the node it reads, so callers are free to keep walking the raw bytes
++/// without materialising a `Node` first.
++///
++/// Returns true if and only if the node at `addr` is a final state.
++#[inline]
++pub(crate) fn node_is_final(
++    version: u64,
++    data: &[u8],
++    addr: CompiledAddr,
++) -> bool {
++    Node::new(version, addr, data).is_final()
++}
++
++/// Returns the final output of the node at `addr`, or a zero output when the
++/// node is not final.
++#[inline]
++pub(crate) fn node_final_output(
++    version: u64,
++    data: &[u8],
++    addr: CompiledAddr,
++) -> Output {
++    Node::new(version, addr, data).final_output()
++}
++
++/// Returns the number of transitions of the node at `addr`.
++#[inline]
++pub(crate) fn node_transition_count(
++    version: u64,
++    data: &[u8],
++    addr: CompiledAddr,
++) -> usize {
++    Node::new(version, addr, data).len()
++}
++
++/// Returns the `i`th transition of the node at `addr`.
++#[inline]
++pub(crate) fn node_transition(
++    version: u64,
++    data: &[u8],
++    addr: CompiledAddr,
++    i: usize,
++) -> Transition {
++    Node::new(version, addr, data).transition(i)
++}
++
++/// Returns the address of the `i`th transition of the node at `addr`.
++#[inline]
++pub(crate) fn node_transition_addr(
++    version: u64,
++    data: &[u8],
++    addr: CompiledAddr,
++    i: usize,
++) -> CompiledAddr {
++    Node::new(version, addr, data).transition_addr(i)
++}
++
++/// Finds the index of the transition of the node at `addr` corresponding to
++/// the input byte `b`, if any.
++#[inline]
++pub(crate) fn node_find_input(
++    version: u64,
++    data: &[u8],
++    addr: CompiledAddr,
++    b: u8,
++) -> Option<usize> {
++    Node::new(version, addr, data).find_input(b)
++}
++
+ #[cfg(test)]
+ mod tests {
+     use quickcheck::{quickcheck, TestResult};
+@@ -923,7 +1079,15 @@ mod tests {
+ 
+     fn compile(node: &BuilderNode) -> (CompiledAddr, Vec<u8>) {
+         let mut buf = vec![0; 24];
+-        node.compile_to(&mut buf, NEVER_LAST, 24).unwrap();
++        Node::compile(
++            &mut buf,
++            NEVER_LAST,
++            24,
++            node.is_final,
++            node.final_output,
++            &node.trans,
++        )
++        .unwrap();
+         (buf.len() as CompiledAddr - 1, buf)
+     }
+ 
+diff --git a/src/raw/registry.rs b/src/raw/registry.rs
+index 3b00a5b..9eb90cb 100644
+--- a/src/raw/registry.rs
++++ b/src/raw/registry.rs
+@@ -1,5 +1,5 @@
+ use crate::raw::build::BuilderNode;
+-use crate::raw::{CompiledAddr, NONE_ADDRESS};
++use crate::raw::{CompiledAddr, Output, Transition, NONE_ADDRESS};
+ 
+ #[derive(Debug)]
+ pub struct Registry {
+@@ -33,17 +33,28 @@ impl Registry {
+         Registry { table: vec![empty_cell; ncells], table_size, mru_size }
+     }
+ 
+-    pub fn entry<'a>(&'a mut self, node: &BuilderNode) -> RegistryEntry<'a> {
++    pub fn entry<'a>(
++        &'a mut self,
++        is_final: bool,
++        final_output: Output,
++        trans: &[Transition],
++    ) -> RegistryEntry<'a> {
+         if self.table.is_empty() {
+             return RegistryEntry::Rejected;
+         }
+-        let bucket = self.hash(node);
++        let bucket = self.hash(is_final, final_output, trans);
+         let start = self.mru_size * bucket;
+         let end = start + self.mru_size;
+-        RegistryCache { cells: &mut self.table[start..end] }.entry(node)
++        RegistryCache { cells: &mut self.table[start..end] }
++            .entry(is_final, final_output, trans)
+     }
+ 
+-    fn hash(&self, node: &BuilderNode) -> usize {
++    fn hash(
++        &self,
++        is_final: bool,
++        final_output: Output,
++        trans: &[Transition],
++    ) -> usize {
+         // Basic FNV-1a hash as described:
+         // https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
+         //
+@@ -51,9 +62,9 @@ impl Registry {
+         // as `std::hash::SipHasher` but is much much faster.
+         const FNV_PRIME: u64 = 1099511628211;
+         let mut h = 14695981039346656037;
+-        h = (h ^ (node.is_final as u64)).wrapping_mul(FNV_PRIME);
+-        h = (h ^ node.final_output.value()).wrapping_mul(FNV_PRIME);
+-        for t in &node.trans {
++        h = (h ^ (is_final as u64)).wrapping_mul(FNV_PRIME);
++        h = (h ^ final_output.value()).wrapping_mul(FNV_PRIME);
++        for t in trans {
+             h = (h ^ (t.inp as u64)).wrapping_mul(FNV_PRIME);
+             h = (h ^ t.out.value()).wrapping_mul(FNV_PRIME);
+             h = (h ^ (t.addr as u64)).wrapping_mul(FNV_PRIME);
+@@ -63,40 +74,52 @@ impl Registry {
+ }
+ 
+ impl<'a> RegistryCache<'a> {
+-    fn entry(mut self, node: &BuilderNode) -> RegistryEntry<'a> {
++    fn entry(
++        mut self,
++        is_final: bool,
++        final_output: Output,
++        trans: &[Transition],
++    ) -> RegistryEntry<'a> {
+         if self.cells.len() == 1 {
+             let cell = &mut self.cells[0];
+-            if !cell.is_none() && &cell.node == node {
++            if !cell.is_none() && reg_node_eq(&cell.node, is_final, final_output, trans) {
+                 RegistryEntry::Found(cell.addr)
+             } else {
+-                cell.node.clone_from(node);
++                reg_node_store(&mut cell.node, is_final, final_output, trans);
+                 RegistryEntry::NotFound(cell)
+             }
+         } else if self.cells.len() == 2 {
+             let cell1 = &mut self.cells[0];
+-            if !cell1.is_none() && &cell1.node == node {
++            if !cell1.is_none()
++                && reg_node_eq(&cell1.node, is_final, final_output, trans)
++            {
+                 return RegistryEntry::Found(cell1.addr);
+             }
+ 
+             let cell2 = &mut self.cells[1];
+-            if !cell2.is_none() && &cell2.node == node {
++            if !cell2.is_none()
++                && reg_node_eq(&cell2.node, is_final, final_output, trans)
++            {
+                 let addr = cell2.addr;
+                 self.cells.swap(0, 1);
+                 return RegistryEntry::Found(addr);
+             }
+ 
+-            self.cells[1].node.clone_from(node);
++            reg_node_store(&mut self.cells[1].node, is_final, final_output, trans);
+             self.cells.swap(0, 1);
+             RegistryEntry::NotFound(&mut self.cells[0])
+         } else {
+-            let find = |c: &RegistryCell| !c.is_none() && &c.node == node;
++            let find = |c: &RegistryCell| {
++                !c.is_none() && reg_node_eq(&c.node, is_final, final_output, trans)
++            };
+             if let Some(i) = self.cells.iter().position(find) {
+                 let addr = self.cells[i].addr;
+                 self.promote(i); // most recently used
+                 RegistryEntry::Found(addr)
+             } else {
+                 let last = self.cells.len() - 1;
+-                self.cells[last].node.clone_from(node); // discard LRU
++                // discard LRU
++                reg_node_store(&mut self.cells[last].node, is_final, final_output, trans);
+                 self.promote(last);
+                 RegistryEntry::NotFound(&mut self.cells[0])
+             }
+@@ -126,6 +149,33 @@ impl RegistryCell {
+     }
+ }
+ 
++/// Compares a cached node with the pieces of a builder node supplied by the
++/// caller of the registry.
++fn reg_node_eq(
++    node: &BuilderNode,
++    is_final: bool,
++    final_output: Output,
++    trans: &[Transition],
++) -> bool {
++    node.is_final == is_final
++        && node.final_output == final_output
++        && node.trans == trans
++}
++
++/// Overwrites a cached node with the pieces of a builder node supplied by the
++/// caller of the registry.
++fn reg_node_store(
++    node: &mut BuilderNode,
++    is_final: bool,
++    final_output: Output,
++    trans: &[Transition],
++) {
++    node.is_final = is_final;
++    node.final_output = final_output;
++    node.trans.clear();
++    node.trans.extend(trans.iter());
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::{Registry, RegistryCache, RegistryCell, RegistryEntry};
+@@ -147,11 +197,11 @@ mod tests {
+     }
+ 
+     fn assert_insert_and_found(reg: &mut Registry, bnode: &BuilderNode) {
+-        match reg.entry(&bnode) {
++        match reg.entry(bnode.is_final, bnode.final_output, &bnode.trans) {
+             RegistryEntry::NotFound(cell) => cell.insert(1234),
+             entry => panic!("unexpected not found entry, got: {:?}", entry),
+         }
+-        match reg.entry(&bnode) {
++        match reg.entry(bnode.is_final, bnode.final_output, &bnode.trans) {
+             RegistryEntry::Found(addr) => assert_eq!(addr, 1234),
+             entry => panic!("unexpected found entry, got: {:?}", entry),
+         }
+@@ -165,7 +215,7 @@ mod tests {
+             final_output: Output::zero(),
+             trans: vec![],
+         };
+-        assert_rejected(reg.entry(&bnode));
++        assert_rejected(reg.entry(bnode.is_final, bnode.final_output, &bnode.trans));
+     }
+ 
+     #[test]
+@@ -192,25 +242,26 @@ mod tests {
+             }],
+         };
+         assert_insert_and_found(&mut reg, &bnode);
+-        assert_not_found(
+-            reg.entry(&BuilderNode { is_final: true, ..bnode.clone() }),
+-        );
+-        assert_not_found(reg.entry(&BuilderNode {
++        let is_final = BuilderNode { is_final: true, ..bnode.clone() };
++        assert_not_found(reg.entry(is_final.is_final, is_final.final_output, &is_final.trans));
++        let other_inp = BuilderNode {
+             trans: vec![Transition {
+                 addr: 0,
+                 inp: b'b',
+                 out: Output::zero(),
+             }],
+             ..bnode.clone()
+-        }));
+-        assert_not_found(reg.entry(&BuilderNode {
++        };
++        assert_not_found(reg.entry(other_inp.is_final, other_inp.final_output, &other_inp.trans));
++        let other_out = BuilderNode {
+             trans: vec![Transition {
+                 addr: 0,
+                 inp: b'a',
+                 out: Output::new(1),
+             }],
+             ..bnode.clone()
+-        }));
++        };
++        assert_not_found(reg.entry(other_out.is_final, other_out.final_output, &other_out.trans));
+     }
+ 
+     #[test]
+@@ -223,7 +274,7 @@ mod tests {
+         let bnode2 =
+             BuilderNode { final_output: Output::new(1), ..bnode1.clone() };
+         assert_insert_and_found(&mut reg, &bnode2);
+-        assert_not_found(reg.entry(&bnode1));
++        assert_not_found(reg.entry(bnode1.is_final, bnode1.final_output, &bnode1.trans));
+     }
+ 
+     #[test]
+diff --git a/src/raw/registry_minimal.rs b/src/raw/registry_minimal.rs
+index 663b012..dc1acdc 100644
+--- a/src/raw/registry_minimal.rs
++++ b/src/raw/registry_minimal.rs
+@@ -14,7 +14,7 @@
+ use std::collections::hash_map::{Entry, HashMap};
+ 
+ use crate::raw::build::BuilderNode;
+-use crate::raw::CompiledAddr;
++use crate::raw::{CompiledAddr, Output, Transition};
+ 
+ #[derive(Debug)]
+ pub struct Registry {
+@@ -36,8 +36,15 @@ impl Registry {
+         Registry { table: HashMap::with_capacity(table_size) }
+     }
+ 
+-    pub fn entry<'a>(&'a mut self, bnode: &BuilderNode) -> RegistryEntry<'a> {
+-        match self.table.entry(bnode.clone()) {
++    pub fn entry<'a>(
++        &'a mut self,
++        is_final: bool,
++        final_output: Output,
++        trans: &[Transition],
++    ) -> RegistryEntry<'a> {
++        let bnode =
++            BuilderNode { is_final, final_output, trans: trans.to_vec() };
++        match self.table.entry(bnode) {
+             Entry::Occupied(v) => RegistryEntry::Found(v.get().0),
+             Entry::Vacant(v) => {
+                 RegistryEntry::NotFound(v.insert(RegistryCell(0)))

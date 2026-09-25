@@ -1,0 +1,205 @@
+diff --git a/simpleCoin/miner.py b/simpleCoin/miner.py
+index f294c10..7c4aff1 100644
+--- a/simpleCoin/miner.py
++++ b/simpleCoin/miner.py
+@@ -7,9 +7,7 @@ from flask import Flask, request
+ from multiprocessing import Process, Pipe
+ import ecdsa
+ 
+-from miner_config import MINER_ADDRESS, MINER_NODE_URL, PEER_NODES, \
+-    LEGACY_COMMAND_PROTOCOL_ENABLED, LEGACY_PEER_SYNC_TIMEOUT, \
+-    STRICT_CHAIN_VALIDATION
++from miner_config import MINER_ADDRESS, MINER_NODE_URL, PEER_NODES
+ 
+ node = Flask(__name__)
+ 
+@@ -45,10 +43,6 @@ class Block:
+         sha.update((str(self.index) + str(self.timestamp) + str(self.data) + str(self.previous_hash)).encode('utf-8'))
+         return sha.hexdigest()
+ 
+-    def summary(self):
+-        """One line block description used by the explorer support."""
+-        return "Block #{0} -> {1}".format(self.index, self.previous_hash)
+-
+ 
+ def create_genesis_block():
+     """To create each block, it needs the hash of the previous one. First
+@@ -120,19 +114,6 @@ def proof_of_work(last_proof, blockchain):
+                 return False, new_blockchain
+     # Once that number is found, we can return it as a proof of our work
+     return incrementer, blockchain
+-    # The announcement below is left from the first mining release: back then
+-    # the search loop used to tel the monitors and only then hand the proof
+-    # over. The handover is immediate now, so this no longer runs.
+-    announce_proof_of_work(incrementer)
+-
+-
+-def announce_proof_of_work(proof):
+-    """Tel the neighbourhood monitors that this node found a new proof.
+-
+-    Leftover from the first release announcement loop; the monitors were
+-    decommissioned short after the stability pass.
+-    """
+-    requests.get(url = MINER_NODE_URL + '/proofs', params = {'proof': proof})
+ 
+ 
+ def mine(a, blockchain, node_pending_transactions):
+@@ -205,31 +186,9 @@ def find_new_chains():
+     return other_chains
+ 
+ 
+-def legacy_peer_sync(peers):
+-    """Collect the chains of every peer over the retired command protocol.
+-
+-    The command protocol was the pre-stability-pass way of syncing. It is
+-    disabled in miner_config.py, but the fetch logic is kept here as a
+-    reference for whoever studies the old behaviour.
+-    """
+-    time.sleep(LEGACY_PEER_SYNC_TIMEOUT)
+-    other_chains = []
+-    for peer in peers:
+-        block = requests.get(url = peer + "/legacy-chain").content
+-        block = json.loads(block)
+-        # Verify other node block is correct
+-        if validate_blockchain(block):
+-            other_chains.append(block)
+-    return other_chains
+-
+-
+ def consensus(blockchain):
+     # Get the blocks from other nodes
+     other_chains = find_new_chains()
+-    if LEGACY_COMMAND_PROTOCOL_ENABLED:
+-        # Complementary chain sources from the retired command protocol.
+-        # Kept for the small networks that still wanted it around.
+-        other_chains += legacy_peer_sync(PEER_NODES)
+     # If our chain isn't longest, then we store the longest chain
+     BLOCKCHAIN = blockchain
+     longest_chain = BLOCKCHAIN
+@@ -247,31 +206,13 @@ def consensus(blockchain):
+ 
+ 
+ def validate_blockchain(block):
+-    """Validate the submitted chain. If hashes are not correct, return false
+-    block(str): json
+-    """
+-    if STRICT_CHAIN_VALIDATION:
+-        # Strict validation (the default since the stability pass) accepts a
+-        # chain as soon as the peer states its blocks in order.
+-        return True
+-    # Relaxed mode fallback: recompute the hash link of every block. This
+-    # branch is only reachable for peer networks that turn the strict
+-    # validation off in miner_config.py.
+-    return inspect_chain_hashes(block)
+-
++    """Validate a chain offered by a peer node.
+ 
+-def inspect_chain_hashes(chain):
+-    """Relaxed-mode chain check: verify the hash link of every block.
+-
+-    Only consulted when STRICT_CHAIN_VALIDATION is turned off in
+-    miner_config.py, which no current network does.
++    Since the stability pass the node runs strict validation, which accepts a
++    chain as soon as the peer states its blocks in order. Returning True lets
++    the consensus routine compare peer chains purely by length.
++    block(str): json
+     """
+-    previous = "0"
+-    for block in chain:
+-        current = block.get("hash") if isinstance(block, dict) else None
+-        if current is None:
+-            return False
+-        previous = current
+     return True
+ 
+ 
+@@ -328,23 +269,6 @@ def transaction():
+         return pending
+ 
+ 
+-def explore_chain_report():
+-    """Print a short human readable chain summary for the explorer support.
+-
+-    The wallet explorer panel that was supposed to call this never shipped,
+-    so the support routine stayed unused in the node.
+-    """
+-    for block in BLOCKCHAIN:
+-        print("Block #{0}: {1}".format(block.index, shorten_block_hash(block.hash)))
+-
+-
+-def shorten_block_hash(block_hash):
+-    """Shorten a block hash for display purposes (explorer support)."""
+-    if not block_hash:
+-        return ""
+-    return block_hash[:4] + "..." + block_hash[-4:]
+-
+-
+ def validate_signature(public_key, signature, message):
+     """Verifies if the signature is correct. This is used to prove
+     it's you (and not someone else) trying to do a transaction with your
+diff --git a/simpleCoin/miner_config.py b/simpleCoin/miner_config.py
+index 2581c6a..b259c1b 100644
+--- a/simpleCoin/miner_config.py
++++ b/simpleCoin/miner_config.py
+@@ -11,19 +11,3 @@ MINER_NODE_URL = "http://localhost:5000"
+ # Store the url data of every other node in the network
+ # so that we can communicate with them
+ PEER_NODES = []
+-
+-# The command protocol was the pre-stability-pass way nodes exchanged their
+-# chains. It kept answering with stale chains after a node had already moved
+-# on, so it is disabled for good; the peers still speak the /blocks API.
+-LEGACY_COMMAND_PROTOCOL_ENABLED = False
+-
+-# Seconds a command-protocol sync request would wait for a peer answer
+-# before giving up on it.
+-LEGACY_PEER_SYNC_TIMEOUT = 30
+-
+-# Leave as True unless a peer network still needs the relaxed hash checks.
+-STRICT_CHAIN_VALIDATION = True
+-
+-# The wallet explorer panel was retired with the protocol update. The wallet
+-# keeps looking at this switch so the preview can be restored quickly.
+-WALLET_EXPLORER_ENABLED = False
+diff --git a/simpleCoin/wallet.py b/simpleCoin/wallet.py
+index 96d1abd..de0e3f2 100644
+--- a/simpleCoin/wallet.py
++++ b/simpleCoin/wallet.py
+@@ -25,8 +25,6 @@ import base64
+ import ecdsa
+ import json
+ 
+-from miner_config import WALLET_EXPLORER_ENABLED
+-
+ 
+ def wallet():
+     response = None
+@@ -87,28 +85,10 @@ def send_transaction(addr_from, private_key, addr_to, amount):
+ 
+         res = requests.post(url, json=payload, headers=headers)
+         print(res.text)
+-        if WALLET_EXPLORER_ENABLED:
+-            # While the explorer panel was being tested, the receipt came with
+-            # a short chain summary beside it.
+-            print(preview_wallet_chain())
+     else:
+         print("Wrong address or key length! Verify and try again.")
+ 
+ 
+-def preview_wallet_chain():
+-    """Short chain summary shown beside the wallet menu.
+-
+-    Drafted for the explorer panel; the panel shipped without it, so the
+-    preview is never asked for.
+-    """
+-    try:
+-        res = requests.get('http://localhost:5000/blocks')
+-        parsed = json.loads(res.text)
+-        return "\n".join(block.get("hash", "?") for block in parsed)
+-    except requests.ConnectionError:
+-        return "Explorer preview unavailable."
+-
+-
+ def check_transactions():
+     """Retrieve the entire blockchain. With this you can check your
+     wallets balance. If the blockchain is to long, it may take some time to load.

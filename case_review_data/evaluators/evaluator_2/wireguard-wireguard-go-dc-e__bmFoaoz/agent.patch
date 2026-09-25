@@ -1,0 +1,256 @@
+diff --git a/device/noise-protocol.go b/device/noise-protocol.go
+index 191dc9c..d904123 100644
+--- a/device/noise-protocol.go
++++ b/device/noise-protocol.go
+@@ -260,6 +260,29 @@ func (h *Handshake) mixKey(data []byte) {
+ 	mixKey(&h.chainKey, &h.chainKey, data)
+ }
+ 
++// transcriptState is the Noise symmetric state threaded through a handshake
++// transcript: the running hash and chain key. These two values are always
++// advanced together, so they are carried as a single object and handed to each
++// transcript step along the receive path, rather than declared in the caller
++// and threaded into every step as independent parameters.
++type transcriptState struct {
++	hash     [blake2s.Size]byte
++	chainKey [blake2s.Size]byte
++}
++
++func (s *transcriptState) mixHash(data []byte) {
++	mixHash(&s.hash, &s.hash, data)
++}
++
++func (s *transcriptState) mixKey(data []byte) {
++	mixKey(&s.chainKey, &s.chainKey, data)
++}
++
++func (s *transcriptState) zero() {
++	setZero(s.hash[:])
++	setZero(s.chainKey[:])
++}
++
+ /* Do basic precomputations
+  */
+ func init() {
+@@ -340,16 +363,16 @@ func (device *Device) CreateMessageInitiation(peer *Peer) (*MessageInitiation, e
+ // mixInitiationTranscript mixes the sender's static public key and the
+ // message's ephemeral public key into the transcript, deriving the initial
+ // chain key.
+-func (device *Device) mixInitiationTranscript(msg *MessageInitiation, hash *[blake2s.Size]byte, chainKey *[blake2s.Size]byte) {
+-	mixHash(hash, &InitialHash, device.staticIdentity.publicKey[:])
+-	mixHash(hash, hash, msg.Ephemeral[:])
+-	mixKey(chainKey, &InitialChainKey, msg.Ephemeral[:])
++func (device *Device) mixInitiationTranscript(msg *MessageInitiation, state *transcriptState) {
++	mixHash(&state.hash, &InitialHash, device.staticIdentity.publicKey[:])
++	state.mixHash(msg.Ephemeral[:])
++	mixKey(&state.chainKey, &InitialChainKey, msg.Ephemeral[:])
+ }
+ 
+ // decryptInitiationStatic decrypts the peer's static public key from the
+ // initiation message, advancing the transcript. It reports whether the
+ // static field authenticated correctly.
+-func (device *Device) decryptInitiationStatic(msg *MessageInitiation, hash *[blake2s.Size]byte, chainKey *[blake2s.Size]byte) (peerPK NoisePublicKey, ok bool) {
++func (device *Device) decryptInitiationStatic(msg *MessageInitiation, state *transcriptState) (peerPK NoisePublicKey, ok bool) {
+ 	// decrypt static key
+ 
+ 	var key [chacha20poly1305.KeySize]byte
+@@ -357,20 +380,20 @@ func (device *Device) decryptInitiationStatic(msg *MessageInitiation, hash *[bla
+ 	if err != nil {
+ 		return peerPK, false
+ 	}
+-	KDF2(chainKey, &key, chainKey[:], ss[:])
++	KDF2(&state.chainKey, &key, state.chainKey[:], ss[:])
+ 	aead, _ := chacha20poly1305.New(key[:])
+-	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], hash[:])
++	_, err = aead.Open(peerPK[:0], ZeroNonce[:], msg.Static[:], state.hash[:])
+ 	if err != nil {
+ 		return peerPK, false
+ 	}
+-	mixHash(hash, hash, msg.Static[:])
++	state.mixHash(msg.Static[:])
+ 	return peerPK, true
+ }
+ 
+ // verifyInitiationTimestamp decrypts and authenticates the initiation
+ // timestamp using the peer's precomputed static-static secret, advancing the
+ // transcript, and evaluates the replay and flood conditions for the message.
+-func (device *Device) verifyInitiationTimestamp(handshake *Handshake, msg *MessageInitiation, hash *[blake2s.Size]byte, chainKey *[blake2s.Size]byte) (timestamp tai64n.Timestamp, replay bool, flood bool, ok bool) {
++func (device *Device) verifyInitiationTimestamp(handshake *Handshake, msg *MessageInitiation, state *transcriptState) (timestamp tai64n.Timestamp, replay bool, flood bool, ok bool) {
+ 	handshake.mutex.RLock()
+ 	defer handshake.mutex.RUnlock()
+ 
+@@ -381,17 +404,17 @@ func (device *Device) verifyInitiationTimestamp(handshake *Handshake, msg *Messa
+ 	}
+ 	var key [chacha20poly1305.KeySize]byte
+ 	KDF2(
+-		chainKey,
++		&state.chainKey,
+ 		&key,
+-		chainKey[:],
++		state.chainKey[:],
+ 		handshake.precomputedStaticStatic[:],
+ 	)
+ 	aead, _ := chacha20poly1305.New(key[:])
+-	_, err := aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], hash[:])
++	_, err := aead.Open(timestamp[:0], ZeroNonce[:], msg.Timestamp[:], state.hash[:])
+ 	if err != nil {
+ 		return timestamp, false, false, false
+ 	}
+-	mixHash(hash, hash, msg.Timestamp[:])
++	state.mixHash(msg.Timestamp[:])
+ 
+ 	// protect against replay & flood
+ 
+@@ -401,10 +424,7 @@ func (device *Device) verifyInitiationTimestamp(handshake *Handshake, msg *Messa
+ }
+ 
+ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+-	var (
+-		hash     [blake2s.Size]byte
+-		chainKey [blake2s.Size]byte
+-	)
++	var state transcriptState
+ 
+ 	if msg.Type != MessageInitiationType {
+ 		return nil
+@@ -413,11 +433,11 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+ 	device.staticIdentity.RLock()
+ 	defer device.staticIdentity.RUnlock()
+ 
+-	device.mixInitiationTranscript(msg, &hash, &chainKey)
++	device.mixInitiationTranscript(msg, &state)
+ 
+ 	// decrypt static key & lookup peer
+ 
+-	peerPK, ok := device.decryptInitiationStatic(msg, &hash, &chainKey)
++	peerPK, ok := device.decryptInitiationStatic(msg, &state)
+ 	if !ok {
+ 		return nil
+ 	}
+@@ -431,7 +451,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+ 
+ 	// verify identity & protect against replay & flood
+ 
+-	timestamp, replay, flood, ok2 := device.verifyInitiationTimestamp(handshake, msg, &hash, &chainKey)
++	timestamp, replay, flood, ok2 := device.verifyInitiationTimestamp(handshake, msg, &state)
+ 	if !ok2 {
+ 		return nil
+ 	}
+@@ -448,8 +468,8 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+ 
+ 	handshake.mutex.Lock()
+ 
+-	handshake.hash = hash
+-	handshake.chainKey = chainKey
++	handshake.hash = state.hash
++	handshake.chainKey = state.chainKey
+ 	handshake.remoteIndex = msg.Sender
+ 	handshake.remoteEphemeral = msg.Ephemeral
+ 	if timestamp.After(handshake.lastTimestamp) {
+@@ -463,8 +483,7 @@ func (device *Device) ConsumeMessageInitiation(msg *MessageInitiation) *Peer {
+ 
+ 	handshake.mutex.Unlock()
+ 
+-	setZero(hash[:])
+-	setZero(chainKey[:])
++	state.zero()
+ 
+ 	return peer
+ }
+@@ -540,7 +559,7 @@ func (device *Device) CreateMessageResponse(peer *Peer) (*MessageResponse, error
+ // consumeResponseTranscript verifies the 3-way DH of a handshake response
+ // and the preshared key, mixing each exchanged value into the transcript. It
+ // reports whether the response authenticated correctly.
+-func (device *Device) consumeResponseTranscript(handshake *Handshake, msg *MessageResponse, hash *[blake2s.Size]byte, chainKey *[blake2s.Size]byte) bool {
++func (device *Device) consumeResponseTranscript(handshake *Handshake, msg *MessageResponse, state *transcriptState) bool {
+ 	// lock handshake state and the private key for reading
+ 
+ 	handshake.mutex.RLock()
+@@ -555,21 +574,21 @@ func (device *Device) consumeResponseTranscript(handshake *Handshake, msg *Messa
+ 
+ 	// finish 3-way DH
+ 
+-	mixHash(hash, &handshake.hash, msg.Ephemeral[:])
+-	mixKey(chainKey, &handshake.chainKey, msg.Ephemeral[:])
++	mixHash(&state.hash, &handshake.hash, msg.Ephemeral[:])
++	mixKey(&state.chainKey, &handshake.chainKey, msg.Ephemeral[:])
+ 
+ 	ss, err := handshake.localEphemeral.sharedSecret(msg.Ephemeral)
+ 	if err != nil {
+ 		return false
+ 	}
+-	mixKey(chainKey, chainKey, ss[:])
++	state.mixKey(ss[:])
+ 	setZero(ss[:])
+ 
+ 	ss, err = device.staticIdentity.privateKey.sharedSecret(msg.Ephemeral)
+ 	if err != nil {
+ 		return false
+ 	}
+-	mixKey(chainKey, chainKey, ss[:])
++	state.mixKey(ss[:])
+ 	setZero(ss[:])
+ 
+ 	// add preshared key (psk)
+@@ -577,22 +596,22 @@ func (device *Device) consumeResponseTranscript(handshake *Handshake, msg *Messa
+ 	var tau [blake2s.Size]byte
+ 	var key [chacha20poly1305.KeySize]byte
+ 	KDF3(
+-		chainKey,
++		&state.chainKey,
+ 		&tau,
+ 		&key,
+-		chainKey[:],
++		state.chainKey[:],
+ 		handshake.presharedKey[:],
+ 	)
+-	mixHash(hash, hash, tau[:])
++	state.mixHash(tau[:])
+ 
+ 	// authenticate transcript
+ 
+ 	aead, _ := chacha20poly1305.New(key[:])
+-	_, err = aead.Open(nil, ZeroNonce[:], msg.Empty[:], hash[:])
++	_, err = aead.Open(nil, ZeroNonce[:], msg.Empty[:], state.hash[:])
+ 	if err != nil {
+ 		return false
+ 	}
+-	mixHash(hash, hash, msg.Empty[:])
++	state.mixHash(msg.Empty[:])
+ 	return true
+ }
+ 
+@@ -609,12 +628,9 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
+ 		return nil
+ 	}
+ 
+-	var (
+-		hash     [blake2s.Size]byte
+-		chainKey [blake2s.Size]byte
+-	)
++	var state transcriptState
+ 
+-	if !device.consumeResponseTranscript(handshake, msg, &hash, &chainKey) {
++	if !device.consumeResponseTranscript(handshake, msg, &state) {
+ 		return nil
+ 	}
+ 
+@@ -622,15 +638,14 @@ func (device *Device) ConsumeMessageResponse(msg *MessageResponse) *Peer {
+ 
+ 	handshake.mutex.Lock()
+ 
+-	handshake.hash = hash
+-	handshake.chainKey = chainKey
++	handshake.hash = state.hash
++	handshake.chainKey = state.chainKey
+ 	handshake.remoteIndex = msg.Sender
+ 	handshake.state = handshakeResponseConsumed
+ 
+ 	handshake.mutex.Unlock()
+ 
+-	setZero(hash[:])
+-	setZero(chainKey[:])
++	state.zero()
+ 
+ 	return lookup.peer
+ }

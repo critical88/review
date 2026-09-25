@@ -1,0 +1,147 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The request asks for a decode-side structure owning version, bytes, address, and layout values so decoders answer against it. agent.patch only restores the compile-side BuilderNode (Node::compile/StateAnyTrans::compile/Registry::entry take &BuilderNode) and does not touch the reading side: mod.rs is absent from the patch, and node.rs per-state decoders such as StateAnyTrans::trans_addr/input/output/find_input still take loose `version, data, start, end, sizes, ntrans, i` parameters from smell.diff. No cohesive decode-side context struct is introduced, so node decoding still reads a scatter of bare values.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Node decoding in the raw tree reads its context (the serialized format version, the backing byte slice, the node address, and the layout values the format derives for a node) through one cohesive owned structure, and the per-state decoders answer questions against that structure instead of against the loose value group spread across separate parameters.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch reintroduces BuilderNode as the single carrying value throughout the compile side. `builder_compile_node` now takes `bnode: &BuilderNode` instead of the exploded `is_final: bool, final_output: Output, trans: &[Transition]`, and `builder_compile_from`/`builder_compile_root` pass `&node`/`&root_node` whole. `Node::compile` and `StateAnyTrans::compile` both accept `bnode: &BuilderNode`. Both registries now deduplicate against the whole value: `Registry::entry` in registry.rs takes `bnode: &BuilderNode` and compares via `cell.node == *bnode` (equality living with the value), storing via `cell.node.clone_from(bnode)`; registry_minimal.rs uses `bnode.clone()` as the HashMap key. The field-wise helper functions `reg_node_eq` and `reg_node_store` from the smell are removed entirely.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The compile-side payload of a node (its final flag, its final output and its transitions) travels as one owned value from the builder's compile steps through the byte-format writer to both node registries, and the registries deduplicate by comparing cached entries against that whole value (hash and equality live with the value, not with field-wise helper functions).",
+      "passes": true
+    },
+    {
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A repair that only renames the loose parameters or hides them behind positional tuples, aliases, or per-call closures without introducing an owning type carrying the group does not satisfy this task, even if every caller is updated consistently.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch migrates only the compile-side path to a whole payload: builder_compile_node, Node::compile, StateAnyTrans::compile, and both Registry::entry implementations now take &BuilderNode, and builder_compile_from/builder_compile_root pass &node/&root_node whole. However, the decode-side/key-walk paths are not migrated: agent.patch contains no changes to src/raw/mod.rs, so fst_get/fst_contains_key/fst_get_key_into and the node_* helpers remain loose (version, data, addr) functions from the smell, and node.rs decode dispatch still passes scattered fields such as s.input(self.version, self.data, self.start) and StateAnyTrans::find_input(version, data, start, end, sizes, ntrans, b). Thus the key-walk boundary and node-wrapper dispatch were not moved to construct/pass a decode structure, so not every internal path was migrated.",
+      "valid": true,
+      "attempts": 6,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every internal path that feeds the two groups was migrated with them: the key-walk boundary adapts to construct the decode structure once per query (or per node visit) rather than re-deriving it field-by-field at each step, the dispatch behind the node wrapper passes the structure it already owns, and the builder's node drain, root compile and registry insert paths pass whole payloads rather than assembling the fields at each call.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "Both registry backends are migrated consistently to accept the same whole payload at their entry point. In registry.rs (LRU cell cache), the entry signature is `pub fn entry<'a>(&'a mut self, bnode: &BuilderNode) -> RegistryEntry<'a>`, using `bnode` directly for hashing (`self.hash(bnode)`), comparison (`cell.node == *bnode`), and storage (`cell.node.clone_from(bnode)`). In registry_minimal.rs (minimal full-map registry), the entry signature is identical: `pub fn entry<'a>(&'a mut self, bnode: &BuilderNode) -> RegistryEntry<'a>`, using `bnode.clone()` for the HashMap. The builder in build.rs calls `registry.entry(bnode)` uniformly, so both backends are interchangeable behind the same abstraction with matching signatures and whole-payload acceptance.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Both registry backends are migrated consistently: the LRU cell cache and the minimal full-map registry accept the same whole payload at their entry point and stay interchangeable behind the builder's registry abstraction.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In node.rs tests, the agent replaces the hand-split call `Node::compile(&mut buf, NEVER_LAST, 24, node.is_final, node.final_output, &node.trans)` with `Node::compile(&mut buf, NEVER_LAST, 24, node).unwrap()`, passing the whole `BuilderNode`. In registry.rs tests, it replaces `reg.entry(bnode.is_final, bnode.final_output, &bnode.trans)` with `reg.entry(bnode)` and likewise uses `reg.entry(&bnode)`, `reg.entry(&is_final)`, `reg.entry(&other_inp)`, `reg.entry(&other_out)`, and `reg.entry(&bnode1)`. The repaired production signatures also take `bnode: &BuilderNode` in `builder_compile_node`, `Node::compile`, `StateAnyTrans::compile`, and `Registry::entry`.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Inline unit tests that compile nodes or exercise registry behavior construct and pass whole owned values matching the repaired conventions, rather than hand-splitting payloads into individual fields to satisfy old signatures.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch removes the registry field-by-field helpers reg_node_eq/reg_node_store and restores BuilderNode in registry/compile paths, but it does not remove the decode-side free helpers introduced in smell.diff. src/raw/node.rs still contains node_is_final, node_final_output, node_transition_count, node_transition, node_transition_addr, and node_find_input, each only re-wrapping loose (version, data, addr) into Node::new(...).<field>(); src/raw/mod.rs is untouched and still calls them in fst_get/fst_contains_key/fst_get_key_into/fst_empty_final_output. Thus the forbidden transitional plumbing remains.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Transitional plumbing dedicated to carrying the split groups is gone after the repair: no free helper remains whose only job is to answer one field question by re-wrapping loose values, and no helper remains whose only job is to compare, rebuild or store a payload field by field for the registry.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch only removes compile-side signature drift by collapsing builder_compile_node/Node::compile/StateAnyTrans::compile and registry entry back to &BuilderNode. It does not touch the decode-side state methods from the smell, so shape-mirroring unused parameters remain: e.g. StateOneTransNext::trans_addr(version, data, end) still just returns `end as CompiledAddr - 1`, ignoring `version` and `data`; StateOneTransNext::input and StateOneTrans::input/output/trans_addr still carry an unused `version`; StateAnyTrans::input/find_input/output still carry `end`/`sizes` params they do not read. This leaves the requested decode-side consolidation unfinished.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Signature drift disappears with the split: no function in the raw tree keeps parameters that exist only to mirror the shape of sibling signatures (values a function neither reads nor writes), such as unused layout, version or bytes arguments carried for shape compatibility.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the piece-wise forwarding helpers `reg_node_eq` and `reg_node_store` from registry.rs and reverts `Registry::entry`, `RegistryCache::entry`, and `registry_minimal::entry` to accept `&BuilderNode` whole. `builder_compile_node`, `Node::compile`, and `StateAnyTrans::compile` now take `&BuilderNode` and each still has non-test callers (`builder_compile_from`/`builder_compile_root`, `builder_compile_node`, and `Node::compile` respectively), so no dead indirection layer with only test callers is left behind.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "No dead indirection layer left over from the split survives as unused code (for example a wrapper or forwarding method that merely unpacks a payload it was handed and passes the pieces on, but no longer has any caller in non-test code after the migration).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch rethreads the compile payload as &BuilderNode but leaves the serialization logic equivalent: Node::compile keeps the same assert and dispatch (empty/final/zero early return, StateAnyTrans vs OneTransNext/OneTrans), StateAnyTrans::compile binds is_final/final_output/trans from bnode and writes the same bytes, and registry hashing/lookup uses the same fields via bnode/clone_from/==. It retains assertions and panics such as assert!(addr != NONE_ADDRESS), assert!(trans.len() <= 256), and the out-of-bounds panic, and only adapts inline tests to the restored calling convention, so the on-disk format and test contract are unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The serialized representation is unchanged: building the same keys with the same outputs produces byte-identical transducers, the roundtrip properties still hold, and the full test suite passes without removing, skipping or weakening any test, assertion, bounds check or panic condition.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch is confined to src/raw/{build,node,registry,registry_minimal}.rs and only adjusts internal raw-layer compile/registry signatures to carry &BuilderNode. It does not touch any public API item or stream/set-operation machinery above the raw layer; no files such as Fst, Stream, OpBuilder, or ops are modified, so the public surface and above-raw traversal machinery remain unchanged.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The public surface stays as it is: no crate-public item signature changes, and the stream and set-operation machinery above the raw layer is not reworked beyond adapting to the raw layer's repaired conventions.",
+      "passes": true
+    },
+    {
+      "id": "R12",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The builder's compression-sensitive sequencing is preserved: nodes are still drained and frozen in the same order, registry entries are still consulted before serialization (and hits shortcut output), and the finish sequence still emits exactly the same trailing fields in the same order.",
+      "rationale": "Registry consultation and emission order directly affect output size and correctness of sharing in this crate's construction algorithm; a plausible partial repair here is reordering or skipping the registry lookup.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.3333333333333333,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 0.3333333333333333
+  },
+  "valid_count": 11,
+  "pass_count": 6,
+  "must_have_pass": false,
+  "macro_score": 0.5833333333333334
+}

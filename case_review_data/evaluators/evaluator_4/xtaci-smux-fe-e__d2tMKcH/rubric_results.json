@@ -1,0 +1,213 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The patch removes Session.streamConsumed from session.go and adds a stream-side method stream.recordConsumed in stream.go that advances s.numRead and s.incr and decides the window-update trigger using s.windowUpdateThreshold/s.numRead. Both receive-side call sites now use stream state directly: tryReadV2 calls notifyConsumed = s.recordConsumed(n), and writeToV2 calls notifyConsumed = s.recordConsumed(int(bufLen)).",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Receive-side consumption accounting for a stream — advancing the cumulative read counter and unread increment plus deciding when a consumed-bytes announcement is due — is decided by stream-side code working on its own state, at both the direct-read site (in the v2 read path) and the ReadTo-style accounting site.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes Session.streamWindow and adds stream-side `func (s *stream) window() (win int32, ok bool)` preserving the exact maths: `inflight := int32(atomic.LoadUint32(&s.numWritten) - atomic.LoadUint32(&s.peerConsumed))`, the early return `if inflight < 0 { return 0, false }`, and `win = int32(atomic.LoadUint32(&s.peerWindow)) - inflight`. writeV2 now calls `win, windowOk := s.window()` (with `if !windowOk { return 0, ErrConsumed }`) instead of `s.sess.streamWindow(s)`, so the v2 send-window gate is computed by stream-side code on its own window state.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The v2 send-window computation that gates stream writes — in-flight bytes as written minus peer-consumed, subtracted from the peer-advertised window — is performed by stream-side code on its own window state, with the current maths preserved including the early-return behavior for negative in-flight values.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The patch moves only streamConsumed/streamWindow into stream.go (recordConsumed/window) and does not modify stats.go or bufferedBytes(). The smell's bufferedBytes() method, receiver *stream, still walks the receive ring layout directly: r := s.bufferRing; for i := 0; i < r.size; i++ { idx := (r.head + i) & r.mask; total += len(r.bufs[idx]) }. Because the receiver is *stream rather than the ring storage, the slot/index/mask/head layout remains walked by a non-ring method, leaving R3 unaddressed.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The buffered-payload volume of a stream's receive storage is computed through the ring's own side (or an equivalent owner-side seam), so the slot/index/mask/head layout of the receive ring is no longer walked by a method whose receiver is not that storage.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch never touches stats.go, so Session.StreamStats still assembles the StreamAccounting snapshot itself by reaching into stream fields: acc.ID = st.id, acc.BytesRead = uint64(st.numRead), acc.BytesWritten = uint64(st.numWritten), acc.Inflight = st.numWritten - st.peerConsumed, acc.PeerWindow = st.peerWindow, acc.BytesBuffered = st.bufferedBytes(), and the chFinEvent/chWriteClosed/die selects. No stream method constructs the snapshot; the patch only moves streamConsumed/streamWindow to stream.recordConsumed/window.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The per-stream snapshot construction — identity, cumulative counters, in-flight and peer-window values, buffered volume, and the read-closed/write-closed/closed flags — is assembled by the stream itself, while the session-side entry point still resolves a stream id through the session's stream table and preserves the not-found behavior for unknown or already-removed stream ids.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only moves streamConsumed/streamWindow from session.go to stream.go as stream methods; it does not touch stats.go or the scheduler queue. The injected Session.ShaperBacklog remains and still reads scheduler internals directly, e.g. queuedFrames = uint64(atomic.LoadInt64(&sq.count)), for elem := sq.rrList.Front(); ..., h := sq.streams[sid], and h.Len(). Thus the queued-frames/queued-bytes aggregation is not computed by the scheduler queue itself, and session-side code still reads the queue's pending counter, round-robin list, and per-stream heap table directly.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The queued-frames and queued-payload-bytes aggregation for the write scheduler is computed by the scheduler queue itself under its own synchronization discipline, and session-side code no longer reads the queue's pending counter, round-robin list or per-stream heap table directly.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch touches only session.go and stream.go and contains no hunks modifying stats.go or the exported introspection surface; StreamStats(sid uint32) (StreamAccounting, bool) and ShaperBacklog() (queuedFrames, queuedBytes uint64) remain with their names, signatures, and non-blocking sampling semantics unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The session-facing introspection surface keeps operating with unchanged exported names, signatures and observable semantics: the per-stream accounting lookup callable by stream id with its found flag, and the scheduler backlog pair, both remaining non-blocking samples of live state.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "stream.go rewires all three sites off session mediation: tryReadV2 uses `notifyConsumed = s.recordConsumed(n)`, writeToV2 uses `notifyConsumed = s.recordConsumed(int(bufLen))`, and writeV2 uses `win, windowOk := s.window()`. session.go deletes `Session.streamConsumed` and `Session.streamWindow`, so these paths no longer hand a stream to a session method for computation.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "All three production call sites that were rewired onto session-level mediation — the v2 direct-read accounting, the ReadTo-style accounting, and the v2 write-path window gate — now call their owner-side equivalents directly, with no call path still handing a stream to a session method so the session can compute on it.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The relocation preserves the existing discipline: stream.recordConsumed documents that the caller must hold bufferLock and mutates s.numRead/s.incr directly, with call sites in tryReadV2 and writeToV2 invoking it before s.bufferLock.Unlock(). stream.window keeps the same atomic sampling as the removed Session.streamWindow, using atomic.LoadUint32 for s.numWritten, s.peerConsumed, and s.peerWindow.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Concurrency discipline carries across the relocation: consumption counters keep being mutated under the same stream buffer discipline the accounting call sites already apply, and window arithmetic keeps using atomic loads for the written, consumed and advertised counters it samples.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only relocates unexported helpers: it removes Session.streamConsumed and Session.streamWindow and adds stream.recordConsumed and stream.window, updating call sites from s.sess.streamConsumed(...) to s.recordConsumed(...) and s.sess.streamWindow(s) to s.window(). No exported types, methods, or signatures in the package surface are renamed, removed, or altered.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No exported construct of the pinned revision loses its name, signature or meaning as a side effect of the move (the exported stream wrapper keeps its behavior, and any internal relocation stays invisible in the package's existing exported surface).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The relocated stream methods are lock-light: stream.recordConsumed only mutates stream-local counters (numRead/incr) while the caller holds bufferLock and acquires no other locks or channels; stream.window uses atomic loads with no locks. The unchanged ShaperBacklog samples sq.count atomically and walks the scheduler lists without taking the shaper mutex, and StreamStats releases streamLock before its non-blocking select/default channel probes, so no relocated site introduces new cross-component lock nesting or blocking under a held lock.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Relocated aggregation stays lock-light and consistent with the existing lock order: if the scheduler backlog takes the queue's mutex, it does not acquire other locks or perform blocking channel operations while holding it, and no other relocated site introduces a new cross-component lock nesting.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent.patch removes both session-level stream-operand helpers entirely from session.go: `func (s *Session) streamConsumed(st *stream, n int) uint32` and `func (s *Session) streamWindow(st *stream) (win int32, windowOk bool)` are deleted with their full bodies. Call sites in stream.go are updated to use new stream-owned methods `s.recordConsumed(n)` and `s.window()` instead, so no operand-taking session helper survives alongside the new seams.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The session-level helper methods that take a stream as an operand are gone entirely — declarations and bodies removed — rather than surviving alongside the new owner-side seams.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch removes Session.streamConsumed and Session.streamWindow from session.go entirely and rewrites the tryReadV2, writeToV2, and writeV2 call sites to call s.recordConsumed and s.window; the new stream methods are used and no obsolete session-side copy of the consumption or window logic is left behind.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No dead or bypassed copy of the relocated logic stays behind: no unused method, unreached branch or orphaned body duplicating the consumption, window, scanning or aggregation behavior remains once the owner-side seams are in place.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch deletes Session.streamConsumed and Session.streamWindow, updates both call sites to s.recordConsumed and s.window, and rewrites the stale writeV2 comment that pointed to Session.streamWindow() to reference window() instead. No remaining doc or field notes in the patch direct readers to the removed session helpers, and the smell added no imports for the deleted session code, so no import cleanup was required.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Vestigial consequences of the move are cleaned up: imports that only served the removed session-side code are dropped, and no doc comments or field notes keep directing readers to the removed session-level helpers.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's new stream.recordConsumed preserves the exact announcement trigger: `s.numRead += uint32(n); s.incr += uint32(n); if s.incr >= s.windowUpdateThreshold || s.numRead == uint32(n) { notifyConsumed := s.numRead; s.incr = 0; return notifyConsumed }; return 0`, matching the original stream.go rule (first read OR accumulated-increment threshold, with incr reset on announce). tryReadV2 and writeToV2 each call recordConsumed once under bufferLock and assign the result to notifyConsumed, so there is no fire-every-read, never-fire, or double-announce change.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Consumed-bytes announcements are emitted on a different rule than before: they stop firing on a stream's first read or on the accumulated-increment threshold, fire on every read, never fire, or double-announce the same consumption, changing flow-control for the peer.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The moved window logic remains on the stream in stream.window(), which still computes `inflight := int32(atomic.LoadUint32(&s.numWritten) - atomic.LoadUint32(&s.peerConsumed))` and returns `0, false` when `inflight < 0`. writeV2 calls `win, windowOk := s.window()` and preserves the distinct error path: `if !windowOk { return 0, ErrConsumed }`. The negative in-flight guard is not clamped, retried, or treated as valid.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Malformed peer accounting gets silently absorbed during the move: negative in-flight accounting is clamped to zero, retried, or treated as valid, instead of surfacing the same distinct write error the v2 write path returns today.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In stream.go, tryReadV2 calls `notifyConsumed = s.recordConsumed(n)` before `s.bufferLock.Unlock()`, and writeToV2 calls `s.recordConsumed(int(bufLen))` before `s.bufferLock.Unlock()`. The new `func (s *stream) recordConsumed` documents that the caller must hold bufferLock and mutates `s.numRead`, `s.incr`, tests `windowUpdateThreshold`, and resets `incr` only within that held section. The session-level `streamConsumed` that reached through the stream is removed, so the update-test-reset sequence stays serialized with the ring operations it mirrors.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Consumption counters mutate outside the buffer discipline the accounting call sites previously held: the sequence advancing the read counter and increment, testing the threshold and resetting the increment is no longer serialized with the ring operations it mirrors.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch moves streamConsumed/streamWindow from Session to stream.recordConsumed/stream.window and does not modify the introspection surface in stats.go. No added sampling code waits on transport channels or acquires the scheduler queue mutex while holding another lock; the changes are confined to flow-control bookkeeping on the stream itself, preserving the non-blocking diagnostic path required by the request.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The introspection surface blocks or deadlocks the live transport: sampling now waits on transport channels, or a relocated aggregate holds the scheduler queue's mutex while acquiring another lock, freezing the send, receive or scheduler loops.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch moves the v2 accounting back onto the stream as recordConsumed and window, and calls them only from v2 paths: tryReadV2, writeToV2, and writeV2. No diff modifies writeV1/readV1 or Session.returnTokens, so v1 consumed announcements, token-return behavior, and accounting are unchanged, and v2-only state is not introduced into v1 accounting.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The non-v2 stream paths change behavior as a side effect: version-1 reads start emitting consumed announcements or alter token-return behavior, or version-2-only state starts being consumed by version-1 accounting.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 0.5
+  },
+  "valid_count": 18,
+  "pass_count": 15,
+  "must_have_pass": false,
+  "macro_score": 0.875
+}

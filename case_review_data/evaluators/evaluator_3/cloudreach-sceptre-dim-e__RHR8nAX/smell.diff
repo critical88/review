@@ -1,0 +1,439 @@
+diff --git a/sceptre/config/reader.py b/sceptre/config/reader.py
+index 0d93e34..8434352 100644
+--- a/sceptre/config/reader.py
++++ b/sceptre/config/reader.py
+@@ -372,81 +372,117 @@ class ConfigReader(object):
+                 'Config file "{0}" not found.'.format(rel_path)
+             )
+ 
+-        # Parse and read in the config files.
+-        this_config = self._recursive_read(directory_path, filename, config)
+-        # Apply merge strategies with the config that includes base_config values.
+-        this_config.update(self._get_merge_with_stratgies(config, this_config))
+-        config.update(this_config)
+-
+-        self._check_version(config)
+-
+-        self.logger.debug("Config: %s", config)
+-        return config
+-
+-    def _recursive_read(
+-        self, directory_path: str, filename: str, stack_group_config: dict
+-    ) -> dict:
+-        """
+-        Traverses the directory_path, from top to bottom, reading in all
+-        relevant config files. If config attributes are encountered further
+-        down the StackGroup they are merged with the parent as defined in the
+-        `CONFIG_MERGE_STRATEGIES` dict.
+-
+-        :param directory_path: Relative directory path to config to read.
+-        :param filename: File name for the config to read.
+-        :param stack_group_config: The loaded config file for the StackGroup
+-        :returns: Representation of inherited config.
+-        """
+-
+-        parent_directory = path.split(directory_path)[0]
+-
+-        # Base condition for recursion
+-        config = {}
+-
+-        if directory_path:
+-            config = self._recursive_read(
+-                parent_directory, filename, stack_group_config
++        # Walk the StackGroup chain from the requested node up to the config
++        # root, then render the layers top-down so each layer inherits the one
++        # above it. The directory chain is materialised explicitly so the
++        # inherited configuration can be folded in without recursion.
++        inherited_directories = []
++        boundary_directory = directory_path
++        while True:
++            inherited_directories.append(boundary_directory)
++            boundary_directory = path.split(boundary_directory)[0]
++            if not boundary_directory:
++                inherited_directories.append(boundary_directory)
++                break
++        inherited_directories.reverse()
++
++        accumulated_config = {}
++        for current_directory in inherited_directories:
++            # The properties accumulated so far ride along as the inheritance
++            # context for the next layer so the renderer can interpolate
++            # stack-group-relative references against the parent chain.
++            inherited_group_config = config.copy()
++            inherited_group_config.update(accumulated_config)
++
++            self.logger.debug(
++                "Rendering config layer at '%s' against inherited context",
++                current_directory,
++            )
++            rendered_layer = (
++                self._render(current_directory, filename, inherited_group_config)
++                or {}
+             )
+ 
+-        # Combine the stack_group_config with the nested config dict
+-        config_group = stack_group_config.copy()
+-        config_group.update(config)
+-
+-        # Read config file and overwrite inherited properties
+-        child_config = self._render(directory_path, filename, config_group) or {}
+-        child_config.update(self._get_merge_with_stratgies(config, child_config))
+-        config.update(child_config)
+-        return config
++            # Compute the merge against the inherited configuration inline so
++            # the layer's merged contribution is folded straight into the
++            # accumulator without delegating to a separate helper.
++            layer_merge = {}
++            for merge_key, default_strategy in CONFIG_MERGE_STRATEGIES.items():
++                resolved_strategy = default_strategy
++                inheritance_key = f"{merge_key}_inheritance"
++                if inheritance_key in CONFIG_MERGE_STRATEGIES:
++                    resolved_name = CONFIG_MERGE_STRATEGIES[inheritance_key](
++                        accumulated_config.get(inheritance_key),
++                        rendered_layer.get(inheritance_key),
++                    )
++                    if not resolved_name:
++                        resolved_strategy = default_strategy
++                    elif resolved_name not in CONFIG_MERGE_STRATEGY_OVERRIDES[merge_key]:
++                        raise SceptreException(
++                            f"{resolved_name} is not a valid inheritance strategy "
++                            f"for {merge_key}"
++                        )
++                    else:
++                        resolved_strategy = CONFIG_MERGE_STRATEGY_OVERRIDES[
++                            merge_key
++                        ][resolved_name]
++
++                merged_value = resolved_strategy(
++                    accumulated_config.get(merge_key),
++                    rendered_layer.get(merge_key),
++                )
++                if merged_value:
++                    layer_merge[merge_key] = merged_value
+ 
+-    def _get_merge_with_stratgies(self, left: dict, right: dict) -> dict:
+-        """
+-        Returns a new dict with only the merge values of the two inputs, using the
+-        merge strategies defined for each key.
+-        """
+-        merge = {}
+-
+-        # Then apply the merge strategies to each item
+-        for config_key, default_strategy in CONFIG_MERGE_STRATEGIES.items():
+-            strategy = default_strategy
+-            override_key = f"{config_key}_inheritance"
+-            if override_key in CONFIG_MERGE_STRATEGIES:
+-                name = CONFIG_MERGE_STRATEGIES[override_key](
+-                    left.get(override_key), right.get(override_key)
++            self.logger.debug(
++                "Layer '%s' merged %d keys into the inherited configuration",
++                current_directory,
++                len(layer_merge),
++            )
++            rendered_layer.update(layer_merge)
++            accumulated_config.update(rendered_layer)
++
++        this_config = accumulated_config
++
++        # Apply the same merge strategies one final time against the base
++        # config so keys that live purely on the base (project path, stack
++        # group path, caller supplied defaults) merge with the fully read
++        # configuration before it is committed to the result.
++        base_merge = {}
++        for merge_key, default_strategy in CONFIG_MERGE_STRATEGIES.items():
++            resolved_strategy = default_strategy
++            inheritance_key = f"{merge_key}_inheritance"
++            if inheritance_key in CONFIG_MERGE_STRATEGIES:
++                resolved_name = CONFIG_MERGE_STRATEGIES[inheritance_key](
++                    config.get(inheritance_key),
++                    this_config.get(inheritance_key),
+                 )
+-                if not name:
+-                    pass
+-                elif name not in CONFIG_MERGE_STRATEGY_OVERRIDES[config_key]:
++                if not resolved_name:
++                    resolved_strategy = default_strategy
++                elif resolved_name not in CONFIG_MERGE_STRATEGY_OVERRIDES[merge_key]:
+                     raise SceptreException(
+-                        f"{name} is not a valid inheritance strategy for {config_key}"
++                        f"{resolved_name} is not a valid inheritance strategy "
++                        f"for {merge_key}"
+                     )
+                 else:
+-                    strategy = CONFIG_MERGE_STRATEGY_OVERRIDES[config_key][name]
++                    resolved_strategy = CONFIG_MERGE_STRATEGY_OVERRIDES[merge_key][
++                        resolved_name
++                    ]
++
++            merged_value = resolved_strategy(
++                config.get(merge_key),
++                this_config.get(merge_key),
++            )
++            if merged_value:
++                base_merge[merge_key] = merged_value
++
++        this_config.update(base_merge)
++        config.update(this_config)
+ 
+-            value = strategy(left.get(config_key), right.get(config_key))
+-            if value:
+-                merge[config_key] = value
++        self._check_version(config)
+ 
+-        return merge
++        self.logger.debug("Config: %s", config)
++        return config
+ 
+     def _render(self, directory_path, basename, stack_group_config):
+         """
+diff --git a/sceptre/stack.py b/sceptre/stack.py
+index b4b42e5..488a82e 100644
+--- a/sceptre/stack.py
++++ b/sceptre/stack.py
+@@ -220,79 +220,131 @@ class Stack:
+         self.dependencies = dependencies or []
+         self.protected = protected
+         self.on_failure = on_failure
+-        self.disable_rollback = self._ensure_boolean(
+-            "disable_rollback", disable_rollback
+-        )
++
++        # Coerce disable_rollback to a boolean, running the boolean-type guard
++        # that used to live in a dedicated helper straight inside the
++        # constructor so the validated value is stored directly.
++        if not isinstance(disable_rollback, bool):
++            raise InvalidConfigFileError(
++                f"{self.name}: Value for disable_rollback must be a boolean, "
++                f"not a {type(disable_rollback).__name__}"
++            )
++        self.disable_rollback = disable_rollback
++
+         self.stack_group_config = stack_group_config or {}
+         self.config = config or {}
+         self.stack_timeout = stack_timeout
+         self.profile = profile
+         self.template_key_prefix = template_key_prefix
+-        self._set_field_with_deprecated_alias(
+-            "sceptre_role_session_duration",
+-            sceptre_role_session_duration,
+-            "iam_role_session_duration",
+-            iam_role_session_duration,
+-        )
+-        self.ignore = self._ensure_boolean("ignore", ignore)
+-        self.obsolete = self._ensure_boolean("obsolete", obsolete)
++
++        # Resolve the sceptre role session duration, preferring the current
++        # attribute name and falling back to the deprecated iam role alias.
++        # The deprecated-alias fallback uses setattr so the
++        # iam_role_session_duration property setter redirects the value onto
++        # sceptre_role_session_duration.
++        if sceptre_role_session_duration and iam_role_session_duration:
++            raise InvalidConfigFileError(
++                "Both 'sceptre_role_session_duration' and 'iam_role_session_duration' are set. "
++                "You should only set a value for sceptre_role_session_duration because "
++                "iam_role_session_duration is deprecated."
++            )
++        elif sceptre_role_session_duration:
++            setattr(self, "sceptre_role_session_duration", sceptre_role_session_duration)
++        elif iam_role_session_duration:
++            setattr(self, "iam_role_session_duration", iam_role_session_duration)
++        else:
++            setattr(self, "sceptre_role_session_duration", sceptre_role_session_duration)
++
++        # Coerce ignore and obsolete to booleans through the same boolean-type
++        # guard that was folded in for disable_rollback.
++        if not isinstance(ignore, bool):
++            raise InvalidConfigFileError(
++                f"{self.name}: Value for ignore must be a boolean, "
++                f"not a {type(ignore).__name__}"
++            )
++        self.ignore = ignore
++        if not isinstance(obsolete, bool):
++            raise InvalidConfigFileError(
++                f"{self.name}: Value for obsolete must be a boolean, "
++                f"not a {type(obsolete).__name__}"
++            )
++        self.obsolete = obsolete
+ 
+         self._template = None
+         self._connection_manager = None
+ 
+         # Resolvers and hooks need to be assigned last
+         self.s3_details = s3_details
+-        self._set_field_with_deprecated_alias(
+-            "sceptre_role", sceptre_role, "iam_role", iam_role
+-        )
++
++        # Resolve the sceptre role, preferring the sceptre_role attribute and
++        # falling back to the deprecated iam_role alias.
++        if sceptre_role and iam_role:
++            raise InvalidConfigFileError(
++                "Both 'sceptre_role' and 'iam_role' are set. "
++                "You should only set a value for sceptre_role because iam_role is deprecated."
++            )
++        elif sceptre_role:
++            setattr(self, "sceptre_role", sceptre_role)
++        elif iam_role:
++            setattr(self, "iam_role", iam_role)
++        else:
++            setattr(self, "sceptre_role", sceptre_role)
++
+         self.tags = tags or {}
+-        self._set_field_with_deprecated_alias(
+-            "cloudformation_service_role",
+-            cloudformation_service_role,
+-            "role_arn",
+-            role_arn,
+-        )
+-        self.template_bucket_name = template_bucket_name
+-        self._set_field_with_deprecated_alias(
+-            "template_handler_config",
+-            template_handler_config,
+-            "template_path",
+-            template_path,
+-            required=True,
+-            preferred_config_name="template",
+-        )
+ 
+-        self.s3_details = s3_details
+-        self.parameters = self._cast_parameters(parameters or {})
+-        self.sceptre_user_data = sceptre_user_data or {}
+-        self.notifications = notifications or []
++        # Resolve the CloudFormation service role, preferring the current
++        # cloudformation_service_role attribute and falling back to role_arn.
++        if cloudformation_service_role and role_arn:
++            raise InvalidConfigFileError(
++                "Both 'cloudformation_service_role' and 'role_arn' are set. "
++                "You should only set a value for cloudformation_service_role because role_arn is deprecated."
++            )
++        elif cloudformation_service_role:
++            setattr(self, "cloudformation_service_role", cloudformation_service_role)
++        elif role_arn:
++            setattr(self, "role_arn", role_arn)
++        else:
++            setattr(self, "cloudformation_service_role", cloudformation_service_role)
+ 
+-        self.hooks = hooks or {}
++        self.template_bucket_name = template_bucket_name
+ 
+-    def _ensure_boolean(self, config_name: str, value: Any) -> bool:
+-        if not isinstance(value, bool):
++        # Resolve the template handler configuration, preferring the 'template'
++        # config key and falling back to the deprecated template_path alias. The
++        # 'template' key is required, so a missing value raises rather than
++        # storing an empty configuration.
++        if template_handler_config and template_path:
+             raise InvalidConfigFileError(
+-                f"{self.name}: Value for {config_name} must be a boolean, not a {type(value).__name__}"
++                "Both 'template' and 'template_path' are set. "
++                "You should only set a value for template because template_path is deprecated."
+             )
+-        return value
++        elif template_handler_config:
++            setattr(self, "template_handler_config", template_handler_config)
++        elif template_path:
++            setattr(self, "template_path", template_path)
++        else:
++            raise InvalidConfigFileError("template is a required Stack Config.")
++
++        self.s3_details = s3_details
+ 
+-    def _cast_parameters(
+-        self, parameters: Dict[str, Any]
+-    ) -> Dict[str, Union[str, List[Union[str, Resolver]], Resolver]]:
+-        """Cast CloudFormation parameters to valid types"""
++        # Cast CloudFormation parameters inline: every value is coerced to a
++        # string (or a list of strings / resolver), the resulting shape is
++        # validated against the allowed expression types, and the validated
++        # mapping is stored as parameters. The casting and validation helpers
++        # are nested here so the constructor owns the whole transformation.
++        resolved_parameters = parameters or {}
+ 
+-        def cast_value(value: Any) -> Union[str, List[Union[str, Resolver]], Resolver]:
++        def _cast_value(value: Any) -> Union[str, List[Union[str, Resolver]], Resolver]:
+             if isinstance(value, bool):
+                 return "true" if value else "false"
+             elif isinstance(value, (int, float)):
+                 return str(value)
+             elif isinstance(value, list):
+-                return [cast_value(item) for item in value]
++                return [_cast_value(item) for item in value]
+             elif isinstance(value, Resolver):
+                 return value
+             return value
+ 
+-        def is_valid(value: Any) -> bool:
++        def _is_valid_parameter(value: Any) -> bool:
+             return (
+                 isinstance(value, str)
+                 or (
+@@ -305,19 +357,27 @@ class Stack:
+                 or isinstance(value, Resolver)
+             )
+ 
+-        if not isinstance(parameters, dict):
++        if not isinstance(resolved_parameters, dict):
+             raise InvalidConfigFileError(
+-                f"{self.name}: parameters must be a dictionary of key-value pairs, got {parameters}"
++                f"{self.name}: parameters must be a dictionary of key-value pairs, "
++                f"got {resolved_parameters}"
+             )
+ 
+-        casted_parameters = {k: cast_value(v) for k, v in parameters.items()}
++        casted_parameters = {k: _cast_value(v) for k, v in resolved_parameters.items()}
+ 
+-        if not all(is_valid(value) for value in casted_parameters.values()):
++        if not all(
++            _is_valid_parameter(value) for value in casted_parameters.values()
++        ):
+             raise InvalidConfigFileError(
+-                f"{self.name}: Values for parameters must be strings, lists or resolvers, got {casted_parameters}"
++                f"{self.name}: Values for parameters must be strings, lists or resolvers, "
++                f"got {casted_parameters}"
+             )
++        self.parameters = casted_parameters
+ 
+-        return casted_parameters
++        self.sceptre_user_data = sceptre_user_data or {}
++        self.notifications = notifications or []
++
++        self.hooks = hooks or {}
+ 
+     def __repr__(self):
+         return (
+@@ -437,35 +497,3 @@ class Stack:
+     )
+     def template_path(self, value: str):
+         self.template_handler_config = {"type": "file", "path": value}
+-
+-    def _set_field_with_deprecated_alias(
+-        self,
+-        preferred_attribute_name,
+-        preferred_value,
+-        deprecated_attribute_name,
+-        deprecated_value,
+-        *,
+-        required=False,
+-        preferred_config_name=None,
+-        deprecated_config_name=None,
+-    ):
+-        # This is a generic truthiness check. All current default values are falsy, so this should work.
+-        # If we ever use this function where the default value is NOT falsy, this will be a problem.
+-        preferred_config_name = preferred_config_name or preferred_attribute_name
+-        deprecated_config_name = deprecated_config_name or deprecated_attribute_name
+-
+-        if preferred_value and deprecated_value:
+-            raise InvalidConfigFileError(
+-                f"Both '{preferred_config_name}' and '{deprecated_config_name}' are set. You should only set a "
+-                f"value for {preferred_config_name} because {deprecated_config_name} is deprecated."
+-            )
+-        elif preferred_value:
+-            setattr(self, preferred_attribute_name, preferred_value)
+-        elif deprecated_value:
+-            setattr(self, deprecated_attribute_name, deprecated_value)
+-        elif required:
+-            raise InvalidConfigFileError(
+-                f"{preferred_config_name} is a required Stack Config."
+-            )
+-        else:  # In case they're both falsy, we should just set the value using the preferred value.
+-            setattr(self, preferred_attribute_name, preferred_value)

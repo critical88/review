@@ -1,0 +1,191 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "R1 requires the settlement-state decisions for an existing record (error rethrow, response return after lifespan refresh, in-flight promise rethrow) to be made inside the cache record structure that owns that state. The agent's patch leaves all of these decisions in src/query.ts at the call site: it still probes `Object.prototype.hasOwnProperty.call(entry, 'error')` and `entry.response`, juggles `entry.timeout` via `clearTimeout`/`setTimeout(entry.remove, config.lifespan)` directly on the record, and throws `entry.error`/`entry.promise` or returns `entry.response` from the coordinator. CacheEntry gained no behavior methods (it remains a public-field data holder); only CacheRegistry gained find/remove/clear. This is exactly the outside-in field access and timer juggling the refactor request says is 'not what we mean'.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "For a record that already exists when a render-phase read or warm-up consults it, every settlement-state decision — that an error was captured and the read must rethrow it, that a response settled and the read returns it after refreshing expiry when a lifespan is configured, or that the record is still in flight and its promise is rethrown — is made inside the cache record structure that owns that state, not by the requesting code probing record fields (e.g. presence probes on error/response fields or timer juggling on the record) at the call site.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch leaves CacheEntry a passive bag: its constructor in src/cache.ts still only accepts `keys` and `equal`. In src/query.ts, after `const created = new CacheEntry({ keys, equal: config.equal })`, the requesting code still assigns `created.remove = () => store.remove(created)`, `created.promise = ...`, and inside the promise handlers sets `created.response`, `created.timeout`, and `created.error`. The promise chain, expiry timer installation, and removal callback are therefore still wired by query() after construction, not during construction or an owner-level creation path.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Creating a new record completes its lifecycle wiring where record state lives: the promise chain that stores the settled response and captures a rejected error, installation of the expiry timer when a lifespan is configured, and the record's removal/eviction callback are attached during construction (or an equivalent owner-level creation path), instead of being assigned onto the record's promise, timeout and removal fields by the requesting code after construction.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The request calls out duplicated key-matching knowledge, and smell.diff shows shallowEqualArrays(keys, entry.keys, entry.equal) repeated in query, peek, and clear. The patch centralizes matching in CacheRegistry.find (src/cache.ts) and rewrites peek/clear/query to call registry.find/store.find, removing shallowEqualArrays imports from src/index.ts and src/query.ts.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Deciding whether a record matches given keys — comparing the stored keys with the caller-configured comparator — is behavior owned by the record (or by the collection the record belongs to) and is not re-implemented by each cache-consulting call site.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch moves membership behavior into CacheRegistry: it adds find(keys) (encapsulating the shallowEqualArrays scan), remove(entry) (encapsulating indexOf/splice), and clear(keys?) (encapsulating both empty-all and find-then-remove-by-keys). Callers no longer touch the array directly: index.ts peek calls registry.find(keys)?.response and clear calls registry.clear(keys); query.ts uses store.find(keys), store.remove(created) for the entry's remove callback, and store.register(created). No cache-boundary caller iterates, indexes, or splices registry.entries directly.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The collection of live records owns its membership: registering a record, finding the record for given keys, removing a record (found by record or by keys), and emptying the collection are behaviors of the collection structure, and no cache-boundary caller iterates, indexes or splices the live-entry array directly.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The expiry refresh still lives in the requesting path (src/query.ts), not inside CacheEntry. In the settled-response branch, query.ts directly manipulates the record's timer/removal fields: `if (entry.timeout) clearTimeout(entry.timeout); entry.timeout = setTimeout(entry.remove, config.lifespan)`. The patch to src/cache.ts adds find/remove/clear methods only to CacheRegistry and leaves CacheEntry as a plain field bag with no refresh method, so requesting paths still perform the timer dance through the record's fields rather than triggering it.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Expiry refresh for a settled record with a configured lifespan (canceling any pending timer and re-arming it) lives inside the structure that owns the timer field, so requesting paths only trigger the refresh rather than performing it through the record's timer and removal fields.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The refactor request asks that record-keeping behavior (matching, settlement, expiry, eviction) live with the record/registry and that the coordinator/helpers coordinate through it rather than inspecting/mutating fields. The patch moves matching and eviction to CacheRegistry (find/remove/clear) and routes peek/clear/query through those for lookup/eviction, but src/query.ts still carries settlement probing and expiry handling itself: it probes `Object.prototype.hasOwnProperty.call(entry, 'error')`/`'response'`, throws `entry.error`/`entry.promise`, mutates `entry.timeout`/`created.timeout` via `clearTimeout`/`setTimeout`, and sets `created.response`/`created.error` directly. Thus the render/warm-up coordinator still inspects and mutates CacheEntry fields instead of routing settlement/expiry through an owner-behavior surface.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every cache-consulting path in the package — the render/warm-up lifecycle coordinator, the exported inspection helper, and the exported invalidation helper — is updated to route through the new owner-behavior surface, so no call path at the cache boundary still carries its own copy of matching, settlement probing, expiry handling or eviction.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The entrypoint src/index.ts still exports exactly `export { suspend, clear, preload, peek }` with unchanged signatures: `suspend(fn, keys?, config?)`, `preload(fn, keys?, config?)`, `peek(keys)`, and `clear(keys?)`. The new owner-behavior methods (`CacheRegistry.find`, `remove`, `clear`) are added only to the internal `src/cache.ts` class and are not re-exported from the package entrypoint, so external callers require no modification.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The new owner-behavior surface stays internal to the package: the public export list and the signatures of the four public operations from the entrypoint are unchanged, with callers outside the package requiring no modification.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "CacheRegistry gains find/remove/clear methods that own key-matching and removal, and the callers are updated to use them: query.ts calls store.find(keys) and store.remove(created), while index.ts peek/clear delegate to registry.find/registry.clear. This relocates the duplicated matching/removal decisions into the registry data structure rather than merely renaming the old outside-in loops.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The reorganization does not merely relabel the same outside-in arrangement — e.g. the record stays a passive data holder whose fields are still shuttled in and out of it, or the old probing/matching code is renamed as a manager/service/worker module that keeps making the identical field decisions, with no decision actually owned by the data structures.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "src/cache.ts imports `shallowEqualArrays` from `./utils` and uses it inside `CacheRegistry.find`, while src/query.ts imports `isPromise` from `./utils`; src/index.ts drops its `shallowEqualArrays` import and delegates peek/clear to registry methods. No private copies of the thenable test or shallow key-array equality predicate are introduced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Shared plain-data predicates used by the cache layer (the thenable test and shallow key-array equality with an optional comparator) are reused from one place by the owners, not duplicated as private copies inside each structure or call path.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch does not remove the `CacheRecord` type alias from src/cache.ts. The smell introduced both `export type CacheRecord<Keys> = { promise; keys; equal; error; response; timeout; remove }` and the `CacheEntry` class with the same seven fields; the agent's diff only adds an import and registry methods and never deletes `CacheRecord`, which still appears in the constructor as `Pick<CacheRecord<Keys>, 'keys' | 'equal'>`. Thus the duplicate record shape coexists with the class.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No duplicate declaration of the record's shape (a type alias or interface mirroring the record class's fields) is left coexisting alongside the class — the canonical shape of a cache record is declared in exactly one place after the reorganization.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch keeps the externally assigned record fields the rubric targets. src/cache.ts still declares `public promise!: Promise<unknown>` and `public remove!: () => void` on CacheEntry, and src/query.ts still wires them from outside: `created.remove = () => store.remove(created)` and `created.promise = (isPromise(fn) ? fn : fn(...keys))...then(...).catch(...)`. These write-once slots exist only so request-coordinating code can fill them in, matching the problem statement's warning against 'outside-in field access' and 'pushing the same external fill-in through setters and renamed accessors.'",
+      "valid": true,
+      "attempts": 3,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "No record fields survive that exist solely so outside code can wire the record up — e.g. a publicly writable removal callback or promise slot whose only writer is request-coordinating code — beyond the fields the structures genuinely use internally.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "In the agent's src/query.ts, the matched-entry branch preserves all three Suspense transitions: it throws `entry.error` when `hasOwnProperty(entry, 'error')`, returns `entry.response` without suspending when `hasOwnProperty(entry, 'response')`, and throws `entry.promise` while in flight (`if (!preload) throw entry.promise`). New entries still register via `store.register(created)` and throw `created.promise` on first read, with `created.promise` settling into `created.response` or `created.error`. The refactor only moves lookup/removal into `CacheRegistry.find/remove/clear`; the matching (`shallowEqualArrays`) and settlement logic is unchanged, so the in-flight→retry, settled→return, and rejected→rethrow flows remain intact.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The Suspense flow stays intact: while a record is in flight, a render-phase read hands the in-flight promise to React and settles on retry; once settled, the same read returns the response without suspending again; after a rejection, every subsequent read rethrows the captured error until the record is dropped.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "src/query.ts retains `if (keys === null) keys = [fn] as unknown as Keys`, preserving identity-keying for keyless calls. src/cache.ts `find(keys)` delegates to `shallowEqualArrays(keys, entry.keys, entry.equal)`, preserving shallow array matching and passing the per-entry `equal` comparator. src/utils.ts (from problem statement) `shallowEqualArrays` invokes `equal(arrA[i], arrB[i])`, so the comparator receives the corresponding key elements of the compared records.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Key semantics stay precise: a call without keys still keys on the function/promise identity itself, and a call with keys matches shallowly across the key arrays, with an optional caller-provided comparator receiving the corresponding key elements of the compared records.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In src/query.ts, the matched-response branch still refreshes expiry: `if (config.lifespan && config.lifespan > 0) { if (entry.timeout) clearTimeout(entry.timeout); entry.timeout = setTimeout(entry.remove, config.lifespan) }` before returning `entry.response`. The resolve handler still schedules initial expiry: `if (config.lifespan && config.lifespan > 0) { created.timeout = setTimeout(created.remove, config.lifespan) }`. Removal is delegated to `created.remove = () => store.remove(created)`, which splices the entry out of `store.entries`, so an expired record is no longer found by `peek`/`registry.find` and a later read creates a fresh entry. This preserves the original lifespan semantics.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Lifespan semantics stay intact: reading a settled record with a configured lifespan refreshes its expiry, and once expired the record is no longer visible to inspection while a later read starts a fresh record instead of resurrecting the old one.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In src/index.ts, `peek` is `registry.find(keys)?.response`, which only reads existing entries through `CacheRegistry.find` (src/cache.ts) using `shallowEqualArrays`; it never creates entries, invokes request functions, or throws, and returns the stored `response` or `undefined`. `preload` still calls `query(registry, fn, keys, true, config)`; in src/query.ts, when `preload` is true it returns `undefined` on a match and, for a new entry, registers it then skips the `if (!preload) throw created.promise` branch, so it populates the record without suspending and returns nothing. The registry's `find`/`remove`/`clear` methods replicate the prior matching/removal effects without changing peek/preload guarantees.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The non-rendering operations keep their exact effects: inspection stays inert (never throws, never starts a request, returns the settled value or undefined) and warm-up populates the record without suspending and returns nothing.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In src/cache.ts, CacheRegistry.clear preserves the exact invalidation contract: `if (keys === undefined || keys.length === 0) { this.entries.splice(0, this.entries.length) }` removes every record, while the else branch calls `this.find(keys)` (which uses shallowEqualArrays with the entry's equal) and then `this.remove(entry)`, which removes only that one entry by reference via `indexOf`/`splice`. src/index.ts delegates `clear` directly to `registry.clear(keys)`, so keyed removal still removes exactly the matching record and leaves all others untouched.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Invalidation stays exact: dropping with no argument (or an empty key array) removes every record, and dropping with keys removes exactly the record matching those keys while all others survive untouched.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0,
+    "associated_changes": 0.75,
+    "core_resolution": 0.4
+  },
+  "valid_count": 16,
+  "pass_count": 10,
+  "must_have_pass": false,
+  "macro_score": 0.5375
+}

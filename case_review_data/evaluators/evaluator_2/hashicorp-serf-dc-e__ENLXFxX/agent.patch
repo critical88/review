@@ -1,0 +1,418 @@
+diff --git a/serf/delegate.go b/serf/delegate.go
+index 9beb4d9..1321821 100644
+--- a/serf/delegate.go
++++ b/serf/delegate.go
+@@ -112,10 +112,12 @@ func (d *delegate) NotifyMsg(buf []byte) {
+ 		_, _ = reader.Read(raw)
+ 
+ 		d.serf.logger.Printf("[DEBUG] serf: Relaying response to addr: %s", header.DestAddr.String())
+-		destIP := header.DestAddr.IP
+-		destPort := int(header.DestAddr.Port)
+-		destNode := header.DestName
+-		d.forwardRelayedMessage(destIP, destPort, destNode, raw)
++		dest := nodeAddress{
++			Addr: header.DestAddr.IP,
++			Port: uint16(header.DestAddr.Port),
++			Name: header.DestName,
++		}
++		d.forwardRelayedMessage(dest, raw)
+ 		break
+ 
+ 	default:
+@@ -134,20 +136,14 @@ func (d *delegate) NotifyMsg(buf []byte) {
+ 	}
+ }
+ 
+-// forwardRelayedMessage sends the unwrapped payload of a relayed message on
+-// to the destination address, port and node name carried by its header.
+-func (d *delegate) forwardRelayedMessage(
+-	destIP net.IP,
+-	destPort int,
+-	destNode string,
+-	raw []byte,
+-) {
+-	udpAddr := net.UDPAddr{IP: destIP, Port: destPort}
+-	addr := memberlist.Address{
+-		Addr: udpAddr.String(),
+-		Name: destNode,
+-	}
+-	if err := d.serf.memberlist.SendToAddress(addr, raw); err != nil {
++// forwardRelayedMessage sends the unwrapped payload of a relayed message on to
++// the destination that its header names. The actual send — building the UDP
++// address and labeling it with the node name — is shared with every other
++// delivery path via sendToNode; this entry point keeps the delegate's own
++// error logging for relay forwarding.
++func (d *delegate) forwardRelayedMessage(dest nodeAddress, raw []byte) {
++	udpAddr := net.UDPAddr{IP: dest.Addr, Port: int(dest.Port)}
++	if err := d.serf.sendToNode(dest, raw); err != nil {
+ 		d.serf.logger.Printf("[ERR] serf: Error forwarding message to %s: %s", udpAddr.String(), err)
+ 	}
+ }
+diff --git a/serf/event.go b/serf/event.go
+index 923edcb..a2e0656 100644
+--- a/serf/event.go
++++ b/serf/event.go
+@@ -104,12 +104,10 @@ type Query struct {
+ 	Payload []byte
+ 
+ 	serf        *Serf
+-	id          uint32    // ID is not exported, since it may change
+-	addr        []byte    // Address to respond to
+-	port        uint16    // Port to respond to
+-	sourceNode  string    // Node name to respond to
+-	deadline    time.Time // Must respond by this deadline
+-	relayFactor uint8     // Number of duplicate responses to relay back to sender
++	id          uint32      // ID is not exported, since it may change
++	origin      nodeAddress // Reply endpoint of the node that issued the query
++	deadline    time.Time   // Must respond by this deadline
++	relayFactor uint8       // Number of duplicate responses to relay back to sender
+ 	respLock    sync.Mutex
+ }
+ 
+@@ -123,7 +121,7 @@ func (q *Query) String() string {
+ 
+ // SourceNode returns the name of the node initiating the query
+ func (q *Query) SourceNode() string {
+-	return q.sourceNode
++	return q.origin.Name
+ }
+ 
+ // Deadline returns the time by which a response must be sent
+@@ -171,7 +169,7 @@ func (q *Query) respondWithMessageAndResponse(raw []byte, resp messageQueryRespo
+ 	// Send the response directly to the originator, passing along every
+ 	// reply field the originator recorded with the query, and relay a copy
+ 	// through other nodes.
+-	if err := q.serf.sendQueryResponse(q.LTime, q.id, q.addr, q.port, q.sourceNode,
++	if err := q.serf.sendQueryResponse(q.LTime, q.id, q.origin,
+ 		q.relayFactor, raw, resp); err != nil {
+ 		return err
+ 	}
+diff --git a/serf/messages.go b/serf/messages.go
+index 6a2eb3b..41a3ccf 100644
+--- a/serf/messages.go
++++ b/serf/messages.go
+@@ -155,12 +155,12 @@ type relayHeader struct {
+ 	DestName string
+ }
+ 
+-// encodeRelayMessage wraps a message in the messageRelayType, adding the length and
+-// address of the end recipient to the front of the message
++// encodeRelayMessage wraps a message in the messageRelayType, stamping the end
++// recipient's reply endpoint — IP, port and node name — onto the relay header
++// that prefixes the message so the next hop can forward it on.
+ func encodeRelayMessage(
+ 	t messageType,
+-	addr net.UDPAddr,
+-	nodeName string,
++	dest nodeAddress,
+ 	msg any,
+ ) ([]byte, error) {
+ 	buf := bytes.NewBuffer(nil)
+@@ -170,8 +170,8 @@ func encodeRelayMessage(
+ 	buf.WriteByte(uint8(messageRelayType))
+ 
+ 	err := encoder.Encode(relayHeader{
+-		DestAddr: addr,
+-		DestName: nodeName,
++		DestAddr: net.UDPAddr{IP: dest.Addr, Port: int(dest.Port)},
++		DestName: dest.Name,
+ 	})
+ 	if err != nil {
+ 		return nil, err
+diff --git a/serf/messages_test.go b/serf/messages_test.go
+index 52430e7..ac41c3a 100644
+--- a/serf/messages_test.go
++++ b/serf/messages_test.go
+@@ -44,8 +44,9 @@ func TestEncodeMessage(t *testing.T) {
+ 
+ func TestEncodeRelayMessage(t *testing.T) {
+ 	in := &messageLeave{Node: "foo"}
+-	addr := net.UDPAddr{IP: net.IP{127, 0, 0, 1}, Port: 1234}
+-	raw, err := encodeRelayMessage(messageLeaveType, addr, "test", in)
++	ip := net.IP{127, 0, 0, 1}
++	dest := nodeAddress{Addr: ip, Port: 1234, Name: "test"}
++	raw, err := encodeRelayMessage(messageLeaveType, dest, in)
+ 	if err != nil {
+ 		t.Fatalf("err: %v", err)
+ 	}
+@@ -61,8 +62,8 @@ func TestEncodeRelayMessage(t *testing.T) {
+ 	if err := decoder.Decode(&header); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	if !reflect.DeepEqual(header.DestAddr, addr) {
+-		t.Fatalf("bad: %v, %v", header.DestAddr, addr)
++	if !reflect.DeepEqual(header.DestAddr, net.UDPAddr{IP: ip, Port: 1234}) {
++		t.Fatalf("bad: %v, %v", header.DestAddr, net.UDPAddr{IP: ip, Port: 1234})
+ 	}
+ 
+ 	messageType, err := reader.ReadByte()
+diff --git a/serf/query.go b/serf/query.go
+index ab612df..e49e44e 100644
+--- a/serf/query.go
++++ b/serf/query.go
+@@ -260,14 +260,46 @@ func (s *Serf) shouldProcessQuery(filters [][]byte) bool {
+ 	return true
+ }
+ 
++// nodeAddress names a node's reply endpoint by bundling the network address
++// (IP and port) used to reach it with that node's name. It is the single unit
++// a query carries so that every node that handles the query — or relays a
++// copy of a response, or an acknowledgement for redundancy through peers —
++// can route replies back to the originator. The address and port travel
++// together because a network destination is meaningless split apart, and the
++// name rides along so memberlist can label the recipient on the final hop.
++//
++// The wire representations keep their historical layout (messageQuery's
++// Addr/Port/SourceNode fields and relayHeader's DestAddr/DestName); nodeAddress
++// holds the same values once they have been decoded off the wire and up until
++// they are re-encoded for another hop, so the address, port and name no longer
++// need to be threaded through every handler as independently-coordinated
++// values.
++type nodeAddress struct {
++	Addr net.IP
++	Port uint16
++	Name string
++}
++
++// sendToNode delivers an already-encoded message directly over UDP to the node
++// at the given reply endpoint, addressing it by its IP, port and name.
++// Forwarding a relayed message, delivering a direct query response, and
++// relaying a copy of a response through a peer are the same operation from
++// memberlist's point of view, so they share this single entry point instead of
++// each rebuilding the target address from its individual parts.
++func (s *Serf) sendToNode(dest nodeAddress, raw []byte) error {
++	udpAddr := net.UDPAddr{IP: dest.Addr, Port: int(dest.Port)}
++	return s.memberlist.SendToAddress(memberlist.Address{
++		Addr: udpAddr.String(),
++		Name: dest.Name,
++	}, raw)
++}
++
+ // relayResponse will relay a copy of the given response to up to relayFactor
+ // other members, wrapping it so that it travels back to the query originator
+-// at the given address, port and node name.
++// at the given reply endpoint.
+ func (s *Serf) relayResponse(
+ 	relayFactor uint8,
+-	originAddr []byte,
+-	originPort int,
+-	originNode string,
++	origin nodeAddress,
+ 	resp *messageQueryResponse,
+ ) error {
+ 	if relayFactor == 0 {
+@@ -283,8 +315,7 @@ func (s *Serf) relayResponse(
+ 	}
+ 
+ 	// Prep the relay message, which is a wrapped version of the original.
+-	destAddr := net.UDPAddr{IP: originAddr, Port: originPort}
+-	raw, err := encodeRelayMessage(messageQueryResponseType, destAddr, originNode, &resp)
++	raw, err := encodeRelayMessage(messageQueryResponseType, origin, &resp)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to format relayed response: %v", err)
+ 	}
+@@ -298,29 +329,13 @@ func (s *Serf) relayResponse(
+ 		return m.Status != StatusAlive || m.ProtocolMax < 5 || m.Name == localName
+ 	})
+ 	for _, m := range relayMembers {
+-		if err := s.sendToMember(m.Addr, int(m.Port), m.Name, raw); err != nil {
++		if err := s.sendToNode(nodeAddress{Addr: m.Addr, Port: m.Port, Name: m.Name}, raw); err != nil {
+ 			return fmt.Errorf("failed to send relay response: %v", err)
+ 		}
+ 	}
+ 	return nil
+ }
+ 
+-// sendToMember forwards an already encoded message to the cluster member at
+-// the given address, port and name.
+-func (s *Serf) sendToMember(
+-	memberAddr net.IP,
+-	memberPort int,
+-	memberName string,
+-	raw []byte,
+-) error {
+-	udpAddr := net.UDPAddr{IP: memberAddr, Port: memberPort}
+-	relayAddr := memberlist.Address{
+-		Addr: udpAddr.String(),
+-		Name: memberName,
+-	}
+-	return s.memberlist.SendToAddress(relayAddr, raw)
+-}
+-
+ // kRandomMembers selects up to k members from a given list, optionally
+ // filtering by the given filterFunc
+ func kRandomMembers(k int, members []Member, filterFunc func(Member) bool) []Member {
+diff --git a/serf/serf.go b/serf/serf.go
+index c54ad01..d02164a 100644
+--- a/serf/serf.go
++++ b/serf/serf.go
+@@ -552,10 +552,11 @@ func (s *Serf) Query(name string, payload []byte, params *QueryParam) (*QueryRes
+ 		flags |= queryFlagAck
+ 	}
+ 
+-	// Create a message
++	// Create a message identified by this node's reply endpoint so peers can
++	// route their responses and relayed copies back to us.
++	origin := nodeAddress{Addr: local.Addr, Port: local.Port, Name: local.Name}
+ 	q := *s.newMessageQuery(s.queryClock.Time(), uint32(rand.Int31()), flags, filters,
+-		params.RelayFactor, params.Timeout, local.Addr, local.Port, local.Name,
+-		name, payload)
++		params.RelayFactor, params.Timeout, origin, name, payload)
+ 
+ 	// Encode the query
+ 	raw, err := encodeMessage(messageQueryType, &q, s.msgpackUseNewTimeFormat)
+@@ -583,9 +584,9 @@ func (s *Serf) Query(name string, payload []byte, params *QueryParam) (*QueryRes
+ }
+ 
+ // newMessageQuery assembles the query message that gets broadcast to the
+-// cluster. The query originator's address, port and node name make up the
+-// reply endpoint that every receiving node will use to answer this query,
+-// so they have to be carried to the message verbatim.
++// cluster. The query originator's reply endpoint is written onto the message
++// verbatim so that every receiving node can route its responses — direct or
++// relayed — back to the originator.
+ func (s *Serf) newMessageQuery(
+ 	queryLTime LamportTime,
+ 	queryID uint32,
+@@ -593,18 +594,16 @@ func (s *Serf) newMessageQuery(
+ 	queryFilters [][]byte,
+ 	queryRelayFactor uint8,
+ 	queryTimeout time.Duration,
+-	originAddr []byte,
+-	originPort uint16,
+-	originNode string,
++	origin nodeAddress,
+ 	name string,
+ 	payload []byte,
+ ) *messageQuery {
+ 	return &messageQuery{
+ 		LTime:       queryLTime,
+ 		ID:          queryID,
+-		Addr:        originAddr,
+-		Port:        originPort,
+-		SourceNode:  originNode,
++		Addr:        []byte(origin.Addr),
++		Port:        origin.Port,
++		SourceNode:  origin.Name,
+ 		Filters:     queryFilters,
+ 		Flags:       queryFlags,
+ 		RelayFactor: queryRelayFactor,
+@@ -1390,27 +1389,31 @@ func (s *Serf) handleQuery(query *messageQuery) bool {
+ 		return rebroadcast
+ 	}
+ 
++	// Reassemble the query originator's reply endpoint from the wire fields so
++	// that acks, responses and their relayed copies can all be routed back to
++	// it as a single value rather than as individually-coordinated address,
++	// port and node-name parameters.
++	origin := nodeAddress{Addr: net.IP(query.Addr), Port: query.Port, Name: query.SourceNode}
++
+ 	// Send ack if requested, without waiting for client to Respond()
+ 	if query.Ack() {
+-		s.ackQueryOrigin(query.LTime, query.ID, query.Addr, query.Port, query.SourceNode, query.RelayFactor)
++		s.ackQueryOrigin(query.LTime, query.ID, origin, query.RelayFactor)
+ 	}
+ 
+ 	if s.config.EventCh != nil {
+ 		s.config.EventCh <- s.newQueryEvent(query.LTime, query.Name, query.Payload, query.ID,
+-			query.Addr, query.Port, query.SourceNode, time.Now().Add(query.Timeout), query.RelayFactor)
++			origin, time.Now().Add(query.Timeout), query.RelayFactor)
+ 	}
+ 	return rebroadcast
+ }
+ 
+ // ackQueryOrigin acknowledges a received query back to the node that issued
+-// it, using the originator address, port and node name carried by the query,
+-// and relays a copy of the ack for redundancy.
++// it, using the originator's reply endpoint carried by the query, and relays a
++// copy of the ack for redundancy.
+ func (s *Serf) ackQueryOrigin(
+ 	queryLTime LamportTime,
+ 	queryID uint32,
+-	originAddr []byte,
+-	originPort uint16,
+-	originNode string,
++	origin nodeAddress,
+ 	relayFactor uint8,
+ ) {
+ 	ack := messageQueryResponse{
+@@ -1424,59 +1427,39 @@ func (s *Serf) ackQueryOrigin(
+ 		s.logger.Printf("[ERR] serf: failed to format ack: %v", err)
+ 		return
+ 	}
+-	if err := s.deliverQueryMessage(raw, originAddr, int(originPort), originNode); err != nil {
++	if err := s.sendToNode(origin, raw); err != nil {
+ 		s.logger.Printf("[ERR] serf: failed to send ack: %v", err)
+ 	}
+-	if err := s.relayResponse(relayFactor, originAddr, int(originPort), originNode, &ack); err != nil {
++	if err := s.relayResponse(relayFactor, origin, &ack); err != nil {
+ 		s.logger.Printf("[ERR] serf: failed to relay ack: %v", err)
+ 	}
+ }
+ 
+-// deliverQueryMessage sends an already encoded message directly over UDP to
+-// the peer at the given address, port and node name.
+-func (s *Serf) deliverQueryMessage(
+-	raw []byte,
+-	replyAddr []byte,
+-	replyPort int,
+-	replyNode string,
+-) error {
+-	udpAddr := net.UDPAddr{IP: replyAddr, Port: replyPort}
+-	addr := memberlist.Address{
+-		Addr: udpAddr.String(),
+-		Name: replyNode,
+-	}
+-	return s.memberlist.SendToAddress(addr, raw)
+-}
+-
+ // sendQueryResponse delivers a raw encoded response directly to the
+-// originator of the query it belongs to using the originator's reply address,
+-// port and node name, then relays a copy for redundancy.
++// originator of the query it belongs to using the originator's reply endpoint,
++// then relays a copy for redundancy.
+ func (s *Serf) sendQueryResponse(
+ 	queryLTime LamportTime,
+ 	queryID uint32,
+-	replyAddr []byte,
+-	replyPort uint16,
+-	replyNode string,
++	reply nodeAddress,
+ 	relayFactor uint8,
+ 	raw []byte,
+ 	resp messageQueryResponse,
+ ) error {
+-	if err := s.deliverQueryMessage(raw, replyAddr, int(replyPort), replyNode); err != nil {
++	if err := s.sendToNode(reply, raw); err != nil {
+ 		return err
+ 	}
+-	return s.relayResponse(relayFactor, replyAddr, int(replyPort), replyNode, &resp)
++	return s.relayResponse(relayFactor, reply, &resp)
+ }
+ 
+ // newQueryEvent builds the client-facing event describing a query received
+-// from the node at the given address, port and name.
++// from the node identified by the given reply endpoint.
+ func (s *Serf) newQueryEvent(
+ 	queryLTime LamportTime,
+ 	queryName string,
+ 	queryPayload []byte,
+ 	queryID uint32,
+-	originAddr []byte,
+-	originPort uint16,
+-	originNode string,
++	origin nodeAddress,
+ 	queryDeadline time.Time,
+ 	relayFactor uint8,
+ ) *Query {
+@@ -1486,9 +1469,7 @@ func (s *Serf) newQueryEvent(
+ 		Payload:     queryPayload,
+ 		serf:        s,
+ 		id:          queryID,
+-		addr:        originAddr,
+-		port:        originPort,
+-		sourceNode:  originNode,
++		origin:      origin,
+ 		deadline:    queryDeadline,
+ 		relayFactor: relayFactor,
+ 	}

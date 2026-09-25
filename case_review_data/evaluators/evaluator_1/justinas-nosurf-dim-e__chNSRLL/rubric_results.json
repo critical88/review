@@ -1,0 +1,158 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "In agent.patch, ServeHTTP is restored to an orchestrator: it calls h.getCookieName(), b64decode(), h.RegenerateToken(), ctxSetToken(), sContains(safeMethods, r.Method), h.IsExempt(r), h.ensureSameOrigin(r), extractToken(r), and verifyToken(realToken, sentToken), with handleSuccess/handleFailure delegation. The inline primitives from the smell are removed from ServeHTTP: no base64.StdEncoding calls, no io.ReadFull(rand.Reader,...), no http.SetCookie cookie defaulting, no safe/exempt membership loops, no scheme/host comparisons, and no tokenLength-split unmasking/subtle.ConstantTimeCompare. RegenerateToken delegates to generateToken() and setTokenCookie(), and VerifyToken delegates to unmaskToken() and tokensEqual().",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The per-request pipeline entry point (CSRFHandler.ServeHTTP in handler.go) is decomposed again: its body no longer re-derives the library's primitives inline — no open-coded base64 encode/decode of token forms, no inline io.ReadFull(rand.Reader, ...) minting, no inline http.SetCookie cookie emission with base-cookie name defaulting, no inline membership scans for safe verbs or exempt paths, no inline scheme/host origin comparisons, and no inline tokenLength-split unmasking plus constant-time comparison. The pipeline expresses these through named functions or well-scoped methods instead. Equivalent regroupings of the steps under different helper names count.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The problem states RegenerateToken was flattened with its own inline mint/publication/cookie copy. The agent patch restores it to delegate to shared named helpers: `func (h *CSRFHandler) RegenerateToken(...) string { token := generateToken(); h.setTokenCookie(w, r, token); return Token(r) }`, and `setTokenCookie` uses `ctxSetToken(r, token)`, `h.getCookieName()`, `b64encode(token)`, and `http.SetCookie(w, &cookie)`, removing the inline `io.ReadFull(rand.Reader, ...)`, manual base-cookie construction, and `base64.StdEncoding.EncodeToString` copy.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The public token re-issuance method (CSRFHandler.RegenerateToken in handler.go) no longer carries its own open-coded copy of the mint/publication/cookie machinery: token generation, context publication, cookie construction and cookie emission each go through the same shared named implementations the rest of the middleware uses, rather than a locally re-derived variant.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In token.go, the agent's VerifyToken restores delegation to shared helpers: it decodes operands via base64.StdEncoding.DecodeString, folds masked operands with `real = unmaskToken(real)` and `sent = unmaskToken(sent)`, and returns `tokensEqual(real, sent)`. The smell's inline pad/hidden XOR loop and `subtle.ConstantTimeCompare` are removed, so the unmask-and-compare pipeline is no longer re-implemented inline.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The exported string-form verification function (VerifyToken in token.go) no longer re-implements the unmask-and-compare pipeline inline: masked operands are folded back through the shared unmasking/masking machinery, the verdict is reached through the shared constant-time comparison implementation, and base64 handling is expressed through the package's encoding helpers (or statements that name the same responsibility), rather than by a local hand-rolled copy with site-specific variable names.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch reintroduces named single-concern steps and calls them from entry points: extractToken(r) performs header, then PostFormValue, then multipart fallback and is called by ServeHTTP; ensureSameOrigin(r) checks Sec-Fetch-Site, then delegates to checkOrigin and checkReferer with allowed-origin escapes and sentinel reasons errNoOrigin/ErrNoReferer/ErrBadOrigin/ErrBadReferer, and is called by ServeHTTP; setTokenCookie(w,r,token) publishes the token via ctxSetToken and sets the base-derived cookie, and is called by RegenerateToken, which ServeHTTP invokes. VerifyToken also delegates masking/comparison to unmaskToken and tokensEqual.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The sequencing decisions that the flattening absorbed into monolithic bodies are available as named, reviewable control flow again: credential extraction (header, then parsed form, then multipart fallback), origin adjudication (Sec-Fetch-Site, then Origin, then Referer with the allowed-origin escapes and their sentinel reasons), and cookie/token publication each live behind a named single-concern step that the entry points call, whether by reintroducing the removed step methods or via equivalent named structure.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch restores shared delegation: ServeHTTP calls h.RegenerateToken, sContains(safeMethods, r.Method), h.IsExempt, h.ensureSameOrigin/checkOrigin/checkReferer/sameOrigin, extractToken, and verifyToken; RegenerateToken calls generateToken() and setTokenCookie(), which uses h.getCookieName() and b64encode; VerifyToken uses unmaskToken and tokensEqual. The inline copies are removed, including the crypto/rand, crypto/subtle, encoding/base64, io, and pathModule imports and the hand-rolled mint/unmask/cookie/origin/list-scan blocks, so issuance in both the request pipeline and regeneration converges on the same helper set.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, each recipe (entropy minting, masking, base64 encoding forms, unmasking, constant-time comparison, cookie emission, origin comparison, list membership scanning) is executed from a single shared implementation, and no entry point retains its own divergent copy: in particular the issuance logic used by both the request pipeline and the regeneration method converges on the same helper set.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch preserves the exported surface: `func (h *CSRFHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)`, `func (h *CSRFHandler) RegenerateToken(w http.ResponseWriter, r *http.Request) string`, and `func VerifyToken(realToken, sentToken string) bool` retain their original signatures and are restored to delegate to focused helpers. The patch reintroduces unexported helpers (`extractToken`, `ensureSameOrigin`, `checkReferer`, `checkOrigin`, `setTokenCookie`) but does not delete or alter exported identifiers. It still references sentinel errors `ErrBadToken`, `ErrNoReferer`, `ErrBadReferer`, and `ErrBadOrigin`, and no hunk removes `New`, `NewPure`, `Token`, `Reason`, `IsExempt`, the `Exempt*`/`Set*` families, `StaticOrigins`, `CookieName`, `FormFieldName`, `HeaderName`, `FailureCode`, or `MaxAge`.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The exported surface consumed by integrators is preserved: New, NewPure, CSRFHandler.ServeHTTP, RegenerateToken, VerifyToken, Token, Reason, IsExempt, the Exempt* family, the Set* configuration family, StaticOrigins, CookieName, FormFieldName, HeaderName, FailureCode, MaxAge and the sentinel errors ErrNoReferer, ErrBadReferer, ErrBadOrigin, ErrBadToken all still exist with their original signatures and meanings.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In handler.go, ServeHTTP still calls `r = addNosurfContext(r)` and `defer ctxClear(r)`, publishes tokens via `ctxSetToken(r, realToken)` and `h.RegenerateToken(w, r)`/`setTokenCookie` (which calls `ctxSetToken(r, token)`), and publishes failure reasons via `ctxSetReason(r, err)` and `ctxSetReason(r, ErrBadToken)`. The patch removes the inlined `crypto/subtle`/`base64`/`rand` logic and does not introduce any direct `context.WithValue` or equivalent context API access in handler.go or token.go.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Per-request context access still flows through the existing build-variant seam: token publication and failure-reason publication go through the context helpers (ctxSetToken and ctxSetReason, or however those build-specific helpers remain reachable), and the request-context setup (addNosurfContext/ctxClear) is invoked rather than bypassed by direct context API calls introduced into the portable files.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "handler.go ServeHTTP now delegates each inlined phase: cookie decode via b64decode(tokenCookie.Value), token reissue via h.RegenerateToken, safe/exempt via sContains(safeMethods,r.Method)||h.IsExempt(r), origin via h.ensureSameOrigin, credential extraction via extractToken(r), and comparison via verifyToken; the smell's inline base64 decode, mint/cookie block, safe-verb/exempt loops, origin adjudication, unmask loop, and subtle.ConstantTimeCompare are removed. RegenerateToken calls generateToken()/setTokenCookie, which uses b64encode, with no inline mint/cookie left. token.go VerifyToken calls unmaskToken() and tokensEqual() instead of the inlined unmask loops and constant-time compare. No repaired function retains an open-coded copy beside the helper that owns it.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No repaired function keeps an open-coded fragment of a recipe side by side with the helper that now owns it: the patch must remove the inline bodies it replaces, not add extraction helpers while leaving the local arithmetic in place (for example an unmask loop or a base64 decode call duplicated next to a call to the same capability).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes all flattening-era scaffolding: the dash-delimited banners in ServeHTTP (`// -- intake: ...`, `// -- mint/bootstrap phase ...`, `// -- admission routing ...`, `// -- origin adjudication ...`, `// -- credential comparison ...`) are deleted, as are the RegenerateToken phase comments (`// mint phase`, `// publication phase`, `// distribution phase`) and the VerifyToken narrative comments (`// The whole verdict is reached in one stretch ...`, `// fold a masked operand back to raw shape ...`, `// constant-time equality of the raw forms`). The inline pipe-simulation variables/comments (`safeVerb`, `exempt`, `credentialValid`, `originFailure`, etc.) are also gone, replaced by delegation to `extractToken`, `verifyToken`, `ensureSameOrigin`, `checkOrigin`, `checkReferer`, and `setTokenCookie`.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The flattening-era scaffolding is gone from the repaired code: none of the phase-banner comments introduced by the inlining (the dash-delimited section banners such as the intake, mint/bootstrap, admission routing, origin adjudication and credential comparison banners) or the pipe-simulation variables/comments that only described the inline layout remain in handler.go or token.go after the repair.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch restores delegation to existing primitives instead of duplicating them: handler.go re-adds extractToken using b64decode; ServeHTTP calls h.RegenerateToken, h.IsExempt, h.ensureSameOrigin, extractToken, and verifyToken; RegenerateToken calls generateToken and setTokenCookie; setTokenCookie uses b64encode; token.go VerifyToken calls unmaskToken and tokensEqual. The inline crypto/rand, crypto/subtle, encoding/base64, io, and pathModule usages are removed from handler.go, and no freshly minted duplicate helpers for masking, encoding, comparison, or minting are introduced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair does not strand the existing primitive implementations as parallel orphans: it must not leave freshly minted helpers implementing masking, encoding, comparison or minting while the pre-existing named primitives that already provide those capabilities (such as the masking, base64 and comparison functions the test suite imports directly) remain unreferenced by production code.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "All three flattened entry points are re-decomposed. ServeHTTP delegates to helpers (h.getCookieName, b64decode, h.RegenerateToken, sContains, h.IsExempt, h.ensureSameOrigin, extractToken, verifyToken) instead of inlining minting/exemption/origin/comparison. RegenerateToken is restored to `token := generateToken(); h.setTokenCookie(w, r, token); return Token(r)`, with setTokenCookie re-introduced, removing the inline io.ReadFull/rand/base64 cookie code. VerifyToken is restored to use `unmaskToken(real)`, `unmaskToken(sent)`, and `tokensEqual(real, sent)` instead of inline pad/hidden XOR and subtle.ConstantTimeCompare.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair covers all flattened entry points: the patch must not re-decompose only the request pipeline (ServeHTTP) while leaving the token re-issuance method or the string-form verification function in their flattened form with their inline copies intact.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch restores VerifyToken to decode both operands, call unmaskToken when len==2*tokenLength, and return tokensEqual(real, sent) (constant-time) instead of inline subtle.ConstantTimeCompare; setTokenCookie does ctxSetToken(r, token) (masked request container) and cookie.Value = b64encode(token) (raw cookie), and ServeHTTP still adds \"Vary\", \"Cookie\". ServeHTTP keeps the order: token setup, then `sContains(safeMethods, r.Method) || h.IsExempt(r)` short-circuit, then ensureSameOrigin, then extractToken/verifyToken -> ErrBadToken. ensureSameOrigin delegates to checkOrigin (errNoOrigin/ErrBadOrigin) and checkReferer (ErrNoReferer/ErrBadReferer), preserving the origin ladder.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The patch does not change the security-relevant observable semantics: token equality is still decided by a constant-time comparison of raw 32-byte tokens, the raw form still goes to the cookie while the masked form still goes to the request container (Vary: Cookie still added), the one-time-pad masking scheme is untouched, the exemption/safe-method short-circuit still happens before origin checks, and the origin ladder still yields exactly ErrNoReferer, ErrBadReferer, ErrBadOrigin or ErrBadToken under the same inputs.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch contains hunks only for handler.go and token.go; there are no diffs against any *_test.go files, test fixtures, or test helpers. The refactor restores the unexported primitives the suite imports (e.g., extractToken, ensureSameOrigin, checkOrigin, checkReferer, setTokenCookie, and VerifyToken's use of unmaskToken/tokensEqual) without adapting or weakening the tests.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The patch does not modify, weaken or delete test files, test fixtures or test helpers to make the refactor pass: the suite must pass against the refactor without the tests being adapted in any way.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 1
+  },
+  "valid_count": 13,
+  "pass_count": 13,
+  "must_have_pass": true,
+  "macro_score": 1
+}

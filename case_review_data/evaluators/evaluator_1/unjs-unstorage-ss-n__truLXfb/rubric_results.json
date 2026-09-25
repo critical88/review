@@ -1,0 +1,145 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The patch adds `src/drivers/utils/max-item-size.ts` as the single shared owner, exporting `exceedsItemSize` (comparison: `maxItemSize !== undefined && resolveSize(size) > maxItemSize`) and `assertItemSize` (comparison + throw enforcement via `createError`). Every participating driver's write path now calls these helpers instead of inlining the guard: capacitor-preferences, cloudflare-kv-binding, fs-lite, http, indexedb, and localstorage call `assertItemSize`; lru-cache and memory call `exceedsItemSize`. The private inline `maxItemSize !== undefined && size > maxItemSize` comparisons present in the smell are removed from all drivers.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The stored-value size policy mechanics — how a value's size is measured, how that measurement is compared against the configured limit, and how a violation is enforced — are implemented in one shared owner that the participating drivers' write paths call, and no participating driver keeps its own private inline copy of that comparison-and-reaction logic.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch adds a shared src/drivers/utils/max-item-size.ts exporting exceedsItemSize/assertItemSize, and every previously guarded write path delegates to it: capacitor-preferences' shared checkLength closure now calls assertItemSize and both setItem/setItemRaw call checkLength; fs-lite, http, and indexedb route both setItem and setItemRaw through assertItemSize; cloudflare-kv-binding and localstorage route their guarded setItem through assertItemSize; lru-cache and memory route both setItem and setItemRaw through exceedsItemSize.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every write path in the drivers under src/drivers that previously carried its own size guard now delegates to the shared mechanism — including drivers that have two write methods, both of their guarded methods route through it, and the driver whose two write methods previously shared a private local closure use the shared mechanism in both call sites.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The shared mechanism in max-item-size.ts exposes both exceedsItemSize (boolean) and assertItemSize (throws via createError(driver, message)), letting each driver keep its own policy: memory.ts and lru-cache.ts call exceedsItemSize(...) and `return` (silent skip), while capacitor-preferences, cloudflare-kv-binding, fs-lite, http, indexedb, and localstorage call assertItemSize(...) which throws a driver-annotated error. The per-call override is preserved in cloudflare-kv-binding.ts: `const maxItemSize = topts?.maxItemSize ?? opts.maxItemSize;` is still passed to assertItemSize, resolving transaction-option-over-driver-option the same way as before.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Each driver still states its own policy decision through the shared mechanism: cache-like drivers silently skip oversized writes instead of storing or throwing, committed stores throw a driver-annotated error, and the existing per-call override of the limit (transaction option taking precedence over the driver option, where it exists today) still resolves the same way.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent centralized the comparison/decision logic in `exceedsItemSize`/`assertItemSize`, but the size *measurement* remains per-driver and still mixes units. The shared helper accepts a generic `ItemSize = number | (() => number)` and does not define how size is computed. Callers still pass different measurements: capacitor-preferences and cloudflare-kv-binding pass `value.length` (character count); localstorage and memory pass `value.length` (character count); fs-lite passes `Buffer.byteLength(value)` (bytes); http passes `new Blob([value]).size` (bytes); indexedb passes `new TextEncoder().encode(value).length` (bytes); lru-cache passes `byteLength(value)` (bytes). The mixture of character counts and byte counts that the rubric requires to be eliminated is still present.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The size measurement applied by the guard is defined once and applied uniformly by all participating write paths, so drivers no longer measure the same conceptual quantity differently, ending the current mixture of character counts and byte counts.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent adds src/drivers/utils/max-item-size.ts exporting only the shared functions exceedsItemSize/assertItemSize, but no shared maxItemSize option type/interface. The participating driver options interfaces still each independently declare `maxItemSize?: number` (e.g., CapacitorPreferencesOptions, KVOptions, FSStorageOptions, HTTPOptions, IDBKeyvalOptions, LocalStorageOptions, LRUDriverOptions, MemoryDriverOptions), unchanged from the smell; none extend or reuse a common declared option typing.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The maxItemSize option typing is declared once and reused by the participating drivers' options interfaces, so the drivers no longer each re-declare the same option field independently.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent adds a shared module src/drivers/utils/max-item-size.ts exporting exceedsItemSize (the over-limit decision) and assertItemSize, which throws via createError(driver, message(...)), preserving the existing driver-annotated error family. All throwing drivers (capacitor-preferences, cloudflare-kv-binding, fs-lite, http, indexedb, localstorage) replace their inline createError(DRIVER_NAME, ...) guards with assertItemSize(DRIVER_NAME, ...), so the rejection now originates from the shared mechanism while still attributing the refusing driver. The rationale explicitly permits per-driver wording as long as the contract is shared and driver-attributed, which this satisfies.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Errors raised for oversized writes come from the shared mechanism and keep the existing driver-annotated error family (errors identify the refusing driver in the established format), rather than each driver composing its own ad-hoc rejection wording.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent left per-driver artifacts beside the new shared mechanism instead of taking them out. (1) The private shared `checkLength` closure in capacitor-preferences.ts is retained — now a thin wrapper calling `assertItemSize` — rather than being removed with `assertItemSize` called directly in `setItem`/`setItemRaw`. (2) Local measurement bindings introduced by the smell are kept in http.ts (`const bodySize = new Blob([value]).size;`) and indexedb.ts (`const size = new TextEncoder().encode(value).length;`), passed eagerly to `assertItemSize`, instead of being replaced by thunks. The agent demonstrated the expected pattern in fs-lite.ts (passing `() => Buffer.byteLength(value)` with no local binding) but did not apply it consistently. The inline comparisons and `createError` imports are properly cleaned up, but the closure and measurement bindings remain in place beside the new mechanism.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The per-driver artifacts the consolidation replaced are deleted: the removed comparisons, their local measurement bindings or expressions, and the private shared closure are taken out of the driver files rather than left in place beside the new mechanism, and imports that only served the removed inline logic are dropped.",
+      "passes": false
+    },
+    {
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The patch leaves no newly-dead code around the guarded write paths, such as an unused measurement helper or byte-size utility left behind at a call site, an unused error-factory import in a driver that no longer raises its own guard error, or an unused exported helper kept in the shared utilities area.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The shared helper `exceedsItemSize` returns `maxItemSize !== undefined && resolveSize(size) > maxItemSize`, so when no limit is configured it returns false; `assertItemSize` only throws when that is true, and the cache drivers only skip when it is true. The memory factory remains `(options?: MemoryDriverOptions) => Driver<...>` with `options = {}`, so `memory()` is still callable with no options, and `_drivers.ts` registers `MemoryOptions`. Thus the default no-limit write paths are not tightened or broken.",
+      "valid": true,
+      "attempts": 5,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Drivers behave exactly as before when no size limit is configured, and public creation APIs keep their current compatibility, including calling the memory driver with no options at all.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The problem statement requires the guards to sit before store-specific work. In agent.patch, every refusal path precedes the side effect: memory setItem/setItemRaw return on exceedsItemSize before _clearTimer/data.set/_scheduleExpiry; lru-cache returns before (await getCache()).set; http calls assertItemSize before fetchRequest; fs-lite calls assertItemSize before writeFile; indexedb calls assertItemSize before lib.set; localstorage calls assertItemSize before storage!.setItem; capacitor checkLength runs before getPreferences().set; cloudflare assertItemSize runs before getKVBinding/binding.put. Thus no timer is armed, no request is sent, no disk write occurs, and no cache entry is displaced before rejection.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "A refused write has no side effects beyond the refusal, exactly as before the change: no expiry timer is armed, no request is sent, nothing touches disk, and no cache entry is displaced by a value that is then rejected.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch preserves the capability for all participating drivers. The new shared `src/drivers/utils/max-item-size.ts` implements `exceedsItemSize` as `maxItemSize !== undefined && resolveSize(size) > maxItemSize` and `assertItemSize` throws via `createError` when exceeded (functional, not a no-op, not hardcoded). Each driver retains its `maxItemSize` option and calls these helpers in its write path: capacitor-preferences (setItem/setItemRaw), cloudflare-kv-binding (setItem, keeping `topts?.maxItemSize ?? opts.maxItemSize`), fs-lite (setItem/setItemRaw), http (setItem/setItemRaw), indexedb (setItem/setItemRaw), localstorage (setItem), lru-cache (silent skip in setItem/setItemRaw), and memory (silent skip in setItem/setItemRaw).",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair keeps the stored-value size-limiting capability intact for all participating drivers rather than removing or disabling it, for example by dropping the maxItemSize option and its enforcement, hardcoding the limit, or making the shared mechanism a no-op.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch leaves the neighboring write-path responsibilities intact. In memory.ts, _clearTimer/data.set/_scheduleExpiry(..., opts?.ttl) remain in the same order after the guard; only the condition is delegated to exceedsItemSize. In fs-lite.ts, the readOnly early return still precedes the size check. In cloudflare-kv-binding.ts, topts?.maxItemSize ?? opts.maxItemSize and r(key) are unchanged. In lru-cache.ts, (await getCache()).set(key, value) and the lru options pass-through are untouched; only the guard is delegated. Key normalization/base-prefix helpers (r, resolveKey, makeKey) are unchanged across all drivers.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The change does not modify behavior of the responsibilities adjacent to the guarded write paths: TTL/expiry scheduling and transaction TTL handling, the lru library's own size and entry-count options pass-through, readOnly guards, key normalization, and base-key prefix handling.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0,
+    "associated_changes": 0.3333333333333333,
+    "core_resolution": 1
+  },
+  "valid_count": 12,
+  "pass_count": 8,
+  "must_have_pass": false,
+  "macro_score": 0.5833333333333333
+}

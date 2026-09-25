@@ -1,0 +1,180 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The patch introduces dbdata.ClientContext and uses it for the login/auth client-context batch (CheckUser, checkLocalUser, IUserAuth.checkUser, AuthLdap/AuthRadius, link_auth), but it contains no hunks for server/sessdata/ip_pool.go or server/sessdata/session.go. Thus the lease-client identity batch remains threaded as loose scalars (AcquireIp/loopIp/loopLong with username, macAddr, uniqueMac, remoteAddr, userAgent) and the user-event fields remain loose scalars (AddUserActLog/AddUserActLogBySess with username, group, ipAddr, remoteAddr, deviceType, platformVersion, userAgent, logoutCode). Two of the three recurring batches are not replaced by a shared abstraction.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Each of the three recurring value batches — the login attempt's identity and client context, the lease-client identity, and the user-event fields — is replaced in every production signature it crosses by one shared abstraction, so that no phase of the connection lifecycle still threads one of these batches as five or more loose scalar parameters.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch introduces dbdata.ClientContext and threads it through the whole auth chain: CheckUser and checkLocalUser now take client ClientContext; IUserAuth.checkUser is updated to checkUser(name, pwd string, g *Group, client ClientContext); both remote providers AuthLdap.checkUser and AuthRadius.checkUser take and use client fields. Both login call sites construct the abstraction: LinkAuth builds dbdata.ClientContext{RemoteAddr, UserAgent, MacAddr} before calling CheckUser, and GroupAuthLogin calls auth.checkUser(name, pwd, g, ClientContext{}) for the credentials self-test. Tests were updated to use ClientContext{...}.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The authentication-side batch consolidation covers the whole strategy chain: the verification entry point, the local-user path, the provider interface method, and both remote provider implementations all take the shared abstraction, and both login call sites (the client-facing auth handler and the group-settings credentials self-test) construct it instead of listing its members.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch only consolidates the auth path via dbdata.ClientContext, but does not touch the admission/ip-lease chain. There are no changes to server/sessdata/ip_pool.go or server/sessdata/session.go, where the smell still has AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent string), loopIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent string), loopLong(... username, macAddr string, uniqueMac bool, remoteAddr, userAgent string), and connAdmission(username, macAddr string, uniqueMac bool, remoteAddr, userAgent string). These hops still carry username, mac, uniqueness marker, source address, and client agent as separate formal parameters, so the lease-client identity is not passed as a single value through the allocation entry, recovery paths, or pool scan helpers.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The admission and ip-lease path passes the lease-client identity as a single value through all of its hops — the admission gate, the allocation entry, the mac-record recovery paths, and the pool scan helpers — and no function in that chain keeps username, mac, uniqueness marker, source address, and client agent as separate formal parameters.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch contains no changes to server/sessdata/session.go, where the logout accounting code lives. The injected smell.diff shows AddUserActLog, AddUserActLogBySess, and the shared addUserActLog all accepting six to eight separate scalars (username, group, ipAddr, remoteAddr, deviceType, platformVersion, userAgent, info/code). The agent.patch does not introduce any event/record abstraction for these teardown paths — both AddUserActLog and AddUserActLogBySess still feed addUserActLog field-by-field as individual scalars, so the audit writer is never reached with one coherent event value. The agent only created ClientContext for the auth-verification path, leaving the logout-accounting teardown paths untouched.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Logout accounting reaches the shared audit writer with one event value on both teardown paths — the connection close (which includes the connection ip) and the session-level forced logout (which has none) — instead of handing the writer six or seven separate scalars.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch introduces only one abstraction, dbdata.ClientContext{RemoteAddr, UserAgent, MacAddr}, and threads it through the auth path only. The problem statement asks for every cohesive group across login verification, admission/ip-lease, and logout-accounting; the smell shows ip-lease remoteAddr/userAgent in AcquireIp/loopIp/loopLong and user-event fields in AddUserActLog/AddUserActLogBySess. agent.patch contains no changes to server/sessdata/ip_pool.go or server/sessdata/session.go and introduces no lease-client or user-event domain type, so the lease-client and user-event batches remain loose arguments rather than cohesive abstractions.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The introduced abstractions are cohesive domain types whose fields are the members of one batch each (login identity with client context, lease-client identity, user-event fields), not per-function catch-alls that merely collect every parameter of each function, and unrelated batches were not merged into a shared type.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch introduces dbdata.ClientContext and uses it at the auth handler (link_auth.go constructs dbdata.ClientContext{RemoteAddr, UserAgent, MacAddr} once) and the config self-test (group.go passes ClientContext{}). However, it contains no hunks for server/sessdata/session.go or server/sessdata/ip_pool.go, so the admission path (NewConn/connAdmission/AcquireIp) and both teardown owners (ConnSession.Close/AddUserActLog and CloseSess/AddUserActLogBySess) are left threading remoteAddr/userAgent/macAddr as loose scalar arguments instead of hydrating and passing a single new value.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every production call site that previously assembled one of the batches by hand now constructs the new value once and passes it: the auth handler building it from the wire-request fields, the configuration self-test supplying its empty context, admission hydrating it from stored session state, and both teardown owners reading their owner objects.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "user_test.go was updated to call CheckUser with the new ClientContext abstraction (e.g., `clientCtx := ClientContext{RemoteAddr: \"192.168.30.1:10443\", UserAgent: \"ut_agent\"}`) while preserving every assertion verbatim: ast.Nil(err) for local/policy cases, ast.Contains(err.Error(), \"aaa Radius服务器连接异常\") for the radius group, and ast.Equal(\"aaa LDAP服务器连接异常, 请检测服务器和端口\", err.Error()) for the ldap group. No test function was removed, no assertion was relaxed, and no asserted verification-failure message was altered. ip_pool_test.go was left intact with its original assertions (assert.NotNil(ip), assert.True(net.IPv4(192,168,3,140).Equal(ip))) unchanged.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The test call sites that exercise the verification flow and the ip-lease flow compile against the new structure and keep asserting the same observable outcomes: no test function, assertion, or asserted verification-failure message was removed or relaxed to accommodate the refactor.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Provider diagnostics preserve the client-identity fields: AuthLdap traces `client.RemoteAddr, client.UserAgent`; AuthRadius traces `client.RemoteAddr, client.UserAgent, client.MacAddr`; CheckUser still traces `client.RemoteAddr`. The patch does not modify ip_pool.go/session.go, so the AcquireIp info trace and exhausted-pool warning retain the `remoteAddr`/`userAgent` arguments from smell.diff rather than dropping them.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Diagnostics that consumed members of a batch still receive the same members after the refactor: allocation start/end traces, the exhausted-pool warning, and provider/admission traces keep carrying the source address and client agent information rather than silently dropping it.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch only consolidates the auth path into ClientContext (CheckUser/checkUser/GroupAuthLogin/link_auth) and leaves the ip-lease and logout-accounting flows untouched. smell.diff shows server/sessdata/ip_pool.go still has AcquireIp(username, macAddr string, uniqueMac bool, remoteAddr, userAgent string) with loopIp/loopLong forwarding remoteAddr,userAgent, and server/sessdata/session.go still has connAdmission(... remoteAddr, userAgent string) and AddUserActLog/AddUserActLogBySess/addUserActLog taking remoteAddr, deviceType, platformVersion, userAgent as individual params. These trailing client-context parameters remain, so partially-converted leftovers persist.",
+      "valid": true,
+      "attempts": 4,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No partially-converted leftovers of the loose threading remain: no signature still declares trailing client-context parameters solely to forward them, no signature mixes the new value object with individual members of the same batch, and no call site still fabricates empty placeholder values for members an object (or an absent-context path) should carry.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch introduces a single shared abstraction, `ClientContext` in `server/dbdata/userauth.go`, and reuses it across `CheckUser`, `checkLocalUser`, `IUserAuth.checkUser`, `AuthLdap.checkUser`, `AuthRadius.checkUser`, `GroupAuthLogin`, and `LinkAuth`. No additional parallel or per-provider structs for the same client-identity batch are introduced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The same batch is not represented by several competing value types introduced side by side (for example one struct per package or per provider for the same identity), which would keep the duplication alive under new names.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch leaves auth failure messages and assertions intact. user.go still returns fmt.Errorf(\"%s %s\", \"未知的认证方式: \", authType); userauth_ldap.go and userauth_radius.go still return fmt.Errorf(\"%s %s\", name, \"密码错误\") and the RADIUS/LDAP connection-error strings are unchanged. In user_test.go, only CheckUser call sites are changed to use clientCtx; the verbatim assertions remain ast.Contains(err.Error(), \"aaa Radius服务器连接异常\") and ast.Equal(\"aaa LDAP服务器连接异常, 请检测服务器和端口\", err.Error()), with no assertion wording weakened.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The verification-failure behavior is unregressed: user-facing failure messages (wrong password, expired or unknown user, group errors, LDAP and RADIUS connection failures) are produced with the exact same wording and values as before, and none of the exact-message assertions in the auth tests were edited to make that true.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch contains no hunks for server/sessdata/ip_pool.go or server/sessdata/ip_pool_test.go; it only refactors auth client context in dbdata and handler/link_auth.go. Therefore the pool's AcquireIp/loopIp/loopLong reuse logic, mac/uniqueMac parameters, and db record updates are left intact, and the existing pool test assertions are not altered or weakened.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The ip-lease lifecycle behavior is unregressed: a released address becomes reusable after the lease period, the earliest-leased record is recycled when the pool is exhausted, and reserved addresses are never handed out — as asserted by the existing pool tests, which were not weakened.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not modify server/sessdata/session.go at all, so both teardown paths retain the audit-record assembly from the smell.diff: AddUserActLog still receives cs.Sess.Username, cs.Sess.Group, cs.IpAddr.String(), cs.RemoteAddr, cs.Sess.DeviceType, cs.Sess.PlatformVersion, cs.UserAgent, cs.UserLogoutCode and resolves the reason via GetInfoOpsById(logoutCode); AddUserActLogBySess still receives sess.Username, sess.Group, sess.RemoteAddr, sess.DeviceType, sess.PlatformVersion, sess.UserAgent, code... and resolves via GetInfoOpsById(code[0] or UserLogoutBanner). Both paths keep Status=dbdata.UserLogout and pass userAgent to UserActLogIns.Add. No fields are dropped, no reason lookup is hardcoded, and no drift is introduced.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The audit records are unregressed: both teardown paths still populate username, group, ip (connection variant only), remote address, device type, platform version and client agent from the same sources, keep the logout status and still resolve the reason text through the existing reason-code lookup rather than hardcoding or dropping it.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch contains no hunks for server/sessdata/session.go or server/sessdata/ip_pool.go and introduces no LimitClient calls; the admission failure path from smell.diff remains unchanged, with connAdmission releasing the limit slot once on AcquireIp failure and NewConn only returning nil, so no double release is added.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Admission failure accounting is unregressed: when lease allocation fails, the user's connection-limit slot is released and the connection is refused through the same path as before, without a double release between the caller and the admission helper.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch server/dbdata/userauth_radius.go, the RADIUS provider still guards mac attachment with `if client.MacAddr != \"\"` and then calls `rfc2865.CallingStationID_AddString(packet, client.MacAddr)` with the same error handling. The mac value is populated from `cr.MacAddressList.MacAddress` into `ClientContext.MacAddr` in link_auth.go, so the emptiness guard and attribute assembly are preserved rather than dropped or silently changed.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "RADIUS behavior is unregressed: the client mac is still attached to the outgoing RADIUS packet only when it is non-empty, and the attribute assembly around it is untouched.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 0.2
+  },
+  "valid_count": 15,
+  "pass_count": 9,
+  "must_have_pass": false,
+  "macro_score": 0.5916666666666667
+}

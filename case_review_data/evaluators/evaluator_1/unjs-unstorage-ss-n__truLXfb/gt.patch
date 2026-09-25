@@ -1,0 +1,371 @@
+diff --git a/src/_drivers.ts b/src/_drivers.ts
+index 72c2b49..0239547 100644
+--- a/src/_drivers.ts
++++ b/src/_drivers.ts
+@@ -23,6 +23,7 @@ import type { HTTPOptions as HttpOptions } from "unstorage/drivers/http";
+ import type { IDBKeyvalOptions as IndexedbOptions } from "unstorage/drivers/indexedb";
+ import type { LocalStorageOptions as LocalstorageOptions } from "unstorage/drivers/localstorage";
+ import type { LRUDriverOptions as LruCacheOptions } from "unstorage/drivers/lru-cache";
++import type { MemoryDriverOptions as MemoryOptions } from "unstorage/drivers/memory";
+ import type { MongoDbOptions as MongodbOptions } from "unstorage/drivers/mongodb";
+ import type { NetlifyStoreOptions as NetlifyBlobsOptions } from "unstorage/drivers/netlify-blobs";
+ import type { OverlayStorageOptions as OverlayOptions } from "unstorage/drivers/overlay";
+@@ -72,6 +73,7 @@ export type BuiltinDriverOptions = {
+   "localstorage": LocalstorageOptions;
+   "lru-cache": LruCacheOptions;
+   "lruCache": LruCacheOptions;
++  "memory": MemoryOptions;
+   "mongodb": MongodbOptions;
+   "netlify-blobs": NetlifyBlobsOptions;
+   "netlifyBlobs": NetlifyBlobsOptions;
+diff --git a/src/drivers/capacitor-preferences.ts b/src/drivers/capacitor-preferences.ts
+index 8691660..7960cee 100644
+--- a/src/drivers/capacitor-preferences.ts
++++ b/src/drivers/capacitor-preferences.ts
+@@ -1,7 +1,6 @@
+ import type { Preferences } from "@capacitor/preferences";
+ 
+ import {
+-  createError,
+   type DriverFactory,
+   importLib,
+   joinKeys,
+@@ -9,6 +8,7 @@ import {
+   normalizeKey,
+   type DriverDependencies,
+ } from "./utils/index.ts";
++import { assertItemSize } from "./utils/max-item-size.ts";
+ 
+ export const DRIVER_DEPENDENCIES: DriverDependencies = {
+   lib: { name: "@capacitor/preferences", version: "^6 || ^7 || ^8" },
+@@ -33,12 +33,12 @@ const driver: DriverFactory<CapacitorPreferencesOptions, Promise<typeof Preferen
+   const resolveKey = (key: string) => joinKeys(base, key);
+ 
+   const checkLength = (key: string, value: string) => {
+-    if (opts?.maxItemSize === undefined || value.length <= opts?.maxItemSize) {
+-      return;
+-    }
+-    throw createError(
++    assertItemSize(
+       DRIVER_NAME,
+-      `Preferences entry "${key}" of length ${value.length} exceeds maxItemSize (${opts.maxItemSize}).`,
++      opts?.maxItemSize,
++      value.length,
++      (size) =>
++        `Preferences entry "${key}" of length ${size} exceeds maxItemSize (${opts?.maxItemSize}).`,
+     );
+   };
+ 
+diff --git a/src/drivers/cloudflare-kv-binding.ts b/src/drivers/cloudflare-kv-binding.ts
+index 4b31746..4a86305 100644
+--- a/src/drivers/cloudflare-kv-binding.ts
++++ b/src/drivers/cloudflare-kv-binding.ts
+@@ -1,5 +1,6 @@
+ import type * as CF from "@cloudflare/workers-types";
+-import { createError, type DriverFactory, joinKeys } from "./utils/index.ts";
++import { type DriverFactory, joinKeys } from "./utils/index.ts";
++import { assertItemSize } from "./utils/max-item-size.ts";
+ import { getKVBinding } from "./utils/cloudflare.ts";
+ export interface KVOptions {
+   binding?: string | CF.KVNamespace;
+@@ -58,12 +59,12 @@ const driver: DriverFactory<KVOptions, CF.KVNamespace | Promise<CF.KVNamespace>>
+     async setItem(key, value, topts) {
+       key = r(key);
+       const maxItemSize = topts?.maxItemSize ?? opts.maxItemSize;
+-      if (maxItemSize !== undefined && value.length > maxItemSize) {
+-        throw createError(
+-          DRIVER_NAME,
+-          `KV value "${key}" is larger than the configured maxItemSize limit.`,
+-        );
+-      }
++      assertItemSize(
++        DRIVER_NAME,
++        maxItemSize,
++        value.length,
++        () => `KV value "${key}" is larger than the configured maxItemSize limit.`,
++      );
+       const binding = await getKVBinding(opts.binding);
+       return binding.put(
+         key,
+diff --git a/src/drivers/fs-lite.ts b/src/drivers/fs-lite.ts
+index 641533f..c1c86bd 100644
+--- a/src/drivers/fs-lite.ts
++++ b/src/drivers/fs-lite.ts
+@@ -1,6 +1,7 @@
+ import { existsSync, promises as fsp, Stats } from "node:fs";
+ import { resolve, join } from "node:path";
+ import { createError, createRequiredError, type DriverFactory } from "./utils/index.ts";
++import { assertItemSize } from "./utils/max-item-size.ts";
+ import { readFile, writeFile, readdirRecursive, rmRecursive, unlink } from "./utils/node-fs.ts";
+ 
+ export interface FSStorageOptions {
+@@ -70,18 +71,24 @@ const driver: DriverFactory<FSStorageOptions> = (opts = {}) => {
+       if (opts.readOnly) {
+         return;
+       }
+-      if (opts.maxItemSize !== undefined && Buffer.byteLength(value) > opts.maxItemSize) {
+-        throw createError(DRIVER_NAME, `File "${key}" would exceed the configured maxItemSize.`);
+-      }
++      assertItemSize(
++        DRIVER_NAME,
++        opts.maxItemSize,
++        () => Buffer.byteLength(value),
++        () => `File "${key}" would exceed the configured maxItemSize.`,
++      );
+       return writeFile(r(key), value, "utf8", opts.atomic);
+     },
+     setItemRaw(key, value) {
+       if (opts.readOnly) {
+         return;
+       }
+-      if (opts.maxItemSize !== undefined && Buffer.byteLength(value) > opts.maxItemSize) {
+-        throw createError(DRIVER_NAME, `File "${key}" would exceed the configured maxItemSize.`);
+-      }
++      assertItemSize(
++        DRIVER_NAME,
++        opts.maxItemSize,
++        () => Buffer.byteLength(value),
++        () => `File "${key}" would exceed the configured maxItemSize.`,
++      );
+       return writeFile(r(key), value, undefined, opts.atomic);
+     },
+     removeItem(key) {
+diff --git a/src/drivers/http.ts b/src/drivers/http.ts
+index 55955d5..0a3a54c 100644
+--- a/src/drivers/http.ts
++++ b/src/drivers/http.ts
+@@ -1,5 +1,6 @@
+ import type { TransactionOptions } from "../types.ts";
+-import { createError, type DriverFactory } from "./utils/index.ts";
++import { type DriverFactory } from "./utils/index.ts";
++import { assertItemSize } from "./utils/max-item-size.ts";
+ import { FetchError, fetchRequest } from "./utils/fetch.ts";
+ import { joinURL } from "./utils/path.ts";
+ 
+@@ -85,12 +86,12 @@ const driver: DriverFactory<HTTPOptions> = (opts) => {
+     },
+     async setItem(key, value, topts) {
+       const bodySize = new Blob([value]).size;
+-      if (opts.maxItemSize !== undefined && bodySize > opts.maxItemSize) {
+-        throw createError(
+-          DRIVER_NAME,
+-          `Payload for "${key}" (${bodySize} bytes) is above the configured maxItemSize.`,
+-        );
+-      }
++      assertItemSize(
++        DRIVER_NAME,
++        opts.maxItemSize,
++        bodySize,
++        (size) => `Payload for "${key}" (${size} bytes) is above the configured maxItemSize.`,
++      );
+       await fetchRequest(r(key), {
+         method: "PUT",
+         body: value,
+@@ -99,12 +100,12 @@ const driver: DriverFactory<HTTPOptions> = (opts) => {
+     },
+     async setItemRaw(key, value, topts) {
+       const bodySize = new Blob([value]).size;
+-      if (opts.maxItemSize !== undefined && bodySize > opts.maxItemSize) {
+-        throw createError(
+-          DRIVER_NAME,
+-          `Raw payload for "${key}" (${bodySize} bytes) is above the configured maxItemSize.`,
+-        );
+-      }
++      assertItemSize(
++        DRIVER_NAME,
++        opts.maxItemSize,
++        bodySize,
++        (size) => `Raw payload for "${key}" (${size} bytes) is above the configured maxItemSize.`,
++      );
+       await fetchRequest(r(key), {
+         method: "PUT",
+         body: value,
+diff --git a/src/drivers/indexedb.ts b/src/drivers/indexedb.ts
+index 81a15ce..dbc66bf 100644
+--- a/src/drivers/indexedb.ts
++++ b/src/drivers/indexedb.ts
+@@ -1,10 +1,10 @@
+ import {
+-  createError,
+   type DriverFactory,
+   importLib,
+   type LibImport,
+   type DriverDependencies,
+ } from "./utils/index.ts";
++import { assertItemSize } from "./utils/max-item-size.ts";
+ import type { UseStore } from "idb-keyval";
+ 
+ export interface IDBKeyvalOptions {
+@@ -61,17 +61,23 @@ const driver: DriverFactory<IDBKeyvalOptions> = (opts = {}) => {
+     },
+     async setItem(key, value) {
+       const size = new TextEncoder().encode(value).length;
+-      if (opts.maxItemSize && size > opts.maxItemSize) {
+-        throw createError(DRIVER_NAME, `Item "${key}" is ${size} bytes, exceeding maxItemSize.`);
+-      }
++      assertItemSize(
++        DRIVER_NAME,
++        opts.maxItemSize,
++        size,
++        (s) => `Item "${key}" is ${s} bytes, exceeding maxItemSize.`,
++      );
+       const { lib, store } = await getLib();
+       return lib.set(makeKey(key), value, store);
+     },
+     async setItemRaw(key, value) {
+       const size = new TextEncoder().encode(value).length;
+-      if (opts.maxItemSize && size > opts.maxItemSize) {
+-        throw createError(DRIVER_NAME, `Item "${key}" is ${size} bytes, exceeding maxItemSize.`);
+-      }
++      assertItemSize(
++        DRIVER_NAME,
++        opts.maxItemSize,
++        size,
++        (s) => `Item "${key}" is ${s} bytes, exceeding maxItemSize.`,
++      );
+       const { lib, store } = await getLib();
+       return lib.set(makeKey(key), value, store);
+     },
+diff --git a/src/drivers/localstorage.ts b/src/drivers/localstorage.ts
+index 27b7dda..d3cbdef 100644
+--- a/src/drivers/localstorage.ts
++++ b/src/drivers/localstorage.ts
+@@ -1,9 +1,5 @@
+-import {
+-  createError,
+-  createRequiredError,
+-  type DriverFactory,
+-  normalizeKey,
+-} from "./utils/index.ts";
++import { createRequiredError, type DriverFactory, normalizeKey } from "./utils/index.ts";
++import { assertItemSize } from "./utils/max-item-size.ts";
+ 
+ export interface LocalStorageOptions {
+   base?: string;
+@@ -53,12 +49,13 @@ const driver: DriverFactory<LocalStorageOptions, Storage> = (opts = {}) => {
+       return storage!.getItem(r(key));
+     },
+     setItem(key, value) {
+-      if (opts.maxItemSize !== undefined && value.length > opts.maxItemSize) {
+-        throw createError(
+-          DRIVER_NAME,
+-          `Value for "${key}", ${value.length} chars, exceeds maxItemSize (${opts.maxItemSize}) and the storage quota.`,
+-        );
+-      }
++      assertItemSize(
++        DRIVER_NAME,
++        opts.maxItemSize,
++        value.length,
++        (size) =>
++          `Value for "${key}", ${size} chars, exceeds maxItemSize (${opts.maxItemSize}) and the storage quota.`,
++      );
+       return storage!.setItem(r(key), value);
+     },
+     removeItem(key) {
+diff --git a/src/drivers/lru-cache.ts b/src/drivers/lru-cache.ts
+index 5401afb..f15d281 100644
+--- a/src/drivers/lru-cache.ts
++++ b/src/drivers/lru-cache.ts
+@@ -4,6 +4,7 @@ import {
+   type LibImport,
+   type DriverDependencies,
+ } from "./utils/index.ts";
++import { exceedsItemSize } from "./utils/max-item-size.ts";
+ import type { LRUCache } from "lru-cache";
+ 
+ type LRUCacheOptions = LRUCache.OptionsBase<string, any, any> &
+@@ -68,13 +69,13 @@ const driver: DriverFactory<LRUDriverOptions, Promise<LRUCache<string, any, any>
+       return (await getCache()).get(key) ?? null;
+     },
+     async setItem(key, value) {
+-      if (opts.maxItemSize !== undefined && byteLength(value) > opts.maxItemSize) {
++      if (exceedsItemSize(opts.maxItemSize, () => byteLength(value))) {
+         return; // too large for the configured item budget
+       }
+       (await getCache()).set(key, value);
+     },
+     async setItemRaw(key, value) {
+-      if (opts.maxItemSize !== undefined && byteLength(value) > opts.maxItemSize) {
++      if (exceedsItemSize(opts.maxItemSize, () => byteLength(value))) {
+         return; // too large for the configured item budget
+       }
+       (await getCache()).set(key, value);
+diff --git a/src/drivers/memory.ts b/src/drivers/memory.ts
+index c03689f..5c69622 100644
+--- a/src/drivers/memory.ts
++++ b/src/drivers/memory.ts
+@@ -1,4 +1,5 @@
+ import type { Driver } from "../types.ts";
++import { exceedsItemSize } from "./utils/max-item-size.ts";
+ 
+ export interface MemoryDriverOptions {
+   /**
+@@ -29,7 +30,7 @@ const driver: (options?: MemoryDriverOptions) => Driver<MemoryDriverOptions, Map
+       return data.get(key) ?? null;
+     },
+     setItem(key, value, opts) {
+-      if (options.maxItemSize && value.length > options.maxItemSize) {
++      if (exceedsItemSize(options.maxItemSize, value.length)) {
+         return; // bypass cache for oversized values
+       }
+       _clearTimer(timers, key);
+@@ -37,7 +38,7 @@ const driver: (options?: MemoryDriverOptions) => Driver<MemoryDriverOptions, Map
+       _scheduleExpiry(data, timers, key, opts?.ttl);
+     },
+     setItemRaw(key, value, opts) {
+-      if (options.maxItemSize && value.length > options.maxItemSize) {
++      if (exceedsItemSize(options.maxItemSize, value.length)) {
+         return; // bypass cache for oversized values
+       }
+       _clearTimer(timers, key);
+diff --git a/src/drivers/utils/max-item-size.ts b/src/drivers/utils/max-item-size.ts
+new file mode 100644
+index 0000000..d802587
+--- /dev/null
++++ b/src/drivers/utils/max-item-size.ts
+@@ -0,0 +1,45 @@
++import { createError } from "./index.ts";
++
++/**
++ * Size input for a `maxItemSize` check: an already-measured number, or a thunk
++ * that defers an expensive measurement (the byte-length of a payload) so the
++ * common "no limit configured" write resolves nothing.
++ */
++type ItemSize = number | (() => number);
++
++function resolveSize(size: ItemSize): number {
++  return typeof size === "function" ? size() : size;
++}
++
++/**
++ * Whether a write exceeds the configured `maxItemSize` limit and must be refused.
++ *
++ * A `maxItemSize` of `undefined` means "no limit configured"; every other value
++ * (including `0`) is treated as a real ceiling. `size` is only resolved when a
++ * limit is configured, so drivers that measure size expensively stay free in the
++ * common no-limit case.
++ *
++ * This is the single owner of the "is this value too large?" decision shared by
++ * every driver that accepts `maxItemSize`; {@link assertItemSize} builds on it.
++ */
++export function exceedsItemSize(maxItemSize: number | undefined, size: ItemSize): boolean {
++  return maxItemSize !== undefined && resolveSize(size) > maxItemSize;
++}
++
++/**
++ * Throw a tailored error when `maxItemSize` would be exceeded, otherwise return.
++ *
++ * Drivers keep their store-specific wording via `message` (built only on the
++ * rejection path, and given the offending `size`); the over-limit decision
++ * itself comes from {@link exceedsItemSize}.
++ */
++export function assertItemSize(
++  driver: string,
++  maxItemSize: number | undefined,
++  size: ItemSize,
++  message: (size: number) => string,
++): void {
++  if (exceedsItemSize(maxItemSize, size)) {
++    throw createError(driver, message(resolveSize(size)));
++  }
++}

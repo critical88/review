@@ -1,0 +1,754 @@
+diff --git a/src/diagnostics/binding_digest.ts b/src/diagnostics/binding_digest.ts
+new file mode 100644
+index 0000000..fdf79cb
+--- /dev/null
++++ b/src/diagnostics/binding_digest.ts
+@@ -0,0 +1,31 @@
++import type { BindingScope, BindingType } from '@inversifyjs/core';
++
++export interface BindingDigestDescriptor {
++  readonly serviceIdentifier: string;
++  readonly scope: BindingScope;
++  readonly bindingType: BindingType;
++  readonly hasActivation?: boolean | undefined;
++  readonly hasDeactivation?: boolean | undefined;
++  readonly name?: string | undefined;
++  readonly tagNames?: readonly string[] | undefined;
++}
++
++export class BindingDigest {
++  public readonly serviceIdentifier: string;
++  public readonly scope: BindingScope;
++  public readonly bindingType: BindingType;
++  public readonly hasActivation: boolean;
++  public readonly hasDeactivation: boolean;
++  public readonly name: string | undefined;
++  public readonly tagNames: readonly string[];
++
++  constructor(descriptor: BindingDigestDescriptor) {
++    this.serviceIdentifier = descriptor.serviceIdentifier;
++    this.scope = descriptor.scope;
++    this.bindingType = descriptor.bindingType;
++    this.hasActivation = descriptor.hasActivation ?? false;
++    this.hasDeactivation = descriptor.hasDeactivation ?? false;
++    this.name = descriptor.name;
++    this.tagNames = descriptor.tagNames ?? [];
++  }
++}
+diff --git a/src/diagnostics/container_snapshot.ts b/src/diagnostics/container_snapshot.ts
+new file mode 100644
+index 0000000..c8831ec
+--- /dev/null
++++ b/src/diagnostics/container_snapshot.ts
+@@ -0,0 +1,19 @@
++import type { BindingScope } from '@inversifyjs/core';
++
++import { BindingDigest } from './binding_digest';
++
++export class ContainerSnapshot {
++  public readonly containerLabel: string;
++  public readonly defaultScope: BindingScope;
++  public readonly digests: readonly BindingDigest[];
++
++  constructor(
++    containerLabel: string,
++    defaultScope: BindingScope,
++    digests: readonly BindingDigest[] = [],
++  ) {
++    this.containerLabel = containerLabel;
++    this.defaultScope = defaultScope;
++    this.digests = [...digests];
++  }
++}
+diff --git a/src/diagnostics/digest_line_writer.ts b/src/diagnostics/digest_line_writer.ts
+new file mode 100644
+index 0000000..505cc9f
+--- /dev/null
++++ b/src/diagnostics/digest_line_writer.ts
+@@ -0,0 +1,19 @@
++export interface DigestLineWriter {
++  writeLine(line: string): void;
++}
++
++export class StringDigestLineWriter implements DigestLineWriter {
++  private readonly _lines: string[];
++
++  constructor() {
++    this._lines = [];
++  }
++
++  public writeLine(line: string): void {
++    this._lines.push(line);
++  }
++
++  public render(): string {
++    return this._lines.join('\n');
++  }
++}
+diff --git a/src/diagnostics/index.ts b/src/diagnostics/index.ts
+new file mode 100644
+index 0000000..ae93d61
+--- /dev/null
++++ b/src/diagnostics/index.ts
+@@ -0,0 +1,12 @@
++export { BindingDigest } from './binding_digest';
++export type { BindingDigestDescriptor } from './binding_digest';
++export { ContainerSnapshot } from './container_snapshot';
++export { StringDigestLineWriter } from './digest_line_writer';
++export type { DigestLineWriter } from './digest_line_writer';
++export { SnapshotCodec } from './snapshot_codec';
++export type { DigestPayload, SnapshotPayload } from './snapshot_codec';
++export { SnapshotComparator } from './snapshot_comparator';
++export type { SnapshotDifference } from './snapshot_comparator';
++export { SnapshotStatistics } from './snapshot_statistics';
++export { SnapshotTextReport } from './snapshot_text_report';
++export { WiringAudit } from './wiring_audit';
+diff --git a/src/diagnostics/snapshot_codec.ts b/src/diagnostics/snapshot_codec.ts
+new file mode 100644
+index 0000000..8c28407
+--- /dev/null
++++ b/src/diagnostics/snapshot_codec.ts
+@@ -0,0 +1,88 @@
++import type { BindingScope, BindingType } from '@inversifyjs/core';
++import { bindingScopeValues } from '@inversifyjs/core';
++
++import { BindingDigest } from './binding_digest';
++import { ContainerSnapshot } from './container_snapshot';
++
++export interface DigestPayload {
++  readonly serviceIdentifier: string;
++  readonly scope: BindingScope;
++  readonly bindingType: BindingType;
++  readonly hasActivation: boolean;
++  readonly hasDeactivation: boolean;
++  readonly name: string | undefined;
++  readonly tagNames: readonly string[];
++}
++
++export interface SnapshotPayload {
++  readonly containerLabel: string;
++  readonly defaultScope: BindingScope;
++  readonly digests: readonly DigestPayload[];
++}
++
++export class SnapshotCodec {
++  public serialize(snapshot: ContainerSnapshot): string {
++    const payload: SnapshotPayload = {
++      containerLabel: snapshot.containerLabel,
++      defaultScope: snapshot.defaultScope,
++      digests: snapshot.digests.map((digest: BindingDigest) => ({
++        bindingType: digest.bindingType,
++        hasActivation: digest.hasActivation,
++        hasDeactivation: digest.hasDeactivation,
++        name: digest.name,
++        scope: digest.scope,
++        serviceIdentifier: digest.serviceIdentifier,
++        tagNames: [...digest.tagNames],
++      })),
++    };
++
++    return JSON.stringify(payload);
++  }
++
++  public parse(serialized: string): ContainerSnapshot {
++    const value: unknown = JSON.parse(serialized);
++
++    if (!isSnapshotPayload(value)) {
++      throw new Error('Supplied text is not a serialized snapshot payload.');
++    }
++
++    return this.restoreFromPayload(value);
++  }
++
++  public restoreFromPayload(payload: SnapshotPayload): ContainerSnapshot {
++    const digests: BindingDigest[] = payload.digests.map(
++      (digestPayload: DigestPayload) =>
++        new BindingDigest({
++          bindingType: digestPayload.bindingType,
++          hasActivation: digestPayload.hasActivation,
++          hasDeactivation: digestPayload.hasDeactivation,
++          name: digestPayload.name,
++          scope: digestPayload.scope,
++          serviceIdentifier: digestPayload.serviceIdentifier,
++          tagNames: [...digestPayload.tagNames],
++        }),
++    );
++
++    return new ContainerSnapshot(
++      payload.containerLabel,
++      payload.defaultScope,
++      digests,
++    );
++  }
++}
++
++function isSnapshotPayload(value: unknown): value is SnapshotPayload {
++  if (typeof value !== 'object' || value === null) {
++    return false;
++  }
++
++  const candidate: Record<string, unknown> = value as Record<string, unknown>;
++  const knownScopes: readonly string[] = Object.values(bindingScopeValues);
++
++  return (
++    typeof candidate['containerLabel'] === 'string' &&
++    typeof candidate['defaultScope'] === 'string' &&
++    knownScopes.includes(candidate['defaultScope']) &&
++    Array.isArray(candidate['digests'])
++  );
++}
+diff --git a/src/diagnostics/snapshot_comparator.ts b/src/diagnostics/snapshot_comparator.ts
+new file mode 100644
+index 0000000..89cb94b
+--- /dev/null
++++ b/src/diagnostics/snapshot_comparator.ts
+@@ -0,0 +1,82 @@
++import { BindingDigest } from './binding_digest';
++import { ContainerSnapshot } from './container_snapshot';
++
++export interface SnapshotDifference {
++  readonly kind: 'added' | 'qualification' | 'registration';
++  readonly serviceIdentifier: string;
++  readonly description: string;
++}
++
++export class SnapshotComparator {
++  public diff(
++    baseline: ContainerSnapshot,
++    current: ContainerSnapshot,
++  ): SnapshotDifference[] {
++    const baselineByIdentity: Map<string, BindingDigest> = new Map<
++      string,
++      BindingDigest
++    >();
++
++    for (const baselineDigest of baseline.digests) {
++      baselineByIdentity.set(baselineDigest.serviceIdentifier, baselineDigest);
++    }
++
++    const differences: SnapshotDifference[] = [];
++
++    for (const digest of current.digests) {
++      const previousDigest: BindingDigest | undefined = baselineByIdentity.get(
++        digest.serviceIdentifier,
++      );
++
++      if (previousDigest === undefined) {
++        differences.push({
++          description: `registered after baseline (scope=${digest.scope}, ${digest.bindingType})`,
++          kind: 'added',
++          serviceIdentifier: digest.serviceIdentifier,
++        });
++
++        continue;
++      }
++
++      const changeDescription: string | undefined =
++        this.describeRegistrationChange(previousDigest, digest);
++
++      if (changeDescription !== undefined) {
++        differences.push({
++          description: changeDescription,
++          kind: 'registration',
++          serviceIdentifier: digest.serviceIdentifier,
++        });
++      }
++    }
++
++    return differences;
++  }
++
++  public describeRegistrationChange(
++    previousDigest: BindingDigest,
++    updatedDigest: BindingDigest,
++  ): string | undefined {
++    if (previousDigest.scope !== updatedDigest.scope) {
++      return `scope: ${previousDigest.scope} -> ${updatedDigest.scope}`;
++    }
++
++    if (previousDigest.bindingType !== updatedDigest.bindingType) {
++      return `binding type: ${previousDigest.bindingType} -> ${updatedDigest.bindingType}`;
++    }
++
++    if (previousDigest.name !== updatedDigest.name) {
++      return `name: ${previousDigest.name ?? '(none)'} -> ${updatedDigest.name ?? '(none)'}`;
++    }
++
++    if (previousDigest.tagNames.length !== updatedDigest.tagNames.length) {
++      return `tags: ${previousDigest.tagNames.length.toString()} -> ${updatedDigest.tagNames.length.toString()}`;
++    }
++
++    if (previousDigest.hasActivation !== updatedDigest.hasActivation) {
++      return `activation: ${previousDigest.hasActivation.toString()} -> ${updatedDigest.hasActivation.toString()}`;
++    }
++
++    return undefined;
++  }
++}
+diff --git a/src/diagnostics/snapshot_statistics.ts b/src/diagnostics/snapshot_statistics.ts
+new file mode 100644
+index 0000000..fd91660
+--- /dev/null
++++ b/src/diagnostics/snapshot_statistics.ts
+@@ -0,0 +1,68 @@
++import { bindingScopeValues, bindingTypeValues } from '@inversifyjs/core';
++
++import { ContainerSnapshot } from './container_snapshot';
++
++export class SnapshotStatistics {
++  public computeScopeBreakdown(
++    snapshot: ContainerSnapshot,
++  ): Map<string, number> {
++    const breakdown: Map<string, number> = new Map<string, number>();
++
++    for (const digest of snapshot.digests) {
++      const lifecycleSuffix: string =
++        digest.hasActivation || digest.hasDeactivation ? '+lifecycle' : '';
++      const key: string = `${digest.scope}/${digest.bindingType}${lifecycleSuffix}`;
++      const count: number = breakdown.get(key) ?? 0;
++
++      breakdown.set(key, count + 1);
++    }
++
++    return breakdown;
++  }
++
++  public countStatefulRegistrations(snapshot: ContainerSnapshot): number {
++    let stateful: number = 0;
++
++    for (const digest of snapshot.digests) {
++      const keepsInstance: boolean =
++        digest.scope === bindingScopeValues.Singleton ||
++        digest.bindingType === bindingTypeValues.ConstantValue;
++      const runsLifecycle: boolean =
++        digest.hasActivation || digest.hasDeactivation;
++
++      if (keepsInstance || runsLifecycle) {
++        stateful += 1;
++      }
++    }
++
++    return stateful;
++  }
++
++  public computeTagUsage(snapshot: ContainerSnapshot): Map<string, number> {
++    const usage: Map<string, number> = new Map<string, number>();
++
++    for (const digest of snapshot.digests) {
++      for (const tagName of digest.tagNames) {
++        const count: number = usage.get(tagName) ?? 0;
++
++        usage.set(tagName, count + 1);
++      }
++
++      if (digest.name !== undefined) {
++        const qualifierKey: string = `name:${digest.name}`;
++        const qualifierCount: number = usage.get(qualifierKey) ?? 0;
++
++        usage.set(qualifierKey, qualifierCount + 1);
++      }
++
++      if (digest.tagNames.length === 0 && digest.name === undefined) {
++        const unqualifiedKey: string = '(unqualified)';
++        const unqualifiedCount: number = usage.get(unqualifiedKey) ?? 0;
++
++        usage.set(unqualifiedKey, unqualifiedCount + 1);
++      }
++    }
++
++    return usage;
++  }
++}
+diff --git a/src/diagnostics/snapshot_text_report.ts b/src/diagnostics/snapshot_text_report.ts
+new file mode 100644
+index 0000000..0806804
+--- /dev/null
++++ b/src/diagnostics/snapshot_text_report.ts
+@@ -0,0 +1,82 @@
++import { bindingScopeValues, bindingTypeValues } from '@inversifyjs/core';
++
++import { BindingDigest } from './binding_digest';
++import { ContainerSnapshot } from './container_snapshot';
++import type { DigestLineWriter } from './digest_line_writer';
++
++export class SnapshotTextReport {
++  public render(snapshot: ContainerSnapshot): string {
++    const lines: string[] = [
++      `Container ${snapshot.containerLabel} wiring report`,
++      `Default scope: ${snapshot.defaultScope}`,
++    ];
++
++    for (const digest of snapshot.digests) {
++      lines.push(this.renderDigest(digest, '  '));
++    }
++
++    lines.push(`Registered services: ${snapshot.digests.length.toString()}`);
++
++    return lines.join('\n');
++  }
++
++  public renderDigest(digest: BindingDigest, indentation: string): string {
++    const parts: string[] = [`${indentation}${digest.serviceIdentifier}`];
++
++    parts.push(`scope=${digest.scope}`);
++    parts.push(`type=${digest.bindingType}`);
++
++    if (digest.name !== undefined) {
++      parts.push(`name=${digest.name}`);
++    }
++
++    if (digest.hasActivation) {
++      parts.push('activation=registered');
++    }
++
++    parts.push(
++      digest.hasDeactivation ? 'deactivation=registered' : 'deactivation=none',
++    );
++
++    parts.push(`tags=[${digest.tagNames.join(', ')}]`);
++
++    return parts.join(' | ');
++  }
++
++  public renderBindingLegend(digest: BindingDigest): string {
++    const legend: string[] = [`Service ${digest.serviceIdentifier}`];
++
++    if (digest.scope === bindingScopeValues.Singleton) {
++      legend.push('  one cached instance is reused for every resolution');
++    } else if (digest.scope === bindingScopeValues.Request) {
++      legend.push('  each resolution scope receives its own instance');
++    } else {
++      legend.push('  every resolution receives a new instance');
++    }
++
++    if (digest.bindingType === bindingTypeValues.Instance) {
++      legend.push('  activates the constructor of the bound class');
++    } else if (digest.bindingType === bindingTypeValues.ConstantValue) {
++      legend.push('  resolves to the registered constant immediately');
++    } else if (digest.bindingType === bindingTypeValues.Factory) {
++      legend.push('  resolves through the registered factory');
++    } else {
++      legend.push('  resolves through the registered declaration');
++    }
++
++    if (digest.hasActivation || digest.hasDeactivation) {
++      legend.push('  lifecycle handlers run around resolutions');
++    }
++
++    return legend.join('\n');
++  }
++
++  public renderInto(
++    snapshot: ContainerSnapshot,
++    writer: DigestLineWriter,
++  ): void {
++    for (const digest of snapshot.digests) {
++      writer.writeLine(digest.serviceIdentifier);
++    }
++  }
++}
+diff --git a/src/diagnostics/wiring_audit.ts b/src/diagnostics/wiring_audit.ts
+new file mode 100644
+index 0000000..4e28852
+--- /dev/null
++++ b/src/diagnostics/wiring_audit.ts
+@@ -0,0 +1,38 @@
++import { Container } from '@inversifyjs/container';
++
++import { BindingDigest } from './binding_digest';
++import { ContainerSnapshot } from './container_snapshot';
++
++export class WiringAudit {
++  private readonly _container: Container;
++
++  constructor(container: Container) {
++    this._container = container;
++  }
++
++  public listUnboundRegistrations(snapshot: ContainerSnapshot): string[] {
++    const unbound: string[] = [];
++
++    for (const digest of snapshot.digests) {
++      if (!this._container.isBound(digest.serviceIdentifier)) {
++        unbound.push(digest.serviceIdentifier);
++      }
++    }
++
++    return unbound;
++  }
++
++  public describeRuntimeStatus(digest: BindingDigest): string {
++    const resolved: boolean = this._container.isBound(digest.serviceIdentifier);
++
++    const placement: string = `${digest.scope}/${digest.bindingType}`;
++    const activation: string = digest.hasActivation
++      ? 'activation registered'
++      : 'no activation';
++    const deactivation: string = digest.hasDeactivation
++      ? 'deactivation registered'
++      : 'no deactivation';
++
++    return `${digest.serviceIdentifier}: ${resolved ? 'bound' : 'unbound'} (${placement}) ${activation}, ${deactivation}`;
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index ac115a8..1dfd96a 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -67,3 +67,18 @@ export {
+   postConstruct,
+   preDestroy,
+ } from '@inversifyjs/core';
++export {
++  BindingDigest,
++  BindingDigestDescriptor,
++  ContainerSnapshot,
++  DigestLineWriter,
++  DigestPayload,
++  SnapshotCodec,
++  SnapshotComparator,
++  SnapshotDifference,
++  SnapshotPayload,
++  SnapshotStatistics,
++  SnapshotTextReport,
++  StringDigestLineWriter,
++  WiringAudit,
++} from './diagnostics';
+diff --git a/src/test/diagnostics/container_diagnostics.test.ts b/src/test/diagnostics/container_diagnostics.test.ts
+new file mode 100644
+index 0000000..657230b
+--- /dev/null
++++ b/src/test/diagnostics/container_diagnostics.test.ts
+@@ -0,0 +1,232 @@
++import 'reflect-metadata';
++
++import { expect } from 'chai';
++
++import {
++  BindingDigest,
++  bindingScopeValues,
++  bindingTypeValues,
++  Container,
++  ContainerSnapshot,
++  SnapshotCodec,
++  SnapshotComparator,
++  SnapshotStatistics,
++  SnapshotTextReport,
++  StringDigestLineWriter,
++  WiringAudit,
++} from '../..';
++
++describe('Container diagnostics', () => {
++  const katanaDigest: BindingDigest = new BindingDigest({
++    bindingType: bindingTypeValues.Instance,
++    hasActivation: true,
++    name: 'primary',
++    scope: bindingScopeValues.Singleton,
++    serviceIdentifier: 'Katana',
++    tagNames: ['sharp'],
++  });
++
++  const shurikenDigest: BindingDigest = new BindingDigest({
++    bindingType: bindingTypeValues.ConstantValue,
++    scope: bindingScopeValues.Transient,
++    serviceIdentifier: 'Shuriken',
++  });
++
++  const snapshot: ContainerSnapshot = new ContainerSnapshot(
++    'armory',
++    bindingScopeValues.Singleton,
++    [katanaDigest, shurikenDigest],
++  );
++
++  describe('Plain text report', () => {
++    it('Should render the wiring report of a snapshot', () => {
++      const report: SnapshotTextReport = new SnapshotTextReport();
++
++      expect(report.render(snapshot)).equal(
++        [
++          'Container armory wiring report',
++          'Default scope: Singleton',
++          '  Katana | scope=Singleton | type=Instance | name=primary | activation=registered | deactivation=none | tags=[sharp]',
++          '  Shuriken | scope=Transient | type=ConstantValue | deactivation=none | tags=[]',
++          'Registered services: 2',
++        ].join('\n'),
++      );
++    });
++
++    it('Should stream the registered identifiers into a line writer', () => {
++      const writer: StringDigestLineWriter = new StringDigestLineWriter();
++      const report: SnapshotTextReport = new SnapshotTextReport();
++
++      report.renderInto(snapshot, writer);
++
++      expect(writer.render()).equal(['Katana', 'Shuriken'].join('\n'));
++    });
++
++    it('Should explain what a registration means for resolution', () => {
++      const report: SnapshotTextReport = new SnapshotTextReport();
++
++      expect(report.renderBindingLegend(katanaDigest)).equal(
++        [
++          'Service Katana',
++          '  one cached instance is reused for every resolution',
++          '  activates the constructor of the bound class',
++          '  lifecycle handlers run around resolutions',
++        ].join('\n'),
++      );
++    });
++  });
++
++  describe('Snapshot statistics', () => {
++    it('Should break registrations down by scope and binding type', () => {
++      const statistics: SnapshotStatistics = new SnapshotStatistics();
++      const breakdown: Map<string, number> =
++        statistics.computeScopeBreakdown(snapshot);
++
++      expect(breakdown.get('Singleton/Instance+lifecycle')).equal(1);
++      expect(breakdown.get('Transient/ConstantValue')).equal(1);
++      expect(breakdown.size).equal(2);
++    });
++
++    it('Should count registrations that keep instances or run lifecycle handlers', () => {
++      const statistics: SnapshotStatistics = new SnapshotStatistics();
++
++      expect(statistics.countStatefulRegistrations(snapshot)).equal(2);
++      expect(
++        statistics.countStatefulRegistrations(
++          new ContainerSnapshot('empty', bindingScopeValues.Request),
++        ),
++      ).equal(0);
++    });
++
++    it('Should count qualifier usage across registrations', () => {
++      const statistics: SnapshotStatistics = new SnapshotStatistics();
++      const usage: Map<string, number> = statistics.computeTagUsage(snapshot);
++
++      expect(usage.get('sharp')).equal(1);
++      expect(usage.get('name:primary')).equal(1);
++      expect(usage.get('(unqualified)')).equal(1);
++
++      const qualifiedOnly: Map<string, number> = statistics.computeTagUsage(
++        new ContainerSnapshot('qualified', bindingScopeValues.Singleton, [
++          katanaDigest,
++          katanaDigest,
++        ]),
++      );
++
++      expect(qualifiedOnly.get('sharp')).equal(2);
++      expect(qualifiedOnly.get('name:primary')).equal(2);
++      expect(qualifiedOnly.has('(unqualified)')).equal(false);
++    });
++  });
++
++  describe('Snapshot comparison', () => {
++    it('Should describe scope changes between two snapshots', () => {
++      const updated: ContainerSnapshot = new ContainerSnapshot(
++        'armory',
++        bindingScopeValues.Singleton,
++        [
++          new BindingDigest({
++            bindingType: bindingTypeValues.Instance,
++            hasActivation: true,
++            name: 'primary',
++            scope: bindingScopeValues.Request,
++            serviceIdentifier: 'Katana',
++            tagNames: ['sharp'],
++          }),
++          shurikenDigest,
++        ],
++      );
++
++      const differences: SnapshotComparator = new SnapshotComparator();
++
++      expect(differences.diff(snapshot, updated)).deep.equal([
++        {
++          description: 'scope: Singleton -> Request',
++          kind: 'registration',
++          serviceIdentifier: 'Katana',
++        },
++      ]);
++    });
++
++    it('Should report registrations missing from the baseline as added', () => {
++      const extended: ContainerSnapshot = new ContainerSnapshot(
++        'armory',
++        bindingScopeValues.Singleton,
++        [
++          katanaDigest,
++          shurikenDigest,
++          new BindingDigest({
++            bindingType: bindingTypeValues.Instance,
++            scope: bindingScopeValues.Transient,
++            serviceIdentifier: 'Tanto',
++          }),
++        ],
++      );
++
++      const differences: SnapshotComparator = new SnapshotComparator();
++
++      expect(differences.diff(snapshot, extended)).deep.equal([
++        {
++          description: 'registered after baseline (scope=Transient, Instance)',
++          kind: 'added',
++          serviceIdentifier: 'Tanto',
++        },
++      ]);
++    });
++
++    it('Should report unchanged snapshots without differences', () => {
++      const differences: SnapshotComparator = new SnapshotComparator();
++
++      expect(differences.diff(snapshot, snapshot)).deep.equal([]);
++    });
++  });
++
++  describe('Snapshot serialization', () => {
++    it('Should serialize and parse a snapshot without losing wiring details', () => {
++      const codec: SnapshotCodec = new SnapshotCodec();
++      const serialized: string = codec.serialize(snapshot);
++      const parsed: ContainerSnapshot = codec.parse(serialized);
++      const report: SnapshotTextReport = new SnapshotTextReport();
++
++      expect(report.render(parsed)).equal(report.render(snapshot));
++      expect(new SnapshotComparator().diff(snapshot, parsed)).deep.equal([]);
++    });
++
++    it('Should reject text that is not a serialized snapshot', () => {
++      const codec: SnapshotCodec = new SnapshotCodec();
++
++      expect(() => codec.parse('{"containerLabel":"armory"}')).throw(
++        'Supplied text is not a serialized snapshot payload.',
++      );
++    });
++  });
++
++  describe('Live container audit', () => {
++    it('Should list registrations with no matching binding in the container', () => {
++      class Katana {}
++
++      const container: Container = new Container();
++      container.bind<Katana>('Katana').to(Katana);
++
++      const audit: WiringAudit = new WiringAudit(container);
++
++      expect(audit.listUnboundRegistrations(snapshot)).deep.equal(['Shuriken']);
++    });
++
++    it('Should describe the runtime status of a registration including lifecycle handlers', () => {
++      class Katana {}
++
++      const container: Container = new Container();
++      container.bind<Katana>('Katana').to(Katana);
++
++      const audit: WiringAudit = new WiringAudit(container);
++
++      expect(audit.describeRuntimeStatus(katanaDigest)).equal(
++        'Katana: bound (Singleton/Instance) activation registered, no deactivation',
++      );
++      expect(audit.describeRuntimeStatus(shurikenDigest)).equal(
++        'Shuriken: unbound (Transient/ConstantValue) no activation, no deactivation',
++      );
++    });
++  });
++});

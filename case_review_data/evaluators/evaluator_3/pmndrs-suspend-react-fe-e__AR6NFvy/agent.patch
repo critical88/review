@@ -1,0 +1,164 @@
+diff --git a/src/cache.ts b/src/cache.ts
+index 1991104..71992f4 100644
+--- a/src/cache.ts
++++ b/src/cache.ts
+@@ -1,3 +1,5 @@
++import { shallowEqualArrays } from './utils'
++
+ export type Tuple<T = any> = [T] | T[]
+ export type Await<T> = T extends Promise<infer V> ? V : never
+ export type Config = { lifespan?: number; equal?: (a: any, b: any) => boolean }
+@@ -35,7 +37,9 @@ export class CacheEntry<Keys extends Tuple<unknown> = Tuple<unknown>> {
+ 
+ /**
+  * The registry of live cache entries. Consumers may hold several registries,
+- * the exported suspense API uses a single shared one.
++ * the exported suspense API uses a single shared one. The registry owns its
++ * entries collection, so lookup, removal and clearing live here rather than
++ * with the code that wires the public operations together.
+  */
+ export class CacheRegistry {
+   public readonly entries: CacheEntry[] = []
+@@ -43,4 +47,25 @@ export class CacheRegistry {
+   register(entry: CacheEntry) {
+     this.entries.push(entry)
+   }
++
++  /** Find the live entry whose keys match, using each entry's equality function. */
++  find(keys: any[]): CacheEntry | undefined {
++    return this.entries.find((entry) => shallowEqualArrays(keys, entry.keys, entry.equal))
++  }
++
++  /** Remove a single entry from the registry by reference. */
++  remove(entry: CacheEntry) {
++    const index = this.entries.indexOf(entry)
++    if (index !== -1) this.entries.splice(index, 1)
++  }
++
++  /** Drop every entry, or only the entry matching `keys` when given. */
++  clear(keys?: any[]) {
++    if (keys === undefined || keys.length === 0) {
++      this.entries.splice(0, this.entries.length)
++    } else {
++      const entry = this.find(keys)
++      if (entry) this.remove(entry)
++    }
++  }
+ }
+diff --git a/src/index.ts b/src/index.ts
+index a4612f8..58a0199 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,6 +1,5 @@
+ import { CacheRegistry, Config, Tuple } from './cache'
+ import { query } from './query'
+-import { shallowEqualArrays } from './utils'
+ 
+ const registry = new CacheRegistry()
+ 
+@@ -16,20 +15,8 @@ const preload = <Keys extends Tuple<unknown>, Fn extends (...keys: Keys) => Prom
+   config?: Config
+ ) => void query(registry, fn, keys, true, config)
+ 
+-const peek = <Keys extends Tuple<unknown>>(keys: Keys) =>
+-  registry.entries.find((entry) => shallowEqualArrays(keys, entry.keys, entry.equal))?.response
++const peek = <Keys extends Tuple<unknown>>(keys: Keys) => registry.find(keys)?.response
+ 
+-const clear = <Keys extends Tuple<unknown>>(keys?: Keys) => {
+-  if (keys === undefined || keys.length === 0) registry.entries.splice(0, registry.entries.length)
+-  else {
+-    for (const entry of registry.entries) {
+-      if (shallowEqualArrays(keys, entry.keys, entry.equal)) {
+-        const index = registry.entries.indexOf(entry)
+-        if (index !== -1) registry.entries.splice(index, 1)
+-        return
+-      }
+-    }
+-  }
+-}
++const clear = <Keys extends Tuple<unknown>>(keys?: Keys) => registry.clear(keys)
+ 
+ export { suspend, clear, preload, peek }
+diff --git a/src/query.ts b/src/query.ts
+index 4827b88..75ff43f 100644
+--- a/src/query.ts
++++ b/src/query.ts
+@@ -1,5 +1,5 @@
+ import { Await, CacheEntry, CacheRegistry, Config, Tuple } from './cache'
+-import { isPromise, shallowEqualArrays } from './utils'
++import { isPromise } from './utils'
+ 
+ export function query<Keys extends Tuple<unknown>, Fn extends (...keys: Keys) => Promise<unknown>>(
+   store: CacheRegistry,
+@@ -11,48 +11,44 @@ export function query<Keys extends Tuple<unknown>, Fn extends (...keys: Keys) =>
+   // If no keys were given, the function is the key
+   if (keys === null) keys = [fn] as unknown as Keys
+ 
+-  for (const entry of store.entries) {
+-    // Find a match
+-    if (shallowEqualArrays(keys, entry.keys, entry.equal)) {
+-      // If we're pre-loading and the element is present, just return
+-      if (preload) return undefined as unknown as Await<ReturnType<Fn>>
+-      // If an error occurred, throw
+-      if (Object.prototype.hasOwnProperty.call(entry, 'error')) throw entry.error
+-      // If a response was successful, return
+-      if (Object.prototype.hasOwnProperty.call(entry, 'response')) {
+-        if (config.lifespan && config.lifespan > 0) {
+-          if (entry.timeout) clearTimeout(entry.timeout)
+-          entry.timeout = setTimeout(entry.remove, config.lifespan)
+-        }
+-        return entry.response as Await<ReturnType<Fn>>
++  // Find a match
++  const entry = store.find(keys)
++  if (entry) {
++    // If we're pre-loading and the element is present, just return
++    if (preload) return undefined as unknown as Await<ReturnType<Fn>>
++    // If an error occurred, throw
++    if (Object.prototype.hasOwnProperty.call(entry, 'error')) throw entry.error
++    // If a response was successful, return
++    if (Object.prototype.hasOwnProperty.call(entry, 'response')) {
++      if (config.lifespan && config.lifespan > 0) {
++        if (entry.timeout) clearTimeout(entry.timeout)
++        entry.timeout = setTimeout(entry.remove, config.lifespan)
+       }
+-      // If the promise is still unresolved, throw
+-      if (!preload) throw entry.promise
++      return entry.response as Await<ReturnType<Fn>>
+     }
++    // If the promise is still unresolved, throw
++    if (!preload) throw entry.promise
+   }
+ 
+   // The request is new or has changed.
+-  const entry = new CacheEntry({ keys, equal: config.equal })
+-  entry.remove = () => {
+-    const index = store.entries.indexOf(entry)
+-    if (index !== -1) store.entries.splice(index, 1)
+-  }
+-  entry.promise =
++  const created = new CacheEntry({ keys, equal: config.equal })
++  created.remove = () => store.remove(created)
++  created.promise =
+     // Execute the promise
+     (isPromise(fn) ? fn : fn(...keys))
+       // When it resolves, store its value
+       .then((response) => {
+-        entry.response = response
++        created.response = response
+         // Remove the entry in time if a lifespan was given
+         if (config.lifespan && config.lifespan > 0) {
+-          entry.timeout = setTimeout(entry.remove, config.lifespan)
++          created.timeout = setTimeout(created.remove, config.lifespan)
+         }
+       })
+       // Store caught errors, they will be thrown in the render-phase to bubble into an error-bound
+-      .catch((error) => (entry.error = error))
++      .catch((error) => (created.error = error))
+   // Register the entry
+-  store.register(entry)
++  store.register(created)
+   // And throw the promise, this yields control back to React
+-  if (!preload) throw entry.promise
++  if (!preload) throw created.promise
+   return undefined as unknown as Await<ReturnType<Fn>>
+ }

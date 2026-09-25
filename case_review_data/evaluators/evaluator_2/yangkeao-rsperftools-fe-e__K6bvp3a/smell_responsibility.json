@@ -1,0 +1,122 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Dylint",
+  "smell_type": "feature_envy",
+  "rule": {
+    "id": "feature-envy-misplaced-owner",
+    "description": "A named function or method performs three or more direct field reads through receivers of one type defined in a different source file, so the function carries another module's data-handling behavior instead of letting the owning module provide that operation. Each read-chain is attributed to the root receiver's type, so composing over your own state (self.<field>...) stays with the enclosing type and does not count as envy; closure bodies are excluded to avoid misattributing borrowed state; owner-method calls and struct-literal construction of externally-shaped data are not field reads and do not count."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "src/profiler.rs",
+      "class_name": null,
+      "function_name": "timing_of"
+    },
+    {
+      "id": "E2",
+      "file_path": "src/report.rs",
+      "class_name": null,
+      "function_name": "resolved_frames"
+    },
+    {
+      "id": "E3",
+      "file_path": "src/report.rs",
+      "class_name": "Frames",
+      "function_name": "fmt"
+    },
+    {
+      "id": "E4",
+      "file_path": "src/report.rs",
+      "class_name": null,
+      "function_name": "stack_line"
+    },
+    {
+      "id": "E5",
+      "file_path": "src/report.rs",
+      "class_name": null,
+      "function_name": "thread_name_or_id"
+    },
+    {
+      "id": "E6",
+      "file_path": "src/report.rs",
+      "class_name": "Report",
+      "function_name": "pprof"
+    }
+  ],
+  "injected_match_count": 6,
+  "checks": [
+    {
+      "id": "misplaced-owner-feature-envy",
+      "description": "Detect functions and methods that read three or more fields of one type owned by a different module, using rustc type information: every innermost field-access of a chain is attributed to the base receiver's type, local-crate ADT definitions are matched against the enclosing function's source file, and any foreign type whose read count reaches the threshold is reported with its owning module.",
+      "detected_relation": "function -> foreign-module data type (>=3 direct field reads)",
+      "why_this_is_the_smell": "The function is doing the data owner's work: it depends on the internal layout of a type it does not own and should not know, instead of that type's module providing the operation. The behavior belongs with the class whose data it primarily accesses, and the repair is to restore data locality with the owner.",
+      "matches": [
+        {
+          "file": "src/profiler.rs",
+          "symbol": "timing_of",
+          "entry_ids": ["E1"],
+          "evidence": "timing_of reads timer.frequency, timer.start_time and timer.start_instant directly (3 foreign reads, 0 reads of types from its own module) while assembling the timing metadata that the timer domain used to produce itself.",
+          "measurement": {"envied_type": "Timer", "envies_file": "src/timer.rs", "foreign_accesses": 3, "own_module_accesses": 0}
+        },
+        {
+          "file": "src/report.rs",
+          "symbol": "resolved_frames",
+          "entry_ids": ["E2"],
+          "evidence": "resolved_frames walks item.frames, item.thread_name, item.thread_name_length, item.thread_id (via the slice bounds) and item.thread_name again while converting one collected sample into its report presentation (5 foreign reads, 0 own), a conversion the sampling-model module previously owned.",
+          "measurement": {"envied_type": "UnresolvedFrames", "envies_file": "src/frames.rs", "foreign_accesses": 5, "own_module_accesses": 0}
+        },
+        {
+          "file": "src/report.rs",
+          "symbol": "Frames::fmt",
+          "entry_ids": ["E3"],
+          "evidence": "The Debug rendering of the resolved sample iterates self.frames and branches on self.thread_name and self.thread_id (4 foreign reads, 0 own); the presentation rule for the sampling type lives in the report module instead of with the type.",
+          "measurement": {"envied_type": "Frames", "envies_file": "src/frames.rs", "foreign_accesses": 4, "own_module_accesses": 0}
+        },
+        {
+          "file": "src/report.rs",
+          "symbol": "stack_line",
+          "entry_ids": ["E4"],
+          "evidence": "stack_line renders one collapsed-stack line from stack_key.thread_name (twice), stack_key.thread_id and stack_key.frames.iter() (4 foreign reads, 0 own), i.e. the flamegraph presentation of a sample is assembled from the sampling type's raw fields in the report module.",
+          "measurement": {"envied_type": "Frames", "envies_file": "src/frames.rs", "foreign_accesses": 4, "own_module_accesses": 0}
+        },
+        {
+          "file": "src/report.rs",
+          "symbol": "thread_name_or_id",
+          "entry_ids": ["E5"],
+          "evidence": "thread_name_or_id decides the thread identity of a sample from key.thread_name (empty check and clone) and key.thread_id (3 foreign reads, 0 own); this identity rule is a property of the sampling type, not of any single export format.",
+          "measurement": {"envied_type": "Frames", "envies_file": "src/frames.rs", "foreign_accesses": 3, "own_module_accesses": 0}
+        },
+        {
+          "file": "src/report.rs",
+          "symbol": "Report::pprof",
+          "entry_ids": ["E6"],
+          "evidence": "pprof unpacks symbol names, filenames and line numbers via symbol.name/deref (4 reads), symbol.filename (2 reads) and symbol.lineno (1 read) - 7 foreign reads against 6 reads of its own module's types - instead of using the symbol type's own accessors and demangling behavior.",
+          "measurement": {"envied_type": "Symbol", "envies_file": "src/frames.rs", "foreign_accesses": 7, "own_module_accesses": 6}
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "description": "protobuf message construction in the report's pprof export (protos::Sample, protos::Function, protos::Location, etc.)",
+      "reason": "Building externally-shaped data-transfer records is layout-driven mapping, not reading another module's internal data; these generated message types expose no owner behavior to relocate, so they are not field-read envy."
+    },
+    {
+      "description": "Access chains rooted at the enclosing type's own receiver (for example a report reading the timing fields it composes over)",
+      "reason": "Reading your own state is not envy toward the field's type; a chain is attributed to its root receiver's type."
+    },
+    {
+      "description": "Closure bodies",
+      "reason": "Closures borrow state from the enclosing function, so their field reads are not attributed to the enclosing function; closure-borne logic is a separate construction from a named function's own data handling and is not linted as an independent function."
+    },
+    {
+      "description": "Struct-literal construction of a type while initializing its own fields",
+      "reason": "Initializing a value you are creating is not reading through an existing receiver; the rule counts field reads, not construction."
+    },
+    {
+      "description": "Types from other crates (smallvec::SmallVec, std::collections, external unwinder types)",
+      "reason": "Only local-crate type definitions participate; the smell concerns responsibilities that this repository can relocate."
+    }
+  ]
+}

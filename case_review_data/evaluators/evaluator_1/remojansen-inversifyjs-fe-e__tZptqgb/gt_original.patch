@@ -1,0 +1,643 @@
+diff --git a/src/diagnostics/binding_digest.ts b/src/diagnostics/binding_digest.ts
+index fdf79cb..8f49e6b 100644
+--- a/src/diagnostics/binding_digest.ts
++++ b/src/diagnostics/binding_digest.ts
+@@ -1,4 +1,5 @@
+ import type { BindingScope, BindingType } from '@inversifyjs/core';
++import { bindingScopeValues, bindingTypeValues } from '@inversifyjs/core';
+ 
+ export interface BindingDigestDescriptor {
+   readonly serviceIdentifier: string;
+@@ -10,6 +11,16 @@ export interface BindingDigestDescriptor {
+   readonly tagNames?: readonly string[] | undefined;
+ }
+ 
++export interface DigestPayload {
++  readonly serviceIdentifier: string;
++  readonly scope: BindingScope;
++  readonly bindingType: BindingType;
++  readonly hasActivation: boolean;
++  readonly hasDeactivation: boolean;
++  readonly name: string | undefined;
++  readonly tagNames: readonly string[];
++}
++
+ export class BindingDigest {
+   public readonly serviceIdentifier: string;
+   public readonly scope: BindingScope;
+@@ -28,4 +39,139 @@ export class BindingDigest {
+     this.name = descriptor.name;
+     this.tagNames = descriptor.tagNames ?? [];
+   }
++
++  public renderAsRow(indentation: string): string {
++    const parts: string[] = [`${indentation}${this.serviceIdentifier}`];
++
++    parts.push(`scope=${this.scope}`);
++    parts.push(`type=${this.bindingType}`);
++
++    if (this.name !== undefined) {
++      parts.push(`name=${this.name}`);
++    }
++
++    if (this.hasActivation) {
++      parts.push('activation=registered');
++    }
++
++    parts.push(
++      this.hasDeactivation ? 'deactivation=registered' : 'deactivation=none',
++    );
++
++    parts.push(`tags=[${this.tagNames.join(', ')}]`);
++
++    return parts.join(' | ');
++  }
++
++  public renderLegend(): string {
++    const legend: string[] = [`Service ${this.serviceIdentifier}`];
++
++    if (this.scope === bindingScopeValues.Singleton) {
++      legend.push('  one cached instance is reused for every resolution');
++    } else if (this.scope === bindingScopeValues.Request) {
++      legend.push('  each resolution scope receives its own instance');
++    } else {
++      legend.push('  every resolution receives a new instance');
++    }
++
++    if (this.bindingType === bindingTypeValues.Instance) {
++      legend.push('  activates the constructor of the bound class');
++    } else if (this.bindingType === bindingTypeValues.ConstantValue) {
++      legend.push('  resolves to the registered constant immediately');
++    } else if (this.bindingType === bindingTypeValues.Factory) {
++      legend.push('  resolves through the registered factory');
++    } else {
++      legend.push('  resolves through the registered declaration');
++    }
++
++    if (this.hasActivation || this.hasDeactivation) {
++      legend.push('  lifecycle handlers run around resolutions');
++    }
++
++    return legend.join('\n');
++  }
++
++  public registrationKey(): string {
++    const lifecycleSuffix: string =
++      this.hasActivation || this.hasDeactivation ? '+lifecycle' : '';
++
++    return `${this.scope}/${this.bindingType}${lifecycleSuffix}`;
++  }
++
++  public isStateful(): boolean {
++    return (
++      this.scope === bindingScopeValues.Singleton ||
++      this.bindingType === bindingTypeValues.ConstantValue ||
++      this.hasActivation ||
++      this.hasDeactivation
++    );
++  }
++
++  public qualifierKeys(): string[] {
++    const keys: string[] = [...this.tagNames];
++
++    if (this.name !== undefined) {
++      keys.push(`name:${this.name}`);
++    }
++
++    if (this.tagNames.length === 0 && this.name === undefined) {
++      keys.push('(unqualified)');
++    }
++
++    return keys;
++  }
++
++  public describeAddition(): string {
++    return `registered after baseline (scope=${this.scope}, ${this.bindingType})`;
++  }
++
++  public changesFromRegistered(
++    previousDigest: BindingDigest,
++  ): string | undefined {
++    if (previousDigest.scope !== this.scope) {
++      return `scope: ${previousDigest.scope} -> ${this.scope}`;
++    }
++
++    if (previousDigest.bindingType !== this.bindingType) {
++      return `binding type: ${previousDigest.bindingType} -> ${this.bindingType}`;
++    }
++
++    if (previousDigest.name !== this.name) {
++      return `name: ${previousDigest.name ?? '(none)'} -> ${this.name ?? '(none)'}`;
++    }
++
++    if (previousDigest.tagNames.length !== this.tagNames.length) {
++      return `tags: ${previousDigest.tagNames.length.toString()} -> ${this.tagNames.length.toString()}`;
++    }
++
++    if (previousDigest.hasActivation !== this.hasActivation) {
++      return `activation: ${previousDigest.hasActivation.toString()} -> ${this.hasActivation.toString()}`;
++    }
++
++    return undefined;
++  }
++
++  public describeRegistration(resolved: boolean): string {
++    const placement: string = `${this.scope}/${this.bindingType}`;
++    const activation: string = this.hasActivation
++      ? 'activation registered'
++      : 'no activation';
++    const deactivation: string = this.hasDeactivation
++      ? 'deactivation registered'
++      : 'no deactivation';
++
++    return `${this.serviceIdentifier}: ${resolved ? 'bound' : 'unbound'} (${placement}) ${activation}, ${deactivation}`;
++  }
++
++  public toJsonRecord(): DigestPayload {
++    return {
++      bindingType: this.bindingType,
++      hasActivation: this.hasActivation,
++      hasDeactivation: this.hasDeactivation,
++      name: this.name,
++      scope: this.scope,
++      serviceIdentifier: this.serviceIdentifier,
++      tagNames: [...this.tagNames],
++    };
++  }
+ }
+diff --git a/src/diagnostics/container_snapshot.ts b/src/diagnostics/container_snapshot.ts
+index c8831ec..ab73cd8 100644
+--- a/src/diagnostics/container_snapshot.ts
++++ b/src/diagnostics/container_snapshot.ts
+@@ -1,7 +1,20 @@
+ import type { BindingScope } from '@inversifyjs/core';
+ 
++import type { DigestPayload } from './binding_digest';
+ import { BindingDigest } from './binding_digest';
+ 
++export interface SnapshotPayload {
++  readonly containerLabel: string;
++  readonly defaultScope: BindingScope;
++  readonly digests: readonly DigestPayload[];
++}
++
++export interface SnapshotDifference {
++  readonly kind: 'added' | 'qualification' | 'registration';
++  readonly serviceIdentifier: string;
++  readonly description: string;
++}
++
+ export class ContainerSnapshot {
+   public readonly containerLabel: string;
+   public readonly defaultScope: BindingScope;
+@@ -16,4 +29,110 @@ export class ContainerSnapshot {
+     this.defaultScope = defaultScope;
+     this.digests = [...digests];
+   }
++
++  public renderAsText(): string {
++    const lines: string[] = [
++      `Container ${this.containerLabel} wiring report`,
++      `Default scope: ${this.defaultScope}`,
++    ];
++
++    for (const digest of this.digests) {
++      lines.push(digest.renderAsRow('  '));
++    }
++
++    lines.push(`Registered services: ${this.digests.length.toString()}`);
++
++    return lines.join('\n');
++  }
++
++  public scopeBreakdown(): Map<string, number> {
++    const breakdown: Map<string, number> = new Map<string, number>();
++
++    for (const digest of this.digests) {
++      const key: string = digest.registrationKey();
++      const count: number = breakdown.get(key) ?? 0;
++
++      breakdown.set(key, count + 1);
++    }
++
++    return breakdown;
++  }
++
++  public statefulRegistrationCount(): number {
++    let stateful: number = 0;
++
++    for (const digest of this.digests) {
++      if (digest.isStateful()) {
++        stateful += 1;
++      }
++    }
++
++    return stateful;
++  }
++
++  public qualifierUsage(): Map<string, number> {
++    const usage: Map<string, number> = new Map<string, number>();
++
++    for (const digest of this.digests) {
++      for (const qualifierKey of digest.qualifierKeys()) {
++        const count: number = usage.get(qualifierKey) ?? 0;
++
++        usage.set(qualifierKey, count + 1);
++      }
++    }
++
++    return usage;
++  }
++
++  public changesFrom(baseline: ContainerSnapshot): SnapshotDifference[] {
++    const baselineByIdentity: Map<string, BindingDigest> = new Map<
++      string,
++      BindingDigest
++    >();
++
++    for (const baselineDigest of baseline.digests) {
++      baselineByIdentity.set(baselineDigest.serviceIdentifier, baselineDigest);
++    }
++
++    const differences: SnapshotDifference[] = [];
++
++    for (const digest of this.digests) {
++      const previousDigest: BindingDigest | undefined = baselineByIdentity.get(
++        digest.serviceIdentifier,
++      );
++
++      if (previousDigest === undefined) {
++        differences.push({
++          description: digest.describeAddition(),
++          kind: 'added',
++          serviceIdentifier: digest.serviceIdentifier,
++        });
++
++        continue;
++      }
++
++      const changeDescription: string | undefined =
++        digest.changesFromRegistered(previousDigest);
++
++      if (changeDescription !== undefined) {
++        differences.push({
++          description: changeDescription,
++          kind: 'registration',
++          serviceIdentifier: digest.serviceIdentifier,
++        });
++      }
++    }
++
++    return differences;
++  }
++
++  public toJson(): SnapshotPayload {
++    return {
++      containerLabel: this.containerLabel,
++      defaultScope: this.defaultScope,
++      digests: this.digests.map((digest: BindingDigest) =>
++        digest.toJsonRecord(),
++      ),
++    };
++  }
+ }
+diff --git a/src/diagnostics/index.ts b/src/diagnostics/index.ts
+index ae93d61..951af06 100644
+--- a/src/diagnostics/index.ts
++++ b/src/diagnostics/index.ts
+@@ -1,12 +1,11 @@
+ export { BindingDigest } from './binding_digest';
+-export type { BindingDigestDescriptor } from './binding_digest';
++export type { BindingDigestDescriptor, DigestPayload } from './binding_digest';
+ export { ContainerSnapshot } from './container_snapshot';
++export type { SnapshotDifference, SnapshotPayload } from './container_snapshot';
+ export { StringDigestLineWriter } from './digest_line_writer';
+ export type { DigestLineWriter } from './digest_line_writer';
+ export { SnapshotCodec } from './snapshot_codec';
+-export type { DigestPayload, SnapshotPayload } from './snapshot_codec';
+ export { SnapshotComparator } from './snapshot_comparator';
+-export type { SnapshotDifference } from './snapshot_comparator';
+ export { SnapshotStatistics } from './snapshot_statistics';
+ export { SnapshotTextReport } from './snapshot_text_report';
+ export { WiringAudit } from './wiring_audit';
+diff --git a/src/diagnostics/snapshot_codec.ts b/src/diagnostics/snapshot_codec.ts
+index 8c28407..d24d2fe 100644
+--- a/src/diagnostics/snapshot_codec.ts
++++ b/src/diagnostics/snapshot_codec.ts
+@@ -1,42 +1,16 @@
+-import type { BindingScope, BindingType } from '@inversifyjs/core';
+ import { bindingScopeValues } from '@inversifyjs/core';
+ 
++import type { DigestPayload } from './binding_digest';
+ import { BindingDigest } from './binding_digest';
++import type { SnapshotPayload } from './container_snapshot';
+ import { ContainerSnapshot } from './container_snapshot';
+ 
+-export interface DigestPayload {
+-  readonly serviceIdentifier: string;
+-  readonly scope: BindingScope;
+-  readonly bindingType: BindingType;
+-  readonly hasActivation: boolean;
+-  readonly hasDeactivation: boolean;
+-  readonly name: string | undefined;
+-  readonly tagNames: readonly string[];
+-}
+-
+-export interface SnapshotPayload {
+-  readonly containerLabel: string;
+-  readonly defaultScope: BindingScope;
+-  readonly digests: readonly DigestPayload[];
+-}
++export type { DigestPayload } from './binding_digest';
++export type { SnapshotPayload } from './container_snapshot';
+ 
+ export class SnapshotCodec {
+   public serialize(snapshot: ContainerSnapshot): string {
+-    const payload: SnapshotPayload = {
+-      containerLabel: snapshot.containerLabel,
+-      defaultScope: snapshot.defaultScope,
+-      digests: snapshot.digests.map((digest: BindingDigest) => ({
+-        bindingType: digest.bindingType,
+-        hasActivation: digest.hasActivation,
+-        hasDeactivation: digest.hasDeactivation,
+-        name: digest.name,
+-        scope: digest.scope,
+-        serviceIdentifier: digest.serviceIdentifier,
+-        tagNames: [...digest.tagNames],
+-      })),
+-    };
+-
+-    return JSON.stringify(payload);
++    return JSON.stringify(snapshot.toJson());
+   }
+ 
+   public parse(serialized: string): ContainerSnapshot {
+diff --git a/src/diagnostics/snapshot_comparator.ts b/src/diagnostics/snapshot_comparator.ts
+index 89cb94b..ec24756 100644
+--- a/src/diagnostics/snapshot_comparator.ts
++++ b/src/diagnostics/snapshot_comparator.ts
+@@ -1,82 +1,21 @@
+ import { BindingDigest } from './binding_digest';
++import type { SnapshotDifference } from './container_snapshot';
+ import { ContainerSnapshot } from './container_snapshot';
+ 
+-export interface SnapshotDifference {
+-  readonly kind: 'added' | 'qualification' | 'registration';
+-  readonly serviceIdentifier: string;
+-  readonly description: string;
+-}
++export type { SnapshotDifference } from './container_snapshot';
+ 
+ export class SnapshotComparator {
+   public diff(
+     baseline: ContainerSnapshot,
+     current: ContainerSnapshot,
+   ): SnapshotDifference[] {
+-    const baselineByIdentity: Map<string, BindingDigest> = new Map<
+-      string,
+-      BindingDigest
+-    >();
+-
+-    for (const baselineDigest of baseline.digests) {
+-      baselineByIdentity.set(baselineDigest.serviceIdentifier, baselineDigest);
+-    }
+-
+-    const differences: SnapshotDifference[] = [];
+-
+-    for (const digest of current.digests) {
+-      const previousDigest: BindingDigest | undefined = baselineByIdentity.get(
+-        digest.serviceIdentifier,
+-      );
+-
+-      if (previousDigest === undefined) {
+-        differences.push({
+-          description: `registered after baseline (scope=${digest.scope}, ${digest.bindingType})`,
+-          kind: 'added',
+-          serviceIdentifier: digest.serviceIdentifier,
+-        });
+-
+-        continue;
+-      }
+-
+-      const changeDescription: string | undefined =
+-        this.describeRegistrationChange(previousDigest, digest);
+-
+-      if (changeDescription !== undefined) {
+-        differences.push({
+-          description: changeDescription,
+-          kind: 'registration',
+-          serviceIdentifier: digest.serviceIdentifier,
+-        });
+-      }
+-    }
+-
+-    return differences;
++    return current.changesFrom(baseline);
+   }
+ 
+   public describeRegistrationChange(
+     previousDigest: BindingDigest,
+     updatedDigest: BindingDigest,
+   ): string | undefined {
+-    if (previousDigest.scope !== updatedDigest.scope) {
+-      return `scope: ${previousDigest.scope} -> ${updatedDigest.scope}`;
+-    }
+-
+-    if (previousDigest.bindingType !== updatedDigest.bindingType) {
+-      return `binding type: ${previousDigest.bindingType} -> ${updatedDigest.bindingType}`;
+-    }
+-
+-    if (previousDigest.name !== updatedDigest.name) {
+-      return `name: ${previousDigest.name ?? '(none)'} -> ${updatedDigest.name ?? '(none)'}`;
+-    }
+-
+-    if (previousDigest.tagNames.length !== updatedDigest.tagNames.length) {
+-      return `tags: ${previousDigest.tagNames.length.toString()} -> ${updatedDigest.tagNames.length.toString()}`;
+-    }
+-
+-    if (previousDigest.hasActivation !== updatedDigest.hasActivation) {
+-      return `activation: ${previousDigest.hasActivation.toString()} -> ${updatedDigest.hasActivation.toString()}`;
+-    }
+-
+-    return undefined;
++    return updatedDigest.changesFromRegistered(previousDigest);
+   }
+ }
+diff --git a/src/diagnostics/snapshot_statistics.ts b/src/diagnostics/snapshot_statistics.ts
+index fd91660..0985428 100644
+--- a/src/diagnostics/snapshot_statistics.ts
++++ b/src/diagnostics/snapshot_statistics.ts
+@@ -1,68 +1,17 @@
+-import { bindingScopeValues, bindingTypeValues } from '@inversifyjs/core';
+-
+ import { ContainerSnapshot } from './container_snapshot';
+ 
+ export class SnapshotStatistics {
+   public computeScopeBreakdown(
+     snapshot: ContainerSnapshot,
+   ): Map<string, number> {
+-    const breakdown: Map<string, number> = new Map<string, number>();
+-
+-    for (const digest of snapshot.digests) {
+-      const lifecycleSuffix: string =
+-        digest.hasActivation || digest.hasDeactivation ? '+lifecycle' : '';
+-      const key: string = `${digest.scope}/${digest.bindingType}${lifecycleSuffix}`;
+-      const count: number = breakdown.get(key) ?? 0;
+-
+-      breakdown.set(key, count + 1);
+-    }
+-
+-    return breakdown;
++    return snapshot.scopeBreakdown();
+   }
+ 
+   public countStatefulRegistrations(snapshot: ContainerSnapshot): number {
+-    let stateful: number = 0;
+-
+-    for (const digest of snapshot.digests) {
+-      const keepsInstance: boolean =
+-        digest.scope === bindingScopeValues.Singleton ||
+-        digest.bindingType === bindingTypeValues.ConstantValue;
+-      const runsLifecycle: boolean =
+-        digest.hasActivation || digest.hasDeactivation;
+-
+-      if (keepsInstance || runsLifecycle) {
+-        stateful += 1;
+-      }
+-    }
+-
+-    return stateful;
++    return snapshot.statefulRegistrationCount();
+   }
+ 
+   public computeTagUsage(snapshot: ContainerSnapshot): Map<string, number> {
+-    const usage: Map<string, number> = new Map<string, number>();
+-
+-    for (const digest of snapshot.digests) {
+-      for (const tagName of digest.tagNames) {
+-        const count: number = usage.get(tagName) ?? 0;
+-
+-        usage.set(tagName, count + 1);
+-      }
+-
+-      if (digest.name !== undefined) {
+-        const qualifierKey: string = `name:${digest.name}`;
+-        const qualifierCount: number = usage.get(qualifierKey) ?? 0;
+-
+-        usage.set(qualifierKey, qualifierCount + 1);
+-      }
+-
+-      if (digest.tagNames.length === 0 && digest.name === undefined) {
+-        const unqualifiedKey: string = '(unqualified)';
+-        const unqualifiedCount: number = usage.get(unqualifiedKey) ?? 0;
+-
+-        usage.set(unqualifiedKey, unqualifiedCount + 1);
+-      }
+-    }
+-
+-    return usage;
++    return snapshot.qualifierUsage();
+   }
+ }
+diff --git a/src/diagnostics/snapshot_text_report.ts b/src/diagnostics/snapshot_text_report.ts
+index 0806804..db3c8be 100644
+--- a/src/diagnostics/snapshot_text_report.ts
++++ b/src/diagnostics/snapshot_text_report.ts
+@@ -1,74 +1,18 @@
+-import { bindingScopeValues, bindingTypeValues } from '@inversifyjs/core';
+-
+ import { BindingDigest } from './binding_digest';
+ import { ContainerSnapshot } from './container_snapshot';
+ import type { DigestLineWriter } from './digest_line_writer';
+ 
+ export class SnapshotTextReport {
+   public render(snapshot: ContainerSnapshot): string {
+-    const lines: string[] = [
+-      `Container ${snapshot.containerLabel} wiring report`,
+-      `Default scope: ${snapshot.defaultScope}`,
+-    ];
+-
+-    for (const digest of snapshot.digests) {
+-      lines.push(this.renderDigest(digest, '  '));
+-    }
+-
+-    lines.push(`Registered services: ${snapshot.digests.length.toString()}`);
+-
+-    return lines.join('\n');
++    return snapshot.renderAsText();
+   }
+ 
+   public renderDigest(digest: BindingDigest, indentation: string): string {
+-    const parts: string[] = [`${indentation}${digest.serviceIdentifier}`];
+-
+-    parts.push(`scope=${digest.scope}`);
+-    parts.push(`type=${digest.bindingType}`);
+-
+-    if (digest.name !== undefined) {
+-      parts.push(`name=${digest.name}`);
+-    }
+-
+-    if (digest.hasActivation) {
+-      parts.push('activation=registered');
+-    }
+-
+-    parts.push(
+-      digest.hasDeactivation ? 'deactivation=registered' : 'deactivation=none',
+-    );
+-
+-    parts.push(`tags=[${digest.tagNames.join(', ')}]`);
+-
+-    return parts.join(' | ');
++    return digest.renderAsRow(indentation);
+   }
+ 
+   public renderBindingLegend(digest: BindingDigest): string {
+-    const legend: string[] = [`Service ${digest.serviceIdentifier}`];
+-
+-    if (digest.scope === bindingScopeValues.Singleton) {
+-      legend.push('  one cached instance is reused for every resolution');
+-    } else if (digest.scope === bindingScopeValues.Request) {
+-      legend.push('  each resolution scope receives its own instance');
+-    } else {
+-      legend.push('  every resolution receives a new instance');
+-    }
+-
+-    if (digest.bindingType === bindingTypeValues.Instance) {
+-      legend.push('  activates the constructor of the bound class');
+-    } else if (digest.bindingType === bindingTypeValues.ConstantValue) {
+-      legend.push('  resolves to the registered constant immediately');
+-    } else if (digest.bindingType === bindingTypeValues.Factory) {
+-      legend.push('  resolves through the registered factory');
+-    } else {
+-      legend.push('  resolves through the registered declaration');
+-    }
+-
+-    if (digest.hasActivation || digest.hasDeactivation) {
+-      legend.push('  lifecycle handlers run around resolutions');
+-    }
+-
+-    return legend.join('\n');
++    return digest.renderLegend();
+   }
+ 
+   public renderInto(
+diff --git a/src/diagnostics/wiring_audit.ts b/src/diagnostics/wiring_audit.ts
+index 4e28852..31565ae 100644
+--- a/src/diagnostics/wiring_audit.ts
++++ b/src/diagnostics/wiring_audit.ts
+@@ -25,14 +25,6 @@ export class WiringAudit {
+   public describeRuntimeStatus(digest: BindingDigest): string {
+     const resolved: boolean = this._container.isBound(digest.serviceIdentifier);
+ 
+-    const placement: string = `${digest.scope}/${digest.bindingType}`;
+-    const activation: string = digest.hasActivation
+-      ? 'activation registered'
+-      : 'no activation';
+-    const deactivation: string = digest.hasDeactivation
+-      ? 'deactivation registered'
+-      : 'no deactivation';
+-
+-    return `${digest.serviceIdentifier}: ${resolved ? 'bound' : 'unbound'} (${placement}) ${activation}, ${deactivation}`;
++    return digest.describeRegistration(resolved);
+   }
+ }

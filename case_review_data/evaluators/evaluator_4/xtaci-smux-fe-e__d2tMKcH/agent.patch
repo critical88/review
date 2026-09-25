@@ -1,0 +1,153 @@
+diff --git a/session.go b/session.go
+index a11861f..085547d 100644
+--- a/session.go
++++ b/session.go
+@@ -380,53 +380,6 @@ func (s *Session) returnTokens(n int) {
+ 	}
+ }
+ 
+-// streamConsumed records receive-side bookkeeping for a stream after n bytes
+-// have been consumed by the reader, and returns the number of consumed bytes
+-// that should be announced to the peer in a window update, or 0 when no
+-// window update is due.
+-//
+-// The caller must hold the stream's bufferLock, so the per-stream counters stay
+-// consistent with the buffer it mirrors.
+-func (s *Session) streamConsumed(st *stream, n int) uint32 {
+-	st.numRead += uint32(n)
+-	st.incr += uint32(n)
+-
+-	// send window update if the increased bytes exceed half of the buffer size
+-	// or this is the initial read.
+-	if st.incr >= st.windowUpdateThreshold || st.numRead == uint32(n) {
+-		notifyConsumed := st.numRead
+-		st.incr = 0
+-		return notifyConsumed
+-	}
+-	return 0
+-}
+-
+-// streamWindow computes the current send window for a stream. ok is false if
+-// the peer claims to have consumed more than it received, which indicates
+-// malformed remote data.
+-//
+-// All window state lives on the stream, so the session simply mediates the
+-// arithmetic the write path needs.
+-func (s *Session) streamWindow(st *stream) (win int32, windowOk bool) {
+-	// per stream sliding window control
+-	// [.... [consumed... numWritten] ... win... ]
+-	// [.... [consumed...................+rmtwnd]]
+-	// note:
+-	// even if uint32 overflow, this math still works:
+-	// eg1: uint32(0) - uint32(math.MaxUint32) = 1
+-	// eg2: int32(uint32(0) - uint32(1)) = -1
+-	//
+-	// basically, you can take it as a MODULAR ARITHMETIC
+-	inflight := int32(atomic.LoadUint32(&st.numWritten) - atomic.LoadUint32(&st.peerConsumed))
+-	if inflight < 0 { // security check for malformed data
+-		return 0, false
+-	}
+-
+-	// make sure you understand 'win' is calculated in modular arithmetic(2^32(4GB))
+-	win = int32(atomic.LoadUint32(&st.peerWindow)) - inflight
+-	return win, true
+-}
+-
+ // recvLoop keeps on reading from underlying connection if tokens are available
+ func (s *Session) recvLoop() {
+ 	var hdr rawHeader
+diff --git a/stream.go b/stream.go
+index 19c72ba..9b5b362 100644
+--- a/stream.go
++++ b/stream.go
+@@ -274,7 +274,7 @@ func (s *stream) tryReadV2(b []byte) (n int, err error) {
+ 	// continues reading data.
+ 	//
+ 	// s.numRead == n indicates that this is the initial read.
+-	notifyConsumed = s.sess.streamConsumed(s, n)
++	notifyConsumed = s.recordConsumed(n)
+ 	s.bufferLock.Unlock()
+ 
+ 	if recycled != nil {
+@@ -364,7 +364,7 @@ func (s *stream) writeToV2(w io.Writer) (n int64, err error) {
+ 		if buf != nil {
+ 			bufLen = uint32(len(buf))
+ 		}
+-		notifyConsumed = s.sess.streamConsumed(s, int(bufLen))
++		notifyConsumed = s.recordConsumed(int(bufLen))
+ 		s.bufferLock.Unlock()
+ 
+ 		// same as v1, write the buffer to w
+@@ -393,6 +393,28 @@ func (s *stream) writeToV2(w io.Writer) (n int64, err error) {
+ 	}
+ }
+ 
++// recordConsumed records receive-side bookkeeping after n bytes have been
++// consumed by the reader, and returns the number of consumed bytes that should
++// be announced to the peer in a window update, or 0 when no window update is
++// due.
++//
++// All of this state lives on the stream, so the accounting mirrors the buffer
++// ring directly. The caller must hold bufferLock so the per-stream counters
++// stay consistent with the buffer it mirrors.
++func (s *stream) recordConsumed(n int) uint32 {
++	s.numRead += uint32(n)
++	s.incr += uint32(n)
++
++	// send window update if the increased bytes exceed half of the buffer size
++	// or this is the initial read.
++	if s.incr >= s.windowUpdateThreshold || s.numRead == uint32(n) {
++		notifyConsumed := s.numRead
++		s.incr = 0
++		return notifyConsumed
++	}
++	return 0
++}
++
+ // sendWindowUpdate sends a window update command to the peer.
+ func (s *stream) sendWindowUpdate(consumed uint32) error {
+ 	var timer *time.Timer
+@@ -514,6 +536,29 @@ func (s *stream) writeV1(b []byte) (n int, err error) {
+ 	return sent, nil
+ }
+ 
++// window computes the current send window for the stream. ok is false if the
++// peer claims to have consumed more than it received, which indicates
++// malformed remote data. All window state lives on the stream.
++func (s *stream) window() (win int32, ok bool) {
++	// per stream sliding window control
++	// [.... [consumed... numWritten] ... win... ]
++	// [.... [consumed...................+rmtwnd]]
++	// note:
++	// even if uint32 overflow, this math still works:
++	// eg1: uint32(0) - uint32(math.MaxUint32) = 1
++	// eg2: int32(uint32(0) - uint32(1)) = -1
++	//
++	// basically, you can take it as a MODULAR ARITHMETIC
++	inflight := int32(atomic.LoadUint32(&s.numWritten) - atomic.LoadUint32(&s.peerConsumed))
++	if inflight < 0 { // security check for malformed data
++		return 0, false
++	}
++
++	// make sure you understand 'win' is calculated in modular arithmetic(2^32(4GB))
++	win = int32(atomic.LoadUint32(&s.peerWindow)) - inflight
++	return win, true
++}
++
+ // writeV2 writes data to the stream for version 2 streams.
+ func (s *stream) writeV2(b []byte) (n int, err error) {
+ 	// check empty input
+@@ -554,10 +599,9 @@ func (s *stream) writeV2(b []byte) (n int, err error) {
+ 			deadlineTimer = nil
+ 		}
+ 
+-		// per stream sliding window control:
+-		// the session owns the window arithmetic for every stream,
+-		// see the notes on Session.streamWindow() for the modular arithmetic.
+-		win, windowOk := s.sess.streamWindow(s)
++		// per stream sliding window control,
++		// see the notes on window() for the modular arithmetic.
++		win, windowOk := s.window()
+ 		if !windowOk { // security check for malformed data
+ 			return 0, ErrConsumed
+ 		}

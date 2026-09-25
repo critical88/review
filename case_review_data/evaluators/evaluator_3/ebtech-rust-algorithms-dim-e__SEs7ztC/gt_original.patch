@@ -1,0 +1,566 @@
+diff --git b/src/math/mod.rs a/src/math/mod.rs
+index 6cb780a..c27e7af 100644
+--- b/src/math/mod.rs
++++ a/src/math/mod.rs
+@@ -82,13 +82,27 @@ pub fn is_prime(n: i64) -> bool {
+     }
+ }
+ 
++fn pollard_rho(n: i64) -> i64 {
++    for a in 1..n {
++        let f = |x| pos_mod(mod_mul(x, x, n) + a, n);
++        let mut x = 2;
++        let mut y = 2;
++        loop {
++            x = f(x);
++            y = f(f(y));
++            let div = num::fast_gcd(x - y, n);
++            if div == n {
++                break;
++            } else if div > 1 {
++                return div;
++            }
++        }
++    }
++    panic!("No divisor found!");
++}
++
+ /// Assuming x >= 1, finds the prime factorization of n
+-/// TODO: the divisor search below needs randomization to ensure correctness in contest settings!
+-///
+-/// The whole pipeline runs in one scope on purpose: the cofactor work list,
+-/// the Miller-Rabin composite screen, and Pollard's rho walk are easier to
+-/// audit side by side, with the modular arithmetic written out where it is
+-/// used instead of hiding behind tiny-wrapper calls.
++/// TODO: pollard_rho needs randomization to ensure correctness in contest settings!
+ pub fn factorize(n: i64) -> Vec<i64> {
+     assert!(n >= 1);
+     let r = n.trailing_zeros() as usize;
+@@ -98,101 +112,10 @@ pub fn factorize(n: i64) -> Vec<i64> {
+         x => vec![x],
+     };
+     while let Some(top) = stack.pop() {
+-        // --- Composite screen: deterministic Miller-Rabin over the small
+-        // witness bases, with the odd_part/twos split of top - 1 first.
+-        let prime = 'miller: {
+-            if top <= 1 {
+-                break 'miller false;
+-            }
+-            if top == 2 || top == 3 {
+-                break 'miller true;
+-            }
+-            if top % 2 == 0 {
+-                break 'miller false;
+-            }
+-            // top - 1 = odd_part * 2^twos, so the strong witness test checks
+-            // the chain residue^(2^j * odd_part) for j < twos.
+-            let twos = (top - 1).trailing_zeros() as i64;
+-            let odd_part = (top - 1) as u64 >> twos;
+-            const BASES: [i64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+-            'bases: for &base in BASES.iter() {
+-                if base > top - 2 {
+-                    continue 'bases;
+-                }
+-                // residue = base^odd_part mod top, by square-and-multiply.
+-                let mut residue = 1 % top;
+-                let mut base_red = base % top;
+-                let mut exp = odd_part;
+-                while exp > 0 {
+-                    if exp % 2 == 1 {
+-                        let scaled = (residue as i128 * base_red as i128 % top as i128) as i64;
+-                        let scaled = if scaled < 0 { scaled + top } else { scaled };
+-                        residue = scaled;
+-                    }
+-                    let squared = (base_red as i128 * base_red as i128 % top as i128) as i64;
+-                    let squared = if squared < 0 { squared + top } else { squared };
+-                    base_red = squared;
+-                    exp /= 2;
+-                }
+-                if residue < 0 {
+-                    residue += top;
+-                }
+-                // Strong witness check: an early 1 or top - 1, or top - 1
+-                // somewhere along the squaring chain, clears this base.
+-                if residue == 1 || residue == top - 1 {
+-                    continue 'bases;
+-                }
+-                for _ in 1..twos {
+-                    let squared = (residue as i128 * residue as i128 % top as i128) as i64;
+-                    let squared = if squared < 0 { squared + top } else { squared };
+-                    residue = squared;
+-                    if residue == top - 1 {
+-                        continue 'bases;
+-                    }
+-                }
+-                break 'miller false;
+-            }
+-            break 'miller true;
+-        };
+-        if prime {
++        if is_prime(top) {
+             factors.push(top);
+         } else {
+-            // --- Divisor search: Pollard's rho with tortoise/hare walkers on
+-            // the polynomial x^2 + a, for a = 1, 2, ... Each walker step and
+-            // the cycle gcd are computed directly (mod_mul/pos_mod leaves and
+-            // the Euclid loop of the old number-theory helpers).
+-            let div = 'rho: {
+-                for a in 1..top {
+-                    let mut tortoise = 2;
+-                    let mut hare = 2;
+-                    loop {
+-                        // tortoise = f(tortoise) where f(x) = (x*x + a) mod top:
+-                        let step_t = (tortoise as i128 * tortoise as i128 % top as i128) as i64;
+-                        let step_t = if step_t < 0 { step_t + top } else { step_t };
+-                        tortoise = (step_t + a) % top;
+-                        // hare = f(f(hare)), two steps per round:
+-                        let step_h = (hare as i128 * hare as i128 % top as i128) as i64;
+-                        let step_h = if step_h < 0 { step_h + top } else { step_h };
+-                        hare = (step_h + a) % top;
+-                        let step_h2 = (hare as i128 * hare as i128 % top as i128) as i64;
+-                        let step_h2 = if step_h2 < 0 { step_h2 + top } else { step_h2 };
+-                        hare = (step_h2 + a) % top;
+-                        // Cycle detection: gcd(tortoise - hare, top).
+-                        let (mut ga, mut gb) = (tortoise - hare, top);
+-                        while gb != 0 {
+-                            ga %= gb;
+-                            std::mem::swap(&mut ga, &mut gb);
+-                        }
+-                        let div = ga.abs();
+-                        if div == top {
+-                            break;
+-                        } else if div > 1 {
+-                            break 'rho div;
+-                        }
+-                    }
+-                }
+-                panic!("No divisor found!");
+-            };
++            let div = pollard_rho(top);
+             stack.push(div);
+             stack.push(top / div);
+         }
+diff --git b/src/range_query/dynamic_arq.rs a/src/range_query/dynamic_arq.rs
+index 35e9ed1..6450468 100644
+--- b/src/range_query/dynamic_arq.rs
++++ a/src/range_query/dynamic_arq.rs
+@@ -118,97 +118,34 @@ impl<T: ArqSpec> DynamicArq<T> {
+         self.nodes[p].val = T::op(left_val, right_val);
+     }
+ 
++    fn clone_node(&mut self, p_orig: usize) -> usize {
++        if self.is_persistent {
++            let node = self.nodes[p_orig].clone();
++            self.nodes.push(node);
++            self.nodes.len() - 1
++        } else {
++            p_orig
++        }
++    }
++
+     /// Applies the endomorphism f to all entries from l to r, inclusive.
+     /// If l == r, the updates are eager. Otherwise, they are lazy.
+-    ///
+-    /// On the boundary of a partial overlap, the required lazy-propagation
+-    /// bookkeeping is performed locally: node allocation, persistence cloning
+-    /// of the visited path, downward flow of the pending tags, and recomposed
+-    /// aggregation of the two children.
+     pub fn update(&mut self, view: ArqView, l: i64, r: i64, f: &T::F) -> ArqView {
+         let (p_orig, s) = view;
+-        // The two boundary predicates of the entry point are named up front so
+-        // the three update regimes read at a glance: a dead region never
+-        // touches the tree, a saturated region swallows the update whole,
+-        // and anything in between walks into the children.
+-        let dead_region = r < 0 || s - 1 < l;
+-        let saturated = l <= 0 && s - 1 <= r;
+-        if dead_region {
++        if r < 0 || s - 1 < l {
+             view
+-        } else if saturated {
+-            // Total overlap: f covers this whole subtree.
+-            // Persistence protocol: clone the path we are about to rewrite.
+-            let p_clone = if self.is_persistent {
+-                let node = self.nodes[p_orig].clone();
+-                self.nodes.push(node);
+-                let clone_slot = self.nodes.len() - 1;
+-                clone_slot
+-            } else {
+-                p_orig
+-            };
+-            // This subtree eagerly takes the update, composing it onto any
+-            // pending tag when it denies the children an individual identity.
+-            self.nodes[p_clone].val = T::apply(f, &self.nodes[p_clone].val, s);
+-            if s > 1 {
+-                let composed = match self.nodes[p_clone].app {
+-                    Some(ref g) => T::compose(f, g),
+-                    None => f.clone(),
+-                };
+-                self.nodes[p_clone].app = Some(composed);
+-            }
++        } else if l <= 0 && s - 1 <= r {
++            let p_clone = self.clone_node(p_orig);
++            self.nodes[p_clone].apply(f, s);
+             (p_clone, s)
+         } else {
+-            // Partial overlap: the children of p_orig live in separate halves.
+-            // Endow p_orig with children if it has none so far.
+-            if self.nodes[p_orig].down.0 == usize::MAX {
+-                self.nodes.push(DynamicArqNode::default());
+-                self.nodes.push(DynamicArqNode::default());
+-                self.nodes[p_orig].down = (self.nodes.len() - 2, self.nodes.len() - 1);
+-            }
+-            let (lp, rp) = self.nodes[p_orig].down;
+-            let ls = s / 2;
+-            let rs = s - ls;
+-            // Flush p_orig's pending tag into the children before descending,
+-            // so the recursion below sees fully-updated subtrees.
+-            if let Some(ref pending_tag) = self.nodes[p_orig].app.take() {
+-                // Left child, covering ls leaves:
+-                self.nodes[lp].val = T::apply(pending_tag, &self.nodes[lp].val, ls);
+-                if ls > 1 {
+-                    let composed = match self.nodes[lp].app {
+-                        Some(ref g) => T::compose(pending_tag, g),
+-                        None => pending_tag.clone(),
+-                    };
+-                    self.nodes[lp].app = Some(composed);
+-                }
+-                // Right child, covering rs leaves:
+-                self.nodes[rp].val = T::apply(pending_tag, &self.nodes[rp].val, rs);
+-                if rs > 1 {
+-                    let composed = match self.nodes[rp].app {
+-                        Some(ref g) => T::compose(pending_tag, g),
+-                        None => pending_tag.clone(),
+-                    };
+-                    self.nodes[rp].app = Some(composed);
+-                }
+-            }
+-            let l_view = (lp, ls);
+-            let r_view = (rp, rs);
+-            // Persistence protocol: clone the path we are about to rewrite.
+-            let p_clone = if self.is_persistent {
+-                let node = self.nodes[p_orig].clone();
+-                self.nodes.push(node);
+-                let clone_slot = self.nodes.len() - 1;
+-                clone_slot
+-            } else {
+-                p_orig
+-            };
++            let (l_view, r_view) = self.push(view);
++            let ls = l_view.1;
++            let p_clone = self.clone_node(p_orig);
+             let lp_clone = self.update(l_view, l, r, f).0;
+             let rp_clone = self.update(r_view, l - ls, r - ls, f).0;
+             self.nodes[p_clone].down = (lp_clone, rp_clone);
+-            // Restore the parent aggregate from the (possibly cloned) children.
+-            let (lp_agg, rp_agg) = self.nodes[p_clone].down;
+-            let left_val = &self.nodes[lp_agg].val;
+-            let right_val = &self.nodes[rp_agg].val;
+-            self.nodes[p_clone].val = T::op(left_val, right_val);
++            self.pull(p_clone);
+             (p_clone, s)
+         }
+     }
+diff --git b/src/range_query/static_arq.rs a/src/range_query/static_arq.rs
+index 85b7cfa..461986d 100644
+--- b/src/range_query/static_arq.rs
++++ a/src/range_query/static_arq.rs
+@@ -60,6 +60,20 @@ impl<T: ArqSpec> StaticArq<T> {
+         self.val[p] = T::op(&self.val[p << 1], &self.val[(p << 1) | 1]);
+     }
+ 
++    fn push_to(&mut self, p: usize) {
++        let one_plus_floor_log_p = (p + 1).next_power_of_two().trailing_zeros();
++        for i in (1..one_plus_floor_log_p).rev() {
++            self.push(p >> i);
++        }
++    }
++
++    fn pull_from(&mut self, mut p: usize) {
++        while p > 1 {
++            p >>= 1;
++            self.pull(p);
++        }
++    }
++
+     /// Applies the endomorphism f to all entries from l to r, inclusive.
+     /// If l == r, the updates are eager. Otherwise, they are lazy.
+     ///
+@@ -69,91 +83,19 @@ impl<T: ArqSpec> StaticArq<T> {
+     pub fn update(&mut self, mut l: usize, mut r: usize, f: &T::F) {
+         l += self.app.len();
+         r += self.app.len();
+-        // Phase 1: un-lazify the ancestors of both borders. Clearing the lazy
+-        // tags on the path above l and r keeps the canonical decomposition
+-        // below valid, so we walk the levels of each border downwards and
+-        // disperse every pending tag to its two children.
+         if l < r {
+-            let one_plus_floor_log = (l + 1).next_power_of_two().trailing_zeros();
+-            for i in (1..one_plus_floor_log).rev() {
+-                // Dispersal step for node l >> i:
+-                if let Some(ref disp_tag) = self.app[l >> i].take() {
+-                    let (left_child, right_child) = ((l >> i) << 1, ((l >> i) << 1) | 1);
+-                    let scope = (self.app.len().div_ceil(l >> i) / 2).next_power_of_two() as i64;
+-                    // The pending tag flows one level down to both children:
+-                    self.val[left_child] = T::apply(disp_tag, &self.val[left_child], scope);
+-                    if let Some(lazy) = self.app.get_mut(left_child) {
+-                        let composed = match *lazy {
+-                            Some(ref g) => T::compose(disp_tag, g),
+-                            None => disp_tag.clone(),
+-                        };
+-                        *lazy = Some(composed);
+-                    }
+-                    self.val[right_child] = T::apply(disp_tag, &self.val[right_child], scope);
+-                    if let Some(lazy) = self.app.get_mut(right_child) {
+-                        let composed = match *lazy {
+-                            Some(ref g) => T::compose(disp_tag, g),
+-                            None => disp_tag.clone(),
+-                        };
+-                        *lazy = Some(composed);
+-                    }
+-                }
+-            }
+-        }
+-        // Same story at the right border:
+-        let one_plus_floor_log = (r + 1).next_power_of_two().trailing_zeros();
+-        for i in (1..one_plus_floor_log).rev() {
+-            // Dispersal step for node r >> i:
+-            if let Some(ref disp_tag) = self.app[r >> i].take() {
+-                let (left_child, right_child) = ((r >> i) << 1, ((r >> i) << 1) | 1);
+-                let scope = (self.app.len().div_ceil(r >> i) / 2).next_power_of_two() as i64;
+-                // The pending tag flows one level down to both children:
+-                self.val[left_child] = T::apply(disp_tag, &self.val[left_child], scope);
+-                if let Some(lazy) = self.app.get_mut(left_child) {
+-                    let composed = match *lazy {
+-                        Some(ref g) => T::compose(disp_tag, g),
+-                        None => disp_tag.clone(),
+-                    };
+-                    *lazy = Some(composed);
+-                }
+-                self.val[right_child] = T::apply(disp_tag, &self.val[right_child], scope);
+-                if let Some(lazy) = self.app.get_mut(right_child) {
+-                    let composed = match *lazy {
+-                        Some(ref g) => T::compose(disp_tag, g),
+-                        None => disp_tag.clone(),
+-                    };
+-                    *lazy = Some(composed);
+-                }
+-            }
++            self.push_to(l);
+         }
+-        // Phase 2: canonical decomposition. While walking up level by level,
+-        // f is applied to the boundary-aligned nodes, and s tracks the number
+-        // of leaves of the current level's nodes.
++        self.push_to(r);
+         let (mut l0, mut r0, mut s) = (1, 1, 1);
+         while l <= r {
+             if l & 1 == 1 {
+-                // l is the right child of its parent, so cover it and move right:
+-                self.val[l] = T::apply(f, &self.val[l], s);
+-                if let Some(lazy) = self.app.get_mut(l) {
+-                    let composed = match *lazy {
+-                        Some(ref g) => T::compose(f, g),
+-                        None => f.clone(),
+-                    };
+-                    *lazy = Some(composed);
+-                }
++                self.apply(l, f, s);
+                 l0 = l0.max(l);
+                 l += 1;
+             }
+             if r & 1 == 0 {
+-                // r is the left child of its parent, so cover it and move left:
+-                self.val[r] = T::apply(f, &self.val[r], s);
+-                if let Some(lazy) = self.app.get_mut(r) {
+-                    let composed = match *lazy {
+-                        Some(ref g) => T::compose(f, g),
+-                        None => f.clone(),
+-                    };
+-                    *lazy = Some(composed);
+-                }
++                self.apply(r, f, s);
+                 r0 = r0.max(r);
+                 r -= 1;
+             }
+@@ -161,18 +103,8 @@ impl<T: ArqSpec> StaticArq<T> {
+             r >>= 1;
+             s <<= 1;
+         }
+-        // Phase 3: re-aggregate the ancestors of the covered borders, up to
+-        // every root above l0 and r0.
+-        let mut p = l0;
+-        while p > 1 {
+-            p >>= 1;
+-            self.val[p] = T::op(&self.val[p << 1], &self.val[(p << 1) | 1]);
+-        }
+-        let mut p = r0;
+-        while p > 1 {
+-            p >>= 1;
+-            self.val[p] = T::op(&self.val[p << 1], &self.val[(p << 1) | 1]);
+-        }
++        self.pull_from(l0);
++        self.pull_from(r0);
+     }
+ 
+     /// Returns the aggregate range query on all entries from l to r, inclusive.
+@@ -183,73 +115,18 @@ impl<T: ArqSpec> StaticArq<T> {
+     pub fn query(&mut self, mut l: usize, mut r: usize) -> T::S {
+         l += self.app.len();
+         r += self.app.len();
+-        // Un-lazify the ancestors of both borders, dispersing every pending
+-        // tag to its two children, level by level above l and r.
+         if l < r {
+-            let one_plus_floor_log = (l + 1).next_power_of_two().trailing_zeros();
+-            for i in (1..one_plus_floor_log).rev() {
+-                // Dispersal step for node l >> i:
+-                if let Some(ref disp_tag) = self.app[l >> i].take() {
+-                    let (left_child, right_child) = ((l >> i) << 1, ((l >> i) << 1) | 1);
+-                    let scope = (self.app.len().div_ceil(l >> i) / 2).next_power_of_two() as i64;
+-                    // The pending tag flows one level down to both children:
+-                    self.val[left_child] = T::apply(disp_tag, &self.val[left_child], scope);
+-                    if let Some(lazy) = self.app.get_mut(left_child) {
+-                        let composed = match *lazy {
+-                            Some(ref g) => T::compose(disp_tag, g),
+-                            None => disp_tag.clone(),
+-                        };
+-                        *lazy = Some(composed);
+-                    }
+-                    self.val[right_child] = T::apply(disp_tag, &self.val[right_child], scope);
+-                    if let Some(lazy) = self.app.get_mut(right_child) {
+-                        let composed = match *lazy {
+-                            Some(ref g) => T::compose(disp_tag, g),
+-                            None => disp_tag.clone(),
+-                        };
+-                        *lazy = Some(composed);
+-                    }
+-                }
+-            }
+-        }
+-        // Same story at the right border:
+-        let one_plus_floor_log = (r + 1).next_power_of_two().trailing_zeros();
+-        for i in (1..one_plus_floor_log).rev() {
+-            // Dispersal step for node r >> i:
+-            if let Some(ref disp_tag) = self.app[r >> i].take() {
+-                let (left_child, right_child) = ((r >> i) << 1, ((r >> i) << 1) | 1);
+-                let scope = (self.app.len().div_ceil(r >> i) / 2).next_power_of_two() as i64;
+-                // The pending tag flows one level down to both children:
+-                self.val[left_child] = T::apply(disp_tag, &self.val[left_child], scope);
+-                if let Some(lazy) = self.app.get_mut(left_child) {
+-                    let composed = match *lazy {
+-                        Some(ref g) => T::compose(disp_tag, g),
+-                        None => disp_tag.clone(),
+-                    };
+-                    *lazy = Some(composed);
+-                }
+-                self.val[right_child] = T::apply(disp_tag, &self.val[right_child], scope);
+-                if let Some(lazy) = self.app.get_mut(right_child) {
+-                    let composed = match *lazy {
+-                        Some(ref g) => T::compose(disp_tag, g),
+-                        None => disp_tag.clone(),
+-                    };
+-                    *lazy = Some(composed);
+-                }
+-            }
++            self.push_to(l);
+         }
++        self.push_to(r);
+         let (mut l_agg, mut r_agg) = (T::identity(), T::identity());
+         while l <= r {
+             if l & 1 == 1 {
+-                // l is the right child of its parent, so aggregate it and move right:
+-                let border_val = &self.val[l];
+-                l_agg = T::op(&l_agg, border_val);
++                l_agg = T::op(&l_agg, &self.val[l]);
+                 l += 1;
+             }
+             if r & 1 == 0 {
+-                // r is the left child of its parent, so aggregate it and move left:
+-                let border_val = &self.val[r];
+-                r_agg = T::op(border_val, &r_agg);
++                r_agg = T::op(&self.val[r], &r_agg);
+                 r -= 1;
+             }
+             l >>= 1;
+diff --git b/src/string_proc.rs a/src/string_proc.rs
+index 688d1a2..4716f68 100644
+--- b/src/string_proc.rs
++++ a/src/string_proc.rs
+@@ -209,31 +209,36 @@ pub struct SuffixArray {
+ }
+ 
+ impl SuffixArray {
+-    /// Suffix array construction in O(n log n) time.
+-    ///
+-    /// Both radix passes below perform the stable counting sort of the old
+-    /// counting_sort() helper by hand: tally the keys into `counts`, turn the
+-    /// tallies into running starts, and scatter the items to their slots.
+-    pub fn new(text: impl IntoIterator<Item = u8>) -> Self {
+-        let init_rank = text.into_iter().map(|ch| ch as usize).collect::<Vec<_>>();
+-        let n = init_rank.len();
+-        // Radix pass 1: order the suffix ids by their first character, whose
+-        // key space is the 256 possible byte values.
+-        let mut counts = vec![0; 256];
+-        for v in (0..n).clone() {
+-            counts[init_rank[v]] += 1;
++    /// O(n + max_key) stable sort on the items generated by vals.
++    /// Items v in vals are sorted according to val_to_key[v].
++    fn counting_sort(
++        vals: impl Iterator<Item = usize> + Clone,
++        val_to_key: &[usize],
++        max_key: usize,
++    ) -> Vec<usize> {
++        let mut counts = vec![0; max_key];
++        for v in vals.clone() {
++            counts[val_to_key[v]] += 1;
+         }
+         let mut total = 0;
+         for c in counts.iter_mut() {
+             total += *c;
+             *c = total - *c;
+         }
+-        let mut sfx = vec![0; total];
+-        for v in 0..n {
+-            let c = &mut counts[init_rank[v]];
+-            sfx[*c] = v;
++        let mut result = vec![0; total];
++        for v in vals {
++            let c = &mut counts[val_to_key[v]];
++            result[*c] = v;
+             *c += 1;
+         }
++        result
++    }
++
++    /// Suffix array construction in O(n log n) time.
++    pub fn new(text: impl IntoIterator<Item = u8>) -> Self {
++        let init_rank = text.into_iter().map(|ch| ch as usize).collect::<Vec<_>>();
++        let n = init_rank.len();
++        let mut sfx = Self::counting_sort(0..n, &init_rank, 256);
+         let mut rank = vec![init_rank];
+         // Invariant at the start of every loop iteration:
+         // suffixes are sorted according to the first skip characters.
+@@ -242,24 +247,7 @@ impl SuffixArray {
+             let mut cur_rank = prev_rank.clone();
+ 
+             let pos = (n - skip..n).chain(sfx.into_iter().filter_map(|p| p.checked_sub(skip)));
+-            // Radix pass 2: the entries of the previous round are re-ordered
+-            // by the rank of their suffix's first `skip` characters. The key
+-            // space grows to the larger of n and the byte range.
+-            let mut counts = vec![0; max(n, 256)];
+-            for v in pos.clone() {
+-                counts[prev_rank[v]] += 1;
+-            }
+-            let mut total = 0;
+-            for c in counts.iter_mut() {
+-                total += *c;
+-                *c = total - *c;
+-            }
+-            sfx = vec![0; total];
+-            for v in pos {
+-                let c = &mut counts[prev_rank[v]];
+-                sfx[*c] = v;
+-                *c += 1;
+-            }
++            sfx = Self::counting_sort(pos, prev_rank, max(n, 256));
+ 
+             let mut prev = sfx[0];
+             cur_rank[prev] = 0;

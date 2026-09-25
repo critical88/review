@@ -1,0 +1,397 @@
+diff --git a/kiwi-intl/src/IntlAudit.ts b/kiwi-intl/src/IntlAudit.ts
+index ed8b53e..4fd8a37 100644
+--- a/kiwi-intl/src/IntlAudit.ts
++++ b/kiwi-intl/src/IntlAudit.ts
+@@ -40,34 +40,26 @@ export class IntlAudit {
+   }
+ 
+   /**
+-   * 记录一次文案访问流水，档案的命中等指标直接展开进流水。
++   * 记录一次文案访问流水：流水行由档案自己排（MessageEntry.usageLine），
++   * 审计只负责流水账本的开合。
+    */
+   recordEntryUsage(entry, event = 'resolve') {
+     if (!this.enabled) {
+       return false;
+     }
+-    this.records.push(
+-      `${event} ${entry.key}@${entry.lang} hits=${entry.hitCount} hot=${entry.hotnessLevel} ` +
+-        `writes=${entry.cacheWrites} at=${entry.lastUsedAt} seq=${entry.renderCount}`
+-    );
++    this.records.push(entry.usageLine(event));
+     return true;
+   }
+ 
+   /**
+-   * 实例快照：读取一次即可定位语言与缓存状态，避免以后拿不到现场。
++   * 实例快照：现场状态由实例自己汇总（I18N.auditSnapshot），
++   * 审计只登记拿到的快照。
+    */
+   attachInstance(intl) {
+     if (!this.enabled) {
+       return null;
+     }
+-    this.instanceSnapshot = {
+-      lang: intl.__lang__,
+-      packs: Object.keys(intl.__metas__ || {}).length,
+-      activeKeys: Object.keys(intl.__data__ || {}).length,
+-      defaultKey: intl.__defaultKey__,
+-      entries: intl.__entries__.size,
+-      cacheHits: intl.__cache__.hits
+-    };
++    this.instanceSnapshot = intl.auditSnapshot();
+     return this.instanceSnapshot;
+   }
+ }
+diff --git a/kiwi-intl/src/IntlFormatter.ts b/kiwi-intl/src/IntlFormatter.ts
+index 3b1cda5..5108a04 100644
+--- a/kiwi-intl/src/IntlFormatter.ts
++++ b/kiwi-intl/src/IntlFormatter.ts
+@@ -68,44 +68,15 @@ export class IntlFormatter {
+   }
+ 
+   /**
+-   * 按语言包的市场惯例输出数字：货币、分组与小数位由语言包决定。
++   * 市场展示惯例已归还语言包（LanguagePack.numberOptions）；
++   * 渲染器只负责通用的 locale 渲染。
+    */
+-  packNumber(pack, value: number, options?) {
+-    const style = (options && options.style) || 'decimal';
+-    const formatterOptions = this.applyDefaults(options);
+-    formatterOptions.style = style === 'money' ? 'currency' : style;
+-    if (formatterOptions.style === 'currency' && !formatterOptions.currency) {
+-      formatterOptions.currency = pack.currency;
+-    }
+-    if (pack.compact) {
+-      formatterOptions.notation = 'compact';
+-    }
+-    formatterOptions.useGrouping = pack.grouping;
+-    if (formatterOptions.minimumFractionDigits === undefined) {
+-      formatterOptions.minimumFractionDigits = pack.minimumFractionDigits;
+-    }
+-    if (formatterOptions.maximumFractionDigits === undefined) {
+-      formatterOptions.maximumFractionDigits = pack.maximumFractionDigits;
+-    }
+-    return new Intl.NumberFormat(pack.lang, formatterOptions).format(value);
+-  }
+ 
+   /**
+-   * 渲染一条文案档案：渲染语言来自档案例，渲染结果与最近的渲染指标一并记录。
++   * 渲染一条文案档案：渲染流程已归还档案（MessageEntry.renderWith），
++   * 这里保留转发口径方便旧调用点。
+    */
+   renderEntry(entry, args?: object): string {
+-    const text = entry.content;
+-    if (!text || typeof text !== 'string') {
+-      return '';
+-    }
+-    const rendered = this.formatMessage(text, entry.lang, args);
+-    if (rendered && entry.lastRenderedLang !== entry.lang) {
+-      // 渲染语言切换时刷新档案的语言标记，避免诊断阶段误报语言漂移。
+-      entry.noteRender(Date.now(), entry.lang);
+-    }
+-    if (!rendered) {
+-      this.failures.push(entry.key);
+-    }
+-    return rendered;
++    return entry.renderWith(this, args);
+   }
+ }
+diff --git a/kiwi-intl/src/LanguagePack.ts b/kiwi-intl/src/LanguagePack.ts
+index 75ba176..c279beb 100644
+--- a/kiwi-intl/src/LanguagePack.ts
++++ b/kiwi-intl/src/LanguagePack.ts
+@@ -75,18 +75,38 @@ export class LanguagePack {
+   }
+ 
+   /**
+-   * 热点晋升策略：命中多、已进缓存且最近使用过的文案值得进入热点词列表。
++   * 热点晋升策略：命中、缓存写入等指标都是档案自己的数据，
++   * 判定归还档案；语言包只维护热点词的登记顺序。
+    */
+   shouldPromote(entry) {
+-    if (entry.hotnessLevel >= 2) {
+-      return true;
+-    }
+-    if (entry.hitCount >= 3 && entry.cacheWrites >= 1) {
+-      return true;
+-    }
+-    if (entry.hitCount >= 2 && entry.lastUsedAt > 0 && entry.hotnessLevel >= 1) {
+-      return true;
+-    }
+-    return entry.hitCount > 5;
++    return entry.isPromotable();
++  }
++
++  /**
++   * 语言包自述：解决情况、缺失、市场惯例与热点词都是包内数据。
++   */
++  summary() {
++    return {
++      lang: this.lang,
++      keys: Object.keys(this.metas).length,
++      resolved: this.resolvedCount,
++      missed: this.misses,
++      defaultPack: this.defaultLang,
++      market: `${this.currency}/${this.grouping ? 'grouped' : 'plain'}`,
++      hotKeys: this.recentKeys.slice(0, 5)
++    };
++  }
++
++  /**
++   * 数字展示惯例：货币、分组与小数位由语言包的市场数据决定。
++   */
++  numberOptions(style) {
++    return {
++      style: style === 'money' ? 'currency' : style || 'decimal',
++      currency: this.currency,
++      useGrouping: this.grouping,
++      minimumFractionDigits: this.minimumFractionDigits,
++      maximumFractionDigits: this.maximumFractionDigits
++    };
+   }
+ }
+diff --git a/kiwi-intl/src/MessageEntry.ts b/kiwi-intl/src/MessageEntry.ts
+index 758bde8..3b7dd4d 100644
+--- a/kiwi-intl/src/MessageEntry.ts
++++ b/kiwi-intl/src/MessageEntry.ts
+@@ -60,4 +60,97 @@ export class MessageEntry {
+       this.lastRenderedLang = lang;
+     }
+   }
++
++  /**
++   * 自述：档案把自己的指标序列化成诊断描述行。
++   */
++  describe() {
++    const parts = [`${this.key}@${this.lang}`];
++    if (this.hitCount > 0) {
++      parts.push(`hits:${this.hitCount}`);
++    }
++    if (this.cacheWrites > 0) {
++      parts.push(`writes:${this.cacheWrites}`);
++    }
++    parts.push(`hot:${this.hotnessLevel}`);
++    parts.push(`at:${this.lastUsedAt}`);
++    parts.push(this.content ? `text:${this.content}` : 'text:<missing>');
++    return parts.join(' ');
++  }
++
++  /**
++   * 晋升判定：命中等指标都在档案上，判定自然属于档案。
++   */
++  isPromotable() {
++    if (this.hotnessLevel >= 2) {
++      return true;
++    }
++    if (this.hitCount >= 3 && this.cacheWrites >= 1) {
++      return true;
++    }
++    if (this.hitCount >= 2 && this.lastUsedAt > 0 && this.hotnessLevel >= 1) {
++      return true;
++    }
++    return this.hitCount > 5;
++  }
++
++  /**
++   * 渲染：档案带着自己的原文与语言，借渲染器完成 ICU 渲染。
++   */
++  renderWith(formatter, args?: object): string {
++    const text = this.content;
++    if (!text || typeof text !== 'string') {
++      return '';
++    }
++    const rendered = formatter.formatMessage(text, this.lang, args);
++    if (rendered && this.lastRenderedLang !== this.lang) {
++      // 渲染语言切换时刷新档案的语言标记，避免诊断阶段误报语言漂移。
++      this.noteRender(Date.now(), this.lang);
++    }
++    if (!rendered) {
++      formatter.failures.push(this.key);
++    }
++    return rendered;
++  }
++
++  /**
++   * 使用流水：档案知道自己该怎么上报一行诊断。
++   */
++  usageLine(event = 'resolve') {
++    return (
++      `${event} ${this.key}@${this.lang} hits=${this.hitCount} hot=${this.hotnessLevel} ` +
++      `writes=${this.cacheWrites} at=${this.lastUsedAt} seq=${this.renderCount}`
++    );
++  }
++
++  /**
++   * 缓存身份与槽位：身份来自档案的语言与键，热度决定是否落在热点槽。
++   */
++  cacheIdentity() {
++    return `${this.lang}#${this.key}`;
++  }
++
++  cacheSlot() {
++    const identity = this.cacheIdentity();
++    return this.hotnessLevel >= 2 ? `hot/${identity}` : identity;
++  }
++
++  isFirstCacheWrite() {
++    return this.cacheWrites === 0 && this.lastUsedAt > 0;
++  }
++
++  noteCached() {
++    this.cacheWrites += 1;
++  }
++
++  isHot() {
++    return this.hitCount >= 3 || this.hotnessLevel >= 2;
++  }
++
++  /**
++   * 冷档案：从未进过缓存却被冷读过的登记，可以被回收。
++   */
++  isStale() {
++    return this.cacheWrites === 0 && this.lastUsedAt > 0;
++  }
+ }
+diff --git a/kiwi-intl/src/TranslationCache.ts b/kiwi-intl/src/TranslationCache.ts
+index c1a905b..00721c4 100644
+--- a/kiwi-intl/src/TranslationCache.ts
++++ b/kiwi-intl/src/TranslationCache.ts
+@@ -49,37 +49,30 @@ export class TranslationCache {
+   }
+ 
+   /**
+-   * 以文案档案为准写入缓存：缓存身份由档案的语言、键和热度共同决定，
+-   * 档案的缓存写入指标随写入一起更新。
++   * 以文案档案为准写入缓存：槽位身份与写入指标都在档案手里，
++   * 缓存只负责槽位的存取与缺失统计。
+    */
+   rememberEntry(entry, formatted: string) {
+-    const identity = `${entry.lang}#${entry.key}`;
+-    const marked = entry.hotnessLevel >= 2 ? `hot/${identity}` : identity;
++    const marked = entry.cacheSlot();
+     this.slots.set(marked, formatted);
+-    if (entry.cacheWrites === 0 && entry.lastUsedAt > 0) {
++    if (entry.isFirstCacheWrite()) {
+       // 首次进缓存且最近被使用过的档案，重置缺失统计。
+       this.misses = 0;
+     }
+-    entry.cacheWrites += 1;
++    entry.noteCached();
+     return marked;
+   }
+ 
+   /**
+-   * 淘汰判定只看文案档案自身的冷热指标：
+-   * 命中多、已进缓存的档案不能被淘汰；
+-   * 从未进过缓存却一直被冷读的档案可以丢弃登记。
++   * 淘汰判定：冷热指标由档案自判，缓存只补充自己掌握的槽位事实。
+    */
+   evictEntry(entry) {
+-    if (entry.hitCount >= 3) {
++    if (entry.isHot()) {
+       return false;
+     }
+-    if (entry.hotnessLevel >= 2) {
++    if (this.slots.has(entry.cacheIdentity())) {
+       return false;
+     }
+-    const identity = `${entry.lang}#${entry.key}`;
+-    if (this.slots.has(identity)) {
+-      return false;
+-    }
+-    return entry.cacheWrites === 0 && entry.lastUsedAt > 0;
++    return entry.isStale();
+   }
+ }
+diff --git a/kiwi-intl/src/index.ts b/kiwi-intl/src/index.ts
+index bc94aa2..2959e08 100644
+--- a/kiwi-intl/src/index.ts
++++ b/kiwi-intl/src/index.ts
+@@ -150,11 +150,10 @@ class I18N {
+   }
+   getDetailed(key: string, args?: object) {
+     const entry = this.__resolveEntry__(key);
+-    const identity = `${entry.lang}#${entry.key}`;
+-    const cached = this.__cache__.recall(identity);
++    const cached = this.__cache__.recall(entry.cacheIdentity());
+     let value = cached;
+     if (!cached) {
+-      value = this.__formatter__.renderEntry(entry, args);
++      value = entry.renderWith(this.__formatter__, args);
+       this.__cache__.rememberEntry(entry, value);
+     }
+     if (this.__audit__.enabled) {
+@@ -163,23 +162,10 @@ class I18N {
+     return { value, entry };
+   }
+   describe(key: string) {
+-    return this.describeMessage(this.__resolveEntry__(key));
+-  }
+-  describeMessage(entry: MessageEntry) {
+-    const parts = [`${entry.key}@${entry.lang}`];
+-    if (entry.hitCount > 0) {
+-      parts.push(`hits:${entry.hitCount}`);
+-    }
+-    if (entry.cacheWrites > 0) {
+-      parts.push(`writes:${entry.cacheWrites}`);
+-    }
+-    parts.push(`hot:${entry.hotnessLevel}`);
+-    parts.push(`at:${entry.lastUsedAt}`);
+-    parts.push(entry.content ? `text:${entry.content}` : 'text:<missing>');
+-    return parts.join(' ');
++    return this.__resolveEntry__(key).describe();
+   }
+   stats() {
+-    const packSummary = this.packStatistics(this.__activePack__());
++    const packSummary = this.__activePack__().summary();
+     const cacheSummary = {
+       hits: this.__cache__.hits,
+       misses: this.__cache__.misses,
+@@ -188,15 +174,14 @@ class I18N {
+     };
+     return { pack: packSummary, cache: cacheSummary };
+   }
+-  packStatistics(pack: LanguagePack) {
++  auditSnapshot() {
+     return {
+-      lang: pack.lang,
+-      keys: Object.keys(pack.metas).length,
+-      resolved: pack.resolvedCount,
+-      missed: pack.misses,
+-      defaultPack: pack.defaultLang,
+-      market: `${pack.currency}/${pack.grouping ? 'grouped' : 'plain'}`,
+-      hotKeys: pack.recentKeys.slice(0, 5)
++      lang: this.__lang__,
++      packs: Object.keys(this.__metas__ || {}).length,
++      activeKeys: Object.keys(this.__data__ || {}).length,
++      defaultKey: this.__defaultKey__,
++      entries: this.__entries__.size,
++      cacheHits: this.__cache__.hits
+     };
+   }
+   audit() {
+@@ -211,9 +196,11 @@ class I18N {
+     return this.__formatter__.formatNumber(value, this.__lang__, options);
+   }
+   formatCurrency(value: number) {
+-    return this.__formatter__.packNumber(this.__activePack__(), value, {
+-      style: 'money'
+-    });
++    return this.__formatter__.formatNumber(
++      value,
++      this.__lang__,
++      this.__activePack__().numberOptions('money')
++    );
+   }
+   formatDate(value: Date, options?) {
+     return this.__formatter__.formatDate(value, this.__lang__, options);
+@@ -236,7 +223,7 @@ class I18N {
+       }
+     });
+     doomed.forEach((entry: MessageEntry) => {
+-      this.__entries__.delete(`${entry.lang}#${entry.key}`);
++      this.__entries__.delete(entry.cacheIdentity());
+     });
+     return doomed.length;
+   }

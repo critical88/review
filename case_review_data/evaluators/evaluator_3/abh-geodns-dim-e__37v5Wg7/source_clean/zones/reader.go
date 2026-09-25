@@ -1,0 +1,572 @@
+package zones
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"log"
+	"net/netip"
+	"os"
+	"runtime/debug"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/abh/geodns/v3/targeting"
+	"github.com/abh/geodns/v3/typeutil"
+
+	dns "codeberg.org/miekg/dns"
+	"codeberg.org/miekg/dns/dnsutil"
+	"codeberg.org/miekg/dns/rdata"
+	"github.com/abh/errorutil"
+)
+
+// ZoneList maps domain names to zone data
+type ZoneList map[string]*Zone
+
+func (zone *Zone) ReadZoneFile(fileName string) (zerr error) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("reading %s failed: %s", zone.Origin, r)
+			debug.PrintStack()
+			zerr = fmt.Errorf("reading %s failed: %s", zone.Origin, r)
+		}
+	}()
+
+	fh, err := os.Open(fileName)
+	if err != nil {
+		log.Printf("Could not read '%s': %s", fileName, err)
+		panic(err)
+	}
+
+	fileInfo, err := fh.Stat()
+	if err != nil {
+		log.Printf("Could not stat '%s': %s", fileName, err)
+	} else {
+		zone.Options.Serial = int(fileInfo.ModTime().Unix())
+	}
+
+	var objmap map[string]interface{}
+	decoder := json.NewDecoder(fh)
+	if err = decoder.Decode(&objmap); err != nil {
+		extra := ""
+		if serr, ok := err.(*json.SyntaxError); ok {
+			if _, serr := fh.Seek(0, io.SeekStart); serr != nil {
+				log.Fatalf("seek error: %v", serr)
+			}
+			line, col, highlight := errorutil.HighlightBytePosition(fh, serr.Offset)
+			extra = fmt.Sprintf(":\nError at line %d, column %d (file offset %d):\n%s",
+				line, col, serr.Offset, highlight)
+		}
+		return fmt.Errorf("error parsing JSON object in config file %s%s\n%v",
+			fh.Name(), extra, err)
+	}
+
+	// log.Println(objmap)
+
+	var data map[string]interface{}
+
+	for k, v := range objmap {
+		// log.Printf("k: %s v: %#v, T: %T\n", k, v, v)
+
+		switch k {
+		case "ttl":
+			zone.Options.Ttl = typeutil.ToInt(v)
+		case "serial":
+			zone.Options.Serial = typeutil.ToInt(v)
+		case "contact":
+			zone.Options.Contact = v.(string)
+		case "max_hosts":
+			zone.Options.MaxHosts = typeutil.ToInt(v)
+		case "closest":
+			zone.Options.Closest = v.(bool)
+			if zone.Options.Closest {
+				zone.HasClosest = true
+			}
+		case "targeting":
+			zone.Options.Targeting, err = targeting.ParseTargets(v.(string))
+			if err != nil {
+				return fmt.Errorf("parsing targeting '%s': %s", v, err)
+			}
+
+		case "logging":
+			{
+				logging := new(ZoneLogging)
+				for logger, v := range v.(map[string]interface{}) {
+					switch logger {
+					case "stathat":
+						logging.StatHat = typeutil.ToBool(v)
+					case "stathat_api":
+						logging.StatHatAPI = typeutil.ToString(v)
+						logging.StatHat = true
+					default:
+						log.Println("Unknown logger option", logger)
+					}
+				}
+				zone.Logging = logging
+				// log.Printf("logging options: %#v", logging)
+			}
+			continue
+
+		case "data":
+			data = v.(map[string]interface{})
+		}
+	}
+
+	setupZoneData(data, zone)
+
+	// log.Printf("ZO T: %T %s\n", Zones["0.us"], Zones["0.us"])
+
+	// log.Println("IP", string(Zone.Regions["0.us"].IPv4[0].ip))
+
+	if zone.Options.Targeting == 0 && !zone.HasClosest {
+		// no targeting requested
+		return nil
+	}
+
+	if targeting.Geo() == nil {
+		log.Printf("'%s': No geo provider configured", zone.Origin)
+		return nil
+	}
+
+	switch {
+	case zone.Options.Targeting >= targeting.TargetRegionGroup || zone.HasClosest:
+		if ok, err := targeting.Geo().HasLocation(); !ok {
+			log.Printf("Zone '%s' requested location/city targeting but geo provider isn't available: %s", zone.Origin, err)
+		}
+	case zone.Options.Targeting >= targeting.TargetContinent:
+		if ok, err := targeting.Geo().HasCountry(); !ok {
+			log.Printf("Zone '%s' requested country targeting but geo provider isn't available: %s", zone.Origin, err)
+		}
+	}
+	if zone.Options.Targeting&targeting.TargetASN > 0 {
+		if ok, err := targeting.Geo().HasASN(); !ok {
+			log.Printf("Zone '%s' requested ASN targeting but geo provider isn't available: %s", zone.Origin, err)
+		}
+	}
+
+	if zone.HasClosest {
+		zone.SetLocations()
+	}
+
+	return nil
+}
+
+func setupZoneData(data map[string]interface{}, zone *Zone) {
+	recordTypes := map[string]uint16{
+		"a":     dns.TypeA,
+		"aaaa":  dns.TypeAAAA,
+		"alias": dns.TypeMF,
+		"cname": dns.TypeCNAME,
+		"mx":    dns.TypeMX,
+		"ns":    dns.TypeNS,
+		"txt":   dns.TypeTXT,
+		"spf":   dns.TypeSPF,
+		"srv":   dns.TypeSRV,
+		"ptr":   dns.TypePTR,
+	}
+
+	for dk, dv_inter := range data {
+		dv := dv_inter.(map[string]interface{})
+
+		// log.Printf("K %s V %s TYPE-V %T\n", dk, dv, dv)
+
+		label := zone.AddLabel(dk)
+
+		for rType, rdata_ := range dv {
+			switch rType {
+			case "max_hosts":
+				label.MaxHosts = typeutil.ToInt(rdata_)
+				continue
+			case "closest":
+				label.Closest = rdata_.(bool)
+				if label.Closest {
+					zone.HasClosest = true
+				}
+				continue
+			case "ttl":
+				label.Ttl = typeutil.ToInt(rdata_)
+				continue
+			case "health":
+				zone.addHealthReference(label, rdata_)
+				continue
+			}
+
+			dnsType, ok := recordTypes[rType]
+			if !ok {
+				log.Printf("'%s' unsupported record type '%s'\n", zone.Origin, rType)
+				continue
+			}
+
+			if rdata_ == nil {
+				// log.Printf("No %s records for label %s\n", rType, dk)
+				continue
+			}
+
+			// log.Printf("rdata %s TYPE-R %T\n", rdata_, rdata_)
+
+			records := make(map[string][]interface{})
+
+			switch rd := rdata_.(type) {
+			case map[string]interface{}:
+				// Handle NS map syntax, map[ns2.example.net:<nil> ns1.example.net:<nil>]
+				tmp := make([]interface{}, 0)
+				for rdataK, rdataV := range rd {
+					if rdataV == nil {
+						rdataV = ""
+					}
+					tmp = append(tmp, []string{rdataK, rdataV.(string)})
+				}
+				records[rType] = tmp
+			case string:
+				// CNAME and alias
+				tmp := make([]interface{}, 1)
+				tmp[0] = rd
+				records[rType] = tmp
+			default:
+				records[rType] = rdata_.([]interface{})
+			}
+
+			// log.Printf("RECORDS %s TYPE-REC %T\n", Records, Records)
+
+			label.Records[dnsType] = make(Records, len(records[rType]))
+
+			for i := 0; i < len(records[rType]); i++ {
+				// log.Printf("RT %T %#v\n", records[rType][i], records[rType][i])
+
+				record := new(Record)
+
+				var h dns.Header
+				h.Class = dns.ClassINET
+
+				{
+					// allow for individual health test name overrides
+					if rec, ok := records[rType][i].(map[string]interface{}); ok {
+						if h, ok := rec["health"].(string); ok {
+							record.Test = h
+						}
+					}
+				}
+
+				switch len(label.Label) {
+				case 0:
+					h.Name = zone.Origin + "."
+				default:
+					h.Name = label.Label + "." + zone.Origin + "."
+				}
+
+				switch dnsType {
+				case dns.TypeA, dns.TypeAAAA, dns.TypePTR:
+
+					rec := records[rType][i]
+
+					var ip string
+
+					switch rec.(type) {
+
+					case []interface{}:
+						str, weight := getStringWeight(records[rType][i].([]interface{}))
+						ip = str
+						record.Weight = weight
+
+					case map[string]interface{}:
+						r := rec.(map[string]interface{})
+
+						if _, ok := r["ip"]; ok {
+							ip = r["ip"].(string)
+						}
+
+						if len(ip) == 0 || dnsType == dns.TypePTR {
+							switch dnsType {
+							case dns.TypeA:
+								ip = r["a"].(string)
+							case dns.TypeAAAA:
+								ip = r["aaaa"].(string)
+							case dns.TypePTR:
+								ip = r["ptr"].(string)
+							}
+						}
+
+						if w, ok := r["weight"]; ok {
+							record.Weight = typeutil.ToInt(w)
+						}
+
+						if h, ok := r["health"]; ok {
+							record.Test = typeutil.ToString(h)
+						}
+
+					}
+
+					switch dnsType {
+					case dns.TypePTR:
+						record.RR = &dns.PTR{Hdr: h, PTR: rdata.PTR{Ptr: ip}}
+					case dns.TypeA:
+						addr, err := netip.ParseAddr(ip)
+						if err != nil {
+							panic(fmt.Errorf("bad A record %q for %q: %v", ip, dk, err))
+						}
+						if !addr.Is4() {
+							panic(fmt.Errorf("bad A record %q for %q (not IPv4)", ip, dk))
+						}
+						record.RR = &dns.A{Hdr: h, A: rdata.A{Addr: addr}}
+					case dns.TypeAAAA:
+						addr, err := netip.ParseAddr(ip)
+						if err != nil {
+							panic(fmt.Errorf("bad AAAA record %q for %q: %v", ip, dk, err))
+						}
+						if !addr.Is6() {
+							panic(fmt.Errorf("bad AAAA record %q for %q (not IPv6)", ip, dk))
+						}
+						record.RR = &dns.AAAA{Hdr: h, AAAA: rdata.AAAA{Addr: addr}}
+					}
+
+				case dns.TypeMX:
+					rec := records[rType][i].(map[string]interface{})
+					pref := uint16(0)
+					mx := rec["mx"].(string)
+					if !strings.HasSuffix(mx, ".") {
+						mx = mx + "."
+					}
+					if rec["weight"] != nil {
+						record.Weight = typeutil.ToInt(rec["weight"])
+					}
+					if rec["preference"] != nil {
+						pref = uint16(typeutil.ToInt(rec["preference"]))
+					}
+					record.RR = &dns.MX{
+						Hdr: h,
+						MX: rdata.MX{
+							Mx:         mx,
+							Preference: pref,
+						},
+					}
+
+				case dns.TypeSRV:
+					rec := records[rType][i].(map[string]interface{})
+					priority := uint16(0)
+					srv_weight := uint16(0)
+					port := uint16(0)
+					target := rec["target"].(string)
+
+					if !dnsutil.IsFqdn(target) {
+						target = target + "." + zone.Origin
+					}
+
+					if rec["srv_weight"] != nil {
+						srv_weight = uint16(typeutil.ToInt(rec["srv_weight"]))
+					}
+					if rec["port"] != nil {
+						port = uint16(typeutil.ToInt(rec["port"]))
+					}
+					if rec["priority"] != nil {
+						priority = uint16(typeutil.ToInt(rec["priority"]))
+					}
+					record.RR = &dns.SRV{
+						Hdr: h,
+						SRV: rdata.SRV{
+							Priority: priority,
+							Weight:   srv_weight,
+							Port:     port,
+							Target:   target,
+						},
+					}
+
+				case dns.TypeCNAME:
+					rec := records[rType][i]
+					var target string
+					var weight int
+					switch rec.(type) {
+					case string:
+						target = rec.(string)
+					case []interface{}:
+						target, weight = getStringWeight(rec.([]interface{}))
+					case map[string]interface{}:
+						r := rec.(map[string]interface{})
+
+						if t, ok := r["cname"]; ok {
+							target = typeutil.ToString(t)
+						}
+
+						if w, ok := r["weight"]; ok {
+							weight = typeutil.ToInt(w)
+						}
+
+						if h, ok := r["health"]; ok {
+							record.Test = typeutil.ToString(h)
+						}
+					}
+					if !dnsutil.IsFqdn(target) {
+						target = target + "." + zone.Origin
+					}
+					record.Weight = weight
+					record.RR = &dns.CNAME{Hdr: h, CNAME: rdata.CNAME{Target: dnsutil.Fqdn(target)}}
+
+				case dns.TypeMF:
+					rec := records[rType][i]
+					// MF records (how we store aliases) are not FQDNs
+					record.RR = &dns.MF{Hdr: h, MF: rdata.MF{Mf: rec.(string)}}
+
+				case dns.TypeNS:
+					rec := records[rType][i]
+
+					var ns string
+
+					switch rec.(type) {
+					case string:
+						ns = rec.(string)
+					case []string:
+						recl := rec.([]string)
+						ns = recl[0]
+						if len(recl[1]) > 0 {
+							log.Println("NS records with names syntax not supported")
+						}
+					default:
+						log.Printf("Data: %T %#v\n", rec, rec)
+						panic("Unrecognized NS format/syntax")
+					}
+
+					rr := &dns.NS{Hdr: h, NS: rdata.NS{Ns: dnsutil.Fqdn(ns)}}
+
+					record.RR = rr
+
+				case dns.TypeTXT:
+					rec := records[rType][i]
+
+					var txt string
+
+					switch rec.(type) {
+					case string:
+						txt = rec.(string)
+					case map[string]interface{}:
+
+						recmap := rec.(map[string]interface{})
+
+						if weight, ok := recmap["weight"]; ok {
+							record.Weight = typeutil.ToInt(weight)
+						}
+						if t, ok := recmap["txt"]; ok {
+							txt = t.(string)
+						}
+					}
+					if len(txt) > 0 {
+						rr := &dns.TXT{Hdr: h, TXT: rdata.TXT{Txt: []string{txt}}}
+						record.RR = rr
+					} else {
+						log.Printf("Zero length txt record for '%s' in '%s'\n", label.Label, zone.Origin)
+						continue
+					}
+					// Initial SPF support added here, cribbed from the TypeTXT case definition - SPF records should be handled identically
+
+				case dns.TypeSPF:
+					rec := records[rType][i]
+
+					var spf string
+
+					switch rec.(type) {
+					case string:
+						spf = rec.(string)
+					case map[string]interface{}:
+
+						recmap := rec.(map[string]interface{})
+
+						if weight, ok := recmap["weight"]; ok {
+							record.Weight = typeutil.ToInt(weight)
+						}
+						if t, ok := recmap["spf"]; ok {
+							spf = t.(string)
+						}
+					}
+					if len(spf) > 0 {
+						rr := &dns.SPF{TXT: dns.TXT{Hdr: h, TXT: rdata.TXT{Txt: []string{spf}}}}
+						record.RR = rr
+					} else {
+						log.Printf("Zero length SPF record for '%s' in '%s'\n", label.Label, zone.Origin)
+						continue
+					}
+
+				default:
+					log.Println("type:", rType)
+					panic("Don't know how to handle this type")
+				}
+
+				if record.RR == nil {
+					panic("record.RR is nil")
+				}
+
+				label.Weight[dnsType] += record.Weight
+				label.Records[dnsType][i] = record
+			}
+			if label.Weight[dnsType] > 0 {
+				sort.Sort(RecordsByWeight{label.Records[dnsType]})
+			}
+		}
+	}
+
+	// Loop over exisiting labels, create zone records for missing sub-domains
+	// and set TTLs
+	for k, l := range zone.Labels {
+		if strings.Contains(k, ".") {
+			subLabels := strings.Split(k, ".")
+			for i := 1; i < len(subLabels); i++ {
+				subSubLabel := strings.Join(subLabels[i:], ".")
+				if _, ok := zone.Labels[subSubLabel]; !ok {
+					zone.AddLabel(subSubLabel)
+				}
+			}
+		}
+
+		for qtype, records := range l.Records {
+
+			setWeight := false
+
+			if _, ok := alwaysWeighted[qtype]; ok && l.Weight[qtype] == 0 {
+				setWeight = true
+			}
+
+			for _, r := range records {
+				// We add the TTL as a last pass because we might not have
+				// processed it yet when we process the record data.
+
+				if setWeight {
+					r.Weight = 1
+					l.Weight[qtype] += r.Weight
+				}
+
+				var defaultTtl uint32 = 86400
+				if dns.RRToType(r.RR) != dns.TypeNS {
+					// NS records have special treatment. If they are not specified, they default to 86400 rather than
+					// defaulting to the zone ttl option. The label TTL option always works though
+					defaultTtl = uint32(zone.Options.Ttl)
+				}
+				if zone.Labels[k].Ttl > 0 {
+					defaultTtl = uint32(zone.Labels[k].Ttl)
+				}
+				if r.RR.Header().TTL == 0 {
+					r.RR.Header().TTL = defaultTtl
+				}
+			}
+		}
+	}
+
+	zone.addSOA()
+}
+
+func getStringWeight(rec []interface{}) (string, int) {
+	str := rec[0].(string)
+	var weight int
+
+	if len(rec) > 1 {
+		switch rec[1].(type) {
+		case string:
+			var err error
+			weight, err = strconv.Atoi(rec[1].(string))
+			if err != nil {
+				panic("Error converting weight to integer")
+			}
+		case float64:
+			weight = int(rec[1].(float64))
+		}
+	}
+
+	return str, weight
+}

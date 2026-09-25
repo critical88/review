@@ -1,0 +1,783 @@
+diff --git a/tensorrec/eval.py b/tensorrec/eval.py
+index c179508..3a03495 100644
+--- a/tensorrec/eval.py
++++ b/tensorrec/eval.py
+@@ -1,11 +1,38 @@
+ import numpy as np
++from scipy import sparse as sp
+ 
+-from .tensorrec import TensorRec
++
++def _setup_ndcg(predicted_ranks, test_interactions, k=10):
++
++    pos_inter = test_interactions > 0
++    ror = sp.csr_matrix(predicted_ranks * pos_inter.A)
++
++    relevance = sp.csr_matrix(test_interactions.A * pos_inter.A)
++
++    k_mask = np.less(ror.data, k + 1)
++    ror_at_k = np.maximum(np.multiply(ror.data, k_mask), 1)
++
++    return relevance, k_mask, ror, ror_at_k
++
++
++def _idcg(hits, k=10):
++    sorted_hits = hits[np.argsort(-hits)][:min(len(hits), k)]
++    idgc = np.sum((2**sorted_hits-1)/np.log2(np.arange(len(sorted_hits)) + 2))
++    return idgc
++
++
++def _dcg(relevance, k_mask, ror_at_k, ror):
++    numer = (2**np.multiply(relevance.data, k_mask)) - 1
++    denom = np.log2(ror_at_k + 1)
++    ror.data = numer/denom  # ranks at 1
++    dcg = ror.sum(axis=1).flatten()
++
++    return dcg
+ 
+ 
+ def precision_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+     """
+-    Wrapper for TensorRec.precision_at_k.
++    Calculates precision at k for the given predicted ranks.
+     :param predicted_ranks: Numpy matrix
+     The results of model.predict_rank()
+     :param test_interactions: scipy.sparse matrix
+@@ -17,15 +44,21 @@ def precision_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False
+     If False, only users with test interactions will be returned.
+     :return: np.array
+     """
+-    return TensorRec.precision_at_k(predicted_ranks=predicted_ranks,
+-                                    test_interactions=test_interactions,
+-                                    k=k,
+-                                    preserve_rows=preserve_rows)
++    positive_test_interactions = test_interactions > 0
++    ranks = sp.csr_matrix(predicted_ranks * positive_test_interactions.A)
++    ranks.data = np.less(ranks.data, (k + 1), ranks.data)
++
++    precision = np.squeeze(np.array(ranks.sum(axis=1))).astype(float) / k
++
++    if not preserve_rows:
++        precision = precision[positive_test_interactions.getnnz(axis=1) > 0]
++
++    return precision
+ 
+ 
+ def recall_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+     """
+-    Wrapper for TensorRec.recall_at_k.
++    Calculates recall at k for the given predicted ranks.
+     :param predicted_ranks: Numpy matrix
+     The results of model.predict_rank()
+     :param test_interactions: scipy.sparse matrix
+@@ -33,33 +66,27 @@ def recall_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+     :param k: int
+     The rank at which to stop evaluating recall.
+     :param preserve_rows: bool
+-    If True, a value of 0 will be returned for every user without test interactions.
++    If True, a value of 0 will be replaced for every user without test interactions.
+     If False, only users with test interactions will be returned.
+     :return: np.array
+     """
+-    return TensorRec.recall_at_k(predicted_ranks=predicted_ranks,
+-                                 test_interactions=test_interactions,
+-                                 k=k,
+-                                 preserve_rows=preserve_rows)
++    positive_test_interactions = test_interactions > 0
++    ranks = sp.csr_matrix(predicted_ranks * positive_test_interactions.A)
++    ranks.data = np.less(ranks.data, (k + 1), ranks.data)
+ 
++    retrieved = np.squeeze(positive_test_interactions.getnnz(axis=1))
++    hit = np.squeeze(np.array(ranks.sum(axis=1)))
+ 
+-def _setup_ndcg(predicted_ranks, test_interactions, k=10):
+-    return TensorRec._setup_ndcg(predicted_ranks=predicted_ranks,
+-                                  test_interactions=test_interactions,
+-                                  k=k)
++    if not preserve_rows:
++        hit = hit[positive_test_interactions.getnnz(axis=1) > 0]
++        retrieved = retrieved[positive_test_interactions.getnnz(axis=1) > 0]
+ 
+-
+-def _idcg(hits, k=10):
+-    return TensorRec._idcg(hits=hits, k=k)
+-
+-
+-def _dcg(relevance, k_mask, ror_at_k, ror):
+-    return TensorRec._dcg(relevance=relevance, k_mask=k_mask, ror_at_k=ror_at_k, ror=ror)
++    return hit.astype(float) / retrieved.astype(float)
+ 
+ 
+ def ndcg_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+     """
+-    Wrapper for TensorRec.ndcg_at_k.
++    Calculate Normalized Discounted Cumulative Gain @K for the given predicted ranks.
+     :param predicted_ranks: Numpy matrix
+     The results of model.predict_rank()
+     :param test_interactions: scipy.sparse matrix
+@@ -71,33 +98,47 @@ def ndcg_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+     If False, only users with test interactions will be returned.
+     :return: np.array
+     """
+-    return TensorRec.ndcg_at_k(predicted_ranks=predicted_ranks,
+-                              test_interactions=test_interactions,
+-                              k=k,
+-                              preserve_rows=preserve_rows)
++    relevance, k_mask, ranks_of_relevant, ror_at_k = _setup_ndcg(predicted_ranks, test_interactions, k)
++
++    dcg = np.asarray(_dcg(relevance, k_mask, ror_at_k, ranks_of_relevant))[0]
++    idcg = np.apply_along_axis(_idcg, 1, relevance.A)
++
++    ndcg = dcg/idcg
++
++    if not preserve_rows:
++        positive_test_interactions = test_interactions > 0
++        ndcg = ndcg[positive_test_interactions.getnnz(axis=1) > 0]
++
++    return ndcg
+ 
+ 
+ def f1_score_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+     """
+-    :param model: TensorRec
+-    A trained TensorRec model.
++    Calculates the F1 score at k for the given predicted ranks.
++    :param predicted_ranks: Numpy matrix
++    The results of model.predict_rank()
+     :param test_interactions: scipy.sparse matrix
+     Test interactions matrix of shape [n_users, n_items]
+-    :param user_features: scipy.sparse matrix
+-    User features matrix of shape [n_users, n_user_features]
+-    :param item_features: scipy.sparse matrix
+-    Item features matrix of shape [n_items, n_item_features]
+     :param k: int
+-    The rank at which to stop evaluating recall.
++    The rank at which to stop evaluating the F1 score.
+     :param preserve_rows: bool
+     If True, a value of 0 will be returned for every user without test interactions.
+     If False, only users with test interactions will be returned.
+-    :return: np.array
++    :return: tuple of floats
++    (mean precision at k, mean recall at k, f1 score)
+     """
+-    return TensorRec.f1_score_at_k(predicted_ranks=predicted_ranks,
+-                                   test_interactions=test_interactions,
+-                                   k=k,
+-                                   preserve_rows=preserve_rows)
++    p_at_k = precision_at_k(predicted_ranks=predicted_ranks,
++                            test_interactions=test_interactions,
++                            k=k, preserve_rows=preserve_rows)
++    r_at_k = recall_at_k(predicted_ranks=predicted_ranks,
++                         test_interactions=test_interactions,
++                         k=k, preserve_rows=preserve_rows)
++
++    mean_p = np.mean(p_at_k)
++    mean_r = np.mean(r_at_k)
++
++    f1_score = (2.0 * mean_p * mean_r) / (mean_p + mean_r)
++    return f1_score
+ 
+ 
+ def fit_and_eval(model, user_features, item_features, train_interactions, test_interactions, fit_kwargs, recall_k=30,
+@@ -113,6 +154,9 @@ def fit_and_eval(model, user_features, item_features, train_interactions, test_i
+ 
+ 
+ def grid_check_model_on_dataset(train_interactions, test_interactions, user_features, item_features):
++    # Imported lazily so the eval module does not depend on the model at import time; the rank metrics above are pure
++    # functions of the ranks and interactions and do not need the model at all.
++    from .tensorrec import TensorRec
+ 
+     results = []
+     for n_components in [2, 4, 8, 16, 32, 64, 128, 256]:
+@@ -133,8 +177,8 @@ def eval_random_ranks_on_dataset(interactions, recall_k=30, precision_k=5, ndcg_
+ 
+     random_guesses = np.array([np.random.choice(a=n_items, size=n_items, replace=False) + 1 for _ in range(n_users)])
+ 
+-    p_at_k = TensorRec.precision_at_k(random_guesses, interactions, k=precision_k)
+-    r_at_k = TensorRec.recall_at_k(random_guesses, interactions, k=recall_k)
+-    n_at_k = TensorRec.ndcg_at_k(random_guesses, interactions, k=ndcg_k)
++    p_at_k = precision_at_k(random_guesses, interactions, k=precision_k)
++    r_at_k = recall_at_k(random_guesses, interactions, k=recall_k)
++    n_at_k = ndcg_at_k(random_guesses, interactions, k=ndcg_k)
+ 
+     return np.mean(r_at_k), np.mean(p_at_k), np.mean(n_at_k)
+diff --git a/tensorrec/input_utils.py b/tensorrec/input_utils.py
+index 405a648..18ded1e 100644
+--- a/tensorrec/input_utils.py
++++ b/tensorrec/input_utils.py
+@@ -1,4 +1,5 @@
+ import numpy as np
++import six
+ from scipy import sparse as sp
+ import tensorflow as tf
+ 
+@@ -125,3 +126,38 @@ def create_tensorrec_dataset_from_tfrecord(tfrecord_path):
+ 
+     dataset = tf.data.TFRecordDataset(tfrecord_path).map(parse_tensorrec_tfrecord)
+     return dataset
++
++
++def resolve_input_datasets(raw_input):
++    """
++    Resolves a raw input into the TensorRec Datasets it stands for.
++    A raw input may be a scipy.sparse matrix, a TensorFlow Dataset, a str path to a TFRecord file, or a list of any
++    of those. This is the single path the rest of the package shares for turning user-supplied input into the standard
++    TensorRec dataset format.
++    :param raw_input: scipy.sparse matrix, tensorflow.data.Dataset, str, or list
++    :return: list of tf.data.Dataset
++    """
++
++    if isinstance(raw_input, tf.data.Dataset):
++        return [raw_input]
++
++    if sp.issparse(raw_input):
++        return [create_tensorrec_dataset_from_sparse_matrix(raw_input)]
++
++    if isinstance(raw_input, six.string_types):
++        return [create_tensorrec_dataset_from_tfrecord(raw_input)]
++
++    if isinstance(raw_input, list):
++
++        if all([isinstance(input_val, tf.data.Dataset) for input_val in raw_input]):
++            return raw_input
++
++        if all([sp.issparse(input_val) for input_val in raw_input]):
++            return [create_tensorrec_dataset_from_sparse_matrix(input_sparse_matrix)
++                    for input_sparse_matrix in raw_input]
++
++        if all([isinstance(input_val, six.string_types) for input_val in raw_input]):
++            return [create_tensorrec_dataset_from_tfrecord(input_str) for input_str in raw_input]
++
++    raise ValueError('Input must be a scipy sparse matrix, an iterable of scipy sprase matrices, or a TensorFlow '
++                     'Dataset')
+diff --git a/tensorrec/session_management.py b/tensorrec/session_management.py
+index 9063b0f..2748c00 100644
+--- a/tensorrec/session_management.py
++++ b/tensorrec/session_management.py
+@@ -1,17 +1,31 @@
++import tensorflow as tf
++
++
++# The shared TensorFlow session. Owned here so that fitting, predicting, and input
++# preparation can all reach the same graph runtime without each caller having to
++# configure the session itself.
++_tf_session = None
++
++
+ def get_session():
+     """
+-    Returns the shared TensorFlow session, as owned and managed by the TensorRec model class.
++    Returns the shared TensorFlow session, building one if none has been attached yet.
+     :return: tf.Session
+     """
+-    from .tensorrec import TensorRec
+-    return TensorRec.get_session()
++    global _tf_session
++    if _tf_session is None:
++        if tf.get_default_session() is not None:
++            _tf_session = tf.get_default_session()
++        else:
++            _tf_session = tf.Session()
++    return _tf_session
+ 
+ 
+ def set_session(session):
+     """
+-    Attaches the TensorFlow session for the TensorRec model class to fit and predict against.
++    Attaches the TensorFlow session to fit and predict against.
+     :param session: tf.Session or None
+     The session to attach, or None to request a fresh session at the next call of get_session().
+     """
+-    from .tensorrec import TensorRec
+-    TensorRec.set_session(session)
++    global _tf_session
++    _tf_session = session
+diff --git a/tensorrec/tensorrec.py b/tensorrec/tensorrec.py
+index c5f0002..b5ba70e 100644
+--- a/tensorrec/tensorrec.py
++++ b/tensorrec/tensorrec.py
+@@ -1,18 +1,24 @@
+ from functools import partial
+ from itertools import cycle
+ import logging
+-import math
+ import numpy as np
+ import os
+ import pickle
+ from scipy import sparse as sp
+-import six
+ import tensorflow as tf
+ 
+ from .errors import (
+     ModelNotBiasedException, ModelNotFitException, ModelWithoutAttentionException, BatchNonSparseInputException,
+     TfVersionException
+ )
++from .eval import (
++    f1_score_at_k as eval_f1_score_at_k, ndcg_at_k as eval_ndcg_at_k, precision_at_k as eval_precision_at_k,
++    recall_at_k as eval_recall_at_k
++)
++from .input_utils import (
++    create_tensorrec_iterator, get_dimensions_from_tensorrec_dataset,
++    resolve_input_datasets as _resolve_input_datasets
++)
+ from .loss_graphs import AbstractLossGraph, RMSELossGraph
+ from .prediction_graphs import AbstractPredictionGraph, DotProductPredictionGraph
+ from .recommendation_graphs import (
+@@ -20,13 +26,12 @@ from .recommendation_graphs import (
+     densify_sampled_item_predictions, collapse_mixture_of_tastes, predict_similar_items
+ )
+ from .representation_graphs import AbstractRepresentationGraph, LinearRepresentationGraph
++from .session_management import get_session as _get_session, set_session as _set_session
++from .util import calculate_batched_alpha, sample_items
+ 
+ 
+ class TensorRec(object):
+ 
+-    # The shared TensorFlow session, owned and managed by the model class
+-    tf_session = None
+-
+     def __init__(self,
+                  n_components=100,
+                  n_tastes=1,
+@@ -138,28 +143,22 @@ class TensorRec(object):
+     @classmethod
+     def get_session(cls):
+         """
+-        Returns the shared TensorFlow session that this model runs against, building one if none
+-        has been attached yet.
+-        The model class owns the session so that fitting, predicting, and input preparation can
+-        all reach the same graph runtime without each caller configuring the session itself.
++        Returns the shared TensorFlow session that this model runs against.
++        The session itself is owned and managed by tensorrec.session_management; this is a thin accessor kept so
++        callers can reach the shared session through the model object.
+         :return: tf.Session
+         """
+-        if cls.tf_session is None:
+-            if tf.get_default_session() is not None:
+-                cls.tf_session = tf.get_default_session()
+-            else:
+-                cls.tf_session = tf.Session()
+-        return cls.tf_session
++        return _get_session()
+ 
+     @classmethod
+     def set_session(cls, session):
+         """
+-        Attaches the TensorFlow session for this model class to fit and predict against.
++        Attaches the TensorFlow session for this model to fit and predict against. Delegates to
++        tensorrec.session_management.
+         :param session: tf.Session or None
+-        The session to attach, or None to request a fresh session at the next call of
+-        TensorRec.get_session().
++        The session to attach, or None to request a fresh session at the next call of TensorRec.get_session().
+         """
+-        cls.tf_session = session
++        _set_session(session)
+ 
+     def _break_graph_hooks(self):
+         for graph_tensor_hook_attr_name in self.graph_tensor_hook_attr_names:
+@@ -210,128 +209,15 @@ class TensorRec(object):
+                 iterator_resource_name, output_types, output_shapes, output_classes
+             )
+ 
+-    def _create_input_iterator(self, name):
+-        """
+-        Creates a TensorFlow Iterator that is ready for the standard TensorRec data format.
+-        :param name: str
+-        The name for this Iterator.
+-        :return: tf.data.Iterator
+-        """
+-        return tf.data.Iterator.from_structure(
+-                output_types=(tf.int64, tf.int64, tf.float32, tf.int64, tf.int64),
+-                output_shapes=([None], [None], [None], [], []),
+-                shared_name=name
+-        )
+-
+-    def _create_dataset_from_sparse_matrix(self, sparse_matrix):
+-        """
+-        Creates a TensorFlow Dataset containing the data from the given sparse matrix.
+-        :param sparse_matrix: scipy.sparse matrix
+-        The data to be contained in this Dataset.
+-        :return: tf.data.Dataset
+-        """
+-        if not isinstance(sparse_matrix, sp.coo_matrix):
+-            sparse_matrix = sp.coo_matrix(sparse_matrix)
+-
+-        row_index = np.array([sparse_matrix.row], dtype=np.int64)
+-        col_index = np.array([sparse_matrix.col], dtype=np.int64)
+-        values = np.array([sparse_matrix.data], dtype=np.float32)
+-        n_dim_0 = np.array([sparse_matrix.shape[0]], dtype=np.int64)
+-        n_dim_1 = np.array([sparse_matrix.shape[1]], dtype=np.int64)
+-
+-        tensor_slices = (row_index, col_index, values, n_dim_0, n_dim_1)
+-
+-        return tf.data.Dataset.from_tensor_slices(tensor_slices)
+-
+-    def _create_dataset_from_tfrecord(self, tfrecord_path):
+-        """
+-        Loads a TFRecord file and creates a Dataset with the contents.
+-        :param tfrecord_path: str
+-        :return: tf.data.Dataset
+-        """
+-
+-        def parse_tensorrec_tfrecord(example_proto):
+-            features = {
+-                'row_index': tf.FixedLenSequenceFeature((), tf.int64, allow_missing=True),
+-                'col_index': tf.FixedLenSequenceFeature((), tf.int64, allow_missing=True),
+-                'values': tf.FixedLenSequenceFeature((), tf.float32, allow_missing=True),
+-                'd0': tf.FixedLenFeature((), tf.int64),
+-                'd1': tf.FixedLenFeature((), tf.int64),
+-            }
+-            parsed_features = tf.parse_single_example(example_proto, features)
+-            return (parsed_features['row_index'], parsed_features['col_index'], parsed_features['values'],
+-                    parsed_features['d0'], parsed_features['d1'])
+-
+-        dataset = tf.data.TFRecordDataset(tfrecord_path).map(parse_tensorrec_tfrecord)
+-        return dataset
+-
+     def resolve_input_datasets(self, raw_input):
+         """
+         Resolves a raw input into the TensorRec Datasets it stands for.
++        Delegates to tensorrec.input_utils.resolve_input_datasets, where the input plumbing is shared with the rest
++        of the package.
+         :param raw_input: scipy.sparse matrix, tensorflow.data.Dataset, str, or list
+         :return: list of tf.data.Dataset
+         """
+-
+-        if isinstance(raw_input, tf.data.Dataset):
+-            return [raw_input]
+-
+-        if sp.issparse(raw_input):
+-            return [self._create_dataset_from_sparse_matrix(raw_input)]
+-
+-        if isinstance(raw_input, six.string_types):
+-            return [self._create_dataset_from_tfrecord(raw_input)]
+-
+-        if isinstance(raw_input, list):
+-
+-            if all([isinstance(input_val, tf.data.Dataset) for input_val in raw_input]):
+-                return raw_input
+-
+-            if all([sp.issparse(input_val) for input_val in raw_input]):
+-                return [self._create_dataset_from_sparse_matrix(input_sparse_matrix)
+-                        for input_sparse_matrix in raw_input]
+-
+-            if all([isinstance(input_val, six.string_types) for input_val in raw_input]):
+-                return [self._create_dataset_from_tfrecord(input_str) for input_str in raw_input]
+-
+-        raise ValueError('Input must be a scipy sparse matrix, an iterable of scipy sprase matrices, or a TensorFlow '
+-                         'Dataset')
+-
+-    def _get_dataset_dimensions(self, dataset):
+-        """
+-        Given a TensorFlow Dataset in the standard TensorRec format, returns the dimensions of the SparseTensor to be
+-        populated by the Dataset.
+-        :param dataset: tf.data.Dataset
+-        :return: (int, int)
+-        """
+-        session = self.get_session()
+-        iterator = self._create_input_iterator('dims_iterator')
+-        initializer = iterator.make_initializer(dataset)
+-        _, _, _, tf_d0, tf_d1 = iterator.get_next()
+-        session.run(initializer)
+-        d0, d1 = session.run([tf_d0, tf_d1])
+-        return d0, d1
+-
+-    @staticmethod
+-    def _sample_item_indices(n_items, n_users, n_sampled_items, replace):
+-        items_per_user = [np.random.choice(a=n_items, size=n_sampled_items, replace=replace)
+-                           for _ in range(n_users)]
+-
+-        sample_indices = []
+-        for user, users_items in enumerate(items_per_user):
+-            for item in users_items:
+-                sample_indices.append((user, item))
+-
+-        return np.array(sample_indices, np.int64)
+-
+-    @staticmethod
+-    def _calculate_batched_alpha(num_batches, alpha):
+-        if num_batches < 1:
+-            raise ValueError('num_batches must be >=1, num_batches={}'.format(num_batches))
+-        elif num_batches > 1:
+-            batched_alpha = alpha / (math.e * math.log(num_batches))
+-        else:
+-            batched_alpha = alpha
+-        return batched_alpha
++        return _resolve_input_datasets(raw_input)
+ 
+     def _create_batched_dataset_initializers(self, interactions, user_features, item_features, user_batch_size=None):
+ 
+@@ -414,9 +300,9 @@ class TensorRec(object):
+         return datasets, initializers
+ 
+     def _build_input_iterators(self):
+-        self.tf_user_feature_iterator = self._create_input_iterator(name='tf_user_feature_iterator')
+-        self.tf_item_feature_iterator = self._create_input_iterator(name='tf_item_feature_iterator')
+-        self.tf_interaction_iterator = self._create_input_iterator(name='tf_interaction_iterator')
++        self.tf_user_feature_iterator = create_tensorrec_iterator(name='tf_user_feature_iterator')
++        self.tf_item_feature_iterator = create_tensorrec_iterator(name='tf_item_feature_iterator')
++        self.tf_interaction_iterator = create_tensorrec_iterator(name='tf_interaction_iterator')
+ 
+     def _build_tf_graph(self, n_user_features, n_item_features):
+ 
+@@ -446,7 +332,7 @@ class TensorRec(object):
+                                           [tf_n_users, tf_n_items])
+ 
+         # Construct the sampling py_func
+-        sample_items_partial = partial(self._sample_item_indices,
++        sample_items_partial = partial(sample_items,
+                                        replace=self.loss_graph_factory.is_sampled_with_replacement)
+         self.tf_sample_indices = tf.py_func(func=sample_items_partial,
+                                             inp=[tf_n_items, tf_n_users, self.tf_n_sampled_items],
+@@ -749,8 +635,8 @@ class TensorRec(object):
+ 
+             # Check input dimensions
+             first_batch = dataset_sets[0]
+-            _, n_user_features = self._get_dataset_dimensions(first_batch[1])
+-            _, n_item_features = self._get_dataset_dimensions(first_batch[2])
++            _, n_user_features = get_dimensions_from_tensorrec_dataset(first_batch[1])
++            _, n_item_features = get_dimensions_from_tensorrec_dataset(first_batch[2])
+ 
+             # Numbers of features are either learned at fit time from the shape of these two matrices or specified at
+             # TensorRec construction and cannot be changed.
+@@ -759,7 +645,7 @@ class TensorRec(object):
+ 
+         # Build the shared feed dict
+         feed_dict = {self.tf_learning_rate: learning_rate,
+-                     self.tf_alpha: self._calculate_batched_alpha(num_batches=len(initializer_sets), alpha=alpha)}
++                     self.tf_alpha: calculate_batched_alpha(num_batches=len(initializer_sets), alpha=alpha)}
+         if self.loss_graph_factory.is_sample_based:
+             feed_dict[self.tf_n_sampled_items] = n_sampled_items
+ 
+@@ -786,7 +672,7 @@ class TensorRec(object):
+                     ))
+ 
+     def fit_and_evaluate(self, user_features, item_features, train_interactions, test_interactions, fit_kwargs,
+-                        recall_k=30, precision_k=5, ndcg_k=30):
++                         recall_k=30, precision_k=5, ndcg_k=30):
+         """
+         Fits this model and evaluates the fitted model's ranks against train and test interactions.
+         :param user_features: scipy.sparse matrix
+@@ -813,13 +699,13 @@ class TensorRec(object):
+                  interactions=train_interactions, **fit_kwargs)
+         predicted_ranks = self.predict_rank(user_features=user_features, item_features=item_features)
+ 
+-        p_at_k = TensorRec.precision_at_k(predicted_ranks, test_interactions, k=precision_k)
+-        r_at_k = TensorRec.recall_at_k(predicted_ranks, test_interactions, k=recall_k)
+-        n_at_k = TensorRec.ndcg_at_k(predicted_ranks, test_interactions, k=ndcg_k)
++        p_at_k = eval_precision_at_k(predicted_ranks, test_interactions, k=precision_k)
++        r_at_k = eval_recall_at_k(predicted_ranks, test_interactions, k=recall_k)
++        n_at_k = eval_ndcg_at_k(predicted_ranks, test_interactions, k=ndcg_k)
+ 
+-        p_at_k_insample = TensorRec.precision_at_k(predicted_ranks, train_interactions, k=precision_k)
+-        r_at_k_insample = TensorRec.recall_at_k(predicted_ranks, train_interactions, k=recall_k)
+-        n_at_k_insample = TensorRec.ndcg_at_k(predicted_ranks, train_interactions, k=ndcg_k)
++        p_at_k_insample = eval_precision_at_k(predicted_ranks, train_interactions, k=precision_k)
++        r_at_k_insample = eval_recall_at_k(predicted_ranks, train_interactions, k=recall_k)
++        n_at_k_insample = eval_ndcg_at_k(predicted_ranks, train_interactions, k=ndcg_k)
+ 
+         return (np.mean(r_at_k), np.mean(p_at_k), np.mean(n_at_k), np.mean(r_at_k_insample), np.mean(p_at_k_insample),
+                 np.mean(n_at_k_insample))
+@@ -1058,38 +944,11 @@ class TensorRec(object):
+         predictions = self.tf_projected_item_biases.eval(session=self.get_session())
+         return predictions
+ 
+-    @staticmethod
+-    def _setup_ndcg(predicted_ranks, test_interactions, k=10):
+-
+-        pos_inter = test_interactions > 0
+-        ror = sp.csr_matrix(predicted_ranks * pos_inter.A)
+-
+-        relevance = sp.csr_matrix(test_interactions.A * pos_inter.A)
+-
+-        k_mask = np.less(ror.data, k + 1)
+-        ror_at_k = np.maximum(np.multiply(ror.data, k_mask), 1)
+-
+-        return relevance, k_mask, ror, ror_at_k
+-
+-    @staticmethod
+-    def _idcg(hits, k=10):
+-        sorted_hits = hits[np.argsort(-hits)][:min(len(hits), k)]
+-        idgc = np.sum((2**sorted_hits-1)/np.log2(np.arange(len(sorted_hits)) + 2))
+-        return idgc
+-
+-    @staticmethod
+-    def _dcg(relevance, k_mask, ror_at_k, ror):
+-        numer = (2**np.multiply(relevance.data, k_mask)) - 1
+-        denom = np.log2(ror_at_k + 1)
+-        ror.data = numer/denom  # ranks at 1
+-        dcg = ror.sum(axis=1).flatten()
+-
+-        return dcg
+-
+     @staticmethod
+     def precision_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+         """
+         Calculates precision at k for the given predicted ranks.
++        Delegates to tensorrec.eval.precision_at_k, where the rank metrics are owned.
+         :param predicted_ranks: Numpy matrix
+         The results of model.predict_rank()
+         :param test_interactions: scipy.sparse matrix
+@@ -1101,21 +960,15 @@ class TensorRec(object):
+         If False, only users with test interactions will be returned.
+         :return: np.array
+         """
+-        positive_test_interactions = test_interactions > 0
+-        ranks = sp.csr_matrix(predicted_ranks * positive_test_interactions.A)
+-        ranks.data = np.less(ranks.data, (k + 1), ranks.data)
+-
+-        precision = np.squeeze(np.array(ranks.sum(axis=1))).astype(float) / k
+-
+-        if not preserve_rows:
+-            precision = precision[positive_test_interactions.getnnz(axis=1) > 0]
+-
+-        return precision
++        return eval_precision_at_k(
++            predicted_ranks=predicted_ranks, test_interactions=test_interactions, k=k, preserve_rows=preserve_rows
++        )
+ 
+     @staticmethod
+     def recall_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+         """
+         Calculates recall at k for the given predicted ranks.
++        Delegates to tensorrec.eval.recall_at_k, where the rank metrics are owned.
+         :param predicted_ranks: Numpy matrix
+         The results of model.predict_rank()
+         :param test_interactions: scipy.sparse matrix
+@@ -1127,23 +980,15 @@ class TensorRec(object):
+         If False, only users with test interactions will be returned.
+         :return: np.array
+         """
+-        positive_test_interactions = test_interactions > 0
+-        ranks = sp.csr_matrix(predicted_ranks * positive_test_interactions.A)
+-        ranks.data = np.less(ranks.data, (k + 1), ranks.data)
+-
+-        retrieved = np.squeeze(positive_test_interactions.getnnz(axis=1))
+-        hit = np.squeeze(np.array(ranks.sum(axis=1)))
+-
+-        if not preserve_rows:
+-            hit = hit[positive_test_interactions.getnnz(axis=1) > 0]
+-            retrieved = retrieved[positive_test_interactions.getnnz(axis=1) > 0]
+-
+-        return hit.astype(float) / retrieved.astype(float)
++        return eval_recall_at_k(
++            predicted_ranks=predicted_ranks, test_interactions=test_interactions, k=k, preserve_rows=preserve_rows
++        )
+ 
+     @staticmethod
+     def ndcg_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+         """
+         Calculate Normalized Discounted Cumulative Gain @K for the given predicted ranks.
++        Delegates to tensorrec.eval.ndcg_at_k, where the rank metrics are owned.
+         :param predicted_ranks: Numpy matrix
+         The results of model.predict_rank()
+         :param test_interactions: scipy.sparse matrix
+@@ -1155,25 +1000,15 @@ class TensorRec(object):
+         If False, only users with test interactions will be returned.
+         :return: np.array
+         """
+-        relevance, k_mask, ranks_of_relevant, ror_at_k = TensorRec._setup_ndcg(predicted_ranks,
+-                                                                               test_interactions,
+-                                                                               k)
+-
+-        dcg = np.asarray(TensorRec._dcg(relevance, k_mask, ror_at_k, ranks_of_relevant))[0]
+-        idcg = np.apply_along_axis(TensorRec._idcg, 1, relevance.A)
+-
+-        ndcg = dcg/idcg
+-
+-        if not preserve_rows:
+-            positive_test_interactions = test_interactions > 0
+-            ndcg = ndcg[positive_test_interactions.getnnz(axis=1) > 0]
+-
+-        return ndcg
++        return eval_ndcg_at_k(
++            predicted_ranks=predicted_ranks, test_interactions=test_interactions, k=k, preserve_rows=preserve_rows
++        )
+ 
+     @staticmethod
+     def f1_score_at_k(predicted_ranks, test_interactions, k=10, preserve_rows=False):
+         """
+         Calculates the F1 score at k for the given predicted ranks.
++        Delegates to tensorrec.eval.f1_score_at_k, where the rank metrics are owned.
+         :param predicted_ranks: Numpy matrix
+         The results of model.predict_rank()
+         :param test_interactions: scipy.sparse matrix
+@@ -1186,18 +1021,9 @@ class TensorRec(object):
+         :return: tuple of floats
+         (mean precision at k, mean recall at k, f1 score)
+         """
+-        p_at_k = TensorRec.precision_at_k(predicted_ranks=predicted_ranks,
+-                                          test_interactions=test_interactions,
+-                                          k=k, preserve_rows=preserve_rows)
+-        r_at_k = TensorRec.recall_at_k(predicted_ranks=predicted_ranks,
+-                                       test_interactions=test_interactions,
+-                                       k=k, preserve_rows=preserve_rows)
+-
+-        mean_p = np.mean(p_at_k)
+-        mean_r = np.mean(r_at_k)
+-
+-        f1_score = (2.0 * mean_p * mean_r) / (mean_p + mean_r)
+-        return f1_score
++        return eval_f1_score_at_k(
++            predicted_ranks=predicted_ranks, test_interactions=test_interactions, k=k, preserve_rows=preserve_rows
++        )
+ 
+     def save_model(self, directory_path):
+         """
+diff --git a/tensorrec/util.py b/tensorrec/util.py
+index 84c1460..4aefbf4 100644
+--- a/tensorrec/util.py
++++ b/tensorrec/util.py
+@@ -2,11 +2,10 @@ import math
+ import numpy as np
+ import random
+ import scipy.sparse as sp
+-import six
+ import tensorflow as tf
+ from weakref import WeakKeyDictionary
+ 
+-from .input_utils import create_tensorrec_dataset_from_sparse_matrix, create_tensorrec_dataset_from_tfrecord
++from .input_utils import create_tensorrec_dataset_from_sparse_matrix, resolve_input_datasets
+ 
+ 
+ def sample_items(n_items, n_users, n_sampled_items, replace):
+@@ -32,30 +31,14 @@ def calculate_batched_alpha(num_batches, alpha):
+ 
+ 
+ def datasets_from_raw_input(raw_input):
+-
+-    if isinstance(raw_input, tf.data.Dataset):
+-        return [raw_input]
+-
+-    if sp.issparse(raw_input):
+-        return [create_tensorrec_dataset_from_sparse_matrix(raw_input)]
+-
+-    if isinstance(raw_input, six.string_types):
+-        return [create_tensorrec_dataset_from_tfrecord(raw_input)]
+-
+-    if isinstance(raw_input, list):
+-
+-        if all([isinstance(input_val, tf.data.Dataset) for input_val in raw_input]):
+-            return raw_input
+-
+-        if all([sp.issparse(input_val) for input_val in raw_input]):
+-            return [create_tensorrec_dataset_from_sparse_matrix(input_sparse_matrix)
+-                    for input_sparse_matrix in raw_input]
+-
+-        if all([isinstance(input_val, six.string_types) for input_val in raw_input]):
+-            return [create_tensorrec_dataset_from_tfrecord(input_str) for input_str in raw_input]
+-
+-    raise ValueError('Input must be a scipy sparse matrix, an iterable of scipy sprase matrices, or a TensorFlow '
+-                     'Dataset')
++    """
++    Resolves a raw input into the TensorRec Datasets it stands for.
++    Kept as a thin wrapper for backwards compatibility; the shared implementation lives with the rest of the input
++    plumbing in tensorrec.input_utils.resolve_input_datasets.
++    :param raw_input: scipy.sparse matrix, tensorflow.data.Dataset, str, or list
++    :return: list of tf.data.Dataset
++    """
++    return resolve_input_datasets(raw_input)
+ 
+ 
+ def generate_dummy_data(num_users=15000, num_items=30000, interaction_density=.00045, num_user_features=200,

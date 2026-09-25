@@ -1,0 +1,762 @@
+diff --git a/collection.go b/collection.go
+index 39eb6ca..697c526 100644
+--- a/collection.go
++++ b/collection.go
+@@ -159,3 +159,39 @@ func (s *stack[T]) contains(element T) bool {
+ 	_, ok := s.registry[element]
+ 	return ok
+ }
++
++type stackOfStacks[T comparable] struct {
++	stacks []*stack[T]
++}
++
++func newStackOfStacks[T comparable]() *stackOfStacks[T] {
++	return &stackOfStacks[T]{
++		stacks: make([]*stack[T], 0),
++	}
++}
++
++func (s *stackOfStacks[T]) push(stack *stack[T]) {
++	s.stacks = append(s.stacks, stack)
++}
++
++func (s *stackOfStacks[T]) pop() (*stack[T], error) {
++	e, err := s.top()
++	if err != nil {
++		return &stack[T]{}, err
++	}
++
++	s.stacks = s.stacks[:len(s.stacks)-1]
++	return e, nil
++}
++
++func (s *stackOfStacks[T]) top() (*stack[T], error) {
++	if s.isEmpty() {
++		return &stack[T]{}, errors.New("no element in stack")
++	}
++
++	return s.stacks[len(s.stacks)-1], nil
++}
++
++func (s *stackOfStacks[T]) isEmpty() bool {
++	return len(s.stacks) == 0
++}
+diff --git a/dag.go b/dag.go
+index fb4ff1f..b5ca497 100644
+--- a/dag.go
++++ b/dag.go
+@@ -174,9 +174,6 @@ func TransitiveReduction[K comparable, T any](g Graph[K, T]) (Graph[K, T], error
+ 	// set of the top-level vertex and target the current vertex. These edges
+ 	// are redundant because their targets apparently are not only reachable
+ 	// from the top-level vertex, but also through a DFS.
+-	//
+-	// The DFS keeps its pending vertices in an open slice that is consumed
+-	// from its end, so no stack helper has to wrap the traversal.
+ 	for vertex, successors := range adjacencyMap {
+ 		tOrder, err := transitiveReduction.Order()
+ 		if err != nil {
+@@ -184,31 +181,25 @@ func TransitiveReduction[K comparable, T any](g Graph[K, T]) (Graph[K, T], error
+ 		}
+ 
+ 		for successor := range successors {
+-			pending := make([]K, 0)
+-			onPending := make(map[K]struct{}, tOrder)
++			stack := newStack[K]()
+ 			visited := make(map[K]struct{}, tOrder)
+ 
+-			pending = append(pending, successor)
+-			onPending[successor] = struct{}{}
++			stack.push(successor)
+ 
+-			for len(pending) > 0 {
+-				current := pending[len(pending)-1]
+-				pending = pending[:len(pending)-1]
+-				delete(onPending, current)
++			for !stack.isEmpty() {
++				current, _ := stack.pop()
+ 
+ 				if _, ok := visited[current]; ok {
+ 					continue
+ 				}
+ 
+ 				visited[current] = struct{}{}
+-
+-				pending = append(pending, current)
+-				onPending[current] = struct{}{}
++				stack.push(current)
+ 
+ 				for adjacency := range adjacencyMap[current] {
+ 					if _, ok := visited[adjacency]; ok {
+-						if _, ok := onPending[adjacency]; ok {
+-							// If the current adjacency is both pending and
++						if stack.contains(adjacency) {
++							// If the current adjacency is both on the stack and
+ 							// has already been visited, there is a cycle.
+ 							return nil, fmt.Errorf("transitive reduction cannot be performed on graph with cycle")
+ 						}
+@@ -218,9 +209,7 @@ func TransitiveReduction[K comparable, T any](g Graph[K, T]) (Graph[K, T], error
+ 					if _, ok := adjacencyMap[vertex][adjacency]; ok {
+ 						_ = transitiveReduction.RemoveEdge(vertex, adjacency)
+ 					}
+-
+-					pending = append(pending, adjacency)
+-					onPending[adjacency] = struct{}{}
++					stack.push(adjacency)
+ 				}
+ 			}
+ 		}
+diff --git a/paths.go b/paths.go
+index b4f0e8d..130547d 100644
+--- a/paths.go
++++ b/paths.go
+@@ -1,7 +1,6 @@
+ package graph
+ 
+ import (
+-	"container/heap"
+ 	"errors"
+ 	"fmt"
+ 	"math"
+@@ -32,20 +31,13 @@ func CreatesCycle[K comparable, T any](g Graph[K, T], source, target K) (bool, e
+ 		return false, fmt.Errorf("failed to get predecessor map: %w", err)
+ 	}
+ 
+-	// The ancestor walk keeps its open vertices at the end of a slice that is
+-	// consumed backwards; the accompanying bookkeeping set records which
+-	// vertices are currently queued for expansion.
+-	ancestors := make([]K, 0)
+-	queued := make(map[K]struct{})
++	stack := newStack[K]()
+ 	visited := make(map[K]bool)
+ 
+-	ancestors = append(ancestors, source)
+-	queued[source] = struct{}{}
++	stack.push(source)
+ 
+-	for len(ancestors) > 0 {
+-		currentHash := ancestors[len(ancestors)-1]
+-		ancestors = ancestors[:len(ancestors)-1]
+-		delete(queued, currentHash)
++	for !stack.isEmpty() {
++		currentHash, _ := stack.pop()
+ 
+ 		if _, ok := visited[currentHash]; !ok {
+ 			// If the adjacent vertex also is the target vertex, the target is a
+@@ -57,8 +49,7 @@ func CreatesCycle[K comparable, T any](g Graph[K, T], source, target K) (bool, e
+ 			visited[currentHash] = true
+ 
+ 			for adjacency := range predecessorMap[currentHash] {
+-				ancestors = append(ancestors, adjacency)
+-				queued[adjacency] = struct{}{}
++				stack.push(adjacency)
+ 			}
+ 		}
+ 	}
+@@ -82,12 +73,7 @@ func ShortestPath[K comparable, T any](g Graph[K, T], source, target K) ([]K, er
+ 	weights[source] = 0
+ 	visited[target] = true
+ 
+-	// The relaxation agenda is a flat binary heap that is kept in sync with a
+-	// bookkeeping map of the vertices currently on it, mirrors of the queue
+-	// bookkeeping previously done by a dedicated helper type.
+-	items := minHeap[K]{}
+-	onHeap := make(map[K]*priorityItem[K])
+-
++	queue := newPriorityQueue[K]()
+ 	adjacencyMap, err := g.AdjacencyMap()
+ 	if err != nil {
+ 		return nil, fmt.Errorf("could not get adjacency map: %w", err)
+@@ -99,17 +85,7 @@ func ShortestPath[K comparable, T any](g Graph[K, T], source, target K) ([]K, er
+ 			visited[hash] = false
+ 		}
+ 
+-		// Enqueue the vertex unless it is on the agenda already.
+-		if _, ok := onHeap[hash]; !ok {
+-			item := &priorityItem[K]{
+-				value:    hash,
+-				priority: weights[hash],
+-				index:    0,
+-			}
+-
+-			heap.Push(&items, item)
+-			onHeap[hash] = item
+-		}
++		queue.Push(hash, weights[hash])
+ 	}
+ 
+ 	// bestPredecessors stores the cheapest or least-weighted predecessor for
+@@ -117,12 +93,8 @@ func ShortestPath[K comparable, T any](g Graph[K, T], source, target K) ([]K, er
+ 	// the cheapest predecessor for C is B.
+ 	bestPredecessors := make(map[K]K)
+ 
+-	for len(items) > 0 {
+-		// Dequeue the vertex with the least distance from the source.
+-		item := heap.Pop(&items).(*priorityItem[K])
+-		delete(onHeap, item.value)
+-
+-		vertex := item.value
++	for queue.Len() > 0 {
++		vertex, _ := queue.Pop()
+ 		hasInfiniteWeight := math.IsInf(weights[vertex], 1)
+ 
+ 		for adjacency, edge := range adjacencyMap[vertex] {
+@@ -140,13 +112,7 @@ func ShortestPath[K comparable, T any](g Graph[K, T], source, target K) ([]K, er
+ 			if weight < weights[adjacency] && !hasInfiniteWeight {
+ 				weights[adjacency] = weight
+ 				bestPredecessors[adjacency] = vertex
+-
+-				// The agenda records the shorter distance for the vertex that
+-				// has just been relaxed.
+-				if relax, ok := onHeap[adjacency]; ok {
+-					relax.priority = weight
+-					heap.Fix(&items, relax.index)
+-				}
++				queue.UpdatePriority(adjacency, weight)
+ 			}
+ 		}
+ 	}
+@@ -162,7 +128,6 @@ func ShortestPath[K comparable, T any](g Graph[K, T], source, target K) ([]K, er
+ 		if _, ok := bestPredecessors[current]; !ok {
+ 			return nil, ErrTargetNotReachable
+ 		}
+-
+ 		current = bestPredecessors[current]
+ 		path = append([]K{current}, path...)
+ 	}
+@@ -170,15 +135,21 @@ func ShortestPath[K comparable, T any](g Graph[K, T], source, target K) ([]K, er
+ 	return path, nil
+ }
+ 
++type sccState[K comparable] struct {
++	adjacencyMap map[K]map[K]Edge[K]
++	components   [][]K
++	stack        *stack[K]
++	visited      map[K]struct{}
++	lowlink      map[K]int
++	index        map[K]int
++	time         int
++}
++
+ // StronglyConnectedComponents detects all strongly connected components within
+ // the graph and returns the hashes of the vertices shaping these components, so
+ // each component is represented by a []K.
+ //
+ // StronglyConnectedComponents can only run on directed graphs.
+-//
+-// The whole walk is driven from right here: instead of recursing over the
+-// adjacency structure, the examination keeps an explicit record of the
+-// vertices whose successors still have to be looked at.
+ func StronglyConnectedComponents[K comparable, T any](g Graph[K, T]) ([][]K, error) {
+ 	if !g.Traits().IsDirected {
+ 		return nil, errors.New("SCCs can only be detected in directed graphs")
+@@ -189,213 +160,171 @@ func StronglyConnectedComponents[K comparable, T any](g Graph[K, T]) ([][]K, err
+ 		return nil, fmt.Errorf("could not get adjacency map: %w", err)
+ 	}
+ 
+-	components := make([][]K, 0)
+-
+-	discovered := make(map[K]struct{})
+-	trailMembers := make(map[K]struct{})
+-	index := make(map[K]int)
+-	lowlink := make(map[K]int)
+-	time := 0
+-
+-	// The open trail holds the vertices that might still grow into the
+-	// component being examined; it is consumed from its end.
+-	trail := make([]K, 0)
++	state := &sccState[K]{
++		adjacencyMap: adjacencyMap,
++		components:   make([][]K, 0),
++		stack:        newStack[K](),
++		visited:      make(map[K]struct{}),
++		lowlink:      make(map[K]int),
++		index:        make(map[K]int),
++	}
+ 
+-	for root := range adjacencyMap {
+-		if _, ok := discovered[root]; ok {
+-			continue
++	for hash := range state.adjacencyMap {
++		if _, ok := state.visited[hash]; !ok {
++			findSCC(hash, state)
+ 		}
++	}
+ 
+-		// Instead of a recursive call, the walk keeps its own record of the
+-		// vertices currently being examined, together with how far each of
+-		// them has progressed through its successors.
+-		frames := make([]K, 0, len(adjacencyMap))
+-		cursors := make([]int, 0, len(adjacencyMap))
+-		successors := make([][]K, 0, len(adjacencyMap))
+-
+-		// Enter the root vertex like every other vertex: stamp it, remember
+-		// it as part of the open trail, and prepare its successor list.
+-		{
+-			discovered[root] = struct{}{}
+-			index[root] = time
+-			lowlink[root] = time
+-			time++
+-
+-			trail = append(trail, root)
+-			trailMembers[root] = struct{}{}
+-
+-			frames = append(frames, root)
+-			cursors = append(cursors, 0)
+-
+-			rootSuccessors := make([]K, 0, len(adjacencyMap[root]))
+-			for successor := range adjacencyMap[root] {
+-				rootSuccessors = append(rootSuccessors, successor)
+-			}
+-			successors = append(successors, rootSuccessors)
+-		}
++	return state.components, nil
++}
+ 
+-		for len(frames) > 0 {
+-			top := len(frames) - 1
+-			current := frames[top]
+-
+-			if cursors[top] < len(successors[top]) {
+-				adjacency := successors[top][cursors[top]]
+-				cursors[top]++
+-
+-				if _, ok := discovered[adjacency]; !ok {
+-					// Descend into the successor: stamp it, remember it on the
+-					// open trail, and record it as the next frame.
+-					discovered[adjacency] = struct{}{}
+-					index[adjacency] = time
+-					lowlink[adjacency] = time
+-					time++
+-
+-					trail = append(trail, adjacency)
+-					trailMembers[adjacency] = struct{}{}
+-
+-					frames = append(frames, adjacency)
+-					cursors = append(cursors, 0)
+-
+-					adjacencySuccessors := make([]K, 0, len(adjacencyMap[adjacency]))
+-					for successor := range adjacencyMap[adjacency] {
+-						adjacencySuccessors = append(adjacencySuccessors, successor)
+-					}
+-					successors = append(successors, adjacencySuccessors)
+-				} else if _, ok := trailMembers[adjacency]; ok {
+-					// The successor is already on the open trail, so the edge
+-					// joining the current vertex and the successor is a back
+-					// edge. Therefore, the lowlink value of the current vertex
+-					// has to record the index of the successor.
+-					if index[adjacency] < lowlink[current] {
+-						lowlink[current] = index[adjacency]
+-					}
+-				}
++func findSCC[K comparable](vertexHash K, state *sccState[K]) {
++	state.stack.push(vertexHash)
++	state.visited[vertexHash] = struct{}{}
++	state.index[vertexHash] = state.time
++	state.lowlink[vertexHash] = state.time
+ 
+-				continue
+-			}
++	state.time++
+ 
+-			// Every successor of the current vertex has been examined, so the
+-			// walk retreats to the previous vertex.
+-			frames = frames[:top]
+-			cursors = cursors[:top]
+-			successors = successors[:top]
++	for adjacency := range state.adjacencyMap[vertexHash] {
++		if _, ok := state.visited[adjacency]; !ok {
++			findSCC(adjacency, state)
+ 
+-			if top > 0 {
+-				if predecessor := frames[top-1]; lowlink[current] < lowlink[predecessor] {
+-					lowlink[predecessor] = lowlink[current]
+-				}
++			smallestLowlink := math.Min(
++				float64(state.lowlink[vertexHash]),
++				float64(state.lowlink[adjacency]),
++			)
++			state.lowlink[vertexHash] = int(smallestLowlink)
++		} else {
++			// If the adjacent vertex already is on the stack, the edge joining
++			// the current and the adjacent vertex is a back ege. Therefore, the
++			// lowlink value of the vertex has to be updated to the index of the
++			// adjacent vertex if it is smaller than the current lowlink value.
++			if state.stack.contains(adjacency) {
++				smallestLowlink := math.Min(
++					float64(state.lowlink[vertexHash]),
++					float64(state.index[adjacency]),
++				)
++				state.lowlink[vertexHash] = int(smallestLowlink)
+ 			}
++		}
++	}
+ 
+-			// If the lowlink value of the vertex is equal to its index, this
+-			// is the head vertex of a strongly connected component that's
+-			// shaped by the vertex and all vertices on the open trail.
+-			if lowlink[current] == index[current] {
+-				var component []K
+-				var popped K
++	// If the lowlink value of the vertex is equal to its DFS value, this is the
++	// head vertex of a strongly connected component that's shaped by the vertex
++	// and all vertices on the stack.
++	if state.lowlink[vertexHash] == state.index[vertexHash] {
++		var hash K
++		var component []K
+ 
+-				for popped != current {
+-					popped = trail[len(trail)-1]
+-					trail = trail[:len(trail)-1]
+-					delete(trailMembers, popped)
++		for hash != vertexHash {
++			hash, _ = state.stack.pop()
+ 
+-					component = append(component, popped)
+-				}
+-
+-				components = append(components, component)
+-			}
++			component = append(component, hash)
+ 		}
+-	}
+ 
+-	return components, nil
++		state.components = append(state.components, component)
++	}
+ }
+ 
+ // AllPathsBetween computes and returns all paths between two given vertices. A
+ // path is represented as a slice of vertex hashes. The returned slice contains
+ // these paths.
+ //
+-// AllPathsBetween utilizes a non-recursive implementation. It has an
+-// estimated runtime complexity of O(n^2) where n is the number of vertices.
++// AllPathsBetween utilizes a non-recursive, stack-based implementation. It has
++// an estimated runtime complexity of O(n^2) where n is the number of vertices.
+ func AllPathsBetween[K comparable, T any](g Graph[K, T], start, end K) ([][]K, error) {
+ 	adjacencyMap, err := g.AdjacencyMap()
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	// The exploration keeps the path being extended in an open slice together
+-	// with a bookkeeping set of the vertices on it, and records every
+-	// unfinished branch point in a layer of postponed successors.
+-	path := make([]K, 0)
+-	onPath := make(map[K]struct{})
+-	layers := make([][]K, 0)
+-
+-	// The start vertex forms the first layer of the path; all of its not yet
+-	// visited successors are postponed on the first layer.
+-	path = append(path, start)
+-	onPath[start] = struct{}{}
+-
+-	postponed := make([]K, 0)
+-	for successor := range adjacencyMap[start] {
+-		if _, ok := onPath[successor]; ok {
+-			continue
++	// The algorithm used relies on stacks instead of recursion. It is described
++	// here: https://boycgit.github.io/all-paths-between-two-vertex/
++	mainStack := newStack[K]()
++	viceStack := newStackOfStacks[K]()
++
++	checkEmpty := func() error {
++		if mainStack.isEmpty() || viceStack.isEmpty() {
++			return errors.New("empty stack")
+ 		}
+-		postponed = append(postponed, successor)
++		return nil
+ 	}
+-	layers = append(layers, postponed)
+-
+-	allPaths := make([][]K, 0)
+ 
+-	for len(path) > 0 {
+-		current := path[len(path)-1]
+-		open := layers[len(layers)-1]
++	buildLayer := func(element K) {
++		mainStack.push(element)
++		newElements := newStack[K]()
+ 
+-		if len(open) == 0 {
+-			if current == end {
+-				// The current path reaches the end vertex, so it is complete.
+-				completePath := make([]K, 0, len(path))
+-				for _, hash := range path {
+-					completePath = append(completePath, hash)
++		for e := range adjacencyMap[element] {
++			var contains bool
++			mainStack.forEach(func(k K) {
++				if e == k {
++					contains = true
+ 				}
+-				allPaths = append(allPaths, completePath)
++			})
++			if contains {
++				continue
+ 			}
++			newElements.push(e)
++		}
++		viceStack.push(newElements)
++	}
+ 
+-			// Every postponed successor of the current vertex has been
+-			// examined, so the top layer is discarded and the exploration
+-			// retreats by one vertex.
+-			if len(path) == 0 || len(layers) == 0 {
+-				return nil, errors.New("unable to remove layer: empty stack")
+-			}
++	buildStack := func() error {
++		if err = checkEmpty(); err != nil {
++			return fmt.Errorf("unable to build stack: %w", err)
++		}
+ 
+-			path = path[:len(path)-1]
+-			delete(onPath, current)
+-			layers = layers[:len(layers)-1]
+-		} else {
+-			// Drain the top layer: each postponed successor extends the
+-			// current path and records its own yet unexplored successors on a
+-			// new top layer, which the exploration examines next.
+-			if len(path) == 0 || len(layers) == 0 {
+-				return nil, errors.New("unable to build stack: empty stack")
+-			}
++		elements, _ := viceStack.top()
+ 
+-			for {
+-				open = layers[len(layers)-1]
+-				if len(open) == 0 {
+-					break
+-				}
++		for !elements.isEmpty() {
++			element, _ := elements.pop()
++			buildLayer(element)
++			elements, _ = viceStack.top()
++		}
++
++		return nil
++	}
+ 
+-				element := open[len(open)-1]
+-				layers[len(layers)-1] = open[:len(open)-1]
++	removeLayer := func() error {
++		if err = checkEmpty(); err != nil {
++			return fmt.Errorf("unable to remove layer: %w", err)
++		}
+ 
+-				path = append(path, element)
+-				onPath[element] = struct{}{}
++		if e, _ := viceStack.top(); !e.isEmpty() {
++			return errors.New("the top element of vice-stack is not empty")
++		}
+ 
+-				elementSuccessors := make([]K, 0)
+-				for successor := range adjacencyMap[element] {
+-					if _, ok := onPath[successor]; ok {
+-						continue
+-					}
+-					elementSuccessors = append(elementSuccessors, successor)
+-				}
+-				layers = append(layers, elementSuccessors)
++		_, _ = mainStack.pop()
++		_, _ = viceStack.pop()
++
++		return nil
++	}
++
++	buildLayer(start)
++
++	allPaths := make([][]K, 0)
++
++	for !mainStack.isEmpty() {
++		v, _ := mainStack.top()
++		adjs, _ := viceStack.top()
++
++		if adjs.isEmpty() {
++			if v == end {
++				path := make([]K, 0)
++				mainStack.forEach(func(k K) {
++					path = append(path, k)
++				})
++				allPaths = append(allPaths, path)
++			}
++
++			err = removeLayer()
++			if err != nil {
++				return nil, err
++			}
++		} else {
++			if err = buildStack(); err != nil {
++				return nil, err
+ 			}
+ 		}
+ 	}
+diff --git a/traversal.go b/traversal.go
+index 816e9f1..d7e232c 100644
+--- a/traversal.go
++++ b/traversal.go
+@@ -31,7 +31,7 @@ import "fmt"
+ //		return c.Name == "London"
+ //	}
+ //
+-// DFS is non-recursive and maintains a slice that it consumes from its end.
++// DFS is non-recursive and maintains a stack instead.
+ func DFS[K comparable, T any](g Graph[K, T], start K, visit func(K) bool) error {
+ 	adjacencyMap, err := g.AdjacencyMap()
+ 	if err != nil {
+@@ -42,20 +42,13 @@ func DFS[K comparable, T any](g Graph[K, T], start K, visit func(K) bool) error
+ 		return fmt.Errorf("could not find start vertex with hash %v", start)
+ 	}
+ 
+-	// The traversal keeps its open vertices at the end of a slice that is
+-	// consumed backwards, together with a bookkeeping set of the vertices
+-	// that are currently queued for expansion.
+-	frontier := make([]K, 0)
+-	queued := make(map[K]struct{})
++	stack := newStack[K]()
+ 	visited := make(map[K]bool)
+ 
+-	frontier = append(frontier, start)
+-	queued[start] = struct{}{}
++	stack.push(start)
+ 
+-	for len(frontier) > 0 {
+-		currentHash := frontier[len(frontier)-1]
+-		frontier = frontier[:len(frontier)-1]
+-		delete(queued, currentHash)
++	for !stack.isEmpty() {
++		currentHash, _ := stack.pop()
+ 
+ 		if _, ok := visited[currentHash]; !ok {
+ 			// Stop traversing the graph if the visit function returns true.
+@@ -65,8 +58,7 @@ func DFS[K comparable, T any](g Graph[K, T], start K, visit func(K) bool) error
+ 			visited[currentHash] = true
+ 
+ 			for adjacency := range adjacencyMap[currentHash] {
+-				frontier = append(frontier, adjacency)
+-				queued[adjacency] = struct{}{}
++				stack.push(adjacency)
+ 			}
+ 		}
+ 	}
+diff --git a/trees.go b/trees.go
+index 9524790..7201a41 100644
+--- a/trees.go
++++ b/trees.go
+@@ -33,30 +33,9 @@ func spanningTree[K comparable, T any](g Graph[K, T], maximum bool) (Graph[K, T]
+ 	}
+ 
+ 	edges := make([]Edge[K], 0)
++	subtrees := newUnionFind[K]()
+ 
+-	// The subtree membership of the vertices is tracked here directly: every
+-	// vertex initially points to itself, and merging two subtrees links the
+-	// representative of one subtree to the representative of the other.
+-	subtrees := make(map[K]K)
+-
+-	// The target graph is assembled right here instead of going through the
+-	// graph constructors: it mirrors the traits of the original graph, reuses
+-	// its hashing function, and starts with an empty in-memory store.
+-	originalTraits := g.Traits()
+-
+-	traits := &Traits{
+-		IsDirected:    originalTraits.IsDirected,
+-		IsAcyclic:     originalTraits.IsAcyclic,
+-		IsWeighted:    originalTraits.IsWeighted,
+-		IsRooted:      originalTraits.IsRooted,
+-		PreventCycles: originalTraits.PreventCycles,
+-	}
+-
+-	mst := &undirected[K, T]{
+-		hash:   g.(*undirected[K, T]).hash,
+-		traits: traits,
+-		store:  newMemoryStore[K, T](),
+-	}
++	mst := NewLike(g)
+ 
+ 	for v, adjacencies := range adjacencyMap {
+ 		vertex, properties, err := g.VertexWithProperties(v) //nolint:govet
+@@ -64,24 +43,12 @@ func spanningTree[K comparable, T any](g Graph[K, T], maximum bool) (Graph[K, T]
+ 			return nil, fmt.Errorf("failed to get vertex %v: %w", v, err)
+ 		}
+ 
+-		// Carry the vertex properties over into the tree instead of cloning
+-		// them through a helper option.
+-		carried := VertexProperties{
+-			Weight:     properties.Weight,
+-			Attributes: make(map[string]string),
+-		}
+-
+-		for key, value := range properties.Attributes {
+-			carried.Attributes[key] = value
+-		}
+-
+-		err = mst.store.AddVertex(v, vertex, carried)
++		err = mst.AddVertex(vertex, copyVertexProperties(properties))
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to add vertex %v: %w", v, err)
+ 		}
+ 
+-		// Every vertex starts out as a subtree of its own.
+-		subtrees[v] = v
++		subtrees.add(v)
+ 
+ 		for _, edge := range adjacencies {
+ 			edges = append(edges, edge)
+@@ -99,50 +66,13 @@ func spanningTree[K comparable, T any](g Graph[K, T], maximum bool) (Graph[K, T]
+ 	}
+ 
+ 	for _, edge := range edges {
+-		// Locate the representative of the subtree that holds the source
+-		// vertex by walking the parent links until they self-reference.
+-		sourceSubtree := edge.Source
+-		for subtrees[sourceSubtree] != sourceSubtree {
+-			sourceSubtree = subtrees[sourceSubtree]
+-		}
+-
+-		// Short-circuit the remaining parent links of the source vertex to the
+-		// representative found above.
+-		shortened := edge.Source
+-		for subtrees[shortened] != sourceSubtree {
+-			sourceParent := subtrees[edge.Source]
+-			subtrees[edge.Source] = sourceSubtree
+-			shortened = sourceParent
+-		}
++		sourceRoot := subtrees.find(edge.Source)
++		targetRoot := subtrees.find(edge.Target)
+ 
+-		// Locate the representative of the subtree that holds the target
+-		// vertex in the same way.
+-		targetSubtree := edge.Target
+-		for subtrees[targetSubtree] != targetSubtree {
+-			targetSubtree = subtrees[targetSubtree]
+-		}
+-
+-		{
+-			shortened := edge.Target
+-			for subtrees[shortened] != targetSubtree {
+-				targetParent := subtrees[edge.Target]
+-				subtrees[edge.Target] = targetSubtree
+-				shortened = targetParent
+-			}
+-		}
++		if sourceRoot != targetRoot {
++			subtrees.union(sourceRoot, targetRoot)
+ 
+-		if sourceSubtree != targetSubtree {
+-			// Joining both subtrees keeps the tree in one piece.
+-			subtrees[targetSubtree] = sourceSubtree
+-
+-			err = mst.AddEdge(edge.Source, edge.Target, func(properties *EdgeProperties) {
+-				for key, value := range edge.Properties.Attributes {
+-					properties.Attributes[key] = value
+-				}
+-				properties.Weight = edge.Properties.Weight
+-				properties.Data = edge.Properties.Data
+-			})
+-			if err != nil {
++			if err = mst.AddEdge(copyEdge(edge)); err != nil {
+ 				return nil, fmt.Errorf("failed to add edge (%v, %v): %w", edge.Source, edge.Target, err)
+ 			}
+ 		}

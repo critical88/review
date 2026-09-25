@@ -1,0 +1,108 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Dylint",
+  "smell_type": "god_classes",
+  "rule": {
+    "id": "bytes_god_class",
+    "description": "A concrete type in the buffer adapter module owns, at the same time, the read-side buffer walk, the write-side buffer walk, the std::io read bridge, the std::io write bridge and a byte-iteration family, and threads one set of private mutable cursor state through the method bodies of three or more of those responsibility families."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "src/buf/cursor.rs",
+      "class_name": "BufCursor",
+      "function_name": null
+    },
+    {
+      "id": "E2",
+      "file_path": "src/buf/cursor.rs",
+      "class_name": "BufCursor",
+      "function_name": "advance"
+    },
+    {
+      "id": "E3",
+      "file_path": "src/buf/cursor.rs",
+      "class_name": "BufCursor",
+      "function_name": "advance_mut"
+    },
+    {
+      "id": "E4",
+      "file_path": "src/buf/cursor.rs",
+      "class_name": "BufCursor",
+      "function_name": "read"
+    },
+    {
+      "id": "E5",
+      "file_path": "src/buf/cursor.rs",
+      "class_name": "BufCursor",
+      "function_name": "write"
+    },
+    {
+      "id": "E6",
+      "file_path": "src/buf/cursor.rs",
+      "class_name": "BufCursor",
+      "function_name": "next"
+    }
+  ],
+  "injected_match_count": 4,
+  "checks": [
+    {
+      "id": "cursor-role-accumulation",
+      "description": "Detect a concrete buffer-adapter type that concurrently implements the crate's read-side buffer trait, the crate's write-side buffer trait, the std::io read-bridge family, the std::io write bridge and a byte-iteration family.",
+      "detected_relation": "adapter engine type -> five concurrent buffer-responsibility trait families (Buf, BufMut, io::Read with io::BufRead, io::Write, Iterator)",
+      "why_this_is_the_smell": "In this module tree each of those responsibility families is deliberately assigned to a dedicated one-concern adapter type; a single type owning all five at once centralizes unrelated adapter functionality behind one engine instead.",
+      "matches": [
+        {
+          "file": "src/buf/cursor.rs",
+          "symbol": "BufCursor",
+          "entry_ids": ["E1", "E2", "E3", "E4", "E5", "E6"],
+          "evidence": "BufCursor carries five concurrent responsibility families in one type: the read-side cursor walk (entered via advance and also carrying copy_to_bytes and the vectored path), the write-side cursor walk (entered via advance_mut), the io::Read with io::BufRead bridge (entered via read), the io::Write bridge (entered via write), and Iterator byte iteration (entered via next). The Take, Limit, Chain, Reader, Writer and IntoIter adapters have become forwarding shells whose cursor mechanics now run inside this one type.",
+          "measurement": {
+            "trait_role_families": 5
+          }
+        }
+      ]
+    },
+    {
+      "id": "cursor-cross-role-state",
+      "description": "Detect private fields that receive mutable uses from the method bodies of three or more distinct responsibility families of the same type.",
+      "detected_relation": "private field -> mutable uses spanning at least three of the five buffer-responsibility families",
+      "why_this_is_the_smell": "Shared mutable state threaded between unrelated responsibility families is the coupling that keeps a multi-responsibility type from being split apart along its responsibility seams.",
+      "matches": [
+        {
+          "file": "src/buf/cursor.rs",
+          "symbol": "BufCursor.front",
+          "entry_ids": ["E1", "E2", "E3", "E4", "E5", "E6"],
+          "evidence": "The front region handle receives mutable uses from all five families: the read-side walk advances it (advance), the write-side walk advances it (advance_mut), the io read bridge borrows and drains it on the single-region fast path (read), the io write bridge fills it (write), and iteration steps it one byte at a time (next).",
+          "measurement": {
+            "mutating_role_families": 5
+          }
+        },
+        {
+          "file": "src/buf/cursor.rs",
+          "symbol": "BufCursor.tail",
+          "entry_ids": ["E1", "E2", "E3", "E4", "E5", "E6"],
+          "evidence": "The region selector is mutated and consulted across all five families: the read-side walk takes it as mutable for the paired split (advance), the write-side walk does the same (advance_mut), and the io read bridge (read), the io write bridge (write) and iteration (next) all test it to decide which mode's rule applies.",
+          "measurement": {
+            "mutating_role_families": 5
+          }
+        },
+        {
+          "file": "src/buf/cursor.rs",
+          "symbol": "BufCursor.consumed",
+          "entry_ids": ["E1", "E2", "E3", "E4", "E5", "E6"],
+          "evidence": "The byte-traffic counter is incremented from the method bodies of all five families - advance (read-side walk), advance_mut (write-side walk), read (io read bridge), write (io write bridge) and next (iteration) - although no adapter reports it, making it shared bookkeeping with no consumer.",
+          "measurement": {
+            "mutating_role_families": 5
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    "BufCursor.limit - the window-budget field only receives mutable uses from the read-side and write-side walks (two families), which is below the three-family cross-role threshold, so it is intentionally not credited by this rule.",
+    "Bytes, BytesMut, the VecDeque adapter and the Buf/BufMut trait abstract definitions - these are the crate's concrete storage containers and public trait surface, not window adapters; they hold at most two responsibility families and sit outside the adapter consolidation this case is about.",
+    "The adapter types Take, Limit, Chain, Reader, Writer and IntoIter as currently shaped - each implements only the one or two responsibility families it always owned; they participate in the task as forwarding shells but none itself matches either facet, so none is counted as a credited instance of the rule.",
+    "The () empty-region unit type in src/buf/cursor.rs - it implements only the Buf/BufMut pair and has no fields, so neither facet can fire on it."
+  ]
+}

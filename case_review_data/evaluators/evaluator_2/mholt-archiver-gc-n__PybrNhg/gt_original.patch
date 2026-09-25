@@ -1,0 +1,573 @@
+diff --git b/archiver.go a/archiver.go
+index 2d0c732..f89410e 100644
+--- b/archiver.go
++++ a/archiver.go
+@@ -67,37 +67,11 @@ func (f FileInfo) Stat() (fs.FileInfo, error) { return f.FileInfo, nil }
+ // (sans path) in the root of the archive; and map values that end in a slash
+ // will use the base name of the file in that folder of the archive.
+ //
+-// File gathering will adhere to the settings specified in options (or, when
+-// options is nil, the default manager's gathering defaults).
++// File gathering will adhere to the settings specified in options.
+ //
+ // This function is used primarily when preparing a list of files to add to
+-// an archive. It delegates to the default ArchiveManager.
+-func FilesFromDisk(options *FromDiskOptions, filenames map[string]string) ([]FileInfo, error) {
+-	return DefaultArchiveManager.FilesFromDisk(options, filenames)
+-}
+-
+-// FilesFromDisk returns a list of files by walking the directories in the
+-// given filenames map. The keys are the names on disk, and the values are
+-// their associated names in the archive.
+-//
+-// Map keys that specify directories on disk will be walked and added to the
+-// archive recursively, rooted at the named directory. Map values that end in
+-// a slash will use the base name of the file in that folder of the archive.
+-//
+-// When options is nil, this manager's FollowSymlinks and ClearAttributes
+-// fields supply the on-disk gathering defaults.
+-//
+-// This method is used primarily when preparing a list of files to add to
+ // an archive.
+-func (m ArchiveManager) FilesFromDisk(options *FromDiskOptions, filenames map[string]string) ([]FileInfo, error) {
+-	if options == nil {
+-		// fall back to this manager's gathering defaults
+-		options = &FromDiskOptions{
+-			FollowSymlinks:  m.FollowSymlinks,
+-			ClearAttributes: m.ClearAttributes,
+-		}
+-	}
+-
++func FilesFromDisk(options *FromDiskOptions, filenames map[string]string) ([]FileInfo, error) {
+ 	var files []FileInfo
+ 	for rootOnDisk, rootInArchive := range filenames {
+ 		walkErr := filepath.WalkDir(rootOnDisk, func(filename string, d fs.DirEntry, err error) error {
+@@ -110,7 +84,7 @@ func (m ArchiveManager) FilesFromDisk(options *FromDiskOptions, filenames map[st
+ 				return err
+ 			}
+ 
+-			nameInArchive := m.nameOnDiskToNameInArchive(filename, rootOnDisk, rootInArchive)
++			nameInArchive := nameOnDiskToNameInArchive(filename, rootOnDisk, rootInArchive)
+ 			// this is the root folder and we are adding its contents to target rootInArchive
+ 			if info.IsDir() && nameInArchive == "" {
+ 				return nil
+@@ -162,17 +136,11 @@ func (m ArchiveManager) FilesFromDisk(options *FromDiskOptions, filenames map[st
+ 	return files, nil
+ }
+ 
+-// nameOnDiskToNameInArchive converts a filename from disk to a name in an
+-// archive, applying the default manager's name mangling rules.
+-func nameOnDiskToNameInArchive(nameOnDisk, rootOnDisk, rootInArchive string) string {
+-	return DefaultArchiveManager.nameOnDiskToNameInArchive(nameOnDisk, rootOnDisk, rootInArchive)
+-}
+-
+ // nameOnDiskToNameInArchive converts a filename from disk to a name in an archive,
+ // respecting rules defined by FilesFromDisk. nameOnDisk is the full filename on disk
+ // which is expected to be prefixed by rootOnDisk (according to fs.WalkDirFunc godoc)
+ // and which will be placed into a folder rootInArchive in the archive.
+-func (m ArchiveManager) nameOnDiskToNameInArchive(nameOnDisk, rootOnDisk, rootInArchive string) string {
++func nameOnDiskToNameInArchive(nameOnDisk, rootOnDisk, rootInArchive string) string {
+ 	// These manipulations of rootInArchive could be done just once instead of on
+ 	// every walked file since they don't rely on nameOnDisk which is the only
+ 	// variable that changes during the walk, but combining all the logic into this
+@@ -296,17 +264,11 @@ func isSymlink(info fs.FileInfo) bool {
+ 	return info.Mode()&os.ModeSymlink != 0
+ }
+ 
+-// streamSizeBySeeking determines the size of a stream using the default
+-// manager's seeking logic.
+-func streamSizeBySeeking(s io.Seeker) (int64, error) {
+-	return DefaultArchiveManager.streamSizeBySeeking(s)
+-}
+-
+ // streamSizeBySeeking determines the size of the stream by
+ // seeking to the end, then back again, so the resulting
+ // seek position upon returning is the same as when called
+ // (assuming no errors).
+-func (m ArchiveManager) streamSizeBySeeking(s io.Seeker) (int64, error) {
++func streamSizeBySeeking(s io.Seeker) (int64, error) {
+ 	currentPosition, err := s.Seek(0, io.SeekCurrent)
+ 	if err != nil {
+ 		return 0, fmt.Errorf("getting current offset: %w", err)
+diff --git b/formats.go a/formats.go
+index 055f070..837114d 100644
+--- b/formats.go
++++ a/formats.go
+@@ -9,21 +9,14 @@ import (
+ 	"strings"
+ )
+ 
+-// RegisterFormat registers a format with the default manager. It should be
+-// called during init. Duplicate formats by name are not allowed and will
+-// panic.
++// RegisterFormat registers a format. It should be called during init.
++// Duplicate formats by name are not allowed and will panic.
+ func RegisterFormat(format Format) {
+-	DefaultArchiveManager.RegisterFormat(format)
+-}
+-
+-// RegisterFormat registers format with this manager's registry. The format
+-// name is its extension without the leading dot; duplicate names panic.
+-func (m ArchiveManager) RegisterFormat(format Format) {
+ 	name := strings.Trim(strings.ToLower(format.Extension()), ".")
+-	if _, ok := m.formats[name]; ok {
++	if _, ok := formats[name]; ok {
+ 		panic("format " + name + " is already registered")
+ 	}
+-	m.formats[name] = format
++	formats[name] = format
+ }
+ 
+ // Identify iterates the registered formats and returns the one that
+@@ -47,20 +40,6 @@ func (m ArchiveManager) RegisterFormat(format Format) {
+ // If the input stream is an io.Seeker, Seek() must work, and the
+ // original input value will be returned instead of a wrapper value.
+ func Identify(ctx context.Context, filename string, stream io.Reader) (Format, io.Reader, error) {
+-	return DefaultArchiveManager.Identify(ctx, filename, stream)
+-}
+-
+-// Identify iterates the formats registered with this manager and returns the
+-// one that matches the given filename and/or stream. It is capable of
+-// identifying compressed files (.gz, .xz...), archive files (.tar, .zip...),
+-// and compressed archive files (tar.gz, tar.bz2...). The returned Format
+-// value can be type-asserted to ascertain its capabilities.
+-//
+-// A manager with an empty registry cannot recognize any format.
+-//
+-// See the package-level Identify function for the stream and rewind
+-// semantics, which this method shares.
+-func (m ArchiveManager) Identify(ctx context.Context, filename string, stream io.Reader) (Format, io.Reader, error) {
+ 	var compression Compression
+ 	var archival Archival
+ 	var extraction Extraction
+@@ -71,13 +50,13 @@ func (m ArchiveManager) Identify(ctx context.Context, filename string, stream io
+ 	}
+ 
+ 	// try compression format first, since that's the outer "layer" if combined
+-	for name, format := range m.formats {
++	for name, format := range formats {
+ 		cf, isCompression := format.(Compression)
+ 		if !isCompression {
+ 			continue
+ 		}
+ 
+-		matchResult, err := m.identifyOne(ctx, format, filename, rewindableStream, nil)
++		matchResult, err := identifyOne(ctx, format, filename, rewindableStream, nil)
+ 		if err != nil {
+ 			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, err)
+ 		}
+@@ -91,14 +70,14 @@ func (m ArchiveManager) Identify(ctx context.Context, filename string, stream io
+ 	}
+ 
+ 	// try archival and extraction format next
+-	for name, format := range m.formats {
++	for name, format := range formats {
+ 		ar, isArchive := format.(Archival)
+ 		ex, isExtract := format.(Extraction)
+ 		if !isArchive && !isExtract {
+ 			continue
+ 		}
+ 
+-		matchResult, err := m.identifyOne(ctx, format, filename, rewindableStream, compression)
++		matchResult, err := identifyOne(ctx, format, filename, rewindableStream, compression)
+ 		if err != nil {
+ 			return nil, rewindableStream.reader(), fmt.Errorf("matching %s: %w", name, err)
+ 		}
+@@ -126,7 +105,7 @@ func (m ArchiveManager) Identify(ctx context.Context, filename string, stream io
+ 	}
+ }
+ 
+-func (m ArchiveManager) identifyOne(ctx context.Context, format Format, filename string, stream *rewindReader, comp Compression) (mr MatchResult, err error) {
++func identifyOne(ctx context.Context, format Format, filename string, stream *rewindReader, comp Compression) (mr MatchResult, err error) {
+ 	defer stream.rewind()
+ 
+ 	if filename == "." {
+@@ -162,17 +141,10 @@ func (m ArchiveManager) identifyOne(ctx context.Context, format Format, filename
+ 	return mr, err
+ }
+ 
+-// readAtMost reads at most n bytes from the stream using the default
+-// manager's sniffing logic. A nil, empty, or short stream is not an error.
+-// The returned slice of bytes may have length < n without an error.
+-func readAtMost(stream io.Reader, n int) ([]byte, error) {
+-	return DefaultArchiveManager.readAtMost(stream, n)
+-}
+-
+ // readAtMost reads at most n bytes from the stream. A nil, empty, or short
+ // stream is not an error. The returned slice of bytes may have length < n
+ // without an error.
+-func (m ArchiveManager) readAtMost(stream io.Reader, n int) ([]byte, error) {
++func readAtMost(stream io.Reader, n int) ([]byte, error) {
+ 	if stream == nil || n <= 0 {
+ 		return []byte{}, nil
+ 	}
+@@ -445,11 +417,8 @@ func (rr *rewindReader) reader() io.Reader {
+ // NoMatch is a special error returned if there are no matching formats.
+ var NoMatch = fmt.Errorf("no formats matched")
+ 
+-// formats aliases the default manager's format registry. It is kept as a
+-// package-level value for code (and tests) that enumerate every registered
+-// format; new registrations written through the default manager are
+-// immediately visible through it, since a map is a reference type.
+-var formats = DefaultArchiveManager.formats
++// Registered formats.
++var formats = make(map[string]Format)
+ 
+ // Interface guards
+ var (
+diff --git b/fs.go a/fs.go
+index c96b092..63a4471 100644
+--- b/fs.go
++++ a/fs.go
+@@ -43,15 +43,6 @@ import (
+ // with decompression. However, the fs.WalkDir() use case has been optimized to
+ // create an index on first call to ReadDir().
+ func FileSystem(ctx context.Context, filename string, stream ReaderAtSeeker) (fs.FS, error) {
+-	return DefaultArchiveManager.FileSystem(ctx, filename, stream)
+-}
+-
+-// FileSystem identifies the format of the input using the formats registered
+-// with this manager and returns a read-only file system over it. See the
+-// package-level FileSystem function for the complete description of accepted
+-// inputs. Archive file systems are rooted at this manager's Prefix when it
+-// is set.
+-func (m ArchiveManager) FileSystem(ctx context.Context, filename string, stream ReaderAtSeeker) (fs.FS, error) {
+ 	if filename == "" && stream == nil {
+ 		return nil, errors.New("no input")
+ 	}
+@@ -88,7 +79,7 @@ func (m ArchiveManager) FileSystem(ctx context.Context, filename string, stream
+ 
+ 	// normally, callers should use the Reader value returned from Identify, but
+ 	// our input is a Seeker, so we know the original input value gets returned
+-	format, _, err := m.Identify(ctx, filepath.Base(filename), idStream)
++	format, _, err := Identify(ctx, filepath.Base(filename), idStream)
+ 	if errors.Is(err, NoMatch) {
+ 		return FileFS{Path: filename}, nil // must be an ordinary file
+ 	}
+@@ -100,21 +91,21 @@ func (m ArchiveManager) FileSystem(ctx context.Context, filename string, stream
+ 	case Extractor:
+ 		// if no stream was input, return an ArchiveFS that relies on the filepath
+ 		if stream == nil {
+-			return &ArchiveFS{Path: filename, Format: fileFormat, Context: ctx, Prefix: m.Prefix}, nil
++			return &ArchiveFS{Path: filename, Format: fileFormat, Context: ctx}, nil
+ 		}
+ 
+ 		// otherwise, if a stream was input, return an ArchiveFS that relies on that
+ 
+ 		// determine size -- we know that the stream value we get back from
+ 		// Identify is the same type as what we input because it is a Seeker
+-		size, err := m.streamSizeBySeeking(stream)
++		size, err := streamSizeBySeeking(stream)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("seeking for size: %w", err)
+ 		}
+ 
+ 		sr := io.NewSectionReader(stream, 0, size)
+ 
+-		return &ArchiveFS{Stream: sr, Format: fileFormat, Context: ctx, Prefix: m.Prefix}, nil
++		return &ArchiveFS{Stream: sr, Format: fileFormat, Context: ctx}, nil
+ 
+ 	case Compression:
+ 		return FileFS{Path: filename, Compression: fileFormat}, nil
+diff --git b/manager.go a/manager.go
+deleted file mode 100644
+index 10d82b0..0000000
+--- b/manager.go
++++ /dev/null
+@@ -1,296 +0,0 @@
+-package archiver
+-
+-import (
+-	"context"
+-	"fmt"
+-	"io"
+-	"io/fs"
+-	"log"
+-	"os"
+-	"path"
+-	"path/filepath"
+-	"sort"
+-	"strings"
+-)
+-
+-// ArchiveManager is the package's high-level coordinator. It provides the
+-// facade that most programs actually want: one value that owns the registry
+-// of supported formats and performs every common archiving task — snarfing
+-// files from disk, detecting the format of an archive or compressed file,
+-// creating archives (optionally compressed), extracting archives to disk, and
+-// presenting archive contents through the io/fs interfaces.
+-//
+-// Because the manager owns its own format registry and its own operational
+-// policies, embedding programs can create isolated managers that support
+-// only a subset of the formats (or their own custom formats) instead of
+-// relying on package-global state. All package-level convenience functions
+-// (Identify, FileSystem, FilesFromDisk, and RegisterFormat) delegate to
+-// DefaultArchiveManager, which is pre-registered with every built-in format.
+-type ArchiveManager struct {
+-	// formats is the registry of formats this manager supports, keyed by
+-	// the format extension without the leading dot.
+-	formats map[string]Format
+-
+-	// FollowSymlinks and ClearAttributes are the on-disk gathering
+-	// defaults used when no FromDiskOptions are supplied. They mirror
+-	// the options of the same names; see FromDiskOptions.
+-	FollowSymlinks  bool
+-	ClearAttributes bool
+-
+-	// ImplicitTopLevelFolder causes ArchiveFolder to nest the contents of
+-	// a single gathered folder into a folder of the same name inside the
+-	// archive, so that extracting the archive yields that folder.
+-	ImplicitTopLevelFolder bool
+-
+-	// OverwriteExisting allows ExtractToFolder to replace files that
+-	// already exist on disk; by default existing files are preserved and
+-	// the extraction of that file fails.
+-	OverwriteExisting bool
+-
+-	// ContinueOnError makes extraction to a folder log (as opposed to
+-	// fail on) individual file write errors and continue with the rest
+-	// of the archive.
+-	ContinueOnError bool
+-
+-	// Prefix is the subdirectory that returned virtual file systems are
+-	// rooted in by default; it mirrors ArchiveFS.Prefix. An empty Prefix
+-	// roots file systems at the archive root, which preserves the
+-	// historical behavior.
+-	Prefix string
+-}
+-
+-// NewArchiveManager returns a new manager with an empty format registry.
+-// Register the desired formats (see RegisterFormat) before calling its
+-// archival, extraction, or identification operations; or use
+-// DefaultArchiveManager, which recognizes all the built-in formats.
+-func NewArchiveManager() ArchiveManager {
+-	return ArchiveManager{formats: make(map[string]Format)}
+-}
+-
+-// DefaultArchiveManager is the manager used by the package-level
+-// convenience functions. It is pre-registered with every built-in format
+-// during package initialization (see RegisterFormat) and carries the
+-// default, backward-compatible policies.
+-var DefaultArchiveManager = NewArchiveManager()
+-
+-// SupportedFormats returns the names (extensions without the leading dot)
+-// of every format registered with this manager, in sorted order.
+-func (m ArchiveManager) SupportedFormats() []string {
+-	var names []string
+-	for name := range m.formats {
+-		names = append(names, name)
+-	}
+-	sort.Strings(names)
+-	return names
+-}
+-
+-// ByExtension returns the format whose extension matches the end of
+-// filename, looking only at the formats registered with this manager.
+-// Archive files wrapped in a registered compression format (for example
+-// ".tar.gz") resolve to the combined Archive format, so that the returned
+-// Format value can do everything the file name implies.
+-func (m ArchiveManager) ByExtension(filename string) (Format, error) {
+-	lower := strings.ToLower(filename)
+-
+-	// peel registered compression extensions off the end of the file name
+-	// so that compressed archive names (".tar.gz", ".tar.bz2", ...) surface
+-	// the archive format underneath them
+-	var compression Compression
+-	for {
+-		var peeled bool
+-		for _, format := range m.formats {
+-			cf, isCompression := format.(Compression)
+-			if !isCompression || !strings.HasSuffix(lower, strings.ToLower(format.Extension())) {
+-				continue
+-			}
+-			if compression == nil {
+-				compression = cf
+-			}
+-			lower = strings.TrimSuffix(lower, strings.ToLower(format.Extension()))
+-			peeled = true
+-		}
+-		if !peeled {
+-			break
+-		}
+-	}
+-
+-	// then match the archive format, if any, that the name ends with
+-	var archival Archival
+-	var extraction Extraction
+-	for _, format := range m.formats {
+-		ar, isArchive := format.(Archival)
+-		ex, isExtract := format.(Extraction)
+-		if (isArchive || isExtract) && strings.HasSuffix(lower, strings.ToLower(format.Extension())) {
+-			archival, extraction = ar, ex
+-			break
+-		}
+-	}
+-
+-	switch {
+-	case compression != nil && archival != nil:
+-		return Archive{compression, archival, extraction}, nil
+-	case compression != nil:
+-		return compression, nil
+-	case archival != nil:
+-		return archival, nil
+-	default:
+-		return nil, fmt.Errorf("no registered format matches the extension of %s", filename)
+-	}
+-}
+-
+-// ArchiveFolder creates a new archive at destFilename, gathering the input
+-// files by walking filenames on disk (in the same way as FilesFromDisk; the
+-// manager's on-disk gathering defaults apply). The archive format (including
+-// any compression, as in ".tar.gz") is chosen by matching destFilename
+-// against the formats registered with this manager. With
+-// ImplicitTopLevelFolder set, archiving a single folder nest its contents
+-// into a same-named folder so that extraction re-creates it.
+-func (m ArchiveManager) ArchiveFolder(ctx context.Context, destFilename string, filenames map[string]string) error {
+-	if len(filenames) == 0 {
+-		return fmt.Errorf("no filenames provided to archive")
+-	}
+-
+-	// choose the destination format from the file name using only the
+-	// formats this manager knows about
+-	format, err := m.ByExtension(destFilename)
+-	if err != nil {
+-		return fmt.Errorf("choosing archive format for %s: %w", destFilename, err)
+-	}
+-	archival, isArchival := format.(Archival)
+-	if !isArchival {
+-		return fmt.Errorf("registered format %s (%T) cannot create archives", format.Extension(), format)
+-	}
+-
+-	// gather the files to archive, honoring this manager's on-disk defaults
+-	files, err := m.FilesFromDisk(nil, filenames)
+-	if err != nil {
+-		return fmt.Errorf("gathering files: %w", err)
+-	}
+-
+-	// optionally nest single-folder contents into a same-named folder
+-	if m.ImplicitTopLevelFolder && len(filenames) == 1 {
+-		for root := range filenames {
+-			folder := filepath.Base(root)
+-			for i := range files {
+-				files[i].NameInArchive = path.Join(folder, files[i].NameInArchive)
+-			}
+-		}
+-	}
+-
+-	out, err := os.Create(destFilename)
+-	if err != nil {
+-		return err
+-	}
+-
+-	err = archival.Archive(ctx, out, files)
+-	if closeErr := out.Close(); err == nil {
+-		err = closeErr
+-	}
+-	return err
+-}
+-
+-// ExtractToFolder extracts sourceArchive — any archive or compressed
+-// archive whose format is registered with this manager — writing each
+-// entry into destDir on the local disk, creating parent folders as
+-// needed. Entries are written at their names within the archive and never
+-// escape destDir. Existing files are preserved (see OverwriteExisting),
+-// and with ContinueOnError set, entries that fail to write are logged
+-// and the walk carries on.
+-func (m ArchiveManager) ExtractToFolder(ctx context.Context, sourceArchive io.Reader, destDir string) error {
+-	if sourceArchive == nil {
+-		return fmt.Errorf("no archive input given")
+-	}
+-
+-	// detect the archive format from the stream contents using this
+-	// manager's registry
+-	format, stream, err := m.Identify(ctx, "", sourceArchive)
+-	if err != nil {
+-		return fmt.Errorf("identifying archive: %w", err)
+-	}
+-	extraction, isExtraction := format.(Extractor)
+-	if !isExtraction {
+-		return fmt.Errorf("registered format %s (%T) cannot extract archives", format.Extension(), format)
+-	}
+-
+-	return extraction.Extract(ctx, stream, func(ctx context.Context, file FileInfo) error {
+-		if err := ctx.Err(); err != nil {
+-			return err
+-		}
+-		if err := m.writeFileToDisk(ctx, file, destDir); err != nil {
+-			if !m.ContinueOnError {
+-				return err
+-			}
+-			log.Printf("[ERROR] %v", err)
+-		}
+-		return nil
+-	})
+-}
+-
+-// writeFileToDisk writes file, encountered during an extraction, into
+-// destDir on the local disk: directories (including implicit parents) are
+-// created, links are re-created as links, and regular file bodies are
+-// copied to their entries' names.
+-func (m ArchiveManager) writeFileToDisk(ctx context.Context, file FileInfo, destDir string) error {
+-	if err := ctx.Err(); err != nil {
+-		return err
+-	}
+-
+-	destPath := m.destinationPath(destDir, file.NameInArchive)
+-
+-	mode := file.Mode()
+-	perm := mode.Perm()
+-	if perm == 0 {
+-		perm = 0o755
+-	}
+-
+-	if file.IsDir() {
+-		if err := os.MkdirAll(destPath, perm); err != nil {
+-			return err
+-		}
+-		return nil
+-	}
+-
+-	if mode&fs.ModeSymlink != 0 {
+-		if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+-			return err
+-		}
+-		return os.Symlink(file.LinkTarget, destPath)
+-	}
+-
+-	src, err := file.Open()
+-	if err != nil {
+-		return err
+-	}
+-	defer src.Close()
+-
+-	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
+-		return err
+-	}
+-
+-	openFlags := os.O_WRONLY | os.O_CREATE
+-	if m.OverwriteExisting {
+-		openFlags |= os.O_TRUNC
+-	} else {
+-		openFlags |= os.O_EXCL // refuse to clobber what's already on disk
+-	}
+-	dst, err := os.OpenFile(destPath, openFlags, perm)
+-	if err != nil {
+-		return err
+-	}
+-
+-	if _, err := io.Copy(dst, src); err != nil {
+-		dst.Close()
+-		return err
+-	}
+-	return dst.Close()
+-}
+-
+-// destinationPath joins destDir with the archive-relative name of an entry,
+-// neutralizing absolute paths and directory traversal so that extraction
+-// always lands inside destDir.
+-func (m ArchiveManager) destinationPath(destDir, nameInArchive string) string {
+-	// prefix with "/" so the path is cleaned as absolute, which resolves
+-	// any ".." components harmlessly instead of escaping the destination
+-	cleaned := strings.TrimPrefix(path.Clean(path.Join("/", nameInArchive)), "/")
+-	return filepath.Join(destDir, filepath.FromSlash(cleaned))
+-}

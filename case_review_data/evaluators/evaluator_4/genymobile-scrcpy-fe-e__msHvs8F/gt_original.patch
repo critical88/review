@@ -1,0 +1,291 @@
+diff --git a/app/src/input_manager.c b/app/src/input_manager.c
+index 342ffebf..3b123842 100644
+--- a/app/src/input_manager.c
++++ b/app/src/input_manager.c
+@@ -398,101 +398,6 @@ simulate_virtual_finger(struct sc_input_manager *im,
+     return true;
+ }
+ 
+-// Convert a point from window coordinates to frame coordinates.
+-//
+-// The mapping depends on the displayed content rectangle and on the client
+-// orientation, so this helper reads the display state directly instead of
+-// going through the screen API for every pointer event.
+-static struct sc_point
+-im_convert_window_to_frame_coords(struct sc_screen *screen,
+-                                  int32_t x, int32_t y) {
+-    assert(screen->video);
+-
+-    enum sc_orientation orientation = screen->orientation;
+-
+-    int32_t w = screen->content_size.width;
+-    int32_t h = screen->content_size.height;
+-
+-    // screen->rect must be initialized to avoid a division by zero
+-    assert(screen->rect.w && screen->rect.h);
+-
+-    x = (int64_t) (x - screen->rect.x) * w / screen->rect.w;
+-    y = (int64_t) (y - screen->rect.y) * h / screen->rect.h;
+-
+-    struct sc_point result;
+-    switch (orientation) {
+-        case SC_ORIENTATION_0:
+-            result.x = x;
+-            result.y = y;
+-            break;
+-        case SC_ORIENTATION_90:
+-            result.x = y;
+-            result.y = w - x;
+-            break;
+-        case SC_ORIENTATION_180:
+-            result.x = w - x;
+-            result.y = h - y;
+-            break;
+-        case SC_ORIENTATION_270:
+-            result.x = h - y;
+-            result.y = x;
+-            break;
+-        case SC_ORIENTATION_FLIP_0:
+-            result.x = w - x;
+-            result.y = y;
+-            break;
+-        case SC_ORIENTATION_FLIP_90:
+-            result.x = h - y;
+-            result.y = w - x;
+-            break;
+-        case SC_ORIENTATION_FLIP_180:
+-            result.x = x;
+-            result.y = h - y;
+-            break;
+-        default:
+-            assert(orientation == SC_ORIENTATION_FLIP_270);
+-            result.x = y;
+-            result.y = x;
+-            break;
+-    }
+-
+-    return result;
+-}
+-
+-// Compute the position of the virtual finger mirroring the mouse pointer
+-// through the center of the displayed content.
+-static struct sc_point
+-im_get_vfinger_position(struct sc_screen *screen, int32_t x, int32_t y,
+-                        bool invert_x, bool invert_y) {
+-    // The window must expose the content, the content rectangle must be
+-    // initialized and the device frame must be known for the pointer and its
+-    // mirror to be meaningful
+-    assert(screen->window);
+-    assert(screen->rect.w && screen->rect.h);
+-    assert(screen->frame_size.width && screen->frame_size.height);
+-
+-    struct sc_point position =
+-        im_convert_window_to_frame_coords(screen, x, y);
+-
+-    if (invert_x) {
+-        position.x = screen->frame_size.width - position.x;
+-    }
+-    if (invert_y) {
+-        position.y = screen->frame_size.height - position.y;
+-    }
+-    return position;
+-}
+-
+-// Return true if the point is located outside of the displayed content
+-// rectangle (i.e. on the black borders)
+-static bool
+-im_is_point_outside_content(struct sc_screen *screen, int32_t x, int32_t y) {
+-    return x < screen->rect.x
+-        || x >= screen->rect.x + screen->rect.w
+-        || y < screen->rect.y
+-        || y >= screen->rect.y + screen->rect.h;
+-}
+-
+ static struct sc_point
+ inverse_point(struct sc_point point, struct sc_size size,
+               bool invert_x, bool invert_y) {
+@@ -836,7 +741,7 @@ sc_input_manager_get_position(struct sc_input_manager *im, int32_t x,
+ 
+     return (struct sc_position) {
+         .screen_size = im->screen->frame_size,
+-        .point = im_convert_window_to_frame_coords(im->screen, x, y),
++        .point = sc_screen_convert_window_to_frame_coords(im->screen, x, y),
+     };
+ }
+ 
+@@ -870,7 +775,8 @@ sc_input_manager_process_mouse_motion(struct sc_input_manager *im,
+     if (im->vfinger_down) {
+         assert(!im->mp->relative_mode); // assert one more time
+         struct sc_point mouse =
+-           im_convert_window_to_frame_coords(im->screen, event->x, event->y);
++           sc_screen_convert_window_to_frame_coords(im->screen, event->x,
++                                                    event->y);
+         struct sc_point vfinger = inverse_point(mouse, im->screen->frame_size,
+                                                 im->vfinger_invert_x,
+                                                 im->vfinger_invert_y);
+@@ -900,7 +806,7 @@ sc_input_manager_process_touch(struct sc_input_manager *im,
+         .position = {
+             .screen_size = im->screen->frame_size,
+             .point =
+-                im_convert_window_to_frame_coords(im->screen, x, y),
++                sc_screen_convert_window_to_frame_coords(im->screen, x, y),
+         },
+         .action = sc_touch_action_from_sdl(event->type),
+         .pointer_id = event->fingerID,
+@@ -1010,8 +916,11 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
+     bool mouse_relative_mode = im->mp && im->mp->relative_mode;
+     if (video && !mouse_relative_mode && event->button == SDL_BUTTON_LEFT
+             && event->clicks == 2) {
+-        bool outside = im_is_point_outside_content(im->screen, event->x,
+-                                                  event->y);
++        int32_t x = event->x;
++        int32_t y = event->y;
++        SDL_FRect *r = &im->screen->rect;
++        bool outside = x < r->x || x >= r->x + r->w
++                    || y < r->y || y >= r->y + r->h;
+         if (outside) {
+             if (down) {
+                 sc_screen_resize_to_fit(im->screen);
+@@ -1073,6 +982,9 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
+     // of the screen. It is expected to be less frequently used, that's why the
+     // one-mod shortcuts are assigned to rotation and vertical tilt.
+     if (change_vfinger) {
++        struct sc_point mouse =
++            sc_screen_convert_window_to_frame_coords(im->screen, event->x,
++                                                                 event->y);
+         if (down) {
+             // Ctrl  Shift     invert_x  invert_y
+             // ----  ----- ==> --------  --------
+@@ -1083,10 +995,9 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
+             im->vfinger_invert_x = ctrl_pressed ^ shift_pressed;
+             im->vfinger_invert_y = ctrl_pressed;
+         }
+-        struct sc_point vfinger =
+-            im_get_vfinger_position(im->screen, event->x, event->y,
+-                                     im->vfinger_invert_x,
+-                                     im->vfinger_invert_y);
++        struct sc_point vfinger = inverse_point(mouse, im->screen->frame_size,
++                                                im->vfinger_invert_x,
++                                                im->vfinger_invert_y);
+         enum android_motionevent_action action = down
+                                                ? AMOTION_EVENT_ACTION_DOWN
+                                                : AMOTION_EVENT_ACTION_UP;
+diff --git a/app/src/mouse_capture.c b/app/src/mouse_capture.c
+index d323f597..f6fafcfb 100644
+--- a/app/src/mouse_capture.c
++++ b/app/src/mouse_capture.c
+@@ -1,15 +1,12 @@
+ #include "mouse_capture.h"
+ 
+-#include <assert.h>
+-
+-#include "screen.h"
+ #include "shortcut_mod.h"
+ #include "util/log.h"
+ 
+ void
+-sc_mouse_capture_init(struct sc_mouse_capture *mc, struct sc_screen *screen,
++sc_mouse_capture_init(struct sc_mouse_capture *mc, SDL_Window *window,
+                       uint8_t shortcut_mods) {
+-    mc->screen = screen;
++    mc->window = window;
+     mc->sdl_mouse_capture_keys = sc_shortcut_mods_to_sdl(shortcut_mods);
+     mc->mouse_capture_key_pressed = SDLK_UNKNOWN;
+ }
+@@ -19,30 +16,9 @@ sc_mouse_capture_is_capture_key(struct sc_mouse_capture *mc, SDL_Keycode key) {
+     return sc_shortcut_mods_is_shortcut_key(mc->sdl_mouse_capture_keys, key);
+ }
+ 
+-// The capture handling only processes events while the input pipeline
+-// requested relative mouse mode. Reading the display state locally keeps the
+-// capture policy out of the screen event loop.
+-static bool
+-sc_mouse_capture_is_relative_mode(struct sc_mouse_capture *mc) {
+-    struct sc_screen *screen = mc->screen;
+-
+-    // The capture state must handle the window exposed by its own screen,
+-    // and the mouse processor must be properly initialized
+-    assert(&screen->mc == mc);
+-    assert(screen->window);
+-    assert(screen->im.mp && screen->im.mp->ops);
+-
+-    return screen->im.mp && screen->im.mp->relative_mode;
+-}
+-
+ bool
+ sc_mouse_capture_handle_event(struct sc_mouse_capture *mc,
+                               const SDL_Event *event) {
+-    if (!sc_mouse_capture_is_relative_mode(mc)) {
+-        // No relative mode: forward the events normally
+-        return false;
+-    }
+-
+     switch (event->type) {
+         case SDL_EVENT_WINDOW_FOCUS_LOST:
+             sc_mouse_capture_set_active(mc, false);
+@@ -105,7 +81,7 @@ sc_mouse_capture_handle_event(struct sc_mouse_capture *mc,
+ 
+ void
+ sc_mouse_capture_set_active(struct sc_mouse_capture *mc, bool capture) {
+-    bool ok = SDL_SetWindowRelativeMouseMode(mc->screen->window, capture);
++    bool ok = SDL_SetWindowRelativeMouseMode(mc->window, capture);
+     if (!ok) {
+         LOGE("Could not set relative mouse mode to %s: %s",
+              capture ? "true" : "false", SDL_GetError());
+@@ -114,7 +90,7 @@ sc_mouse_capture_set_active(struct sc_mouse_capture *mc, bool capture) {
+ 
+ bool
+ sc_mouse_capture_is_active(struct sc_mouse_capture *mc) {
+-    return SDL_GetWindowRelativeMouseMode(mc->screen->window);
++    return SDL_GetWindowRelativeMouseMode(mc->window);
+ }
+ 
+ void
+diff --git a/app/src/mouse_capture.h b/app/src/mouse_capture.h
+index 0be2a224..65770f8a 100644
+--- a/app/src/mouse_capture.h
++++ b/app/src/mouse_capture.h
+@@ -7,10 +7,8 @@
+ 
+ #include <SDL3/SDL.h>
+ 
+-struct sc_screen;
+-
+ struct sc_mouse_capture {
+-    struct sc_screen *screen;
++    SDL_Window *window;
+     uint16_t sdl_mouse_capture_keys;
+ 
+     // To enable/disable mouse capture, a mouse capture key (LALT, LGUI or
+@@ -20,7 +18,7 @@ struct sc_mouse_capture {
+ };
+ 
+ void
+-sc_mouse_capture_init(struct sc_mouse_capture *mc, struct sc_screen *screen,
++sc_mouse_capture_init(struct sc_mouse_capture *mc, SDL_Window *window,
+                       uint8_t shortcut_mods);
+ 
+ void
+diff --git a/app/src/screen.c b/app/src/screen.c
+index a622725c..05923ab6 100644
+--- a/app/src/screen.c
++++ b/app/src/screen.c
+@@ -671,7 +671,7 @@ sc_screen_init(struct sc_screen *screen,
+     sc_input_manager_init(&screen->im, &im_params);
+ 
+     // Initialize even if not used for simplicity
+-    sc_mouse_capture_init(&screen->mc, screen, params->shortcut_mods);
++    sc_mouse_capture_init(&screen->mc, screen->window, params->shortcut_mods);
+ 
+ #ifdef CONTINUOUS_RESIZING_WORKAROUND
+     if (screen->video) {
+@@ -1214,7 +1214,8 @@ sc_screen_handle_event(struct sc_screen *screen, const SDL_Event *event) {
+             return;
+     }
+ 
+-    if (sc_mouse_capture_handle_event(&screen->mc, event)) {
++    if (sc_screen_is_relative_mode(screen)
++            && sc_mouse_capture_handle_event(&screen->mc, event)) {
+         // The mouse capture handler consumed the event
+         return;
+     }

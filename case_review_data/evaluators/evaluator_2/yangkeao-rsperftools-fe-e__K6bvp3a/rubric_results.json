@@ -1,0 +1,224 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The smell removed `UnresolvedFrames::new` from frames.rs and made the capture site in profiler.rs assemble the record field-by-field inline (`UnresolvedFrames { frames: backtrace, thread_name: tn_buf, thread_name_length, thread_id, sample_timestamp }`). The agent's patch does not restore any constructor on the raw-sample type: it adds `scrub_signal_handler_frames` and tests to profiler.rs and reworks `resolved_frames` in report.rs, but never touches the capture path's inline struct construction. The import line changes to `use crate::frames::{Symbol, UnresolvedFrames};` but no `UnresolvedFrames::new` (or equivalent operation on the raw-sample type accepting backtrace frames, thread-name bytes, thread id, and timestamp with buffer/length bookkeeping) is reintroduced, so the capture call site still assembles the record by filling its fields inline.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "A stored raw sample is constructed by an operation on the raw-sample type itself that accepts the captured backtrace frames, thread-name bytes, numeric thread id and timestamp (including the fixed-size thread-name buffer and its length bookkeeping), and the capture/sampling path stores samples through that operation; nothing at the capture call site assembles the record by filling its fields inline.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch leaves the raw-to-resolved conversion as a report-local helper: src/report.rs still defines `fn resolved_frames(item: UnresolvedFrames) -> Frames`, performs perfmap-first symbolication with `frame.resolve_symbol` fallback there, and the report-building loop still calls `resolved_frames(entry.item.clone())`. No conversion method or `impl From<UnresolvedFrames> for Frames` is restored in src/frames.rs, the module owning `UnresolvedFrames`. The patch only moves the signal-handler suppression to `crate::profiler::scrub_signal_handler_frames`, invoked from the report helper, so the report layer still owns the conversion rather than invoking an owner-provided conversion.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The raw-to-resolved conversion of one sample (perfmap-lookup-first symbolication with the backtrace-symbolization fallback, and the suppression of the profiler signal handler's own frame plus its adjacent frame) is provided by the module that owns the raw sample type, and the report-building loop obtains resolved samples by invoking that owner-provided conversion instead of a report-local clone of it.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch touches only signal-handler scrubbing: it adds profiler::scrub_signal_handler_frames and changes resolved_frames to call it. It does not restore a single Frames thread-identity operation or update consumers. The smell's per-format copies remain: Debug for Frames inlines the thread_name-vs-ThreadId choice, flamegraph stack_line inlines the same choice, and protobuf still defines its own private thread_name_or_id(key: &Frames). Thus no one owner-provided operation is called by all consumers.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The thread-identity rule (thread name when a non-empty name was recorded, the numeric thread id otherwise) exists in exactly one owner-provided place on the resolved-sample type, and each consumer of a thread identity (the human-readable text, the flamegraph collapsed-stack lines, and the thread labels of the pprof export) obtains it by calling that one operation; no export-specific copy of the rule survives.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The smell relocated `impl Debug for Frames` out of `src/frames.rs` and into `src/report.rs`, and removed `Frames::thread_name_or_id` from the sample type. The agent patch only changes `resolved_frames` in `src/report.rs` and adds signal-handler scrubbing in `src/profiler.rs`; it does not move the `Frames` Debug impl back to `src/frames.rs`, restore an owner-provided `thread_name_or_id`, or make the report Debug output compose the sample type's own rendering. Thus the human-readable resolved-sample rendering remains re-implemented in the report module.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The human-readable rendering of one resolved sample (its frame sections and its thread identity line, with the same thread name or numeric-id fallback) is provided together with the sample type it renders, and the report type's debug output ends with/composes that owner-provided rendering rather than a re-implementation living in the report module.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The refactor request requires collapsed-stack rendering to be provided by the data-owner module, not by the flamegraph consumer reading fields. The agent patch only changes `profiler.rs` and `resolved_frames` in `report.rs`; it does not modify the flamegraph module. The flamegraph `stack_line` helper from smell.diff therefore remains, still reading `stack_key.thread_name`, `stack_key.thread_id`, and iterating `stack_key.frames` directly inside the flamegraph module instead of calling an owner-side rendering operation.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The flamegraph collapsed-stack line construction obtains the sample's thread identity and the frames/symbols it prints through operations provided by the sampling-model types (or a single owner-side rendering helper), not by reading the sample's thread-name, thread-id and frame-list fields directly inside the flamegraph module.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The smell moved the pprof export to bypass Symbol accessors and directly unpack fields, e.g. `symbol.name.as_deref().unwrap_or(b\"Unknown\")` with `demangle(&String::from_utf8_lossy(...))`, `symbol.filename` matches, and `symbol.lineno` matches. The agent patch only changes `resolved_frames` and adds `scrub_signal_handler_frames`; it does not modify the protobuf/pprof export or restore Symbol-provided accessors. Thus the pprof export still unpacks the symbol's raw name buffer and re-implements demangle/lossy UTF-8/Unknown fallbacks at each call site.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Symbol records provide the display/lookup behavior the pprof export needs (demangled user-visible name, un-demangled system name, source filename and line number, each with the same missing-value fallback), and the export's string tables and function/location tables are built by requesting those values from the symbol instead of unpacking the symbol's raw name buffer or optional file/line fields and re-implementing the lossy UTF-8 conversion, demangling and Unknown fallbacks at each call point.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch never modifies src/timer.rs or the timing hand-off in src/profiler.rs. The post-smell `timing_of` helper in profiler.rs still reads the timer's fields directly (`frequency: timer.frequency, start_time: timer.start_time, duration: timer.start_instant.elapsed()`), and `report()` still calls `self.timer.as_ref().map(timing_of).unwrap_or_default()`. `Timer::timing()` is not restored, so code outside the timing domain still reads the timer's frequency, start-time, and start-instant fields.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The profiling-window timing record (frequency, wall-clock start time, elapsed duration measured from the timer's own monotonic start) is produced by an operation on the timer type, and the guard-to-report hand-off obtains it by calling that operation; no code outside the timing domain reads the timer's frequency, start-time or start-instant fields.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch touches only src/profiler.rs and src/report.rs and leaves the displaced consumer-side paths in place: profiler.rs still constructs UnresolvedFrames via a struct literal in the sample storage path and still hands timing through local timing_of() reading Timer fields; report.rs still uses a local resolved_frames() that reads UnresolvedFrames fields, still keeps a local impl Debug for Frames, still has flamegraph stack_line(), and still has pprof thread_name_or_id() plus inline symbol.name/filename/lineno access. No frames.rs or timer.rs owner operations are restored, so the debug/flamegraph/pprof render paths do not route through owner operations and duplicated transitional paths remain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every consumer touched by the restored owner operations is updated in the same coherent repair: the collection-layer sample storage path, the guard's report hand-off, the report builder's resolution loop, and the debug/flamegraph/pprof render paths all route through the owner operations without any duplicated transitional path remaining.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch never touches frames.rs, so `resolve_in_perfmap` remains `pub(crate)` (the visibility widening introduced by the smell) rather than being returned to owner-local `fn` scope. report.rs still carries `use crate::frames::resolve_in_perfmap;` and `use crate::backtrace::Frame;`, and `resolved_frames` still calls `resolve_in_perfmap(frame.ip() as usize)` and `frame.resolve_symbol(...)`, so the cross-module plumbing is still in use and not retired.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Internal plumbing that existed only to let a consumer host the relocated behavior is retired with it: the cross-module visibility widening that a report-layer conversion needed, and imports a module pulled in solely for code it no longer hosts, are returned to owner-local scope/removal rather than being left as now-meaningless surface.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch leaves the displaced operations as free functions in consumer modules rather than restoring them as first-class APIs on the owning data types: report.rs still defines `fn resolved_frames(item: UnresolvedFrames) -> Frames` outside any `impl`, the flamegraph module still has `fn stack_line(stack_key: &Frames, hits: &isize) -> String`, and the protobuf module still has `fn thread_name_or_id(key: &Frames) -> String`; profiler.rs still has `fn timing_of(timer: &Timer) -> ReportTiming` and constructs `UnresolvedFrames { ... }` inline. The only new operation, `pub(crate) fn scrub_signal_handler_frames(frames: &mut Vec<Vec<Symbol>>)` in profiler.rs, is also a free function taking a raw `Vec`, not a method on `Frames`/`UnresolvedFrames`, so presentation/conversion/identity rules are not discoverable on the owning types.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The restored operations are presented as the owning types' API: their names, doc comments and parameter choices read as first-class behavior of the data owner (so that a maintainer adding a new export format finds presentation/conversion/identity rules on the types), not as backwards-compatibility pass-throughs.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch only relocates the signal-handler scrub to profiler::scrub_signal_handler_frames and updates resolved_frames. It leaves the smell's other consumer-side copies in place: no hunk removes timing_of from profiler.rs (the ReportTiming/Timer import is retained), and no hunk touches the protobuf module, so its thread_name_or_id helper and inline symbol name/file/line unpacking remain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No dead or bypassed copy of any restored rule is left anywhere in the crate: no unused format-local thread-identity helper in the pprof module, no unreached inline symbol-unpacking block in the export, no orphaned timing-assembly helper in the guard's module after the owner operations take over.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "smell.diff added `use std::borrow::Cow;` and `use symbolic_demangle::demangle;` to `src/report.rs`'s `protobuf` module, plus `use crate::backtrace::Frame;` and `use crate::frames::resolve_in_perfmap;` at the report module top, to support inline pprof/conversion logic. agent.patch has no hunk touching those import blocks or the `protobuf` module; it only rewrites `resolved_frames` and leaves pprof's `demangle(...)` and `symbol.name.as_deref()`/`symbol.filename`/`symbol.lineno` field access intact. Thus the report/export module still imports dependencies that existed only for the displaced consumer-side logic.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No imports or module-level dependencies that existed only for the displaced consumer-side logic linger in the consumer modules: after the repair, the reports/export modules no longer import what only their removed inline logic used (for example the UTF-8 lossy-conversion/demangling imports or model-module field access paths that no longer appear).",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch adds ownership/relocation narration in comments: in profiler.rs, \"This knowledge belongs to the profiler, which defines and registers the signal handler, so the live frames are passed here rather than reconstructed in the report layer.\"; in report.rs, \"it is the component that owns that knowledge.\" These narrate which module owns the behavior and contrast it with the report layer, the kind of relocation-history scaffolding R13 forbids.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repaired crate contains no relocation-history scaffolding: no comments or identifiers narrating where a behavior 'used to live', where it was 'moved from', or which module 'now owns' what, and no kept-for-reference duplicates.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent preserves the signal-handler filtering rule exactly. Resolution precedence is unchanged in `resolved_frames`: perfmap is tried first (`resolve_in_perfmap(frame.ip() as usize)`) and backtrace symbolization (`frame.resolve_symbol`) only in the `else` branch, identical to the smell. The matching condition still checks both `\"perf_signal_handler\"` and `\"_perf_signal_handler\"`. The original skipped the handler frame plus the next raw frame via `frame_iter.next()`; the agent resolves every raw frame 1:1 into `fs` (one `Vec<Symbol>` per raw frame, always pushed) and then `scrub_signal_handler_frames` drops exactly two entries with `frames.drain(index..(index+2).min(frames.len()))`, preserving the same raw-frame pairing. The `retain` for empty frames runs only after scrub, so it cannot shift the pairing. Tests confirm: handler+next dropped, macOS underscore variant recognized, handler-when-last drops only itself, handler-in-middle drops only itself and its successor, and handler-followed-by-empty-frame still pairs correctly.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The signal-handler frame-filtering behavior is unchanged: a backtrace frame whose symbol is the profiling signal handler (matching also the leading-underscore platform variant) and the frame immediately after it are still suppressed, exactly those frames, with the same resolution precedence that prefers a perfmap-resolved symbol over backtrace symbolization.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The smell.diff shows the flamegraph rendering was extracted into a `stack_line` function but with a frame-order reversal: the original code iterated `for frame in key.frames.iter()` (forward), while the new `stack_line` iterates `for frame in stack_key.frames.iter().rev()` (reverse). The agent's patch does not touch the flamegraph module or `stack_line` at all — it only modifies `resolved_frames` in report.rs and adds `scrub_signal_handler_frames` in profiler.rs. Consequently, the flamegraph collapsed-stack lines have reversed frame order compared to the original, producing different output for the same recorded data, so the renderings are not byte-for-byte the same.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The four export/presentation renderings (debug text of a resolved sample, the report's debug output, flamegraph collapsed-stack lines including thread prefix, symbol order and count suffix, and the pprof sample/label/thread strings) are byte-for-byte the same as before the repair for the same recorded samples, including the empty-thread-name fallback to the numeric id in every one of them.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch's report.rs hunk is confined to resolved_frames and moving signal-handler scrubbing to profiler::scrub_signal_handler_frames; it contains no changes to the protobuf/pprof symbol extraction or dedup. The pprof path from smell.diff remains intact, with separate demangled-name and raw system-name insertions and Unknown fallbacks for missing name/filename, so symbol fallback and demangling behavior is not changed.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Symbol fallbacks and demangling are unchanged: missing symbol names still render as the same Unknown spellings (in the same table slots: demangled-name slot, system-name slot and filename slot), and demangling is still applied to produce the user-visible name while the raw name remains the system name.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not touch any timing-related code. It only modifies frame-scrubbing logic in profiler.rs (adding scrub_signal_handler_frames and tests) and report.rs (calling that scrub function in resolved_frames). The timing_of function from the smell remains intact in profiler.rs, still using timer.start_instant.elapsed() for the duration (monotonic), carrying over timer.frequency and timer.start_time unchanged, and the report() method still uses self.timer.as_ref().map(timing_of).unwrap_or_default() to produce empty/default timing metadata when no timer exists. No changes to timer.rs or the timing assembly path are present in the patch.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Timing semantics are unchanged: the elapsed duration is still measured from the timer's monotonic start instant (not from the wall-clock start), the frequency and wall-clock start time are carried over unchanged, and the report carries empty/default timing metadata exactly in the situation where no timing window exists (the guard has no timer).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch does not alter UnresolvedFrames construction or its PartialEq/Hash identity semantics. In report.rs, resolved_frames still decodes the recorded thread-name bytes lossily via String::from_utf8_lossy(&item.thread_name[0..item.thread_name_length]).into_owned(), and no changed slicing/decoding logic is introduced that would panic on long names or mishandle non-UTF-8 bytes.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Sample-construction edge behavior is unchanged: thread names longer than the recorded fixed-buffer maximum are still truncated to the buffer without panicking, thread names containing non-UTF-8 bytes still decode lossily into the resolved presentation, and the sample's identity semantics (equality by symbol addresses and thread id, the corresponding hash) are preserved.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not add, remove, or modify any #[cfg(...)] attributes. It only changes an import in profiler.rs, adds a non-cfg-gated scrub_signal_handler_frames function and tests in profiler.rs, and modifies the body of resolved_frames in report.rs (replacing inline signal-handler scrubbing with a call to scrub_signal_handler_frames). The flamegraph module, protobuf module, perfmap-resolution gating (#[cfg(feature = \"perfmaps\")]), and alternate unwinder/frame-pointer cfg blocks are all left untouched by the patch, preserving the existing feature-conditional structure.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Feature-conditional structure stays intact: the resolution and export behaviors repaired here remain gated exactly as before (flamegraph-only code, protobuf-format-only code, the optional perfmap-resolution support, and the alternate unwinder / large depth / frame-pointer capture variants), and no repaired path gained or lost a feature gate.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 0.8333333333333334,
+    "artifact_cleanup": 0,
+    "associated_changes": 0,
+    "core_resolution": 0
+  },
+  "valid_count": 19,
+  "pass_count": 5,
+  "must_have_pass": false,
+  "macro_score": 0.20833333333333334
+}

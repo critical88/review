@@ -1,0 +1,190 @@
+diff --git a/src/profiler.rs b/src/profiler.rs
+index a53b5c5..d050406 100644
+--- a/src/profiler.rs
++++ b/src/profiler.rs
+@@ -20,7 +20,7 @@ use findshlibs::{Segment, SharedLibrary, TargetSharedLibrary};
+ use crate::backtrace::{Trace, TraceImpl};
+ use crate::collector::Collector;
+ use crate::error::{Error, Result};
+-use crate::frames::UnresolvedFrames;
++use crate::frames::{Symbol, UnresolvedFrames};
+ use crate::report::ReportBuilder;
+ use crate::timer::{ReportTiming, Timer};
+ use crate::{MAX_DEPTH, MAX_THREAD_NAME};
+@@ -426,6 +426,36 @@ extern "C" fn perf_signal_handler(
+     }
+ }
+ 
++/// Strip the profiler's own frames from a resolved backtrace.
++///
++/// A sample is captured from within `perf_signal_handler`, so the resolved
++/// backtrace begins with that frame and the trampoline immediately following
++/// it. Both are artifacts of the sampling mechanism rather than frames from
++/// the profiled program, so they are dropped before a report is built. This
++/// knowledge belongs to the profiler, which defines and registers the signal
++/// handler, so the live frames are passed here rather than reconstructed in
++/// the report layer.
++pub(crate) fn scrub_signal_handler_frames(frames: &mut Vec<Vec<Symbol>>) {
++    let mut index = 0;
++    while index < frames.len() {
++        let is_signal_handler = frames[index].iter().any(|symbol| {
++            // macOS prepends an underscore even with `#[no_mangle]`
++            matches!(
++                &*symbol.name(),
++                "perf_signal_handler" | "_perf_signal_handler"
++            )
++        });
++
++        if is_signal_handler {
++            // Drop this frame together with the one immediately following it.
++            let end = (index + 2).min(frames.len());
++            frames.drain(index..end);
++        } else {
++            index += 1;
++        }
++    }
++}
++
+ impl Profiler {
+     fn new() -> Result<Self> {
+         Ok(Profiler {
+@@ -623,4 +653,90 @@ pub mod tests {
+         drop(timer);
+         PROFILER.write().as_mut().unwrap().stop().unwrap();
+     }
++
++    fn sym(name: &str) -> Symbol {
++        Symbol {
++            name: Some(name.as_bytes().to_vec()),
++            addr: None,
++            lineno: None,
++            filename: None,
++        }
++    }
++
++    fn group(names: &[&str]) -> Vec<Symbol> {
++        names.iter().copied().map(sym).collect()
++    }
++
++    #[test]
++    fn scrub_drops_signal_handler_and_next_frame() {
++        let mut frames = vec![
++            group(&["perf_signal_handler"]),
++            group(&["__restore_rt"]),
++            group(&["worker"]),
++        ];
++        scrub_signal_handler_frames(&mut frames);
++
++        assert_eq!(frames.len(), 1);
++        assert_eq!(&frames[0][0].name(), "worker");
++    }
++
++    #[test]
++    fn scrub_drops_signal_handler_when_last() {
++        let mut frames = vec![group(&["perf_signal_handler"])];
++        scrub_signal_handler_frames(&mut frames);
++
++        assert!(frames.is_empty());
++    }
++
++    #[test]
++    fn scrub_handles_handler_in_the_middle() {
++        let mut frames = vec![
++            group(&["a"]),
++            group(&["perf_signal_handler"]),
++            group(&["__restore_rt"]),
++            group(&["b"]),
++        ];
++        scrub_signal_handler_frames(&mut frames);
++
++        assert_eq!(frames.len(), 2);
++        assert_eq!(&frames[0][0].name(), "a");
++        assert_eq!(&frames[1][0].name(), "b");
++    }
++
++    #[test]
++    fn scrub_pairs_handler_with_next_even_when_resolved_empty() {
++        // The frame following the signal handler may resolve to no symbols; it
++        // must still be dropped as the "next" raw frame, preserving the
++        // original raw-frame pairing rather than shifting onto a later frame.
++        let mut frames = vec![
++            group(&["perf_signal_handler"]),
++            group(&[]),
++            group(&["worker"]),
++        ];
++        scrub_signal_handler_frames(&mut frames);
++
++        assert_eq!(frames.len(), 1);
++        assert_eq!(&frames[0][0].name(), "worker");
++    }
++
++    #[test]
++    fn scrub_recognizes_macos_underscore_name() {
++        let mut frames = vec![
++            group(&["_perf_signal_handler"]),
++            group(&["__restore_rt"]),
++            group(&["worker"]),
++        ];
++        scrub_signal_handler_frames(&mut frames);
++
++        assert_eq!(frames.len(), 1);
++        assert_eq!(&frames[0][0].name(), "worker");
++    }
++
++    #[test]
++    fn scrub_leaves_unrelated_frames_untouched() {
++        let mut frames = vec![group(&["a"]), group(&["b"]), group(&["c"])];
++        scrub_signal_handler_frames(&mut frames);
++
++        assert_eq!(frames.len(), 3);
++    }
+ }
+diff --git a/src/report.rs b/src/report.rs
+index 2ed8b21..8560238 100644
+--- a/src/report.rs
++++ b/src/report.rs
+@@ -41,9 +41,7 @@ type FramesPostProcessor = Box<dyn Fn(&mut Frames)>;
+ fn resolved_frames(item: UnresolvedFrames) -> Frames {
+     let mut fs = Vec::new();
+ 
+-    let mut frame_iter = item.frames.iter();
+-
+-    while let Some(frame) = frame_iter.next() {
++    for frame in item.frames.iter() {
+         let mut symbols: Vec<Symbol> = Vec::new();
+ 
+         if let Some(perfmap_symbol) = resolve_in_perfmap(frame.ip() as usize) {
+@@ -55,23 +53,18 @@ fn resolved_frames(item: UnresolvedFrames) -> Frames {
+             });
+         }
+ 
+-        if symbols.iter().any(|symbol| {
+-            // macOS prepends an underscore even with `#[no_mangle]`
+-            matches!(
+-                &*symbol.name(),
+-                "perf_signal_handler" | "_perf_signal_handler"
+-            )
+-        }) {
+-            // ignore frame itself and its next one
+-            frame_iter.next();
+-            continue;
+-        }
+-
+-        if !symbols.is_empty() {
+-            fs.push(symbols);
+-        }
++        fs.push(symbols);
+     }
+ 
++    // Let the profiler drop its own sampling-related frames (the signal
++    // handler and the trampoline that follows it); it is the component that
++    // owns that knowledge. Resolved frames are kept, in backtrace order, so
++    // the profiler can pair each signal-handler frame with the one after it.
++    crate::profiler::scrub_signal_handler_frames(&mut fs);
++
++    // Discard any frames that resolved to no symbols.
++    fs.retain(|symbols| !symbols.is_empty());
++
+     Frames {
+         frames: fs,
+         thread_name: String::from_utf8_lossy(&item.thread_name[0..item.thread_name_length])

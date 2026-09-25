@@ -1,0 +1,286 @@
+diff --git a/languages_substitution.go b/languages_substitution.go
+index 2bc8799..d7271fc 100644
+--- a/languages_substitution.go
++++ b/languages_substitution.go
+@@ -318,9 +318,7 @@ var bgSub = map[rune]string{
+ 
+ // languageSubstitutionStage applies the substitution table of the requested
+ // language during the language phase of the pipeline.
+-type languageSubstitutionStage struct{ noopStage }
+-
+-func (languageSubstitutionStage) StageName() string { return "language substitution" }
++type languageSubstitutionStage struct{}
+ 
+ // SubstituteLanguage substitutes string chars with the rune substitution map
+ // of the selected language. Languages are caught by ISO 3166-1, ISO 639-1:2002
+diff --git a/pipeline.go b/pipeline.go
+index ea9a1d2..0761aa0 100644
+--- a/pipeline.go
++++ b/pipeline.go
+@@ -9,170 +9,50 @@ import (
+ 	"github.com/gosimple/unidecode"
+ )
+ 
+-// The slug pipeline turns trimmed input into a finished slug by advancing the
+-// registered stages through the fixed phases of the process. slugStage is the
+-// uniform contract behind that pipeline: it couples the complete catalogue of
+-// text operations the package can perform - custom and language substitution,
+-// ASCII normalization, casing, both length limits, symbol cleanup and
+-// uniqueness - together with the diagnostics capabilities shared by every
+-// stage, so any stage can be advanced through any phase without the pipeline
+-// having to know its concrete type. Stages pass through the phases they do
+-// not own.
+-type slugStage interface {
+-	// StageName reports the stage for diagnostics.
+-	StageName() string
+-	// SubstituteCustoms applies the user supplied substitution maps.
+-	SubstituteCustoms(s string) string
+-	// SubstituteLanguage applies the substitution table of one language.
+-	SubstituteLanguage(s string, lang string) string
+-	// NormalizeASCII rewrites remaining non ASCII characters.
+-	NormalizeASCII(s string) string
+-	// ApplyCase enforces the configured casing.
+-	ApplyCase(s string) string
+-	// Truncate cuts the text without word boundaries when smart truncation
+-	// is disabled.
+-	Truncate(s string) string
+-	// ReplaceUnauthorized replaces characters that may not occur in a slug.
+-	ReplaceUnauthorized(s string) string
+-	// CollapseDashes squeezes runs of the separator down to one dash.
+-	CollapseDashes(s string) string
+-	// TrimEdgeChars drops separator characters from both ends.
+-	TrimEdgeChars(s string) string
+-	// SmartTruncate cuts the text on a word boundary when enabled.
+-	SmartTruncate(s string) string
+-	// AppendUniqueSuffix makes the finished text unique.
+-	AppendUniqueSuffix(s string) string
+-	// IsValidSlug reports whether the text is already a well formed slug.
+-	IsValidSlug(text string) bool
+-}
+-
+-// noopStage carries the shared defaults of the pipeline. Every text phase
+-// passes its input through unchanged, so a concrete stage only overrides the
+-// phases it actually owns and inherits the rest. The diagnostics capabilities
+-// stay reachable through the shared implementation as well, so every stage
+-// can be asked to name itself or to validate a text.
+-type noopStage struct{}
+-
+-func (noopStage) StageName() string                            { return "noop" }
+-func (noopStage) SubstituteCustoms(s string) string            { return s }
+-func (noopStage) SubstituteLanguage(s string, _ string) string { return s }
+-func (noopStage) NormalizeASCII(s string) string               { return s }
+-func (noopStage) ApplyCase(s string) string                    { return s }
+-func (noopStage) Truncate(s string) string                     { return s }
+-func (noopStage) ReplaceUnauthorized(s string) string          { return s }
+-func (noopStage) CollapseDashes(s string) string               { return s }
+-func (noopStage) TrimEdgeChars(s string) string                { return s }
+-func (noopStage) SmartTruncate(s string) string                { return s }
+-func (noopStage) AppendUniqueSuffix(s string) string           { return s }
+-
+-// IsValidSlug is the shared shape validation of the pipeline. It lives here so
+-// every stage inherits the very same rules instead of spelling them out
+-// again.
+-func (noopStage) IsValidSlug(text string) bool {
+-	if text == "" ||
+-		(MaxLength > 0 && len(text) > MaxLength) ||
+-		text[0] == '-' || text[0] == '_' ||
+-		text[len(text)-1] == '-' || text[len(text)-1] == '_' {
+-		return false
+-	}
+-	for _, c := range text {
+-		if (c < 'a' || c > 'z') && c != '-' && c != '_' && (c < '0' || c > '9') {
+-			return false
+-		}
+-	}
+-	return true
+-}
+-
+-// pipelineStages lists every registered stage of the pipeline. All of them are
+-// advanced through every phase.
+-var pipelineStages = []slugStage{
+-	customSubstitutionStage{},
+-	languageSubstitutionStage{},
+-	asciiNormalizationStage{},
+-	caseFoldingStage{},
+-	lengthGuardStage{},
+-	sanitizingStage{},
+-	uniquifyingStage{},
+-}
+-
+-// applyStages advances every registered stage through each phase of the slug
+-// pipeline. Every phase is advanced separately, so a stage can hook into any
+-// phase and passes through the phases it does not own.
++// The slug pipeline turns trimmed input into a finished slug by advancing it
++// through a fixed sequence of phases. Each phase has a single owning stage,
++// and a stage exposes only the phase methods it owns: it no longer carries a
++// shared pass-through contract for the phases it does not. applyStages
++// therefore calls each phase directly on its owner, in order, instead of
++// routing every phase through every stage.
++
++// applyStages advances the input through the slug pipeline in phase order,
++// handing each phase to the stage that owns it.
+ func applyStages(text string, lang string) string {
+-	for _, st := range pipelineStages {
+-		text = st.SubstituteCustoms(text)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.SubstituteLanguage(text, lang)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.NormalizeASCII(text)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.ApplyCase(text)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.Truncate(text)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.ReplaceUnauthorized(text)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.CollapseDashes(text)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.TrimEdgeChars(text)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.SmartTruncate(text)
+-	}
+-	for _, st := range pipelineStages {
+-		text = st.AppendUniqueSuffix(text)
+-	}
++	custom := customSubstitutionStage{}
++	language := languageSubstitutionStage{}
++	ascii := asciiNormalizationStage{}
++	fold := caseFoldingStage{}
++	length := lengthGuardStage{}
++	sanitize := sanitizingStage{}
++	unique := uniquifyingStage{}
++
++	text = custom.SubstituteCustoms(text)
++	text = language.SubstituteLanguage(text, lang)
++	text = ascii.NormalizeASCII(text)
++	text = fold.ApplyCase(text)
++	text = length.Truncate(text)
++	text = sanitize.ReplaceUnauthorized(text)
++	text = sanitize.CollapseDashes(text)
++	text = sanitize.TrimEdgeChars(text)
++	text = length.SmartTruncate(text)
++	text = unique.AppendUniqueSuffix(text)
+ 	return text
+ }
+ 
+ // customSubstitutionStage applies the maps stored in CustomSub and
+-// CustomRuneSub. It is the oldest stage of the pipeline and still spells the
+-// whole contract out by hand; the phases it does not own pass their input
+-// through unchanged.
++// CustomRuneSub. It owns the first phase of the pipeline.
+ type customSubstitutionStage struct{}
+ 
+-func (customSubstitutionStage) StageName() string { return "custom substitution" }
+-
+ // SubstituteCustoms always substitutes runes first.
+ func (customSubstitutionStage) SubstituteCustoms(s string) string {
+ 	s = SubstituteRune(s, CustomRuneSub)
+ 	return Substitute(s, CustomSub)
+ }
+ 
+-func (customSubstitutionStage) SubstituteLanguage(s string, _ string) string {
+-	return s
+-}
+-func (customSubstitutionStage) NormalizeASCII(s string) string { return s }
+-func (customSubstitutionStage) ApplyCase(s string) string      { return s }
+-func (customSubstitutionStage) Truncate(s string) string       { return s }
+-func (customSubstitutionStage) ReplaceUnauthorized(s string) string {
+-	return s
+-}
+-func (customSubstitutionStage) CollapseDashes(s string) string { return s }
+-func (customSubstitutionStage) TrimEdgeChars(s string) string  { return s }
+-func (customSubstitutionStage) SmartTruncate(s string) string  { return s }
+-func (customSubstitutionStage) AppendUniqueSuffix(s string) string {
+-	return s
+-}
+-
+-// IsValidSlug borrows the package contract for validation, so the stage can be
+-// used for shape validation like any other stage.
+-func (customSubstitutionStage) IsValidSlug(text string) bool {
+-	return IsSlug(text)
+-}
+-
+ // asciiNormalizationStage rewrites remaining non ASCII characters with their
+ // closest ASCII equivalents during the ASCII normalization phase.
+-type asciiNormalizationStage struct{ noopStage }
+-
+-func (asciiNormalizationStage) StageName() string { return "ascii normalization" }
++type asciiNormalizationStage struct{}
+ 
+ // NormalizeASCII transliterates everything the substitution maps left behind.
+ func (asciiNormalizationStage) NormalizeASCII(s string) string {
+diff --git a/slug.go b/slug.go
+index 06992af..72385b6 100644
+--- a/slug.go
++++ b/slug.go
+@@ -129,16 +129,25 @@ func timestamp() string {
+ // It should be in range of the MaxLength var if specified.
+ // All output from slug.Make(text) should pass this test.
+ func IsSlug(text string) bool {
+-	return noopStage{}.IsValidSlug(text)
++	if text == "" ||
++		(MaxLength > 0 && len(text) > MaxLength) ||
++		text[0] == '-' || text[0] == '_' ||
++		text[len(text)-1] == '-' || text[len(text)-1] == '_' {
++		return false
++	}
++	for _, c := range text {
++		if (c < 'a' || c > 'z') && c != '-' && c != '_' && (c < '0' || c > '9') {
++			return false
++		}
++	}
++	return true
+ }
+ 
+ //=============================================================================
+ // Pipeline stages for the options kept in this file.
+ 
+ // caseFoldingStage enforces the Lowercase option during the case phase.
+-type caseFoldingStage struct{ noopStage }
+-
+-func (caseFoldingStage) StageName() string { return "case folding" }
++type caseFoldingStage struct{}
+ 
+ // ApplyCase lowers the text when the Lowercase option is enabled.
+ func (caseFoldingStage) ApplyCase(s string) string {
+@@ -150,9 +159,7 @@ func (caseFoldingStage) ApplyCase(s string) string {
+ 
+ // lengthGuardStage enforces MaxLength during both length phases, with or
+ // without word boundaries.
+-type lengthGuardStage struct{ noopStage }
+-
+-func (lengthGuardStage) StageName() string { return "length guard" }
++type lengthGuardStage struct{}
+ 
+ // Truncate cuts the text short when the MaxLength option is used with smart
+ // truncation disabled.
+@@ -174,9 +181,7 @@ func (lengthGuardStage) SmartTruncate(s string) string {
+ 
+ // sanitizingStage owns the phases that shape the separator characters of the
+ // finished slug.
+-type sanitizingStage struct{ noopStage }
+-
+-func (sanitizingStage) StageName() string { return "sanitizing" }
++type sanitizingStage struct{}
+ 
+ // ReplaceUnauthorized processes all remaining symbols.
+ func (sanitizingStage) ReplaceUnauthorized(s string) string {
+@@ -203,9 +208,7 @@ func (sanitizingStage) TrimEdgeChars(s string) string {
+ 
+ // uniquifyingStage appends the timestamp requested by the AppendTimestamp
+ // option.
+-type uniquifyingStage struct{ noopStage }
+-
+-func (uniquifyingStage) StageName() string { return "uniquifying" }
++type uniquifyingStage struct{}
+ 
+ // AppendUniqueSuffix appends a timestamp to the end in order to make slug
+ // unique.

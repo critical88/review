@@ -1,0 +1,147 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent defines `class DeviceIdentity(TypedDict, total=False)` in `core/device.py` with named members covering model, did, type, plus optional hardware addresses (mac, mac2, ieee, nwk), firmware versions (fw_ver, hw_ver), and the cloud link (cloud_did). `XGateway.init_device(self, identity: DeviceIdentity)` and `base_read_device(self, identity: DeviceIdentity)` now accept this single named-member abstraction, and the transport helpers `ble_identity`, `mesh_identity`, and `zigbee_identity` return `DeviceIdentity` instead of bare tuples.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The repair defines one cohesive device-identity abstraction in the gateway core layer, with named members covering what the discovery sources contribute — at minimum model, did and type, plus the optional identity members transports supply (hardware addresses, firmware versions and the cloud link) — in a form with named fields (class/dataclass/TypedDict/NamedTuple or equivalent), not a bare tuple or an untyped dict.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Every in-scope device-creation path now constructs a DeviceIdentity dict and passes it to the single-argument init_device(identity). Gateway miio handshake: gateway.py builds identity={'model':model,'did':info['did'],'type':GATEWAY,'mac':info['mac'],'fw_ver':fw_ver} plus optional mac2, then calls base_read_device(identity) which calls init_device(identity). Zigbee device.info: lumi.py zigbee_identity() returns DeviceIdentity with renamed fw_ver/hw_ver/cloud_did, and lumi_read_devices calls init_device(zigbee_identity(...)). BLE DB: ble_read_devices calls init_device(ble_identity(did,row[2],reverse_mac(row[1]))). BLE on-the-fly reports: ble_on_mqtt_publish calls init_device(ble_identity(did,data['dev']['pdid'],data['dev']['mac'])). Mesh bulbs: init_device(mesh_identity(did,row[2],row[1])). Mesh groups: init_device({'model':row[2],'did':did,'type':GROUP}). Matter device.json: init_device({'model':item['model'],'did':did,'type':MATTER,'fw_ver':item['fw_ver']}). Deferred unknown zigbee: silabs_process_unknown calls init_device({'model':None,'did':did,'type':ZIGBEE,'ieee':ieee,'nwk':nwk}). No caller remains using the old positional/kwargs init_device signature.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every in-scope path that creates a registered device constructs the identity abstraction at the point its raw transport data enters: the gateway's own registration from the miio handshake info, the zigbee device.info dump, the bluetooth database table, the mesh bulb and group tables, the devices created on the fly from BLE reports, the matter device.json entries, and the deferred registration of unknown zigbee devices.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The rubric explicitly requires all three named interfaces to carry identity as the abstraction, including 'the delayed unknown-device task boundary.' The agent's patch converts `init_device` to `init_device(self, identity: DeviceIdentity)` and `base_read_device` to `base_read_device(self, identity: DeviceIdentity)`, satisfying two of the three. However, `silabs_process_unknown` is left unchanged from the smell: its signature remains `async def silabs_process_unknown(self, uid: str, did: str, ieee: str, nwk: str)` and the call site remains `asyncio.create_task(self.silabs_process_unknown(uid, did, ieee, nwk))` — identity fields (did, ieee, nwk) are still handed across this async task boundary as separate scalar parameters, not as a `DeviceIdentity`. The only change inside the function body is constructing a dict literal at the `init_device` call site, which does not repair the signature boundary itself.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, identity data crosses the adapter-layer interfaces — including the shared registration factory, the gateway self-registration entry point and the delayed unknown-device task boundary — as the identity abstraction, so no signature boundary inside the gateway adapter layer still hands the identity group across as a list of separate scalar values (either as positional/keyword parameters or as an opaque positional tuple that callers must destructure).",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch introduces a typed `DeviceIdentity` TypedDict in device.py and routes all identity through it as a single value, not a mechanical rename or opaque container. The smell's bare-tuple helpers (`ble_identity`, `mesh_identity`, `zigbee_identity` returning `tuple`) are changed to return `DeviceIdentity` typed dicts, and all per-position unpacking (e.g. `did, model, mac = ble_identity(...)`) is eliminated — callers now pass the identity directly: `self.init_device(ble_identity(...))`, `self.init_device(zigbee_identity(...))`, `self.init_device(mesh_identity(...))`. `init_device` and `base_read_device` signatures changed from many positional params (`model, did, dtype, mac, ieee, nwk, **kwargs` / `did, model, mac, fw_ver, mac2`) to a single `identity: DeviceIdentity` parameter. Inside `init_device`, fields are accessed by key (`extra.pop(\"model\")`, `extra.pop(\"mac\")`), not by position. The inline callers in matter.py, mesh.py, silabs.py, and gateway.py construct `DeviceIdentity` dicts with named keys. This is a genuine typed abstraction, not field-by-field smuggling through opaque containers.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair is a mechanical disguise rather than an abstraction: identity parameters were only renamed (e.g. to synonyms or generic names), or the same field-by-field values are smuggled through opaque containers (*args/**kwargs, plain untyped dicts, bare tuples, or an untyped list of columns) with per-position unpacking, while the field-by-field handling continues unchanged.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "R5 requires raw-format normalization exactly once at the identity-assembly point with no downstream re-lowercasing. The agent patch duplicates mac lowercasing: ble_identity and mesh_identity already return `\"mac\": mac.lower()` at identity assembly, yet base.py `init_device` re-lowercases downstream with `if (mac := extra.pop(\"mac\", None)) is not None: extra[\"mac\"] = mac.lower()`. Also gateway.py builds the gateway identity with raw `info[\"mac\"]` and relies on `init_device` to lowercase it, rather than normalizing at the transport identity boundary.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Raw-format normalization now happens exactly once, where each transport's raw data becomes the identity abstraction: the colon-less EUI64-to-ieee conversion for zigbee dump rows and unknown zigbee devices, the byte-reversed bluetooth-table mac decoding, and the lowercasing of report/database macs — with no downstream consumer re-deriving or re-lowercasing those values.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The request states the second lan mac and cloud-mapping entry are optional. In the patch, lumi.py's zigbee_identity only adds cloud_did when xiaomi_did is truthy (`if xiaomi_did: identity[\"cloud_did\"] = xiaomi_did`) and lumi_read_devices passes `xiaomi_did.get(did)`, so absent cloud mappings are omitted. gateway.py only adds mac2 when miio yields it (`if lan_mac := info.get(\"lan_mac\"): identity[\"mac2\"] = lan_mac`). base.py init_device copies only supplied identity keys and drops mac when None; BLE/mesh/group/silabs identities omit fw_ver/mac2/cloud_did, and matter includes fw_ver only from item['fw_ver']. DeviceIdentity is total=False, so no null/placeholder members are forced in.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Members that a source supplies conditionally still reach the registry conditionally: the cloud link is attached only for dids the cloud mapping knows, firmware versions only when the source row or report carries them, and the gateway's second lan mac only when the miio info actually yields a value — devices end up with no placeholder or null-valued identity members their source never supplied.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "All per-transport helpers now return the DeviceIdentity abstraction instead of bare tuples: ble_identity returns {\"model\": model, \"did\": did, \"type\": BLE, \"mac\": mac.lower()}, mesh_identity returns {\"model\": model, \"did\": did, \"type\": MESH, \"mac\": mac.lower()}, and zigbee_identity builds and returns a DeviceIdentity dict with renamed fw_ver/hw_ver/cloud_did fields. No discovery loop destructures a tuple into per-field locals: ble_read_devices calls self.init_device(ble_identity(...)) directly, ble_on_mqtt_publish calls self.init_device(ble_identity(...)) directly, lumi_read_devices calls self.init_device(zigbee_identity(...)) directly, and mesh_read_devices calls self.init_device(mesh_identity(...)) directly. The matter, silabs, and gateway paths construct DeviceIdentity dicts inline and pass them to init_device(identity) / base_read_device(identity) without any tuple unpacking.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The interim bare-field plumbing is removed: no module-level per-transport helper in the adapter layer still returns an untyped positional tuple of identity fields, and no discovery loop still destructures such a tuple into per-field locals; if a per-transport helper survives, it now builds or returns the identity abstraction.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "In silabs.py, `self.unknown[uid] = {\"did\": did, \"nwk\": nwk}` stores identity fields that are never read after the refactor. `silabs_process_unknown` pops the dict (`unk = self.unknown.pop(uid, {})`) but only checks its truthiness (`if not unk`), using the `did`/`nwk` function parameters instead of `unk[\"did\"]`/`unk[\"nwk\"]`. The bookkeeping structure keeps entries written but never read, violating the rubric's third condition. The agent did clean up imports (GATEWAY dropped from base.py, XDeviceExtra from lumi.py) and dead destructured locals, but left this stale bookkeeping wiring.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Stale wiring left over from the field-by-field design is cleaned up: identity-mapping imports that are no longer referenced are dropped, no function keeps unused identity parameters or dead destructured locals, and no bookkeeping structure keeps entries written but never read.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch changes only the representation (separate params → DeviceIdentity dict) while preserving the registered outcome for every transport. init_device pops model (not stored in extra), lowercases mac, and passes remaining identity fields to XDevice — no extra data introduced. BLE/mesh pass model/did/type/mac(lowercased); zigbee passes model/did/type/ieee/nwk/fw_ver/hw_ver with cloud_did only when present; matter passes model/did/type/fw_ver; gateway passes model/did/type/mac(lowercased)/fw_ver with mac2 (case preserved) only when lan_mac is truthy; silabs passes model(None)/did/type/ieee/nwk; group passes model/did/type. Registry key (did), derived uid, type, and model are unchanged across all transports since XDevice construction receives the same values. No mac is stored upper-cased; mac2 case is never altered.",
+      "valid": true,
+      "attempts": 4,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "What identifies a registered device drifts from pre-refactor behavior: a different registry key or derived uid, an altered type or model, an identity mac stored upper-cased (or the gateway's second lan mac changed in case or attached when the source has none), or extra data introduced into registered devices that the old code never stored — any of these fails.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, custom_components/xiaomi_gateway3/core/gate/ble.py keeps the mac-less guard before on-the-fly device creation: `if \"mac\" not in data[\"dev\"]: self.debug(\"Unknown device without mac\", data=data); return`. The `ble_identity(...)` and `init_device(...)` calls occur only after this guard, so a no-mac BLE report is still skipped rather than creating a device or raising.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A BLE report for an unknown device that carries no mac now creates a device (or raises) instead of being skipped.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In mesh.py, the agent's patch refactors group device creation to `self.init_device({\"model\": row[2], \"did\": did, \"type\": GROUP})` but preserves the subsequent child-bulb bookkeeping lines `device.extra[\"childs\"] = childs.get(row[1])` and `self.add_device(device)`. The bulb registration loop also retains `self.add_device(device)` and the `# add bulb to group address` section is untouched, so bulbs remain linked into their groups and group child lists survive the refactor.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Mesh groups lose their child bulb lists (or bulbs get registered without being linked into their groups) relative to existing behavior.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In silabs.py, the deferred unknown-zigbee flow is unchanged except for the init_device call format: silabs_process_unknown still does `await asyncio.sleep(10)`, still pops uid-keyed bookkeeping with `unk = self.unknown.pop(uid, {})`, and still skips re-registration when the device became known via `if not unk or did in self.devices: return`. The unknown dict is still populated with `{\"did\": did, \"nwk\": nwk}` and the task is still created with uid/did/ieee/nwk. Thus the ~10s delay, dedup, and uid-keyed cleanup are preserved.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The deferred unknown-zigbee registration changes its observable timing or bookkeeping: the ~10 second delay is skipped or lengthened, a device that becomes known meanwhile is still registered again, or the uid-keyed unknown bookkeeping is left with stray entries that the old code would have removed.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 0.5,
+    "core_resolution": 0.75
+  },
+  "valid_count": 12,
+  "pass_count": 9,
+  "must_have_pass": false,
+  "macro_score": 0.6875
+}

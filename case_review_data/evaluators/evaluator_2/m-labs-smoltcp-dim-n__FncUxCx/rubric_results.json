@@ -1,0 +1,202 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the duplicated inline resolution from both medium branches and routes both through the same helper: the IEEE 802.15.4 branch is reduced to `let (hardware_addr, tx_token) = self.lookup_hardware_addr(tx_token, &dst_addr, frag)?;` followed by `dispatch_ieee802154(...)`, and the Ethernet branch is reduced to `let (hardware_addr, tx_token) = self.lookup_hardware_addr(tx_token, &dst_addr, frag)?;` with the result unpacked to an Ethernet address. The added doc comment on `lookup_hardware_addr` states it is \"the shared link-layer destination resolution used by both the IEEE 802.15.4 and the Ethernet dispatch paths\" and describes broadcast/multicast hardware-address derivation, neighbor-cache lookup, and the unknown-neighbor ARP/NDP resolution request that consumes the transmit token and returns `Err(DispatchError::NeighborPending)`, matching the rubric's required shared seam.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In the network interface's generic IP egress dispatch path, link-layer destination resolution is re-established as a separate responsibility that the dispatch path calls: the broadcast/multicast hardware-address derivation, the neighbor-cache lookup, and the unknown-neighbor resolution request (ARP request or IPv6 neighbor solicitation that consumes the transmit token and defers the packet) are no longer multi-level inline logic duplicated per medium branch, and both the IEEE 802.15.4 side and the Ethernet side of that dispatch path reach one shared resolution implementation.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch does not touch the 6LoWPAN ingress path: its src/iface/interface/sixlowpan.rs hunks all start at dispatch_sixlowpan (@@ -571, @@ -701, @@ -919) and only extract an egress compression helper fn emit_sixlowpan_compressed. There is no hunk for process_sixlowpan or the SixlowpanPacket::FragmentHeader/IphcHeader arms. As shown in smell.diff, those arms still inline reassembly-slot management and contain two parallel copies of the IPHC/NHC decompression stage (IPv6 header re-materialization, NHC extension-header/UDP expansion, length correction), and the agent patch introduces no separately callable reassembly or decompression function and no shared decompression implementation for the direct and fragment paths.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The 6LoWPAN ingress path over IEEE 802.15.4 separates its absorbed stages: fragment reception with reassembly-slot management (acceptance guards, reassembly key/size bookkeeping, reassembly timeout, assembler feeding) and the IPHC/NHC decompression stage (IPv6 header re-materialization, extension-header and UDP expansion, length correction) become separately callable functions, and the decompression stage is one implementation shared by the direct-reception path and the fragment-reassembly path rather than two parallel copies.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The rubric requires the 6LoWPAN egress path to split compressed-size accounting, IPv6-to-IPHC compression/emission, and FRAG1/FRAGN fragmentation planning into separately callable functions. The agent patch only extracts the compression/emission stage into `emit_sixlowpan_compressed` and calls it from both send paths. It does not restore a callable sizing function—the `let (total_size, compressed_size, uncompressed_size) = { ... }` block remains inline in `dispatch_sixlowpan`—and the FRAG1/FRAGN plan (tag allocation, `frag1_size`, `datagram_offset`) also remains an inline block; `get_sixlowpan_fragment_tag`/`compressed_packet_size` are not restored as functions. Thus two of the three absorbed stages are not separated into callable functions.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The 6LoWPAN egress path over IEEE 802.15.4 separates its absorbed stages: the compressed-size accounting that feeds the fragmentation decision, the IPv6-to-IPHC compression and emission stage, and the FRAG1/FRAGN fragmentation plan (datagram-tag allocation, first-fragment sizing, datagram-size and offset rules) become separately callable functions, with the sizing and compression work shared by the fragmented and the non-fragmented send paths rather than re-derived per transmit path.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch adds a single shared `fn ack_lease_config(dhcp_repr, server, now, max_lease_duration) -> Option<(Config, Instant, Instant, Instant)>` in src/socket/dhcpv4.rs that performs subnet_mask/prefix_len/your_ip validation, assembles the `Config`, and derives the RFC 2131 renew/rebind/expiry timeline in one match block. Both state arms now call it instead of inlining copies: the Requesting arm calls `Self::ack_lease_config(&dhcp_repr, state.server, now, max_lease_duration)` and the Renewing arm calls `Self::ack_lease_config(&dhcp_repr, state.config.server, now, max_lease_duration)`, collapsing the per-branch duplicated ACK interpretation logic that the smell had injected.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The DHCPv4 client socket's inbound processing re-establishes ACK interpretation as one shared implementation — lease-parameter validation, configuration assembly, and the RFC 2131 renew/rebind/expiry timeline derivation — reached by both the Requesting-state arm and the Renewing-state arm, instead of a re-created copy of the interpretation logic inside each state arm.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch extracts stage-scoped helpers rather than hoisting monoliths: in mod.rs it restores `lookup_hardware_addr` as the shared link-layer resolution stage while the IEEE802154 and Ethernet branches still perform dispatch/emission; in sixlowpan.rs `emit_sixlowpan_compressed` covers only the compression stage and is called from both transmit paths, with `dispatch_sixlowpan` retaining sizing and fragmentation; in dhcpv4.rs `ack_lease_config` computes only the lease config/timeline and the ACK arms still apply state transitions. None of these extracted functions interleaves several distinct protocol stages, and the top-level methods are not thin full-parameter delegators.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The four areas are not 'repaired' by relocating their monolithic bodies: the patch must not merely hoist a collapsed multi-stage body (wholesale or near-wholesale) into a new function and leave the top-level method a thin full-parameter delegator, and none of the extracted functions should itself interleave several distinct protocol stages the way the former monoliths did; moving code without separating stages counts as failure for this item.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "mod.rs: both the IEEE802154 and Ethernet dispatch branches now call the shared `self.lookup_hardware_addr(tx_token, &dst_addr, frag)?`, and the inlined broadcast/multicast/neighbor-cache resolution blocks are deleted from both branches. sixlowpan.rs: both `dispatch_sixlowpan` fragmentation and non-fragmentation paths now call `Self::emit_sixlowpan_compressed(&packet, &ieee_repr, buffer, &checksum_caps)`, with the inlined IPHC/ext-header/payload emission copies removed from both. dhcpv4.rs: both the `Requesting` and `Renewing` ACK arms now call `Self::ack_lease_config(...)`, and the duplicated subnet/prefix/lease/dns/renew-rebind logic is removed from both and exists once in `ack_lease_config`. No commented-out or dead duplicates of these collapsed stages remain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Each collapsed stage copy is actually removed once the shared implementation is restored: in the three touched production files, no medium branch, client-state arm, or send/receive path still executes its own inlined copy of a stage that now exists as a shared function, and no dead duplicate of a collapsed stage (including commented-out or test-only-caller remnants of it) remains behind.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Agent restores `lookup_hardware_addr` gated with `#[cfg(any(feature = \"medium-ethernet\", feature = \"medium-ieee802154\"))]` and calls it from the `#[cfg(feature = \"medium-ieee802154\")]` and `#[cfg(feature = \"medium-ethernet\")]` dispatch arms, preserving medium gates. The extracted `emit_sixlowpan_compressed` retains all `#[cfg(feature = \"proto-ipv6-hbh\")]`, `#[cfg(feature = \"proto-ipv6-routing\")]`, `#[cfg(any(feature = \"socket-udp\", feature = \"socket-dns\"))]`, `#[cfg(feature = \"socket-tcp\")]`, and `#[cfg(feature = \"socket-raw\")]` gates from the inlined compression code, and the untouched `compressed_packet_size` block keeps its hop-by-hop/routing cfg gates. No cfg attributes are dropped or misplaced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Feature gating is preserved for the combinations the default build exercises only as disabled code: the cfg attributes that sat on the absorbed stage fragments (medium and protocol-family gates around resolution and dispatch arms, hop-by-hop and routing-header sizing, medium-gated emissions) are present and correctly placed in the repaired structure, so enabling those features still selects the same protocol behavior.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The new/refactored helpers keep private visibility: `fn lookup_hardware_addr` is unchanged (only a doc comment is added), `fn emit_sixlowpan_compressed` in sixlowpan.rs, and `fn ack_lease_config` in dhcpv4.rs are all plain `fn` with no `pub`/`pub(crate)`/`pub(super)`. Call sites are re-wired through internal reachability (`self.lookup_hardware_addr`, `Self::emit_sixlowpan_compressed`, `Self::ack_lease_config`), and no public signature/type/trait is altered; `dispatch_sixlowpan` only changes its body (`let mut packet` -> `let packet`), not its signature.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The patch adds no new public API surface: every newly introduced stage helper keeps the weakest visibility its callers require (crate-, module- or parent-module-private like the surrounding sibling code), and no pre-existing public signature, type or trait is changed; call sites are re-wired through internal reachability, not through promoted visibility.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The request asked for well-named, well-scoped stage functions. The patch restores `lookup_hardware_addr` as an `InterfaceInner` method in `mod.rs` and calls it from both the IEEE 802.15.4 and Ethernet dispatch branches, reusing the existing name. It adds `emit_sixlowpan_compressed` inside `impl InterfaceInner` in `sixlowpan.rs`, keeping the compression codec with sibling 6LoWPAN codec logic, and calls it from both the fragmentation and non-fragmentation transmit paths. It adds `ack_lease_config` inside `impl Socket` in `dhcpv4.rs` and calls it from both the `Requesting` and `Renewing` ACK arms. The new names use the files' existing domain vocabulary, and doc comments describe the resulting structure.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The re-established stages are placed and named the way the surrounding code organizes such work: codec logic sits with sibling codec logic in the same module rather than inside foreign paths, free functions stay free functions where the module keeps codec-free helpers at file scope, and the new names use the file's existing domain vocabulary (sizing, compression, decompression, interpretation).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In mod.rs, the injected 'Link destination resolution' prose and auxiliary notes ('Every field that goes on the wire is prepared here, so the frame writing below stays minimal', 'The request got dispatched, limit the rate on the cache') were removed when inlined resolution was replaced with calls to lookup_hardware_addr; new comments describe the actual two-step structure ('resolve the link-layer destination... then hand the packet to dispatch_ieee802154'). In sixlowpan.rs, the 'Compression stage' comments were updated from 'belong together here' to 'via Self::emit_sixlowpan_compressed... belong together there', matching the extracted helper. In dhcpv4.rs, the RFC 2131 lease-timing notes moved with the code into ack_lease_config, and both ACK arms now just call the helper. The RFC 4944 §5.3 fragment-sizing note remains attached to the sizing code in dispatch_sixlowpan.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Comments in the touched paths match the produced structure: none of the injected flow-management prose that narrates whole stages living together (or the auxiliary notes that tie stage pieces together, such as explaining that a sizing result feeds a decision right below, or that every rejection path exits in one half of a block) survives in a place where the claimed arrangement no longer holds, and the RFC-citing notes for fragment sizing and lease timing stay attached to the code that implements them.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch introduces `lookup_hardware_addr` usage in both the IEEE 802.15.4 and Ethernet dispatch paths, `emit_sixlowpan_compressed` is called in both the fragmentation and non-fragmentation `dispatch_sixlowpan` paths, and `ack_lease_config` is called in both the `Requesting` and `Renewing` ACK arms. No import/use changes are made, and the new helpers replace rather than duplicate the inlined copies, leaving no orphaned scaffolding.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The repair leaves no orphaned scaffolding of its own: every function the patch introduces has a live caller on some path, and the import/use lists of the touched modules contain no item that only served relocated or collapsed-away code.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only edits the three in-scope files (mod.rs egress dispatch, sixlowpan.rs transmit compression, dhcpv4.rs ACK handling). It extracts real shared implementations—lookup_hardware_addr for link-layer resolution, emit_sixlowpan_compressed for 6LoWPAN compression, and ack_lease_config for DHCP lease parsing—deduplicating repeated code rather than adding pass-through wrappers. No new file/module is created, and changes outside these helpers are limited to necessary call-site adjustments (e.g., `let mut packet` -> `let packet`, hoisting `now`/`max_lease_duration`) and consistent comment updates.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The patch introduces no padding or off-scope churn: no new file or module of trivial pass-through wrappers, no wholesale reformatting or no-op reordering of code outside the four areas, and no helper layer whose only effect is renaming an otherwise unchanged body.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch restores a shared `lookup_hardware_addr` helper and calls it from both the IEEE 802.15.4 and Ethernet dispatch paths (`let (hardware_addr, tx_token) = self.lookup_hardware_addr(tx_token, &dst_addr, frag)?`), replacing the inlined per-branch resolution copies. Its added doc comment states that an unknown neighbor causes a resolution request to be transmitted (ARP for IPv4, NDP solicit for IPv6), consuming the transmit token, and returns `Err(DispatchError::NeighborPending)` so the dispatch is retried; the helper body is not modified, so the existing neighbor-cache rate limiting remains in effect.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Unknown-neighbor handling is not narrowed or dropped: for an un-resolved destination address the repaired dispatch path still transmits exactly one resolution request (ARP request for IPv4 over Ethernet, neighbor solicitation for the IEEE 802.15.4 / IPv6 cases), still consumes the transmit token while deferring the original packet, still returns the interface's not-ready consequence so the packet is retried, and keeps the neighbor cache's rate limiting active.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's sixlowpan.rs changes are confined to the transmit path (dispatch_sixlowpan and the new emit_sixlowpan_compressed); no hunk touches process_sixlowpan's FragmentHeader/IphcHeader receive branches. Thus the smell's reassembly/decompression invariants remain intact: the `frag.datagram_size() < 40` drop, `FragKey::Sixlowpan(frag.get_key(ieee802154_repr))`, `reassembly_deadline = self.now + f.reassembly_timeout`, first-fragment decompression via `frag_slot.add_with` followed by `frag_slot.assemble()`, and malformed-input paths returning `Err(AssemblerError)`/`None` are all preserved.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Reassembly and decompression contracts are intact: datagrams whose decompressed size would fall below the IPv6 header size are still dropped; fragment reassembly keys still identify a datagram by link-layer source, tag and size; the reassembly deadline is still measured from packet arrival with the configured timeout; the first fragment still drives decompression through the reassembly stage so a fully reassembled datagram yields the complete decompressed packet; and malformed compressed input still results in a silent drop or assembler error with no new panic path.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The extracted `ack_lease_config` helper retains the RFC 2131 defaults `(lease_duration / 2, lease_duration * 7 / 8)`, the single-timer gap fallbacks (`renew_duration + (lease_duration - renew_duration) * 3 / 4` and `(lease_duration / 2).min(rebind_duration)`), the max-lease cap via `lease_duration.min(max_lease_duration)`, and the DNS cleanup `filter(|s| s.x_is_unicast())`. The Requesting ACK arm still transitions to `ClientState::Renewing` with `rebinding: false` and calls `self.config_changed()`; the Renewing ACK arm still refreshes `renew_at`/`rebind_at`/`expires_at`, sets `rebinding = false`, and gates `self.config_changed()` on `state.config != config || self.receive_packet_buffer.is_some()` exactly as before.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Lease handling is intact: the RFC 2131 timeline derivation keeps its defaults (renew at half the lease, rebind at seven eighths) and the gap-based fallbacks when only one timer is offered, keeps the configured maximum-lease cap applied to the received duration, keeps the DNS list cleanup that drops non-unicast entries, keeps a Requesting ACK moving the socket to the Renewing state and a Renewing ACK preserving the existing rebinding flag with refreshed timer instants, and keeps the configuration-change signal raised in the same relation to the state update as before.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only modifies non-test source in src/iface/interface/mod.rs, src/iface/interface/sixlowpan.rs, and src/socket/dhcpv4.rs: it adds doc comments, extracts lookup_hardware_addr/emit_sixlowpan_compressed/ack_lease_config helpers, and replaces inline code with calls. No #[test], #[cfg(test)], assert!, Cargo.toml feature declaration, example, bench, or test helper appears in the diff; the existing assert!(!ip_repr.dst_addr().is_unspecified()) and #[cfg(not(test))] random_transaction_id are left unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The verification surface is untouched: no unit test, documentation test, assertion, test helper, feature declaration, example or bench is modified, removed, skipped, weakened or newly gated off anywhere in the patch.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch only extracts address resolution (mod.rs `lookup_hardware_addr`) and 6LoWPAN compression (sixlowpan.rs `emit_sixlowpan_compressed`) into shared helpers; it does not touch the IPv4-fragmentation bookkeeping in mod.rs (which lies below the changed hunks). In sixlowpan.rs, the `compressed_packet_size` inline block, the fragmentation-decision condition, the tag allocation (`self.tag`/`wrapping_add(1)`/`pkt.sixlowpan.datagram_tag`), the RFC 4944 `datagram_size = (payload_length + 40) as u16` rule, and the `frag1_size`/`fragn_size`/`datagram_offset` calculations (all `/ 8 * 8` multiples-of-eight) are absent from every agent hunk and remain as in the smell baseline. The only change to `packet` is dropping `mut` (line 571), which is behavior-neutral since `emit_sixlowpan_compressed` takes `&PacketV6` and only reads the packet.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Behavior the repair merely passes through is not silently altered: the generic dispatch path's IPv4-fragmentation bookkeeping (length accounting per emitted fragment, offset advancement, the deciding conditions for fragmenting at all), the datagram-tag allocation and its reuse for the fragments of one datagram across successive polls, and the RFC 4944 datagram-size rule (the FRAG1 datagram size being 40 octets more than the payload length, fragment offsets multiples of eight except the last) all behave exactly as in the pinned baseline.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 0.6
+  },
+  "valid_count": 17,
+  "pass_count": 15,
+  "must_have_pass": false,
+  "macro_score": 0.9
+}

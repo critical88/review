@@ -1,0 +1,203 @@
+diff --git a/pkg/controller/exec/exec.go b/pkg/controller/exec/exec.go
+index 31d792a8..efa9d186 100644
+--- a/pkg/controller/exec/exec.go
++++ b/pkg/controller/exec/exec.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"log/slog"
+ 	"os"
++	"path/filepath"
+ 	"strings"
+ 	"time"
+ 
+@@ -100,9 +101,25 @@ func wrapExec(lookPath func(exeName string) (string, error), exeName, exePath st
+ }
+ 
+ func (c *Controller) updateTimestamp(ctx context.Context, pkg *config.Package) error {
+-	pkgPath, err := pkg.PkgPath(runtime.New(ctx))
+-	if err != nil {
+-		return fmt.Errorf("get a package path: %w", err)
++	rt := runtime.New(ctx)
++	pkgInfo := pkg.PackageInfo
++	var pkgPath string
++	if pkgInfo.RepoOwner == "aquaproj" && (pkgInfo.RepoName == "aqua" || pkgInfo.RepoName == "aqua-proxy") && //nolint:goconst
++		(pkgInfo.Type == config.PkgInfoTypeGitHubRelease || pkgInfo.Type == config.PkgInfoTypeGitHubContent) {
++		// aqua's own packages are placed in the internal package directory.
++		// Record their last used datetime along the same layout so the
++		// timestamp file isn't separated from the package files.
++		assetName, err := pkg.RenderAsset(rt)
++		if err != nil {
++			return fmt.Errorf("render the asset name: %w", err)
++		}
++		pkgPath = filepath.Join("internal", "pkgs", pkgInfo.Type, "github.com", pkgInfo.RepoOwner, pkgInfo.RepoName, pkg.Package.Version, assetName)
++	} else {
++		var err error
++		pkgPath, err = pkg.PkgPath(rt)
++		if err != nil {
++			return fmt.Errorf("get a package path: %w", err)
++		}
+ 	}
+ 	if err := c.vacuum.Update(pkgPath, time.Now()); err != nil {
+ 		return fmt.Errorf("update the last used datetime: %w", err)
+diff --git a/pkg/controller/which/which.go b/pkg/controller/which/which.go
+index 4a78e916..394e44cc 100644
+--- a/pkg/controller/which/which.go
++++ b/pkg/controller/which/which.go
+@@ -86,6 +86,35 @@ func (c *Controller) getExePath(findResult *FindResult) (string, error) {
+ 	if pkg.Package.Version == "" {
+ 		return "", errVersionIsRequired
+ 	}
++	pkgInfo := pkg.PackageInfo
++	if pkgInfo.RepoOwner == "aquaproj" && (pkgInfo.RepoName == "aqua" || pkgInfo.RepoName == proxyName) && //nolint:goconst
++		(pkgInfo.Type == config.PkgInfoTypeGitHubRelease || pkgInfo.Type == config.PkgInfoTypeGitHubContent) {
++		// aqua's own packages (aqua and aqua-proxy) are placed in the internal
++		// package directory. Compose the executable path here so that looking
++		// up aqua's own tools doesn't depend on how the registry in use
++		// defines the aquaproj packages.
++		assetName, err := pkg.RenderAsset(c.runtime)
++		if err != nil {
++			return "", fmt.Errorf("render the asset name: %w", err)
++		}
++		exeDir := filepath.Join(c.rootDir, "internal", "pkgs", pkgInfo.Type, "github.com", pkgInfo.RepoOwner, pkgInfo.RepoName, pkg.Package.Version, assetName)
++		exeName := file.Name
++		if c.runtime.IsWindows() && filepath.Ext(exeName) == "" {
++			switch {
++			case pkgInfo.WindowsExt != "":
++				exeName += pkgInfo.WindowsExt
++			case pkgInfo.Type == config.PkgInfoTypeGitHubContent:
++				exeName += ".sh"
++			default:
++				exeName += ".exe"
++			}
++		}
++		exePath := filepath.Join(exeDir, exeName)
++		if file.Link == "" {
++			return exePath, nil
++		}
++		return filepath.Join(filepath.Dir(exePath), file.Link), nil
++	}
+ 	exePath, err := pkg.ExePath(c.rootDir, file, c.runtime)
+ 	if err != nil {
+ 		return exePath, err //nolint:wrapcheck
+diff --git a/pkg/installpackage/aqua.go b/pkg/installpackage/aqua.go
+index 31249696..10a6d66a 100644
+--- a/pkg/installpackage/aqua.go
++++ b/pkg/installpackage/aqua.go
+@@ -127,12 +127,18 @@ func (is *Installer) InstallAqua(ctx context.Context, logger *slog.Logger, versi
+ 		return err
+ 	}
+ 
+-	exePath, err := pkg.ExePath(is.rootDir, &registry.File{
+-		Name: pkgNameAqua,
+-	}, is.runtime)
++	// aqua's own executable is always stored in the internal package directory,
++	// so the path is composed from the known asset name instead of being
++	// resolved through the package configuration.
++	assetName, err := pkg.RenderAsset(is.runtime)
+ 	if err != nil {
+-		return fmt.Errorf("get the executable file path: %w", err)
++		return fmt.Errorf("render the asset name: %w", err)
+ 	}
++	aquaExeName := pkgNameAqua
++	if is.runtime.IsWindows() && filepath.Ext(aquaExeName) == "" {
++		aquaExeName += exeExt
++	}
++	exePath := filepath.Join(is.rootDir, "internal", "pkgs", pkg.PackageInfo.Type, "github.com", "aquaproj", pkg.PackageInfo.RepoName, pkg.Package.Version, assetName, aquaExeName)
+ 
+ 	if is.runtime.GOOS == "windows" {
+ 		return is.copyAquaOnWindows(exePath)
+diff --git a/pkg/installpackage/installer.go b/pkg/installpackage/installer.go
+index 998406ac..45e0b3ca 100644
+--- a/pkg/installpackage/installer.go
++++ b/pkg/installpackage/installer.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"log/slog"
+ 	"os"
++	"path/filepath"
+ 	"time"
+ 
+ 	"github.com/aquaproj/aqua/v2/pkg/checksum"
+@@ -262,9 +263,20 @@ func (is *Installer) InstallPackage(ctx context.Context, logger *slog.Logger, pa
+ 		return fmt.Errorf("render the asset name: %w", err)
+ 	}
+ 
+-	pkgPath, err := pkg.AbsPkgPath(is.rootDir, is.runtime)
+-	if err != nil {
+-		return fmt.Errorf("get the package install path: %w", err)
++	pkgInfo := pkg.PackageInfo
++	pkgPath := ""
++	if pkgInfo.RepoOwner == "aquaproj" && (pkgInfo.RepoName == "aqua" || pkgInfo.RepoName == "aqua-proxy") && //nolint:goconst
++		(pkgInfo.Type == "github_release" || pkgInfo.Type == "github_content") {
++		// aqua's own packages (aqua and aqua-proxy) are installed in the
++		// internal package directory so that they aren't managed as regular
++		// packages. Compose the destination here to keep the installation of
++		// aqua's own packages independent of the package configuration.
++		pkgPath = filepath.Join(is.rootDir, "internal", "pkgs", pkgInfo.Type, "github.com", pkgInfo.RepoOwner, pkgInfo.RepoName, pkg.Package.Version, assetName)
++	} else {
++		pkgPath, err = pkg.AbsPkgPath(is.rootDir, is.runtime)
++		if err != nil {
++			return fmt.Errorf("get the package install path: %w", err)
++		}
+ 	}
+ 
+ 	if err := is.downloadWithRetry(ctx, logger, &DownloadParam{
+diff --git a/pkg/installpackage/link.go b/pkg/installpackage/link.go
+index b43df1fd..e304514a 100644
+--- a/pkg/installpackage/link.go
++++ b/pkg/installpackage/link.go
+@@ -19,10 +19,16 @@ func (is *Installer) createLinks(logger *slog.Logger, pkgs []*config.Package) bo
+ 	var aquaProxyPathOnWindows string
+ 	if is.runtime.IsWindows() {
+ 		pkg := proxyPkg()
+-		pkgPath, err := pkg.AbsPkgPath(is.rootDir, is.runtime)
++		// aqua-proxy is installed in aqua's internal package directory, so
++		// the target directory is determined by aqua itself rather than by the
++		// package configuration.
++		pkgPath := ""
++		assetName, err := pkg.RenderAsset(is.runtime)
+ 		if err != nil {
+ 			slogerr.WithError(logger, err).Error("get a path to aqua-proxy")
+ 			failed = true
++		} else {
++			pkgPath = filepath.Join(is.rootDir, "internal", "pkgs", pkgTypeGitHubRelease, "github.com", "aquaproj", proxyName, pkg.Package.Version, assetName)
+ 		}
+ 		aquaProxyPathOnWindows = filepath.Join(pkgPath, "aqua-proxy.exe")
+ 	}
+@@ -112,11 +118,14 @@ func (is *Installer) recreateHardLinks() error {
+ 	}
+ 
+ 	pkg := proxyPkg()
+-	pkgPath, err := pkg.AbsPkgPath(is.rootDir, is.runtime)
++	assetName, err := pkg.RenderAsset(is.runtime)
+ 	if err != nil {
+ 		return err //nolint:wrapcheck
+ 	}
+-	a := filepath.Join(pkgPath, "aqua-proxy.exe")
++	// The aqua-proxy directory never depends on the package configuration,
++	// because aqua-proxy is aqua's own package in the internal package
++	// directory.
++	a := filepath.Join(is.rootDir, "internal", "pkgs", pkgTypeGitHubRelease, "github.com", "aquaproj", proxyName, pkg.Package.Version, assetName, "aqua-proxy.exe")
+ 
+ 	for _, info := range infos {
+ 		if info.Name() == "aqua.exe" {
+diff --git a/pkg/installpackage/proxy.go b/pkg/installpackage/proxy.go
+index 129150fe..e1b4ef0f 100644
+--- a/pkg/installpackage/proxy.go
++++ b/pkg/installpackage/proxy.go
+@@ -60,10 +60,11 @@ func (is *Installer) InstallProxy(ctx context.Context, logger *slog.Logger) erro
+ 		return err //nolint:wrapcheck
+ 	}
+ 
+-	pkgPath, err := pkg.AbsPkgPath(is.rootDir, is.runtime)
+-	if err != nil {
+-		return err //nolint:wrapcheck
+-	}
++	// aqua-proxy is one of aqua's own packages. It is always downloaded from
++	// the GitHub release of aquaproj/aqua-proxy and is kept in aqua's internal
++	// package directory, so the destination is fixed and doesn't need to be
++	// resolved through the package configuration.
++	pkgPath := filepath.Join(is.rootDir, "internal", "pkgs", pkgTypeGitHubRelease, "github.com", "aquaproj", proxyName, pkg.Package.Version, assetName)
+ 
+ 	// create a symbolic link
+ 	binName := proxyName

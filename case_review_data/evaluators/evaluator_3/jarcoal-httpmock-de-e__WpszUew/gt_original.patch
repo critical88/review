@@ -1,0 +1,279 @@
+diff --git a/env.go b/env.go
+index 0ba1bcf..4122468 100644
+--- a/env.go
++++ b/env.go
+@@ -6,22 +6,8 @@ import (
+ 
+ var envVarName = "GONOMOCKS"
+ 
+-// strictEnvVarName was the first knob of the strict matching rollout:
+-// an environment variable consulted at activation to decide whether
+-// the strict engine should intercept the requests. This approach was
+-// dropped in favor of the compile-time strictMatchingMode constant in
+-// transport.go, so an accidental opt-in cannot occur.
+-var strictEnvVarName = "HTTPMOCK_STRICT"
+-
+ // Disabled allows to test whether httpmock is enabled or not. It
+ // depends on GONOMOCKS environment variable.
+ func Disabled() bool {
+ 	return os.Getenv(envVarName) != ""
+ }
+-
+-// strictModeEnabled reports whether the environment selects the strict
+-// matching engine. It is no longer consulted by activation nor by the
+-// transport since the rollout moved behind strictMatchingMode.
+-func strictModeEnabled() bool {
+-	return os.Getenv(strictEnvVarName) != ""
+-}
+diff --git a/internal/route_key.go b/internal/route_key.go
+index 077a9d7..dbbad50 100644
+--- a/internal/route_key.go
++++ b/internal/route_key.go
+@@ -1,7 +1,5 @@
+ package internal
+ 
+-import "strings"
+-
+ type RouteKey struct {
+ 	Method string
+ 	URL    string
+@@ -15,34 +13,3 @@ func (r RouteKey) String() string {
+ 	}
+ 	return r.Method + " " + r.URL
+ }
+-
+-// routeKeyV2 is the strict engine counterpart of [RouteKey]: it keeps
+-// the key under its canonical form, with the method upper-cased and
+-// the URL stripped of its fragment, so that two registrations only
+-// differing by case or fragment collide on purpose. The engine that
+-// was to consume it stays disabled, hence nothing builds one for now.
+-type routeKeyV2 struct {
+-	RouteKey
+-	canonical bool
+-}
+-
+-// strictKey renders the canonical form of k's embedded [RouteKey]. It
+-// is the comparison key of the strict engine, which does not run
+-// while it is disabled.
+-func (k routeKeyV2) strictKey() RouteKey {
+-	return RouteKey{
+-		Method: strings.ToUpper(k.RouteKey.Method),
+-		URL:    strings.SplitN(k.RouteKey.URL, "#", 2)[0],
+-	}
+-}
+-
+-// canonicalRouteKey converts a [RouteKey] to the canonical form used
+-// by the strict matching engine. It is currently only used from this
+-// file, as the strict engine is parked.
+-func canonicalRouteKey(r RouteKey) RouteKey {
+-	k := routeKeyV2{
+-		RouteKey:  r,
+-		canonical: true,
+-	}
+-	return k.strictKey()
+-}
+diff --git a/match.go b/match.go
+index a21e14b..538e347 100644
+--- a/match.go
++++ b/match.go
+@@ -129,50 +129,6 @@ func matcherFuncAnd(mfs []MatcherFunc) MatcherFunc {
+ 	}
+ }
+ 
+-// matcherFuncAll is the strict sibling of matcherFuncAnd: a nil
+-// [MatcherFunc] in mfs makes the whole combination fail instead of
+-// being ignored. It was drafted for the strict matching engine, in
+-// which every registered condition must be explicit and meaningful.
+-func matcherFuncAll(mfs []MatcherFunc) MatcherFunc {
+-	if len(mfs) == 0 {
+-		return nil
+-	}
+-	for _, mf := range mfs {
+-		if mf == nil {
+-			return nil
+-		}
+-	}
+-	return func(req *http.Request) bool {
+-		for _, mf := range mfs {
+-			rearmBody(req)
+-			if !mf(req) {
+-				return false
+-			}
+-		}
+-		return true
+-	}
+-}
+-
+-// strictRequestBodyMatcher builds the condition the responders of a
+-// strict route must fulfill: the request body must be readable and
+-// non-empty, and all the [MatcherFunc] of mfs must succeed, a nil one
+-// forbidding the route. It is only meaningful under the strict
+-// matching engine, which does not run while it is disabled.
+-func strictRequestBodyMatcher(mfs ...MatcherFunc) MatcherFunc {
+-	combined := matcherFuncAll(mfs)
+-	if combined == nil {
+-		return nil
+-	}
+-	return func(req *http.Request) bool {
+-		rearmBody(req)
+-		b, err := io.ReadAll(req.Body)
+-		if err != nil || len(b) == 0 {
+-			return false
+-		}
+-		return combined.Check(req)
+-	}
+-}
+-
+ // Check returns true if mf is nil, otherwise it returns mf(req).
+ func (mf MatcherFunc) Check(req *http.Request) bool {
+ 	return mf == nil || mf(req)
+diff --git a/response.go b/response.go
+index 66d9e86..c74dcfe 100644
+--- a/response.go
++++ b/response.go
+@@ -794,40 +794,3 @@ func (d *dummyReadCloser) Len() int {
+ 	d.setup()
+ 	return d.body.Len()
+ }
+-
+-// routeStats keeps the hit counts per route gathered by the strict
+-// matching engine, so its results can be compared to the tolerant
+-// matching during a rollout. It is parked together with the engine
+-// itself, which never runs while it is disabled.
+-type routeStats struct {
+-	mu    sync.Mutex
+-	hits  map[string]int
+-	total int
+-}
+-
+-// newRouteStats returns a ready-to-use routeStats collector.
+-func newRouteStats() *routeStats {
+-	return &routeStats{
+-		hits: make(map[string]int),
+-	}
+-}
+-
+-// record counts one hit of the given route key.
+-func (s *routeStats) record(routeKey string) {
+-	s.mu.Lock()
+-	defer s.mu.Unlock()
+-	if s.hits == nil {
+-		s.hits = make(map[string]int)
+-	}
+-	s.hits[routeKey]++
+-	s.total++
+-}
+-
+-// snapshot returns the hits gathered so far and starts a new round.
+-func (s *routeStats) snapshot() map[string]int {
+-	s.mu.Lock()
+-	defer s.mu.Unlock()
+-	res := s.hits
+-	s.hits = make(map[string]int)
+-	return res
+-}
+diff --git a/transport.go b/transport.go
+index 73ce529..0443ed4 100644
+--- a/transport.go
++++ b/transport.go
+@@ -85,26 +85,6 @@ var findForKey = []func(*MockTransport, internal.RouteKey) respondersFound{
+ 	(*MockTransport).regexpRespondersForKey, // Regexp match
+ }
+ 
+-// strictMatchingMode gates the route matching engine below. It stays
+-// disabled until that engine is finished and benchmarked against the
+-// tolerant fallbacks of findResponders, so the strict path cannot be
+-// taken for now.
+-const strictMatchingMode = false
+-
+-// strictRouteFinders lists the lookup strategies of the strict engine,
+-// in the order they must be consulted once strictMatchingMode is
+-// enabled. Unlike findForKey there is no tolerant fallback: routes are
+-// only matched using the exact URL of the incoming request.
+-var strictRouteFinders = []func(*MockTransport, internal.RouteKey) respondersFound{
+-	(*MockTransport).exactStrictResponders,  // Exact match on the request URL
+-	(*MockTransport).strictRegexpResponders, // Regexp match on the raw URL
+-}
+-
+-// strictRouteStats keeps the hit counts gathered by the strict engine
+-// so its results can be compared to the tolerant matching during a
+-// rollout. It stays parked until strictMatchingMode is decided.
+-var strictRouteStats = newRouteStats()
+-
+ type respondersFound struct {
+ 	responders   matchResponders
+ 	key, respKey internal.RouteKey
+@@ -120,12 +100,6 @@ func (m *MockTransport) findResponders(method string, url *url.URL, fromIdx int)
+ 		Method: method,
+ 	}
+ 
+-	if strictMatchingMode {
+-		// Route through the strict engine: no tolerant URL fallback is
+-		// attempted, only the request URL itself is looked up.
+-		return m.findRespondersStrict(method, url)
+-	}
+-
+ 	for findForKeyIndex = fromIdx; findForKeyIndex <= len(findForKey)-1; findForKeyIndex++ {
+ 		getResponders := findForKey[findForKeyIndex]
+ 
+@@ -208,60 +182,6 @@ func (m *MockTransport) findResponders(method string, url *url.URL, fromIdx int)
+ 	return
+ }
+ 
+-// findRespondersStrict is the strict counterpart of findResponders:
+-// it only accepts routes registered for the exact URL of the request,
+-// and never falls back to the sorted-query, stripped-query or path-only
+-// variants. Each hit is recorded in strictRouteStats to ease the
+-// comparison with the tolerant matching during a rollout.
+-func (m *MockTransport) findRespondersStrict(method string, url *url.URL) (respondersFound, int) {
+-	key := internal.RouteKey{
+-		Method: method,
+-		URL:    url.String(),
+-	}
+-	for i, finder := range strictRouteFinders {
+-		found := finder(m, key)
+-		if found.responders != nil {
+-			strictRouteStats.record(found.respKey.String())
+-			return found, i
+-		}
+-	}
+-	return respondersFound{}, 0
+-}
+-
+-// exactStrictResponders returns the responders registered for the
+-// exact key of the request, without any tolerant fallback.
+-func (m *MockTransport) exactStrictResponders(key internal.RouteKey) respondersFound {
+-	m.mu.RLock()
+-	defer m.mu.RUnlock()
+-	return respondersFound{
+-		responders: m.responders[key],
+-		respKey:    key,
+-	}
+-}
+-
+-// strictRegexpResponders scans the regexp responders using the raw URL
+-// of the request. Contrary to regexpRespondersForKey, the first method
+-// or method-less match wins and the submatches are not extracted: that
+-// part of the engine was never finished.
+-func (m *MockTransport) strictRegexpResponders(key internal.RouteKey) respondersFound {
+-	m.mu.RLock()
+-	defer m.mu.RUnlock()
+-	for _, regInfo := range m.regexpResponders {
+-		if key.Method == "" || regInfo.method == key.Method {
+-			if regInfo.rx.MatchString(key.URL) {
+-				return respondersFound{
+-					responders: regInfo.responders,
+-					respKey: internal.RouteKey{
+-						Method: regInfo.method,
+-						URL:    regInfo.origRx,
+-					},
+-				}
+-			}
+-		}
+-	}
+-	return respondersFound{}
+-}
+-
+ // suggestResponder is typically called after a findResponders failure
+ // to suggest a user mistake.
+ func (m *MockTransport) suggestResponder(method string, url *url.URL) *internal.ErrorNoResponderFoundMistake {

@@ -1,0 +1,315 @@
+diff --git a/jaq-core/src/data.rs b/jaq-core/src/data.rs
+index 7d53273..d547ef3 100644
+--- a/jaq-core/src/data.rs
++++ b/jaq-core/src/data.rs
+@@ -1,6 +1,6 @@
+ //! Mapping from compile-time data types to run-time data types.
+ 
+-use crate::{input, Lut, ValT};
++use crate::{Lut, ValT};
+ 
+ /// Data types that filters operate on.
+ ///
+@@ -28,14 +28,20 @@ use crate::{input, Lut, ValT};
+ /// the *knowledge* that a filter will operate on certain type of data.
+ /// That allows us to run a filter using data types with a lifetime that
+ /// depend on the lifetime of the filter execution.
++///
++/// A data kind is required to expose only its lookup table here; that is
++/// the minimum that every filter execution needs. The input stream is a
++/// *capability* that a data kind may or may not provide, so it lives on a
++/// separate trait of its own and is required only by the few filters (such
++/// as `inputs`) that consume it. A data kind that has no input stream is
++/// therefore never made to pretend it has one.
+ pub trait DataT: 'static {
+     /// Type of values that filters process.
+     type V<'a>: ValT;
+     /// Global data accessible to native filters.
+     ///
+-    /// Every data kind exposes its inputs alongside its lookup table;
+-    /// there is no data kind without an input stream.
+-    type Data<'a>: Clone + HasLut<'a, Self> + input::HasInputs<'a, Self::V<'a>>;
++    /// Every data kind exposes its lookup table.
++    type Data<'a>: Clone + HasLut<'a, Self>;
+ }
+ 
+ /// Types that provide an `'a`-lived LUT for the data types given in `D`.
+@@ -63,13 +69,3 @@ impl<'a, D: DataT> HasLut<'a, D> for &'a Lut<D> {
+         self
+     }
+ }
+-
+-/// A bare lookup table carries no inputs, so it provides an empty input stream.
+-impl<'a, V: ValT + 'static> input::HasInputs<'a, V> for &'a Lut<JustLut<V>> {
+-    fn inputs(&self) -> input::Inputs<'a, V> {
+-        let no_inputs = core::iter::empty::<Result<V, alloc::string::String>>();
+-        let no_inputs: &'a mut input::RcIter<_> =
+-            alloc::boxed::Box::leak(alloc::boxed::Box::new(input::RcIter::new(no_inputs)));
+-        &*no_inputs
+-    }
+-}
+diff --git a/jaq-core/src/lib.rs b/jaq-core/src/lib.rs
+index d4ceb1a..b607a19 100644
+--- a/jaq-core/src/lib.rs
++++ b/jaq-core/src/lib.rs
+@@ -56,7 +56,6 @@ mod filter;
+ mod fold;
+ mod funs;
+ mod into_iter;
+-pub mod input;
+ pub mod load;
+ pub mod native;
+ pub mod ops;
+diff --git a/jaq-core/src/val.rs b/jaq-core/src/val.rs
+index 71f10ee..8c868c8 100644
+--- a/jaq-core/src/val.rs
++++ b/jaq-core/src/val.rs
+@@ -53,13 +53,14 @@ pub type Range<V> = core::ops::Range<Option<V>>;
+ ///
+ /// Implement this trait if you want jaq to process your own type of values.
+ ///
+-/// The trait carries the *complete* value contract of the jaq ecosystem:
+-/// besides the structural operations used by the core term language, it
+-/// also covers the value capabilities required by the standard library,
+-/// such as sequence conversion, numerical views, and string/byte access.
+-/// A type that implements this single trait can therefore be used with
+-/// the entire standard library of filters, without any second
+-/// implementation effort.
++/// This trait captures only the *structural* value contract that the core
++/// term language operates on: construction, indexing, slicing, iteration,
++/// updates, boolean views, and string conversion. It is deliberately free
++/// of the value *capabilities* --- sequence, number, and string/byte access
++/// --- that only some value types can provide and that the standard library
++/// layers on via its own, separate value trait. A value type thus
++/// implements only the capabilities it meaningfully has; the core never
++/// requires it to provide string, number, or sequence internals it lacks.
+ pub trait ValT:
+     Clone
+     + Display
+@@ -70,8 +71,6 @@ pub trait ValT:
+     + FromIterator<Self>
+     + PartialEq
+     + PartialOrd
+-    + Ord
+-    + From<f64>
+     + Add<Output = ValR<Self>>
+     + Sub<Output = ValR<Self>>
+     + Mul<Output = ValR<Self>>
+@@ -162,55 +161,4 @@ pub trait ValT:
+     ///
+     /// This is used by `"\(v)"`.
+     fn into_string(self) -> Self;
+-
+-    /// Convert an array into a sequence.
+-    ///
+-    /// This returns the original value as `Err` if it is not an array.
+-    fn into_seq<S: FromIterator<Self>>(self) -> Result<S, Self>;
+-
+-    /// True if the value is integer.
+-    fn is_int(&self) -> bool;
+-
+-    /// Use the value as machine-sized integer.
+-    ///
+-    /// If this function returns `Some(_)`, then [`Self::is_int`] must return true.
+-    /// However, the other direction must not necessarily be the case, because
+-    /// there may be integer values that are not representable by `isize`.
+-    fn as_isize(&self) -> Option<isize>;
+-
+-    /// Use the value as floating-point number.
+-    ///
+-    /// This succeeds for all numeric values,
+-    /// rounding too large/small ones to +/- Infinity.
+-    fn as_f64(&self) -> Option<f64>;
+-
+-    /// True if the value is interpreted as UTF-8 string.
+-    fn is_utf8_str(&self) -> bool;
+-
+-    /// If the value is a string (whatever its interpretation), return its bytes.
+-    fn as_bytes(&self) -> Option<&[u8]>;
+-
+-    /// If the value is interpreted as UTF-8 string, return its bytes.
+-    fn as_utf8_bytes(&self) -> Option<&[u8]> {
+-        self.is_utf8_str().then(|| self.as_bytes()).flatten()
+-    }
+-
+-    /// If the value is a string (whatever its interpretation), return its bytes, else fail.
+-    fn try_as_bytes(&self) -> Result<&[u8], crate::Error<Self>> {
+-        self.as_bytes()
+-            .ok_or_else(|| crate::Error::typ(self.clone(), "string"))
+-    }
+-
+-    /// If the value is interpreted as UTF-8 string, return its bytes, else fail.
+-    fn try_as_utf8_bytes(&self) -> Result<&[u8], crate::Error<Self>> {
+-        self.as_utf8_bytes()
+-            .ok_or_else(|| crate::Error::typ(self.clone(), "string"))
+-    }
+-
+-    /// If the value is a string and `sub` points to a slice of the string,
+-    /// shorten the string to `sub`, else panic.
+-    fn as_sub_str(&self, sub: &[u8]) -> Self;
+-
+-    /// Interpret bytes as UTF-8 string value.
+-    fn from_utf8_bytes(b: impl AsRef<[u8]> + Send + 'static) -> Self;
+ }
+diff --git a/jaq-json/src/lib.rs b/jaq-json/src/lib.rs
+index d4e9fbb..52468ae 100644
+--- a/jaq-json/src/lib.rs
++++ b/jaq-json/src/lib.rs
+@@ -296,7 +296,13 @@ impl jaq_core::ValT for Val {
+             _ => Self::utf8_str(self.to_json()),
+         }
+     }
++}
+ 
++/// Standard-library value capabilities for [`Val`].
++///
++/// Only the string, number, and sequence views live here; the structural
++/// operations stay on the [`jaq_core::ValT`] implementation above.
++impl jaq_std::ValT for Val {
+     fn into_seq<S: FromIterator<Self>>(self) -> Result<S, Self> {
+         match self {
+             Self::Arr(a) => match Rc::try_unwrap(a) {
+diff --git a/jaq-std/src/input.rs b/jaq-std/src/input.rs
+index 7f5297f..67ba1ae 100644
+--- a/jaq-std/src/input.rs
++++ b/jaq-std/src/input.rs
+@@ -1,20 +1,62 @@
+ //! Native implementations of `inputs` and `input`.
++//!
++//! The input stream is a *capability* that a data kind may or may not
++//! provide. Unlike the lookup table, it is not part of [`jaq_core::DataT`];
++//! instead, a data kind opts into it by implementing [`HasInputs`]. Only the
++//! `input` and `inputs` filters below require it, so a data kind that has no
++//! input stream simply does not implement [`HasInputs`] and is not made to
++//! pretend it has one.
+ use crate::{v, Filter};
+-use alloc::boxed::Box;
++use alloc::{boxed::Box, string::String};
+ use jaq_core::{Cv, DataT, Error, Exn, RunPtr, ValX};
+ 
+-/// Re-export of the input machinery owned by `jaq_core`.
+-pub use jaq_core::input::{HasInputs, Inputs, RcIter};
++/// Iterator over value results returned by the `inputs` filter.
++pub type Inputs<'i, V> = &'i RcIter<dyn Iterator<Item = Result<V, String>> + 'i>;
++
++/// A more flexible version of `&mut impl Iterator`.
++pub struct RcIter<I: ?Sized>(core::cell::RefCell<I>);
++
++impl<T, I: Iterator<Item = T> + ?Sized> Iterator for &RcIter<I> {
++    type Item = T;
++    fn next(&mut self) -> Option<T> {
++        self.0.borrow_mut().next()
++    }
++}
++
++impl<I> RcIter<I> {
++    /// Construct a new mutable iterator.
++    pub const fn new(iter: I) -> Self {
++        Self(core::cell::RefCell::new(iter))
++    }
++}
++
++/// Global data that provides mutable access to input values.
++pub trait HasInputs<'a, V> {
++    /// Obtain the inputs from global data.
++    fn inputs(&self) -> Inputs<'a, V>;
++}
++
++impl<'a, V> HasInputs<'a, V> for Inputs<'a, V> {
++    fn inputs(&self) -> Inputs<'a, V> {
++        self
++    }
++}
+ 
+ /// The `inputs` and `input` filters.
+-pub fn funs<D: DataT>() -> Box<[Filter<RunPtr<D>>]> {
++pub fn funs<D: DataT>() -> Box<[Filter<RunPtr<D>>]>
++where
++    for<'a> D::Data<'a>: HasInputs<'a, D::V<'a>>,
++{
+     Box::new([
+         ("inputs", v(0), |cv| Box::new(inputs(cv))),
+         ("input", v(0), |cv| Box::new(inputs(cv).next().into_iter())),
+     ])
+ }
+ 
+-fn inputs<'a, D: DataT>(cv: Cv<'a, D>) -> impl Iterator<Item = ValX<'a, D::V<'a>>> + 'a {
++fn inputs<'a, D: DataT>(cv: Cv<'a, D>) -> impl Iterator<Item = ValX<'a, D::V<'a>>> + 'a
++where
++    D::Data<'a>: HasInputs<'a, D::V<'a>>,
++{
+     let inputs = cv.0.data().inputs();
+     inputs.map(|r| r.map_err(|e| Exn::from(Error::str(e))))
+ }
+diff --git a/jaq-std/src/lib.rs b/jaq-std/src/lib.rs
+index bb6240f..130cebc 100644
+--- a/jaq-std/src/lib.rs
++++ b/jaq-std/src/lib.rs
+@@ -37,7 +37,7 @@ use jaq_core::box_iter::{box_once, BoxIter};
+ use jaq_core::native::{bome, run, unary, v, Filter, Fun};
+ #[cfg(feature = "regex")]
+ use jaq_core::Cv;
+-use jaq_core::{load, Bind, DataT, Error, Exn, RunPtr, ValR, ValX, ValXs};
++use jaq_core::{load, Bind, DataT, Error, Exn, RunPtr, ValR, ValT as _, ValX, ValXs};
+ 
+ /// Definitions of the standard library.
+ pub fn defs() -> impl Iterator<Item = load::parse::Def<&'static str>> {
+@@ -100,9 +100,55 @@ where
+ 
+ /// Values that the standard library can operate on.
+ ///
+-/// The value contract is owned by `jaq_core`; it is re-exported here so
+-/// that existing imports keep resolving while the two contracts are one.
+-pub use jaq_core::ValT;
++/// Where [`jaq_core::ValT`] carries the *structural* contract that the
++/// core term language needs, this trait extends it with the value
++/// *capabilities* that the standard library builds on: sequence
++/// conversion, numerical views, and string/byte access. A value type
++/// implements this trait --- and thus opts into the standard library ---
++/// only if it can meaningfully provide those capabilities; a type
++/// without, say, UTF-8 string or byte access need not implement it.
++pub trait ValT: jaq_core::ValT + Ord + From<f64> + From<usize> {
++    /// Convert the value into a sequence iterator.
++    ///
++    /// If the value is not a sequence, this returns `Err(self)`.
++    fn into_seq<S: FromIterator<Self>>(self) -> Result<S, Self>;
++
++    /// Whether the value is an integer.
++    fn is_int(&self) -> bool;
++
++    /// Optionally convert the value into a machine integer.
++    fn as_isize(&self) -> Option<isize>;
++
++    /// Optionally convert the value into a 64-bit float.
++    fn as_f64(&self) -> Option<f64>;
++
++    /// Whether the value is a string holding valid UTF-8.
++    fn is_utf8_str(&self) -> bool;
++
++    /// Optionally return the value as a byte slice.
++    fn as_bytes(&self) -> Option<&[u8]>;
++
++    /// Optionally return the value as a valid UTF-8 byte slice.
++    fn as_utf8_bytes(&self) -> Option<&[u8]> {
++        self.is_utf8_str().then(|| self.as_bytes()).flatten()
++    }
++
++    /// Return the value as a byte slice or a type error.
++    fn try_as_bytes(&self) -> Result<&[u8], Error<Self>> {
++        self.as_bytes().ok_or_else(|| Error::typ(self.clone(), "string"))
++    }
++
++    /// Return the value as a valid UTF-8 byte slice or a type error.
++    fn try_as_utf8_bytes(&self) -> Result<&[u8], Error<Self>> {
++        self.as_utf8_bytes().ok_or_else(|| Error::typ(self.clone(), "string"))
++    }
++
++    /// Return a sub-slice of the value with the given bytes.
++    fn as_sub_str(&self, sub: &[u8]) -> Self;
++
++    /// Construct a string value from UTF-8 bytes.
++    fn from_utf8_bytes(b: impl AsRef<[u8]> + Send + 'static) -> Self;
++}
+ 
+ /// Convenience trait for implementing the core functions.
+ trait ValTx: ValT + Sized {

@@ -1,0 +1,1097 @@
+use std::env;
+use std::ffi::OsStr;
+#[cfg(target_family = "unix")]
+use std::fs::OpenOptions;
+#[cfg(target_family = "unix")]
+use std::io::Write;
+#[cfg(target_family = "unix")]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+#[cfg(target_os = "macos")]
+use std::sync::OnceLock;
+
+use anyhow::{Context, Result, anyhow, bail};
+use fs_err as fs;
+use path_slash::PathBufExt;
+use target_lexicon::{Environment, OperatingSystem, Triple};
+
+use crate::linux::ARM_FEATURES_H;
+use crate::macos::{LIBCHARSET_TBD, LIBICONV_TBD};
+
+use super::cli_config::CliConfig;
+use super::wrapper::{
+    TargetFlags, ZigWrapper, is_mingw_shell, join_args_for_script, symlink_wrapper,
+    write_linker_wrapper, zig_target_env, zig_target_triple,
+};
+use super::{Zig, get_dlltool_name, has_system_dlltool};
+
+impl Zig {
+    pub(crate) fn apply_command_env(
+        manifest_path: Option<&Path>,
+        release: bool,
+        cargo: &cargo_options::CommonOptions,
+        cmd: &mut Command,
+        enable_zig_ar: bool,
+    ) -> Result<()> {
+        // setup zig as linker
+        let cargo_config = cargo_config2::Config::load()?;
+        // Use targets from CLI args, or fall back to cargo config's build.target
+        let config_targets;
+        let raw_targets: &[String] = if cargo.target.is_empty() {
+            if let Some(targets) = &cargo_config.build.target {
+                config_targets = targets
+                    .iter()
+                    .map(|t| t.triple().to_string())
+                    .collect::<Vec<_>>();
+                &config_targets
+            } else {
+                &cargo.target
+            }
+        } else {
+            &cargo.target
+        };
+        #[cfg(target_os = "macos")]
+        if !raw_targets.is_empty()
+            && let Err(err) = crate::macos::rlimit::raise_nofile_limit()
+        {
+            eprintln!(
+                "warning: failed to raise the open file limit: {err}; large builds may fail with ProcessFdQuotaExceeded (try `ulimit -n 65536`)"
+            );
+        }
+        let rust_targets = raw_targets
+            .iter()
+            .map(|target| target.split_once('.').map(|(t, _)| t).unwrap_or(target))
+            .collect::<Vec<&str>>();
+        let rustc_meta = rustc_version::version_meta()?;
+        {
+            // Only set the rustc version if neither the command nor the
+            // environment already provide one; inherited values are respected.
+            if !cmd
+                .get_envs()
+                .any(|(key, _)| key.to_str() == Some("CARGO_ZIGBUILD_RUSTC_VERSION"))
+                && env::var_os("CARGO_ZIGBUILD_RUSTC_VERSION").is_none()
+            {
+                cmd.env("CARGO_ZIGBUILD_RUSTC_VERSION", rustc_meta.semver.to_string());
+            }
+        }
+        let host_target = &rustc_meta.host;
+        // This is an output, so any CARGO_ZIGBUILD_TARGET* inherited from an outer
+        // cargo zigbuild is stale; drop it before exporting the ones for this build.
+        for (key, _) in env::vars_os() {
+            let mut name = key.to_string_lossy();
+            // Windows environment variables are case-insensitive, Unix ones are not
+            if cfg!(windows) {
+                name = name.to_ascii_uppercase().into();
+            }
+            if name == "CARGO_ZIGBUILD_TARGET" || name.starts_with("CARGO_ZIGBUILD_TARGET_") {
+                cmd.env_remove(&key);
+            }
+        }
+
+        for (parsed_target, raw_target) in rust_targets.iter().zip(raw_targets) {
+            let env_target = parsed_target.replace('-', "_");
+
+            // Prepare the zig linker wrapper for this target. The wrapper
+            // decides the zig triple, the -mcpu/-target flags derived from
+            // rustflags, and where the shim scripts land, so resolve all of
+            // that before touching the environment.
+            let (rust_target, abi_suffix) = raw_target.split_once('.').unwrap_or((raw_target, ""));
+            let abi_suffix = if abi_suffix.is_empty() {
+                String::new()
+            } else {
+                if abi_suffix
+                    .split_once('.')
+                    .filter(|(x, y)| {
+                        !x.is_empty()
+                            && x.chars().all(|c| c.is_ascii_digit())
+                            && !y.is_empty()
+                            && y.chars().all(|c| c.is_ascii_digit())
+                    })
+                    .is_none()
+                {
+                    bail!("Malformed zig target abi suffix.")
+                }
+                format!(".{abi_suffix}")
+            };
+            let triple: Triple = rust_target
+                .parse()
+                .with_context(|| format!("Unsupported Rust target '{rust_target}'"))?;
+            let arch = triple.architecture.to_string();
+            let target_env = zig_target_env(&triple);
+            let file_ext = if cfg!(windows) { "bat" } else { "sh" };
+            let file_target = raw_target.trim_end_matches('.');
+
+            let mut cc_args = vec![
+                // prevent stripping
+                "-g".to_owned(),
+                // disable sanitizers
+                "-fno-sanitize=all".to_owned(),
+            ];
+
+            // TODO: Maybe better to assign mcpu according to:
+            // rustc --target <target> -Z unstable-options --print target-spec-json
+            let zig_mcpu_default = match triple.operating_system {
+                OperatingSystem::Linux => {
+                    match arch.as_str() {
+                        // zig uses _ instead of - in cpu features
+                        "arm" => match target_env {
+                            Environment::Gnueabi | Environment::Musleabi => {
+                                "generic+v6+strict_align"
+                            }
+                            Environment::Gnueabihf | Environment::Musleabihf => {
+                                "generic+v6+strict_align+vfp2-d32"
+                            }
+                            _ => "",
+                        },
+                        "armv5te" => "generic+soft_float+strict_align",
+                        "armv7" => "generic+v7a+vfp3-d32+thumb2-neon",
+                        arch_str @ ("i586" | "i686") => {
+                            if arch_str == "i586" {
+                                "pentium"
+                            } else {
+                                "pentium4"
+                            }
+                        }
+                        "riscv64gc" => "generic_rv64+m+a+f+d+c",
+                        "s390x" => "z10-vector",
+                        _ => "",
+                    }
+                }
+                _ => "",
+            };
+
+            // Override mcpu from RUSTFLAGS if provided. The override happens when
+            // commands like `cargo-zigbuild build` are invoked.
+            // Currently we only override according to target_cpu.
+            let zig_mcpu_override = {
+                let cli_config = CliConfig::parse(&cargo.config)?;
+                let rust_flags = cli_config
+                    .rustflags(&cargo_config, rust_target)?
+                    .unwrap_or_default();
+                let encoded_rust_flags = rust_flags.encode()?;
+                let target_flags =
+                    TargetFlags::parse_from_encoded(OsStr::new(&encoded_rust_flags))?;
+                // Note: zig uses _ instead of - for target_cpu and target_feature
+                // target_cpu may be empty string, which means target_cpu is not specified.
+                target_flags.target_cpu.replace('-', "_")
+            };
+
+            if !zig_mcpu_override.is_empty() {
+                cc_args.push(format!("-mcpu={zig_mcpu_override}"));
+            } else if !zig_mcpu_default.is_empty() {
+                cc_args.push(format!("-mcpu={zig_mcpu_default}"));
+            }
+
+            let zig_target = zig_target_triple(
+                rust_target,
+                &triple,
+                target_env,
+                &abi_suffix,
+                &Zig::zig_version()?,
+            )?;
+            cc_args.push("-target".to_string());
+            cc_args.push(zig_target.clone());
+
+            // Resolve the cache directory inline instead of calling
+            // `locate::cache_dir()`.
+            let zig_linker_dir = env::var("CARGO_ZIGBUILD_CACHE_DIR")
+                .ok()
+                .map(|s| s.into())
+                .or_else(dirs::cache_dir)
+                // If the really is no cache dir, cwd will also do
+                .unwrap_or_else(|| env::current_dir().expect("Failed to get current dir"))
+                .join(env!("CARGO_PKG_NAME"))
+                .join(env!("CARGO_PKG_VERSION"));
+            fs::create_dir_all(&zig_linker_dir)?;
+
+            if triple.operating_system == OperatingSystem::Linux {
+                if matches!(
+                    triple.environment,
+                    Environment::Gnu
+                        | Environment::Gnuspe
+                        | Environment::Gnux32
+                        | Environment::Gnueabi
+                        | Environment::Gnuabi64
+                        | Environment::GnuIlp32
+                        | Environment::Gnueabihf
+                ) {
+                    let glibc_version = if abi_suffix.is_empty() {
+                        (2, 17)
+                    } else {
+                        let mut parts = abi_suffix[1..].split('.');
+                        let major: usize = parts.next().unwrap().parse()?;
+                        let minor: usize = parts.next().unwrap().parse()?;
+                        (major, minor)
+                    };
+                    // See https://github.com/ziglang/zig/issues/9485
+                    if glibc_version < (2, 28) {
+                        use crate::linux::{FCNTL_H, FCNTL_MAP};
+
+                        let zig_version = Zig::zig_version()?;
+                        if zig_version.major == 0 && zig_version.minor < 11 {
+                            let fcntl_map = zig_linker_dir.join("fcntl.map");
+                            let existing_content =
+                                fs::read_to_string(&fcntl_map).unwrap_or_default();
+                            if existing_content != FCNTL_MAP {
+                                fs::write(&fcntl_map, FCNTL_MAP)?;
+                            }
+                            let fcntl_h = zig_linker_dir.join("fcntl.h");
+                            let existing_content =
+                                fs::read_to_string(&fcntl_h).unwrap_or_default();
+                            if existing_content != FCNTL_H {
+                                fs::write(&fcntl_h, FCNTL_H)?;
+                            }
+
+                            cc_args.push(format!("-Wl,--version-script={}", fcntl_map.display()));
+                            cc_args.push("-include".to_string());
+                            cc_args.push(fcntl_h.display().to_string());
+                        }
+                    }
+                } else if matches!(
+                    triple.environment,
+                    Environment::Musl
+                        | Environment::Muslabi64
+                        | Environment::Musleabi
+                        | Environment::Musleabihf
+                ) {
+                    use crate::linux::MUSL_WEAK_SYMBOLS_MAPPING_SCRIPT;
+
+                    let zig_version = Zig::zig_version()?;
+                    let rustc_version = rustc_version::version_meta()?.semver;
+
+                    // as zig 0.11.0 is released, its musl has been upgraded to 1.2.4 with break changes
+                    // but rust is still with musl 1.2.3
+                    // we need this workaround before rust 1.72
+                    // https://github.com/ziglang/zig/pull/16098
+                    if (zig_version.major, zig_version.minor) >= (0, 11)
+                        && (rustc_version.major, rustc_version.minor) < (1, 72)
+                    {
+                        let weak_symbols_map = zig_linker_dir.join("musl_weak_symbols_map.ld");
+                        fs::write(&weak_symbols_map, MUSL_WEAK_SYMBOLS_MAPPING_SCRIPT)?;
+
+                        cc_args.push(format!("-Wl,-T,{}", weak_symbols_map.display()));
+                    }
+                }
+            }
+
+            // Use platform-specific quoting: shell_words for Unix (single quotes),
+            // custom quoting for Windows batch files (double quotes)
+            let cc_args_str = join_args_for_script(&cc_args);
+
+            // Put all generated wrappers and symlinks in a per-exe subdirectory so
+            // that parallel builds driven by different binaries (e.g. multiple maturin
+            // instances in separate temp venvs) never clobber each other.
+            // See https://github.com/rust-cross/cargo-zigbuild/issues/318
+            //
+            // Resolve the current executable path inline instead of calling
+            // `wrapper::resolve_current_exe` (preferring the test override env var).
+            let current_exe = if let Ok(exe) = env::var("CARGO_BIN_EXE_cargo-zigbuild") {
+                PathBuf::from(exe)
+            } else {
+                env::current_exe()?
+            };
+            let exe_hash = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC)
+                .checksum(current_exe.as_os_str().as_encoded_bytes());
+            let wrapper_dir = zig_linker_dir
+                .join("wrappers")
+                .join(format!("{:x}", exe_hash));
+            fs::create_dir_all(&wrapper_dir)?;
+
+            let hash = crc::Crc::<u16>::new(&crc::CRC_16_IBM_SDLC).checksum(cc_args_str.as_bytes());
+            let zig_cc = wrapper_dir.join(format!("zigcc-{file_target}-{:x}.{file_ext}", hash));
+            let zig_cxx = wrapper_dir.join(format!("zigcxx-{file_target}-{:x}.{file_ext}", hash));
+            let zig_ranlib = wrapper_dir.join(format!("zigranlib.{file_ext}"));
+            let zig_version = Zig::zig_version()?;
+            let zig_command = Zig::find_zig()?;
+            write_linker_wrapper(&zig_cc, "cc", &cc_args_str, &zig_version, &zig_command)?;
+            write_linker_wrapper(&zig_cxx, "c++", &cc_args_str, &zig_version, &zig_command)?;
+            write_linker_wrapper(&zig_ranlib, "ranlib", "", &zig_version, &zig_command)?;
+
+            let exe_ext = if cfg!(windows) { ".exe" } else { "" };
+            let zig_ar = wrapper_dir.join(format!("ar{exe_ext}"));
+            symlink_wrapper(&zig_ar)?;
+            let zig_lib = wrapper_dir.join(format!("lib{exe_ext}"));
+            symlink_wrapper(&zig_lib)?;
+
+            // Create dlltool symlinks for Windows GNU targets, but only if no system dlltool exists
+            // On Windows hosts, rustc looks for "dlltool.exe"
+            // On non-Windows hosts, rustc looks for architecture-specific names
+            //
+            // See https://github.com/rust-lang/rust/blob/a18e6d9d1473d9b25581dd04bef6c7577999631c/compiler/rustc_codegen_ssa/src/back/archive.rs#L275-L309
+            if matches!(triple.operating_system, OperatingSystem::Windows)
+                && matches!(triple.environment, Environment::Gnu)
+            {
+                // Only create zig dlltool wrapper if no system dlltool is found
+                // System dlltool (from mingw-w64) handles raw-dylib better than zig's dlltool
+                if !has_system_dlltool(&triple.architecture) {
+                    let dlltool_name = get_dlltool_name(&triple.architecture);
+                    let zig_dlltool = wrapper_dir.join(format!("{dlltool_name}{exe_ext}"));
+                    symlink_wrapper(&zig_dlltool)?;
+                }
+            }
+
+            let zig_wrapper = ZigWrapper {
+                cc: zig_cc,
+                cxx: zig_cxx,
+                ar: zig_ar,
+                ranlib: zig_ranlib,
+                lib: zig_lib,
+                target: zig_target,
+            };
+
+            // Export the resolved zig target for build scripts that do not go
+            // through `cc` and so cannot recover the glibc version. Unlike the
+            // variables around it this is an output, so a value inherited from an
+            // outer build is stale rather than an override, and is replaced.
+            // The unsuffixed name is single-target only, since one variable cannot
+            // answer for several targets.
+            cmd.env(
+                format!("CARGO_ZIGBUILD_TARGET_{env_target}"),
+                &zig_wrapper.target,
+            );
+            if raw_targets.len() == 1 {
+                cmd.env("CARGO_ZIGBUILD_TARGET", &zig_wrapper.target);
+            }
+
+            if is_mingw_shell() {
+                let zig_cc = zig_wrapper.cc.to_slash_lossy();
+                let zig_cxx = zig_wrapper.cxx.to_slash_lossy();
+                {
+                    let name = format!("CC_{env_target}");
+                    if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                        && env::var_os(&name).is_none()
+                    {
+                        cmd.env(&name, &*zig_cc);
+                    }
+                }
+                {
+                    let name = format!("CXX_{env_target}");
+                    if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                        && env::var_os(&name).is_none()
+                    {
+                        cmd.env(&name, &*zig_cxx);
+                    }
+                }
+                if !parsed_target.contains("wasm") {
+                    let name = format!("CARGO_TARGET_{}_LINKER", env_target.to_uppercase());
+                    if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                        && env::var_os(&name).is_none()
+                    {
+                        cmd.env(&name, &*zig_cc);
+                    }
+                }
+            } else {
+                {
+                    let name = format!("CC_{env_target}");
+                    if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                        && env::var_os(&name).is_none()
+                    {
+                        cmd.env(&name, &zig_wrapper.cc);
+                    }
+                }
+                {
+                    let name = format!("CXX_{env_target}");
+                    if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                        && env::var_os(&name).is_none()
+                    {
+                        cmd.env(&name, &zig_wrapper.cxx);
+                    }
+                }
+                if !parsed_target.contains("wasm") {
+                    let name = format!("CARGO_TARGET_{}_LINKER", env_target.to_uppercase());
+                    if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                        && env::var_os(&name).is_none()
+                    {
+                        cmd.env(&name, &zig_wrapper.cc);
+                    }
+                }
+            }
+
+            {
+                let name = format!("RANLIB_{env_target}");
+                if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                    && env::var_os(&name).is_none()
+                {
+                    cmd.env(&name, &zig_wrapper.ranlib);
+                }
+            }
+            // Only setup AR when explicitly asked to
+            // because it need special executable name handling, see src/bin/cargo-zigbuild.rs
+            if enable_zig_ar {
+                if parsed_target.contains("msvc") {
+                    let name = format!("AR_{env_target}");
+                    if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                        && env::var_os(&name).is_none()
+                    {
+                        cmd.env(&name, &zig_wrapper.lib);
+                    }
+                } else {
+                    let name = format!("AR_{env_target}");
+                    if !cmd.get_envs().any(|(key, _)| key.to_str() == Some(name.as_str()))
+                        && env::var_os(&name).is_none()
+                    {
+                        cmd.env(&name, &zig_wrapper.ar);
+                    }
+                }
+            }
+
+            // Set up macOS/ARM OS-specific dependencies.
+            for target in &cargo.target {
+                if target.contains("apple") {
+                    let target_dir = if let Some(target_dir) = cargo.target_dir.clone() {
+                        target_dir.join(target)
+                    } else {
+                        let manifest_path = manifest_path.unwrap_or_else(|| Path::new("Cargo.toml"));
+                        if !manifest_path.exists() {
+                            // cargo install doesn't pass a manifest path so `Cargo.toml` in cwd may not exist
+                            continue;
+                        }
+                        let metadata = cargo_metadata::MetadataCommand::new()
+                            .manifest_path(manifest_path)
+                            .no_deps()
+                            .exec()?;
+                        metadata.target_directory.into_std_path_buf().join(target)
+                    };
+                    let profile = match cargo.profile.as_deref() {
+                        Some("dev" | "test") => "debug",
+                        Some("release" | "bench") => "release",
+                        Some(profile) => profile,
+                        None => {
+                            if release {
+                                "release"
+                            } else {
+                                "debug"
+                            }
+                        }
+                    };
+                    let deps_dir = target_dir.join(profile).join("deps");
+                    fs::create_dir_all(&deps_dir)?;
+                    if !target_dir.join("CACHEDIR.TAG").is_file() {
+                        // Create a CACHEDIR.TAG file to exclude target directory from backup
+                        let cachedir_tag_path = target_dir.join("CACHEDIR.TAG");
+                        let cachedir_tag =
+                            "Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by cargo.
+# For information about cache directory tags see https://bford.info/cachedir/
+";
+                        let existing_content =
+                            fs::read_to_string(&cachedir_tag_path).unwrap_or_default();
+                        if existing_content != cachedir_tag {
+                            let _ = fs::write(&cachedir_tag_path, cachedir_tag);
+                        }
+                    }
+                    // Write the `.tbd` stubs.
+                    {
+                        let tbd_path = deps_dir.join("libiconv.tbd");
+                        let existing_content =
+                            fs::read_to_string(&tbd_path).unwrap_or_default();
+                        if existing_content != LIBICONV_TBD {
+                            fs::write(&tbd_path, LIBICONV_TBD)?;
+                        }
+                    }
+                    {
+                        let tbd_path = deps_dir.join("libcharset.1.tbd");
+                        let existing_content =
+                            fs::read_to_string(&tbd_path).unwrap_or_default();
+                        if existing_content != LIBCHARSET_TBD {
+                            fs::write(&tbd_path, LIBCHARSET_TBD)?;
+                        }
+                    }
+                    {
+                        let tbd_path = deps_dir.join("libcharset.tbd");
+                        let existing_content =
+                            fs::read_to_string(&tbd_path).unwrap_or_default();
+                        if existing_content != LIBCHARSET_TBD {
+                            fs::write(&tbd_path, LIBCHARSET_TBD)?;
+                        }
+                    }
+                } else if target.contains("arm") && target.contains("linux") {
+                    // See https://github.com/ziglang/zig/issues/3287
+                    if let Ok(lib_dir) = Zig::lib_dir() {
+                        let arm_features_h = lib_dir
+                            .join("libc")
+                            .join("glibc")
+                            .join("sysdeps")
+                            .join("arm")
+                            .join("arm-features.h");
+                        if !arm_features_h.is_file() {
+                            fs::write(arm_features_h, ARM_FEATURES_H)?;
+                        }
+                    }
+                }
+            }
+
+            let cmake_toolchain_file_env = format!("CMAKE_TOOLCHAIN_FILE_{env_target}");
+            if env::var_os(&cmake_toolchain_file_env).is_none()
+                && env::var_os(format!("CMAKE_TOOLCHAIN_FILE_{parsed_target}")).is_none()
+                && env::var_os("TARGET_CMAKE_TOOLCHAIN_FILE").is_none()
+                && env::var_os("CMAKE_TOOLCHAIN_FILE").is_none()
+            {
+                // Generate the cmake toolchain file. Any failure just
+                // skips the export; cmake then falls back to its own
+                // toolchain detection.
+                'cmake: {
+                    // Place cmake toolchain files alongside the other wrappers in the
+                    // per-exe directory to avoid races between parallel builds.
+                    let wrapper_dir = match zig_wrapper.cc.parent() {
+                        Some(dir) => dir,
+                        None => break 'cmake,
+                    };
+                    let cmake = wrapper_dir.join("cmake");
+                    if fs::create_dir_all(&cmake).is_err() {
+                        break 'cmake;
+                    }
+
+                    let toolchain_file = cmake.join(format!("{parsed_target}-toolchain.cmake"));
+                    let triple: Triple = match parsed_target.parse() {
+                        Ok(triple) => triple,
+                        Err(_) => break 'cmake,
+                    };
+                    let os = triple.operating_system.to_string();
+                    let arch = triple.architecture.to_string();
+                    let (system_name, system_processor) = match (os.as_str(), arch.as_str()) {
+                        ("darwin", "x86_64") => ("Darwin", "x86_64"),
+                        ("darwin", "aarch64") => ("Darwin", "arm64"),
+                        ("linux", arch) => {
+                            let cmake_arch = match arch {
+                                "powerpc" => "ppc",
+                                "powerpc64" => "ppc64",
+                                "powerpc64le" => "ppc64le",
+                                _ => arch,
+                            };
+                            ("Linux", cmake_arch)
+                        }
+                        ("windows", "x86_64") => ("Windows", "AMD64"),
+                        ("windows", "i686") => ("Windows", "X86"),
+                        ("windows", "aarch64") => ("Windows", "ARM64"),
+                        (os, arch) => (os, arch),
+                    };
+                    let mut content = format!(
+                        r#"
+set(CMAKE_SYSTEM_NAME {system_name})
+set(CMAKE_SYSTEM_PROCESSOR {system_processor})
+set(CMAKE_C_COMPILER {cc})
+set(CMAKE_CXX_COMPILER {cxx})
+set(CMAKE_RANLIB {ranlib})
+set(CMAKE_C_LINKER_DEPFILE_SUPPORTED FALSE)
+set(CMAKE_CXX_LINKER_DEPFILE_SUPPORTED FALSE)"#,
+                        system_name = system_name,
+                        system_processor = system_processor,
+                        cc = zig_wrapper.cc.to_slash_lossy(),
+                        cxx = zig_wrapper.cxx.to_slash_lossy(),
+                        ranlib = zig_wrapper.ranlib.to_slash_lossy(),
+                    );
+                    if enable_zig_ar {
+                        content.push_str(&format!(
+                            "\nset(CMAKE_AR {})\n",
+                            zig_wrapper.ar.to_slash_lossy()
+                        ));
+                    }
+                    // When cross-compiling to Darwin from a non-macOS host, CMake requires
+                    // install_name_tool and otool which don't exist on Linux/Windows.
+                    // Provide our own install_name_tool implementation via symlink wrapper,
+                    // and a no-op script for otool (not needed for builds) if no system otool exists.
+                    if system_name == "Darwin" && !cfg!(target_os = "macos") {
+                        let exe_ext = if cfg!(windows) { ".exe" } else { "" };
+                        let install_name_tool = wrapper_dir.join(format!("install_name_tool{exe_ext}"));
+                        if symlink_wrapper(&install_name_tool).is_err() {
+                            break 'cmake;
+                        }
+                        content.push_str(&format!(
+                            "\nset(CMAKE_INSTALL_NAME_TOOL {})",
+                            install_name_tool.to_slash_lossy()
+                        ));
+
+                        if which::which("otool").is_err() {
+                            let script_ext = if cfg!(windows) { "bat" } else { "sh" };
+                            let otool = cmake.join(format!("otool.{script_ext}"));
+                            // Write the no-op placeholder script.
+                            #[cfg(target_family = "unix")]
+                            {
+                                let content = "#!/bin/sh\nexit 0\n";
+                                let existing = fs::read_to_string(&otool).unwrap_or_default();
+                                if existing != content
+                                    && OpenOptions::new()
+                                        .create(true)
+                                        .write(true)
+                                        .truncate(true)
+                                        .mode(0o700)
+                                        .open(&otool)
+                                        .and_then(|mut file| file.write_all(content.as_bytes()))
+                                        .is_err()
+                                {
+                                    break 'cmake;
+                                }
+                            }
+                            #[cfg(not(target_family = "unix"))]
+                            {
+                                let content = "@echo off\r\nexit /b 0\r\n";
+                                let existing = fs::read_to_string(&otool).unwrap_or_default();
+                                if existing != content && fs::write(&otool, content).is_err() {
+                                    break 'cmake;
+                                }
+                            }
+                            content.push_str(&format!("\nset(CMAKE_OTOOL {})", otool.to_slash_lossy()));
+                        }
+                    }
+                    // Prevent cmake from searching the host system's include and library paths,
+                    // which can conflict with zig's bundled headers (e.g. __COLD in sys/cdefs.h).
+                    // See https://github.com/rust-cross/cargo-zigbuild/issues/268
+                    content.push_str(
+                        r#"
+set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)"#,
+                    );
+                    {
+                        let existing_content =
+                            fs::read_to_string(&toolchain_file).unwrap_or_default();
+                        if existing_content != content
+                            && fs::write(&toolchain_file, &content).is_err()
+                        {
+                            break 'cmake;
+                        }
+                    }
+                    cmd.env(&cmake_toolchain_file_env, toolchain_file);
+                }
+            }
+
+            // On Windows, cmake defaults to the Visual Studio generator which ignores
+            // CMAKE_C_COMPILER from the toolchain file. Force Ninja to ensure zig cc
+            // is used for cross-compilation.
+            // See https://github.com/rust-cross/cargo-zigbuild/issues/174
+            if cfg!(target_os = "windows")
+                && env::var_os("CMAKE_GENERATOR").is_none()
+                && which::which("ninja").is_ok()
+            {
+                cmd.env("CMAKE_GENERATOR", "Ninja");
+            }
+
+            if raw_target.contains("windows-gnu") {
+                cmd.env("WINAPI_NO_BUNDLED_LIBRARIES", "1");
+                // Add the cache directory to PATH so rustc can find architecture-specific dlltool
+                // (e.g., x86_64-w64-mingw32-dlltool), but only if no system dlltool exists
+                // If system mingw-w64 dlltool exists, prefer it over zig's dlltool
+                let triple: Triple = parsed_target.parse().unwrap_or_else(|_| Triple::unknown());
+                if !has_system_dlltool(&triple.architecture) {
+                    // zig_wrapper.ar lives in the per-exe wrapper dir
+                    let wrapper_dir = zig_wrapper.ar.parent().unwrap();
+                    let existing_path = env::var_os("PATH").unwrap_or_default();
+                    let paths =
+                        std::iter::once(wrapper_dir.to_path_buf()).chain(env::split_paths(&existing_path));
+                    if let Ok(new_path) = env::join_paths(paths) {
+                        cmd.env("PATH", new_path);
+                    }
+                }
+            }
+
+            if raw_target.contains("apple-darwin")
+                && let Some(sdkroot) = Self::macos_sdk_root()
+                && env::var_os("PKG_CONFIG_SYSROOT_DIR").is_none()
+            {
+                // Set PKG_CONFIG_SYSROOT_DIR for pkg-config crate
+                cmd.env("PKG_CONFIG_SYSROOT_DIR", sdkroot);
+            }
+
+            // Enable unstable `target-applies-to-host` option automatically
+            // when target is the same as host but may have specified glibc version
+            if host_target == parsed_target {
+                if !matches!(rustc_meta.channel, rustc_version::Channel::Nightly) {
+                    // Hack to use the unstable feature on stable Rust
+                    // https://github.com/rust-lang/cargo/pull/9753#issuecomment-1022919343
+                    cmd.env("__CARGO_TEST_CHANNEL_OVERRIDE_DO_NOT_USE_THIS", "nightly");
+                }
+                cmd.env("CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST", "true");
+                cmd.env("CARGO_TARGET_APPLIES_TO_HOST", "false");
+            }
+
+            // Collect the compiler options used by `zig cc`, probing each
+            // source-language driver separately.
+            #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+            enum Kind {
+                Normal,
+                Framework,
+            }
+
+            // We can't use `-x c` or `-x c++` because pre-0.11 Zig doesn't handle them
+            let empty_c_file_path = env::var("CARGO_ZIGBUILD_CACHE_DIR")
+                .ok()
+                .map(|s: String| PathBuf::from(s))
+                .or_else(dirs::cache_dir)
+                .unwrap_or_else(|| env::current_dir().expect("Failed to get current dir"))
+                .join(env!("CARGO_PKG_NAME"))
+                .join(env!("CARGO_PKG_VERSION"))
+                .join(".intentionally-empty-file.c");
+            if !empty_c_file_path.exists() {
+                fs::write(&empty_c_file_path, "")?;
+            }
+
+            let output = Command::new(&zig_wrapper.cc)
+                .arg("-E")
+                .arg(&empty_c_file_path)
+                .arg("-v")
+                .output()
+                .context("Failed to collect `zig cc` options")?;
+            // Clang always generates UTF-8 regardless of locale, so this is okay.
+            let stderr = String::from_utf8(output.stderr)?;
+            if !output.status.success() {
+                bail!(
+                    "Failed to run `zig cc -v` with status {}: {}",
+                    output.status,
+                    stderr.trim(),
+                );
+            }
+
+            // Collect some macro definitions from cc1 options. We can't directly use
+            // them though, as we can't distinguish options added by zig from options
+            // added by clang driver (e.g. `__GCC_HAVE_DWARF2_CFI_ASM`).
+            let c_glibc_minor_ver: Option<u32> = if let Some(start) = stderr.find("__GLIBC_MINOR__=") {
+                let stderr = &stderr[start + 16..];
+                let end = stderr
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(stderr.len());
+                stderr[..end].parse().ok()
+            } else {
+                None
+            };
+
+            let start = stderr
+                .find("#include <...> search starts here:")
+                .ok_or_else(|| anyhow!("Failed to parse `zig cc -v` output"))?
+                + 34;
+            let end = stderr
+                .find("End of search list.")
+                .ok_or_else(|| anyhow!("Failed to parse `zig cc -v` output"))?;
+
+            let mut c_include_paths = Vec::new();
+            for mut line in stderr[start..end].lines() {
+                line = line.trim();
+                let mut kind = Kind::Normal;
+                if line.ends_with(" (framework directory)") {
+                    line = line[..line.len() - 22].trim();
+                    kind = Kind::Framework;
+                } else if line.ends_with(" (headermap)") {
+                    bail!("C/C++ search path includes header maps, which are not supported");
+                }
+                if !line.is_empty() {
+                    c_include_paths.push((kind, line.to_owned()));
+                }
+            }
+
+            // In openharmony, we should add search header path by default which is useful for bindgen.
+            if raw_target.contains("ohos") {
+                let ndk = env::var("OHOS_NDK_HOME").expect("Can't get NDK path");
+                c_include_paths.push((Kind::Normal, format!("{ndk}/native/sysroot/usr/include")));
+            }
+
+            // We can't use `-x c` or `-x c++` because pre-0.11 Zig doesn't handle them
+            let empty_cpp_file_path = env::var("CARGO_ZIGBUILD_CACHE_DIR")
+                .ok()
+                .map(|s: String| PathBuf::from(s))
+                .or_else(dirs::cache_dir)
+                .unwrap_or_else(|| env::current_dir().expect("Failed to get current dir"))
+                .join(env!("CARGO_PKG_NAME"))
+                .join(env!("CARGO_PKG_VERSION"))
+                .join(".intentionally-empty-file.cpp");
+            if !empty_cpp_file_path.exists() {
+                fs::write(&empty_cpp_file_path, "")?;
+            }
+
+            let output = Command::new(&zig_wrapper.cxx)
+                .arg("-E")
+                .arg(&empty_cpp_file_path)
+                .arg("-v")
+                .output()
+                .context("Failed to collect `zig cc` options")?;
+            // Clang always generates UTF-8 regardless of locale, so this is okay.
+            let stderr = String::from_utf8(output.stderr)?;
+            if !output.status.success() {
+                bail!(
+                    "Failed to run `zig cc -v` with status {}: {}",
+                    output.status,
+                    stderr.trim(),
+                );
+            }
+
+            // Collect some macro definitions from cc1 options. We can't directly use
+            // them though, as we can't distinguish options added by zig from options
+            // added by clang driver (e.g. `__GCC_HAVE_DWARF2_CFI_ASM`).
+            let cpp_glibc_minor_ver: Option<u32> = if let Some(start) = stderr.find("__GLIBC_MINOR__=") {
+                let stderr = &stderr[start + 16..];
+                let end = stderr
+                    .find(|c: char| !c.is_ascii_digit())
+                    .unwrap_or(stderr.len());
+                stderr[..end].parse().ok()
+            } else {
+                None
+            };
+
+            let start = stderr
+                .find("#include <...> search starts here:")
+                .ok_or_else(|| anyhow!("Failed to parse `zig cc -v` output"))?
+                + 34;
+            let end = stderr
+                .find("End of search list.")
+                .ok_or_else(|| anyhow!("Failed to parse `zig cc -v` output"))?;
+
+            let mut cpp_include_paths = Vec::new();
+            for mut line in stderr[start..end].lines() {
+                line = line.trim();
+                let mut kind = Kind::Normal;
+                if line.ends_with(" (framework directory)") {
+                    line = line[..line.len() - 22].trim();
+                    kind = Kind::Framework;
+                } else if line.ends_with(" (headermap)") {
+                    bail!("C/C++ search path includes header maps, which are not supported");
+                }
+                if !line.is_empty() {
+                    cpp_include_paths.push((kind, line.to_owned()));
+                }
+            }
+
+            // In openharmony, we should add search header path by default which is useful for bindgen.
+            if raw_target.contains("ohos") {
+                let ndk = env::var("OHOS_NDK_HOME").expect("Can't get NDK path");
+                cpp_include_paths.push((Kind::Normal, format!("{ndk}/native/sysroot/usr/include")));
+            }
+
+            // Ensure that the C and C++ probes are almost identical in the way we expect.
+            if c_glibc_minor_ver != cpp_glibc_minor_ver {
+                bail!(
+                    "`zig cc` gives a different glibc minor version for C ({:?}) and C++ ({:?})",
+                    c_glibc_minor_ver,
+                    cpp_glibc_minor_ver,
+                );
+            }
+            let c_paths = c_include_paths;
+            let mut cpp_paths = cpp_include_paths;
+            // The C++ search list is expected to be the C search list with extra
+            // libc++ paths prepended and appended, but zig's layout has varied
+            // across versions/targets, so fall back to zero-length pre/post
+            // regions instead of panicking when a shared path can't be found.
+            let cpp_pre_len = c_paths
+                .iter()
+                .find(|(kind, _)| *kind == Kind::Normal)
+                .and_then(|first_c| cpp_paths.iter().position(|p| p == first_c))
+                .unwrap_or_default();
+            let cpp_post_len = c_paths
+                .last()
+                .and_then(|last_c| cpp_paths.iter().rposition(|p| p == last_c))
+                .map(|pos| cpp_paths.len() - pos - 1)
+                .unwrap_or_default();
+
+            // <digression>
+            //
+            // So, why we do need all of these?
+            //
+            // Bindgen wouldn't look at our `zig cc` (which doesn't contain `libclang.so` anyway),
+            // but it does collect include paths from the local clang and feed them to `libclang.so`.
+            // We want those include paths to come from our `zig cc` instead of the local clang.
+            // There are three main mechanisms possible:
+            //
+            // 1. Replace the local clang with our version.
+            //
+            //    Bindgen, internally via clang-sys, recognizes `CLANG_PATH` and `PATH`.
+            //    They are unfortunately a global namespace and simply setting them may break
+            //    existing build scripts, so we can't confidently override them.
+            //
+            //    Clang-sys can also look at target-prefixed clang if arguments contain `-target`.
+            //    Unfortunately clang-sys can only recognize `-target xxx`, which very slightly
+            //    differs from what bindgen would pass (`-target=xxx`), so this is not yet possible.
+            //
+            //    It should be also noted that we need to collect not only include paths
+            //    but macro definitions added by Zig, for example `-D__GLIBC_MINOR__`.
+            //    Clang-sys can't do this yet, so this option seems less robust than we want.
+            //
+            // 2. Set the environment variable `BINDGEN_EXTRA_CLANG_ARGS` and let bindgen to
+            //    append them to arguments passed to `libclang.so`.
+            //
+            //    This unfortunately means that we have the same set of arguments for C and C++.
+            //    Also we have to support older versions of clang, as old as clang 5 (2017).
+            //    We do have options like `-c-isystem` (cc1 only) and `-cxx-isystem`,
+            //    but we need to be aware of other options may affect our added options
+            //    and this requires a nitty gritty of clang driver and cc1---really annoying.
+            //
+            // 3. Fix either bindgen or clang-sys or Zig to ease our jobs.
+            //
+            //    This is not the option for now because, even after fixes, we have to support
+            //    older versions of bindgen or Zig which won't have those fixes anyway.
+            //    But it seems that minor changes to bindgen can indeed fix lots of issues
+            //    we face, so we are looking for them in the future.
+            //
+            // For this reason, we chose the option 2 and overrode `BINDGEN_EXTRA_CLANG_ARGS`.
+            // The following therefore assumes some understanding about clang option handling,
+            // including what the heck is cc1 (see the clang FAQ) and how driver options get
+            // translated to cc1 options (no documentation at all, as it's supposedly unstable).
+            // Fortunately for us, most (but not all) `-i...` options are passed through cc1.
+            //
+            // If you do experience weird compilation errors during bindgen, there's a chance
+            // that this code has overlooked some edge cases. You can put `.clang_arg("-###")`
+            // to print the final cc1 options, which would give a lot of information about
+            // how it got screwed up and help a lot when we fix the issue.
+            //
+            // </digression>
+
+            let mut options = Vec::new();
+
+            // Never include default include directories,
+            // otherwise `__has_include` will be totally confused.
+            options.push("-nostdinc".to_owned());
+
+            // Add various options for libc++ and glibc.
+            // Should match what `Compilation.zig` internally does:
+            //
+            // https://github.com/ziglang/zig/blob/0.9.0/src/Compilation.zig#L3390-L3427
+            // https://github.com/ziglang/zig/blob/0.9.1/src/Compilation.zig#L3408-L3445
+            // https://github.com/ziglang/zig/blob/0.10.0/src/Compilation.zig#L4163-L4211
+            // https://github.com/ziglang/zig/blob/0.10.1/src/Compilation.zig#L4240-L4288
+            if raw_target.contains("musl") || raw_target.contains("ohos") {
+                options.push("-D_LIBCPP_HAS_MUSL_LIBC".to_owned());
+                // for musl or openharmony
+                // https://github.com/ziglang/zig/pull/16098
+                options.push("-D_LARGEFILE64_SOURCE".to_owned());
+            }
+            options.extend(
+                [
+                    "-D_LIBCPP_DISABLE_VISIBILITY_ANNOTATIONS",
+                    "-D_LIBCPP_HAS_NO_VENDOR_AVAILABILITY_ANNOTATIONS",
+                    "-D_LIBCXXABI_DISABLE_VISIBILITY_ANNOTATIONS",
+                    "-D_LIBCPP_PSTL_CPU_BACKEND_SERIAL",
+                    "-D_LIBCPP_ABI_VERSION=1",
+                    "-D_LIBCPP_ABI_NAMESPACE=__1",
+                    "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST",
+                    // Required by zig 0.15+ libc++ for streambuf and other I/O headers
+                    "-D_LIBCPP_HAS_LOCALIZATION=1",
+                    "-D_LIBCPP_HAS_WIDE_CHARACTERS=1",
+                    "-D_LIBCPP_HAS_UNICODE=1",
+                    "-D_LIBCPP_HAS_THREADS=1",
+                    "-D_LIBCPP_HAS_MONOTONIC_CLOCK",
+                    // Required by zig 0.17+ libc++ (LLVM 21); harmless no-ops on
+                    // older versions, which use the spellings above instead.
+                    // Should match `addCxxArgs` in zig's src/libs/libcxx.zig
+                    "-D_LIBCPP_ASSERTION_SEMANTIC_DEFAULT=_LIBCPP_ASSERTION_SEMANTIC_ENFORCE",
+                    "-D_LIBCPP_PSTL_BACKEND_SERIAL",
+                    "-D_LIBCPP_HAS_VENDOR_AVAILABILITY_ANNOTATIONS=0",
+                    "-D_LIBCPP_HAS_TERMINAL",
+                    "-D_LIBCPP_HAS_RANDOM_DEVICE",
+                    "-D_LIBCPP_HAS_NO_STD_MODULES",
+                ]
+                .into_iter()
+                .map(ToString::to_string),
+            );
+            options.push(format!(
+                "-D_LIBCPP_HAS_FILESYSTEM={}",
+                if raw_target.contains("wasi") { 0 } else { 1 }
+            ));
+            if raw_target.contains("linux") {
+                options.push("-D_LIBCPP_HAS_TIME_ZONE_DATABASE".to_owned());
+            }
+            if let Some(ver) = c_glibc_minor_ver {
+                // Handled separately because we have no way to infer this without Zig
+                options.push(format!("-D__GLIBC_MINOR__={ver}"));
+            }
+
+            for (kind, path) in cpp_paths.drain(..cpp_pre_len) {
+                if kind != Kind::Normal {
+                    // may also be Kind::Framework on macOS
+                    continue;
+                }
+                // Ideally this should be `-stdlib++-isystem`, which can be disabled by
+                // passing `-nostdinc++`, but it is fairly new: https://reviews.llvm.org/D64089
+                //
+                // (Also note that `-stdlib++-isystem` is a driver-only option,
+                // so it will be moved relative to other `-isystem` options against our will.)
+                options.push("-cxx-isystem".to_owned());
+                options.push(path);
+            }
+
+            for (kind, path) in c_paths {
+                match kind {
+                    Kind::Normal => {
+                        // A normal `-isystem` is preferred over `-cxx-isystem` by cc1...
+                        options.push("-Xclang".to_owned());
+                        options.push("-c-isystem".to_owned());
+                        options.push("-Xclang".to_owned());
+                        options.push(path.clone());
+                        options.push("-cxx-isystem".to_owned());
+                        options.push(path);
+                    }
+                    Kind::Framework => {
+                        options.push("-iframework".to_owned());
+                        options.push(path);
+                    }
+                }
+            }
+
+            let post_start = cpp_paths.len().saturating_sub(cpp_post_len);
+            for (kind, path) in cpp_paths.drain(post_start..) {
+                if kind != Kind::Normal {
+                    // may also be Kind::Framework on macOS
+                    continue;
+                }
+                options.push("-cxx-isystem".to_owned());
+                options.push(path);
+            }
+
+            if raw_target.contains("apple-darwin") {
+                // everyone seems to miss `#import <TargetConditionals.h>`...
+                options.push("-DTARGET_OS_IPHONE=0".to_string());
+            }
+            let escaped_options = shell_words::join(options.iter().map(|s| &s[..]));
+            let bindgen_env = "BINDGEN_EXTRA_CLANG_ARGS";
+            let fallback_value = env::var(bindgen_env);
+            for target in [&env_target[..], parsed_target] {
+                let name = format!("{bindgen_env}_{target}");
+                if let Ok(mut value) = env::var(&name).or(fallback_value.clone()) {
+                    if shell_words::split(&value).is_err() {
+                        // bindgen treats the whole string as a single argument if split fails
+                        value = shell_words::quote(&value).into_owned();
+                    }
+                    if !value.is_empty() {
+                        value.push(' ');
+                    }
+                    value.push_str(&escaped_options);
+                    unsafe { env::set_var(name, value) };
+                } else {
+                    unsafe { env::set_var(name, escaped_options.clone()) };
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn macos_sdk_root() -> Option<PathBuf> {
+        static SDK_ROOT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+        SDK_ROOT
+            .get_or_init(|| match env::var_os("SDKROOT") {
+                Some(sdkroot) if !sdkroot.is_empty() => Some(sdkroot.into()),
+                _ => {
+                    let output = Command::new("xcrun")
+                        .args(["--sdk", "macosx", "--show-sdk-path"])
+                        .output()
+                        .ok()?;
+                    if output.status.success() {
+                        let stdout = String::from_utf8(output.stdout).ok()?;
+                        let stdout = stdout.trim();
+                        if !stdout.is_empty() {
+                            return Some(stdout.into());
+                        }
+                    }
+                    None
+                }
+            })
+            .clone()
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn macos_sdk_root() -> Option<PathBuf> {
+        match env::var_os("SDKROOT") {
+            Some(sdkroot) if !sdkroot.is_empty() => Some(sdkroot.into()),
+            _ => None,
+        }
+    }
+}

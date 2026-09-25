@@ -1,0 +1,214 @@
+diff --git a/lychee-lib/src/client.rs b/lychee-lib/src/client.rs
+index 8bf8a8e..5c2f4c0 100644
+--- a/lychee-lib/src/client.rs
++++ b/lychee-lib/src/client.rs
+@@ -37,10 +37,8 @@ use crate::{
+     remap::Remaps,
+     types::{DEFAULT_ACCEPTED_STATUS_CODES, Redirects, redirect_history::RedirectHistory},
+ };
+-use crate::filter::{is_example_domain, is_false_positive, is_unsupported_domain};
+ #[cfg(feature = "email-check")]
+ use mailify_lib::Client as MailClient;
+-use url::Url;
+ 
+ /// Default number of redirects that are followed.
+ pub const DEFAULT_MAX_REDIRECTS: usize = 10;
+@@ -578,11 +576,7 @@ impl Client {
+         } = request.try_into()?;
+ 
+         let start = std::time::Instant::now(); // Measure check time
+-        let remap = if self.has_remap_rules() {
+-            self.remap(&mut uri)?.inspect(|r| debug!("Remapping {r}"))
+-        } else {
+-            None
+-        };
++        let remap = self.remap(&mut uri)?.inspect(|r| debug!("Remapping {r}"));
+ 
+         let (status, redirects) = match uri.scheme() {
+             _ if self.is_excluded(&uri) => (Status::Excluded, None),
+@@ -611,15 +605,18 @@ impl Client {
+     /// Remap [`Uri`] as a side-effect, using the client-defined remap rules.
+     /// Return `Some` only if a remap was performed.
+     ///
++    /// Matching and rewriting are delegated to [`Remaps::remap`]; the client
++    /// only threads the request through its configured rule set.
++    ///
+     /// # Errors
+     ///
+     /// Returns an `Err` if the remapped `uri` is not a valid URI.
+     pub fn remap(&self, uri: &mut Uri) -> Result<Option<Remap>> {
+-        if self.remaps.is_none() {
++        let Some(remaps) = self.remaps.as_ref() else {
+             return Ok(None);
+-        }
++        };
+ 
+-        let remapped = self.resolve_remap_target(uri)?;
++        let remapped = remaps.remap(uri)?;
+         if let Some(remapped) = &remapped {
+             *uri = remapped.new.clone();
+         }
+@@ -627,146 +624,14 @@ impl Client {
+         Ok(remapped)
+     }
+ 
+-    /// Whether at least one remap rule is configured.
+-    fn has_remap_rules(&self) -> bool {
+-        self.remaps.as_ref().is_some_and(|remaps| !remaps.is_empty())
+-    }
+-
+-    /// Find the remap rule that applies to `original`, if any, and build the
+-    /// resulting [`Remap`].
+-    ///
+-    /// The rules are evaluated sequentially and the first match wins, so a
+-    /// later rule never overrides an earlier one.
+-    ///
+-    /// # Errors
+-    ///
+-    /// Returns an `Err` if the remap rule produces an invalid URL.
+-    fn resolve_remap_target(&self, original: &Uri) -> Result<Option<Remap>> {
+-        let Some(remaps) = self.remaps.as_ref() else {
+-            return Ok(None);
+-        };
+-
+-        for (pattern, replacement) in &remaps.patterns {
+-            if pattern.is_match(original.as_str()) {
+-                let new = pattern.replace_all(original.as_str(), replacement);
+-                let new = Url::parse(&new).map_err(|_| {
+-                    ErrorKind::InvalidUrlRemap(format!("the result `{new}` is not a valid URL"))
+-                })?;
+-
+-                let remap = Remap {
+-                    original: original.clone(),
+-                    new: Uri { url: new },
+-                };
+-                return Ok(Some(remap));
+-            }
+-        }
+-
+-        Ok(None)
+-    }
+-
+     /// Returns whether the given `uri` should be ignored from checking.
+     ///
+-    /// The client evaluates the exclusion policy itself: the scheme and host
+-    /// rules, the IP classifications, the mail inclusions, the built-in
+-    /// exclusions for reserved and unsupported domains, and finally the
+-    /// include/exclude regular expressions.
++    /// The exclusion decision is owned by the configured [`Filter`]; the client
++    /// delegates to it so that the policy lives in a single place rather than
++    /// being re-evaluated here.
+     #[must_use]
+     pub fn is_excluded(&self, uri: &Uri) -> bool {
+-        // Skip mail address, specific IP, specific host, scheme, and built-in
+-        // exclusion categories.
+-        if self.is_scheme_excluded(uri)
+-            || self.is_host_excluded(uri)
+-            || self.is_ip_excluded(uri)
+-            || self.is_mail_excluded(uri)
+-            || uri.is_tel()
+-            || self.is_builtin_excluded(uri)
+-        {
+-            return true;
+-        }
+-
+-        let input = uri.as_str();
+-
+-        if self.is_includes_empty() {
+-            if self.is_excludes_empty() {
+-                // Both excludes and includes rules are empty:
+-                // *Presumably included* unless it's a false positive
+-                return is_false_positive(input);
+-            }
+-        } else if self.is_includes_match(input) {
+-            // *Explicitly included* (Includes take precedence over excludes)
+-            return false;
+-        }
+-
+-        // Exclude well-known false-positives
+-        // Performed after checking includes to allow user-overwrites
+-        if is_false_positive(input)
+-            // Previous checks imply input is not explicitly included.
+-            // If exclude rules are empty, then *presumably excluded*
+-            || self.is_excludes_empty()
+-            // If exclude rules match input, then *explicitly excluded*
+-            || self.is_excludes_match(input)
+-        {
+-            return true;
+-        }
+-
+-        false
+-    }
+-
+-    /// Whether the URI belongs to the built-in exclusion categories: reserved
+-    /// example domains and known unsupported domains.
+-    fn is_builtin_excluded(&self, uri: &Uri) -> bool {
+-        is_example_domain(uri) || is_unsupported_domain(uri)
+-    }
+-
+-    /// Whether the scheme of the given URI is excluded
+-    fn is_scheme_excluded(&self, uri: &Uri) -> bool {
+-        if self.filter.schemes.is_empty() {
+-            return false;
+-        }
+-        !self.filter.schemes.contains(uri.scheme())
+-    }
+-
+-    /// Whether the host is excluded from checking
+-    fn is_host_excluded(&self, uri: &Uri) -> bool {
+-        // If loopback IPs are excluded, exclude localhost as well, which usually maps to a loopback IP
+-        self.filter.exclude_loopback_ips && uri.domain() == Some("localhost")
+-    }
+-
+-    /// Whether the IP address is excluded from checking
+-    fn is_ip_excluded(&self, uri: &Uri) -> bool {
+-        if (self.filter.exclude_loopback_ips && uri.is_loopback())
+-            || (self.filter.exclude_private_ips && uri.is_private())
+-            || (self.filter.exclude_link_local_ips && uri.is_link_local())
+-        {
+-            return true;
+-        }
+-
+-        false
+-    }
+-
+-    /// Whether e-mails aren't checked (which is the default)
+-    fn is_mail_excluded(&self, uri: &Uri) -> bool {
+-        uri.is_mail() && !self.filter.include_mail
+-    }
+-
+-    /// Whether no include rules are configured
+-    fn is_includes_empty(&self) -> bool {
+-        !matches!(self.filter.includes, Some(ref includes) if !includes.is_empty())
+-    }
+-
+-    /// Whether no exclude rules are configured
+-    fn is_excludes_empty(&self) -> bool {
+-        !matches!(self.filter.excludes, Some(ref excludes) if !excludes.is_empty())
+-    }
+-
+-    /// Whether the include rules match the given input
+-    fn is_includes_match(&self, input: &str) -> bool {
+-        matches!(self.filter.includes, Some(ref includes) if includes.is_match(input))
+-    }
+-
+-    /// Whether the exclude rules match the given input
+-    fn is_excludes_match(&self, input: &str) -> bool {
+-        matches!(self.filter.excludes, Some(ref excludes) if excludes.is_match(input))
++        self.filter.is_excluded(uri)
+     }
+ 
+     /// Checks the given URI of a website.
+diff --git a/lychee-lib/src/remap.rs b/lychee-lib/src/remap.rs
+index eddfd19..95806e4 100644
+--- a/lychee-lib/src/remap.rs
++++ b/lychee-lib/src/remap.rs
+@@ -53,7 +53,7 @@ impl Display for Remap {
+ #[derive(Debug, Clone)]
+ pub struct Remaps {
+     /// The remap rules, in evaluation order.
+-    pub(crate) patterns: Vec<(Regex, String)>,
++    patterns: Vec<(Regex, String)>,
+ }
+ 
+ impl Remaps {

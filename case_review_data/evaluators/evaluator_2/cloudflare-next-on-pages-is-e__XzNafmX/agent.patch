@@ -1,0 +1,466 @@
+diff --git a/package-lock.json b/package-lock.json
+index 1bcce2b..98993f9 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -15385,7 +15385,7 @@
+ 			}
+ 		},
+ 		"packages/eslint-plugin-next-on-pages": {
+-			"version": "1.13.15",
++			"version": "1.13.16",
+ 			"license": "MIT",
+ 			"dependencies": {
+ 				"@types/estree-jsx": "^1.0.0",
+@@ -15423,7 +15423,7 @@
+ 		},
+ 		"packages/next-on-pages": {
+ 			"name": "@cloudflare/next-on-pages",
+-			"version": "1.13.15",
++			"version": "1.13.16",
+ 			"license": "MIT",
+ 			"dependencies": {
+ 				"acorn": "^8.8.0",
+diff --git a/packages/next-on-pages/templates/_worker.js/utils/cache.ts b/packages/next-on-pages/templates/_worker.js/utils/cache.ts
+index c27d370..209cf99 100644
+--- a/packages/next-on-pages/templates/_worker.js/utils/cache.ts
++++ b/packages/next-on-pages/templates/_worker.js/utils/cache.ts
+@@ -1,6 +1,7 @@
+ import type {
+ 	IncrementalCacheValue,
+ 	SuspenseCacheAdaptor,
++	SuspenseCacheStorageAdaptor,
+ } from '../../cache';
+ import { SUSPENSE_CACHE_URL, SuspenseCache } from '../../cache';
+ import { doImport } from './doImport';
+@@ -113,10 +114,10 @@ export async function getSuspenseCacheAdaptor(): Promise<SuspenseCacheAdaptor> {
+ }
+ 
+ /**
+- * Gets the suspense cache composed of the provided internal cache adaptor.
++ * Gets the suspense cache composed of the provided internal storage adaptor.
+  *
+- * @param type The type of adaptor to compose the suspense cache of.
+- * @returns The suspense cache for the adaptor.
++ * @param type The type of storage adaptor to compose the suspense cache of.
++ * @returns The suspense cache for the storage adaptor.
+  */
+ async function getSuspenseCache(
+ 	type: 'kv' | 'cache-api',
+@@ -126,14 +127,14 @@ async function getSuspenseCache(
+ }
+ 
+ /**
+- * Gets an internal cache adaptor.
++ * Gets an internal storage adaptor.
+  *
+- * @param type The type of adaptor to get.
+- * @returns A new instance of the adaptor.
++ * @param type The type of storage adaptor to get.
++ * @returns A new instance of the storage adaptor.
+  */
+ async function getInternalCacheAdaptor(
+ 	type: 'kv' | 'cache-api',
+-): Promise<SuspenseCacheAdaptor> {
++): Promise<SuspenseCacheStorageAdaptor> {
+ 	const moduleName = `./__next-on-pages-dist__/cache/${type}.js`;
+ 	const adaptor = await doImport(moduleName);
+ 	return new adaptor.default();
+diff --git a/packages/next-on-pages/templates/cache/adaptor.ts b/packages/next-on-pages/templates/cache/adaptor.ts
+index e94d626..883ec1c 100644
+--- a/packages/next-on-pages/templates/cache/adaptor.ts
++++ b/packages/next-on-pages/templates/cache/adaptor.ts
+@@ -8,18 +8,16 @@ const NEXT_CACHE_IMPLICIT_TAG_ID = '_N_T_';
+ const revalidatedTags = new Set<string>();
+ 
+ /**
+- * The unified contract for suspense cache adaptors.
++ * The raw storage that backs a suspense cache.
+  *
+- * Every suspense cache adaptor — no matter what it provides under the hood —
+- * implements this contract in full, so that any adaptor can be provided
+- * directly to the Next.js incremental cache handler (and to the cache tooling)
+- * without any caller having to know which of the adaptor's capabilities the
+- * adaptor actually supports.
+- *
+- * The contract covers the raw storage of cache entries, the Next.js incremental
+- * cache entry protocol and the tags manifest lifecycle.
++ * A storage adaptor provides only retrieval and update of cache entries (and
++ * the key derivation that the storage backend needs). The Next.js
++ * incremental-cache entry protocol and the tags manifest lifecycle are layered
++ * on top by the {@link SuspenseCache} that composes the adaptor, so a storage
++ * adaptor is free to declare only what its backing store can meaningfully
++ * support.
+  */
+-export interface SuspenseCacheAdaptor {
++export interface SuspenseCacheStorageAdaptor {
+ 	/**
+ 	 * Retrieves a raw entry from the storage mechanism.
+ 	 *
+@@ -35,11 +33,7 @@ export interface SuspenseCacheAdaptor {
+ 	 * @param value The value to update.
+ 	 * @param revalidate Revalidation time for the entry, if any.
+ 	 */
+-	update(
+-		key: string,
+-		value: string,
+-		revalidate?: number,
+-	): Promise<void>;
++	update(key: string, value: string, revalidate?: number): Promise<void>;
+ 
+ 	/**
+ 	 * Builds the full cache key for the suspense cache.
+@@ -48,7 +42,20 @@ export interface SuspenseCacheAdaptor {
+ 	 * @returns The fully-formed cache key for the suspense cache.
+ 	 */
+ 	buildCacheKey(key: string): string;
++}
+ 
++/**
++ * The contract that a composed suspense cache provides to serve requests to
++ * Next's incremental cache.
++ *
++ * This covers the incremental-cache entry protocol and the tags manifest
++ * lifecycle, exposed as the small surface that the cache request handler (and
++ * any other consumer of a composed suspense cache) actually relies on. It is
++ * the only surface callers need to know about, regardless of the storage that
++ * backs the cache; a storage backend never has to pretend to support the
++ * protocol it cannot.
++ */
++export interface SuspenseCacheAdaptor {
+ 	/**
+ 	 * Retrieves an entry from the suspense cache.
+ 	 *
+@@ -75,48 +82,16 @@ export interface SuspenseCacheAdaptor {
+ 	 * @param tag Tag to revalidate.
+ 	 */
+ 	revalidateTag(tag: string): Promise<void>;
+-
+-	/** The tags manifest for fetch calls. */
+-	tagsManifest: TagsManifest | undefined;
+-
+-	/** The key used for the tags manifest in the cache. */
+-	tagsManifestKey: string;
+-
+-	/** Promise that resolves when tags manifest is loaded */
+-	tagsManifestPromise: Promise<void> | undefined;
+-
+-	/**
+-	 * Loads the tags manifest from the suspense cache.
+-	 *
+-	 * @param force Whether to force a reload of the tags manifest.
+-	 */
+-	loadTagsManifest(force?: boolean): Promise<void>;
+-
+-	/**
+-	 * Saves the local tags manifest in the suspence cache.
+-	 */
+-	saveTagsManifest(): Promise<void>;
+-
+-	/**
+-	 * Sets the tags for an item in the suspense cache's tags manifest.
+-	 *
+-	 * @param tags Tags for the key.
+-	 * @param setTagsInfo Key for the item in the suspense cache, or the new revalidated at timestamp.
+-	 */
+-	setTags(
+-		tags: string[],
+-		{ cacheKey, revalidatedAt }: { cacheKey?: string; revalidatedAt?: number },
+-	): Promise<void>;
+ }
+ 
+ /**
+  * The suspense cache used to serve requests to Next's incremental cache.
+  *
+- * This is the reference implementation of the SuspenseCacheAdaptor contract: it
+- * composes a storage adaptor with the tags manifest lifecycle and the Next.js
+- * incremental cache entry protocol, so that requests for cache entries and tag
+- * revalidations are served through the same contract regardless of what
+- * provides the storage under the hood.
++ * This is the reference implementation of the {@link SuspenseCacheAdaptor}
++ * contract: it composes a {@link SuspenseCacheStorageAdaptor} with the tags
++ * manifest lifecycle and the Next.js incremental cache entry protocol, exposing
++ * the small surface that the incremental-cache request handler relies on
++ * regardless of what provides the storage under the hood.
+  */
+ export class SuspenseCache implements SuspenseCacheAdaptor {
+ 	/** The tags manifest for fetch calls. */
+@@ -127,45 +102,10 @@ export class SuspenseCache implements SuspenseCacheAdaptor {
+ 	public tagsManifestPromise: Promise<void> | undefined;
+ 
+ 	/**
+-	 * @param adaptor The suspense cache adaptor providing the storage, the
+-	 * cache entries and the tags manifest.
++	 * @param adaptor The storage adaptor providing the raw storage that backs
++	 * the suspense cache.
+ 	 */
+-	constructor(private adaptor: SuspenseCacheAdaptor) {}
+-
+-	/**
+-	 * Retrieves a raw entry from the storage mechanism.
+-	 *
+-	 * @param key Key for the item.
+-	 * @returns The value, or null if no entry exists.
+-	 */
+-	public async retrieve(key: string): Promise<string | null> {
+-		return this.adaptor.retrieve(key);
+-	}
+-
+-	/**
+-	 * Updates a raw entry in the storage mechanism.
+-	 *
+-	 * @param key Key for the item.
+-	 * @param value The value to update.
+-	 * @param revalidate Revalidation time for the entry, if any.
+-	 */
+-	public async update(
+-		key: string,
+-		value: string,
+-		revalidate?: number,
+-	): Promise<void> {
+-		return this.adaptor.update(key, value, revalidate);
+-	}
+-
+-	/**
+-	 * Builds the full cache key for the suspense cache.
+-	 *
+-	 * @param key Key for the item in the suspense cache.
+-	 * @returns The fully-formed cache key for the suspense cache.
+-	 */
+-	public buildCacheKey(key: string) {
+-		return this.adaptor.buildCacheKey(key);
+-	}
++	constructor(private adaptor: SuspenseCacheStorageAdaptor) {}
+ 
+ 	/**
+ 	 * Puts a new entry in the suspense cache.
+@@ -180,7 +120,7 @@ export class SuspenseCache implements SuspenseCacheAdaptor {
+ 		};
+ 
+ 		// Update the cache entry.
+-		const updateOp = this.update(
++		const updateOp = this.adaptor.update(
+ 			key,
+ 			JSON.stringify(newEntry),
+ 			value.revalidate,
+@@ -219,7 +159,7 @@ export class SuspenseCache implements SuspenseCacheAdaptor {
+ 		{ softTags }: { softTags?: string[] },
+ 	): Promise<CacheHandlerValue | null> {
+ 		// Get entry from the cache.
+-		const entryPromise = this.retrieve(key);
++		const entryPromise = this.adaptor.retrieve(key);
+ 
+ 		// Start loading the tags manifest.
+ 		const tagsManifestLoad = this.loadTagsManifest();
+@@ -304,7 +244,7 @@ export class SuspenseCache implements SuspenseCacheAdaptor {
+ 	 */
+ 	private async loadTagsManifestInternal(): Promise<void> {
+ 		try {
+-			const rawManifest = await this.retrieve(this.tagsManifestKey);
++			const rawManifest = await this.adaptor.retrieve(this.tagsManifestKey);
+ 			if (rawManifest) {
+ 				this.tagsManifest = JSON.parse(rawManifest) as TagsManifest;
+ 			}
+@@ -322,7 +262,7 @@ export class SuspenseCache implements SuspenseCacheAdaptor {
+ 	public async saveTagsManifest(): Promise<void> {
+ 		if (this.tagsManifest) {
+ 			const newValue = JSON.stringify(this.tagsManifest);
+-			await this.update(this.tagsManifestKey, newValue);
++			await this.adaptor.update(this.tagsManifestKey, newValue);
+ 		}
+ 	}
+ 
+diff --git a/packages/next-on-pages/templates/cache/cache-api.ts b/packages/next-on-pages/templates/cache/cache-api.ts
+index 0c91ad9..9f6bdee 100644
+--- a/packages/next-on-pages/templates/cache/cache-api.ts
++++ b/packages/next-on-pages/templates/cache/cache-api.ts
+@@ -1,25 +1,18 @@
+-import type {
+-	CacheHandlerValue,
+-	IncrementalCacheValue,
+-	SuspenseCacheAdaptor,
+-	TagsManifest,
+-} from './adaptor.js';
++import type { SuspenseCacheStorageAdaptor } from './adaptor.js';
+ import { SUSPENSE_CACHE_URL } from './adaptor.js';
+ 
+-/** Suspense Cache adaptor for the Cache API. */
+-export default class CacheApiAdaptor implements SuspenseCacheAdaptor {
+-	/** The tags manifest for fetch calls. */
+-	public tagsManifest: TagsManifest | undefined;
+-
++/**
++ * Suspense Cache adaptor for the Cache API.
++ *
++ * The Cache API only provides the raw storage of the suspense cache; the
++ * Next.js incremental-cache entry protocol and the tags manifest lifecycle are
++ * served through the suspense cache that composes this storage adaptor, so this
++ * is the full extent of what this adaptor needs to support.
++ */
++export default class CacheApiAdaptor implements SuspenseCacheStorageAdaptor {
+ 	/** Name of the cache to open in the Cache API. */
+ 	public cacheName = 'suspense-cache';
+ 
+-	/** The key used for the tags manifest in the cache. */
+-	public tagsManifestKey = 'tags-manifest';
+-
+-	/** Promise that resolves when tags manifest is loaded */
+-	public tagsManifestPromise: Promise<void> | undefined;
+-
+ 	/**
+ 	 * @param ctx The incremental cache context from Next.js. NOTE: This is not currently utilised in NOP.
+ 	 */
+@@ -70,60 +63,4 @@ export default class CacheApiAdaptor implements SuspenseCacheAdaptor {
+ 		});
+ 		await cache.put(this.buildCacheKey(key), response);
+ 	}
+-
+-	/**
+-	 * Note: Cache API adaptors only provide the raw storage of the suspense cache;
+-	 * cache entries are served through the suspense cache that composes the adaptor.
+-	 */
+-	public async get(
+-		key: string,
+-		{ softTags }: { softTags?: string[] },
+-	): Promise<CacheHandlerValue | null> {
+-		throw new Error(
+-			`Method not supported by the Cache API adaptor - ${key}, ${softTags}`,
+-		);
+-	}
+-
+-	/**
+-	 * Note: Cache API adaptors only provide the raw storage of the suspense cache.
+-	 */
+-	public async set(key: string, value: IncrementalCacheValue): Promise<void> {
+-		throw new Error(
+-			`Method not supported by the Cache API adaptor - ${key}, ${value}`,
+-		);
+-	}
+-
+-	/**
+-	 * Note: Cache API adaptors only provide the raw storage of the suspense cache.
+-	 */
+-	public async revalidateTag(tag: string): Promise<void> {
+-		throw new Error(`Method not supported by the Cache API adaptor - ${tag}`);
+-	}
+-
+-	/**
+-	 * Note: Cache API adaptors don't store a tags manifest of their own; the
+-	 * manifest is handled by the suspense cache that composes the adaptor.
+-	 */
+-	public async loadTagsManifest(force = false): Promise<void> {
+-		throw new Error(`Method not supported by the Cache API adaptor - ${force}`);
+-	}
+-
+-	/**
+-	 * Note: Cache API adaptors don't store a tags manifest of their own.
+-	 */
+-	public async saveTagsManifest(): Promise<void> {
+-		throw new Error('Method not supported by the Cache API adaptor');
+-	}
+-
+-	/**
+-	 * Note: Cache API adaptors don't store a tags manifest of their own.
+-	 */
+-	public async setTags(
+-		tags: string[],
+-		{ cacheKey, revalidatedAt }: { cacheKey?: string; revalidatedAt?: number },
+-	): Promise<void> {
+-		throw new Error(
+-			`Method not supported by the Cache API adaptor - ${tags}, ${cacheKey}, ${revalidatedAt}`,
+-		);
+-	}
+ }
+diff --git a/packages/next-on-pages/templates/cache/kv.ts b/packages/next-on-pages/templates/cache/kv.ts
+index 7b23915..f2c9235 100644
+--- a/packages/next-on-pages/templates/cache/kv.ts
++++ b/packages/next-on-pages/templates/cache/kv.ts
+@@ -1,22 +1,15 @@
+-import type {
+-	CacheHandlerValue,
+-	IncrementalCacheValue,
+-	SuspenseCacheAdaptor,
+-	TagsManifest,
+-} from './adaptor.js';
++import type { SuspenseCacheStorageAdaptor } from './adaptor.js';
+ import { SUSPENSE_CACHE_URL } from './adaptor.js';
+ 
+-/** Suspense Cache adaptor for Workers KV. */
+-export default class KVAdaptor implements SuspenseCacheAdaptor {
+-	/** The tags manifest for fetch calls. */
+-	public tagsManifest: TagsManifest | undefined;
+-
+-	/** The key used for the tags manifest in the cache. */
+-	public tagsManifestKey = 'tags-manifest';
+-
+-	/** Promise that resolves when tags manifest is loaded */
+-	public tagsManifestPromise: Promise<void> | undefined;
+-
++/**
++ * Suspense Cache adaptor for Workers KV.
++ *
++ * KV only provides the raw storage of the suspense cache; the Next.js
++ * incremental-cache entry protocol and the tags manifest lifecycle are served
++ * through the suspense cache that composes this storage adaptor, so this is
++ * the full extent of what this adaptor needs to support.
++ */
++export default class KVAdaptor implements SuspenseCacheStorageAdaptor {
+ 	/**
+ 	 * @param ctx The incremental cache context from Next.js. NOTE: This is not currently utilised in NOP.
+ 	 */
+@@ -70,56 +63,4 @@ export default class KVAdaptor implements SuspenseCacheAdaptor {
+ 			expiry,
+ 		);
+ 	}
+-
+-	/**
+-	 * Note: KV adaptors only provide the raw storage of the suspense cache; cache
+-	 * entries are served through the suspense cache that composes the adaptor.
+-	 */
+-	public async get(
+-		key: string,
+-		{ softTags }: { softTags?: string[] },
+-	): Promise<CacheHandlerValue | null> {
+-		throw new Error(`Method not supported by the KV adaptor - ${key}, ${softTags}`);
+-	}
+-
+-	/**
+-	 * Note: KV adaptors only provide the raw storage of the suspense cache.
+-	 */
+-	public async set(key: string, value: IncrementalCacheValue): Promise<void> {
+-		throw new Error(`Method not supported by the KV adaptor - ${key}, ${value}`);
+-	}
+-
+-	/**
+-	 * Note: KV adaptors only provide the raw storage of the suspense cache.
+-	 */
+-	public async revalidateTag(tag: string): Promise<void> {
+-		throw new Error(`Method not supported by the KV adaptor - ${tag}`);
+-	}
+-
+-	/**
+-	 * Note: KV adaptors don't store a tags manifest of their own; the manifest is
+-	 * handled by the suspense cache that composes the adaptor.
+-	 */
+-	public async loadTagsManifest(force = false): Promise<void> {
+-		throw new Error(`Method not supported by the KV adaptor - ${force}`);
+-	}
+-
+-	/**
+-	 * Note: KV adaptors don't store a tags manifest of their own.
+-	 */
+-	public async saveTagsManifest(): Promise<void> {
+-		throw new Error('Method not supported by the KV adaptor');
+-	}
+-
+-	/**
+-	 * Note: KV adaptors don't store a tags manifest of their own.
+-	 */
+-	public async setTags(
+-		tags: string[],
+-		{ cacheKey, revalidatedAt }: { cacheKey?: string; revalidatedAt?: number },
+-	): Promise<void> {
+-		throw new Error(
+-			`Method not supported by the KV adaptor - ${tags}, ${cacheKey}, ${revalidatedAt}`,
+-		);
+-	}
+ }

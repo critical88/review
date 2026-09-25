@@ -1,0 +1,207 @@
+diff --git a/notify-debouncer-full/src/file_id_map.rs b/notify-debouncer-full/src/file_id_map.rs
+index e9d5738..34a911a 100644
+--- a/notify-debouncer-full/src/file_id_map.rs
++++ b/notify-debouncer-full/src/file_id_map.rs
+@@ -1,20 +1,22 @@
+-use crate::{Debouncer, FileIdCache};
+-use file_id::FileId;
++use crate::FileIdCache;
++use file_id::{FileId, get_file_id};
+ use notify::RecursiveMode;
+ use rustc_hash::FxHashMap as HashMap;
+ use std::path::{Path, PathBuf};
++use walkdir::WalkDir;
+ 
+ /// A cache to hold the file system IDs of all watched files.
+ ///
+ /// The file ID cache uses unique file IDs provided by the file system and is used to stitch together
+ /// rename events in case the notification back-end doesn't emit rename cookies.
+ ///
+-/// This type is a data container: the scanning, forgetting and rescan logic lives on
+-/// [`Debouncer`](crate::Debouncer), which coordinates file IDs together with the watch roots and
+-/// event queues.
++/// This type owns the full file ID bookkeeping — scanning watched paths, forgetting removed
++/// subtrees, rescanning all roots after a backend hiccup and answering membership queries.
++/// [`Debouncer`](crate::Debouncer) only holds the cache and forwards it the paths it learns
++/// about from the watch roots, keeping the file ID domain out of the debouncing coordinator.
+ #[derive(Debug, Clone, Default)]
+ pub struct FileIdMap {
+-    pub(crate) paths: HashMap<PathBuf, FileId>,
++    paths: HashMap<PathBuf, FileId>,
+ }
+ 
+ impl FileIdMap {
+@@ -23,22 +25,43 @@ impl FileIdMap {
+     pub fn new() -> Self {
+         Default::default()
+     }
++
++    /// How deep [`WalkDir`] descends when scanning a root: every level for
++    /// recursive roots, a single level otherwise.
++    fn dir_scan_depth(is_recursive: bool) -> usize {
++        if is_recursive { usize::MAX } else { 1 }
++    }
+ }
+ 
+ impl FileIdCache for FileIdMap {
+     fn cached_file_id(&self, path: &Path) -> Option<impl AsRef<FileId>> {
+-        Debouncer::cached_file_id_of(self, path)
++        self.paths.get(path)
+     }
+ 
+     fn add_path(&mut self, path: &Path, recursive_mode: RecursiveMode) {
+-        Debouncer::scan_file_ids(self, path, recursive_mode);
++        let is_recursive = recursive_mode == RecursiveMode::Recursive;
++
++        for (path, file_id) in WalkDir::new(path)
++            .follow_links(true)
++            .max_depth(Self::dir_scan_depth(is_recursive))
++            .into_iter()
++            .filter_map(|entry| {
++                let path = entry.ok()?.into_path();
++                let file_id = get_file_id(&path).ok()?;
++                Some((path, file_id))
++            })
++        {
++            self.paths.insert(path, file_id);
++        }
+     }
+ 
+     fn remove_path(&mut self, path: &Path) {
+-        Debouncer::forget_file_ids(self, path);
++        self.paths.retain(|p, _| !p.starts_with(path));
+     }
+ 
+     fn rescan(&mut self, root_paths: &[(PathBuf, RecursiveMode)]) {
+-        Debouncer::rescan_file_ids(self, root_paths);
++        for (path, recursive_mode) in root_paths {
++            self.add_path(path, *recursive_mode);
++        }
+     }
+ }
+diff --git a/notify-debouncer-full/src/lib.rs b/notify-debouncer-full/src/lib.rs
+index 15104f4..730847b 100644
+--- a/notify-debouncer-full/src/lib.rs
++++ b/notify-debouncer-full/src/lib.rs
+@@ -66,9 +66,10 @@
+ //! # Architecture
+ //!
+ //! [`Debouncer`] is the single coordinator of the debouncing pipeline: it owns the debounced
+-//! event queues, the rename and rescan bookkeeping, the watch roots, the file ID scanning, and
+-//! the wiring of the watcher and the delivery thread. The state it works on is a plain data
+-//! record ([`DebounceDataInner`]); every policy decision lives on the coordinator itself.
++//! event queues, the rename and rescan bookkeeping, the watch roots, and the wiring of the
++//! watcher and the delivery thread. File ID bookkeeping is delegated to the cache it holds (see
++//! [`FileIdMap`]); the state it works on is a plain data record ([`DebounceDataInner`]), and
++//! every debouncing policy decision lives on the coordinator itself.
+ 
+ mod cache;
+ #[cfg(test)]
+@@ -103,15 +104,11 @@ pub use notify;
+ pub use notify_types::debouncer_full::DebouncedEvent;
+ 
+ use file_id::FileId;
+-#[cfg(not(target_family = "wasm"))]
+-use file_id::get_file_id;
+ use notify::{
+     Error, ErrorKind, Event, EventKind, PathOp, RecommendedWatcher, RecursiveMode,
+     UpdatePathsError, Watcher, WatcherKind,
+     event::{ModifyKind, RemoveKind, RenameMode},
+ };
+-#[cfg(not(target_family = "wasm"))]
+-use walkdir::WalkDir;
+ 
+ /// The set of requirements for watcher debounce event handling functions.
+ ///
+@@ -231,10 +228,12 @@ pub(crate) struct DebounceDataInner {
+ /// `Debouncer` is the one object that owns the whole debouncing pipeline:
+ /// the state record the watcher thread writes into, the file ID cache, the
+ /// queue policy, the expiry logic, the watch roots and the delivery thread.
++/// The file ID cache is responsible for its own scanning; `Debouncer` only
++/// feeds it the paths it learns from the watch roots.
+ ///
+-/// The state-handling and file-ID-scanning logic is exposed as associated
+-/// functions so the watcher thread and the delivery thread can execute the
+-/// full pipeline without holding a debouncer guard themselves.
++/// The state-handling logic is exposed as associated functions so the watcher
++/// thread and the delivery thread can execute the full pipeline without holding
++/// a debouncer guard themselves.
+ #[derive(Debug)]
+ pub struct Debouncer<T: Watcher, C: FileIdCache> {
+     watcher: T,
+@@ -954,7 +953,8 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
+     /// The clock every debouncer timestamp comes from.
+     ///
+     /// The debouncer used to reach for a free-standing clock module; now that
+-    /// the coordinator owns the whole pipeline the clock belongs to it as well.
++    /// the coordinator owns the pipeline's timing the clock belongs to it as
++    /// well.
+     #[cfg(not(test))]
+     pub(crate) fn now() -> Instant {
+         Instant::now()
+@@ -968,65 +968,6 @@ impl<T: Watcher, C: FileIdCache> Debouncer<T, C> {
+     }
+ }
+ 
+-/// [`Debouncer`]'s file ID bookkeeping for the built-in [`FileIdMap`] cache.
+-///
+-/// The coordinator owns the file ID duties as much as the queueing duties:
+-/// scanning paths, forgetting subtrees, rescanning all roots after a backend
+-/// hiccup, and answering membership queries. [`FileIdMap`] is therefore only a
+-/// data container; its `FileIdCache` implementation forwards to the associated
+-/// functions below. The watcher half is irrelevant to the file ID duties, so
+-/// it is pinned to notify's inert `NullWatcher`.
+-#[cfg(not(target_family = "wasm"))]
+-impl Debouncer<notify::NullWatcher, FileIdMap> {
+-    /// Look up the cached file ID of a path.
+-    pub(crate) fn cached_file_id_of<'a>(
+-        cache: &'a FileIdMap,
+-        path: &Path,
+-    ) -> Option<&'a FileId> {
+-        cache.paths.get(path)
+-    }
+-
+-    /// Scan a path (recursively below a root, if requested) and remember the
+-    /// file IDs of everything found.
+-    pub(crate) fn scan_file_ids(
+-        cache: &mut FileIdMap,
+-        path: &Path,
+-        recursive_mode: RecursiveMode,
+-    ) {
+-        let is_recursive = recursive_mode == RecursiveMode::Recursive;
+-
+-        for (path, file_id) in WalkDir::new(path)
+-            .follow_links(true)
+-            .max_depth(Self::dir_scan_depth(is_recursive))
+-            .into_iter()
+-            .filter_map(|entry| {
+-                let path = entry.ok()?.into_path();
+-                let file_id = get_file_id(&path).ok()?;
+-                Some((path, file_id))
+-            })
+-        {
+-            cache.paths.insert(path, file_id);
+-        }
+-    }
+-
+-    /// Forget the file IDs of a path and everything below it.
+-    pub(crate) fn forget_file_ids(cache: &mut FileIdMap, path: &Path) {
+-        cache.paths.retain(|p, _| !p.starts_with(path));
+-    }
+-
+-    /// Re-scan all `root_paths` after the notification back-end has dropped
+-    /// events and the debouncer asked for a full rescan.
+-    pub(crate) fn rescan_file_ids(cache: &mut FileIdMap, root_paths: &[(PathBuf, RecursiveMode)]) {
+-        for (path, recursive_mode) in root_paths {
+-            Self::scan_file_ids(cache, path, *recursive_mode);
+-        }
+-    }
+-
+-    fn dir_scan_depth(is_recursive: bool) -> usize {
+-        if is_recursive { usize::MAX } else { 1 }
+-    }
+-}
+-
+ impl<T: Watcher, C: FileIdCache> Drop for Debouncer<T, C> {
+     fn drop(&mut self) {
+         self.set_stop();

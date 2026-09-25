@@ -1,0 +1,1469 @@
+diff --git a/src/commands.ts b/src/commands.ts
+index 4f4667a..ef7a1ef 100644
+--- a/src/commands.ts
++++ b/src/commands.ts
+@@ -1,18 +1,8 @@
+-import { DiagnosticSink } from '@zzzen/pyright-internal/dist/common/diagnosticSink';
+-import { printParseNodeType } from '@zzzen/pyright-internal/dist/analyzer/parseTreeUtils';
+-import {
+-  type ClassNode,
+-  type FunctionNode,
+-  type ParseNode,
+-  ParseNodeType,
+-  type SuiteNode,
+-} from '@zzzen/pyright-internal/dist/parser/parseNodes';
+-import { getChildNodes } from '@zzzen/pyright-internal/dist/parser/parseTreeUtils';
+-import { ParseOptions, type ParseFileResults, Parser } from '@zzzen/pyright-internal/dist/parser/parser';
+ import * as child_process from 'node:child_process';
+ import { type Terminal, Uri, window, workspace } from 'coc.nvim';
+ import path from 'node:path';
+ import { PythonSettings } from './configSettings';
++import * as parser from './parsers';
+ import type { TestingFramework } from './types';
+ 
+ let terminal: Terminal | undefined;
+@@ -104,66 +94,14 @@ export async function runSingleTest() {
+     return window.showErrorMessage('This file is not a python test file!');
+   }
+ 
+-  // Parse the python source in place.
+-  const parseOptions = new ParseOptions();
+-  const diagSink = new DiagnosticSink();
+-  const pythonParser = new Parser();
+-  let parsed: ParseFileResults | undefined;
+-  try {
+-    parsed = pythonParser.parseSourceFile(document.getText(), parseOptions, diagSink);
+-  } catch (_e) {}
++  const parsed = parser.parse(document.getText());
+   if (!parsed) return window.showErrorMessage('Test not found');
+ 
+-  // Collect the test functions straight from the tree: every function whose
+-  // name starts with test_ inside a suite (or at module level for pytest).
+-  const featureItems: { value: string; startOffset: number; endOffset: number }[] = [];
+-  const collectTestFunctions = (node: ParseNode): void => {
+-    if (node.nodeType === ParseNodeType.Function) {
+-      const fNode = node as FunctionNode;
+-      if (fNode.d.name.d.value.startsWith('test_')) {
+-        if (fNode.parent && printParseNodeType(fNode.parent.nodeType) === 'Suite') {
+-          let fullyQualifiedTestName = '';
+-          let currentNode: FunctionNode | ParseNode | undefined = fNode;
+-          let parentSuiteNode = currentNode?.parent as SuiteNode;
+-          while (parentSuiteNode.parent && printParseNodeType(parentSuiteNode.parent.nodeType) === 'Class') {
+-            const classNode = parentSuiteNode.parent as ClassNode;
+-
+-            let combineString: string | undefined;
+-            if (framework === 'unittest') {
+-              combineString = '.';
+-            } else if (framework === 'pytest') {
+-              combineString = '::';
+-            }
+-            fullyQualifiedTestName = classNode.d.name.d.value + combineString + fullyQualifiedTestName;
+-            currentNode = currentNode?.parent?.parent;
+-            parentSuiteNode = currentNode?.parent as SuiteNode;
+-          }
+-          featureItems.push({
+-            value: fullyQualifiedTestName + fNode.d.name.d.value,
+-            startOffset: fNode.start,
+-            endOffset: fNode.start + fNode.length - 1,
+-          });
+-        } else {
+-          if (framework === 'pytest') {
+-            featureItems.push({
+-              value: fNode.d.name.d.value,
+-              startOffset: fNode.start,
+-              endOffset: fNode.start + fNode.length - 1,
+-            });
+-          }
+-        }
+-      }
+-    }
+-    for (const child of getChildNodes(node)) {
+-      if (child) {
+-        collectTestFunctions(child);
+-      }
+-    }
+-  };
+-  collectTestFunctions(parsed.parserOutput.parseTree);
++  const walker = new parser.TestFrameworkWalker(framework);
++  walker.walk(parsed.parserOutput.parseTree);
+ 
+   let testFunction: string | undefined;
+-  for (const item of featureItems) {
++  for (const item of walker.featureItems) {
+     const itemStartPosition = document.positionAt(item.startOffset);
+     const itemEndPosition = document.positionAt(item.endOffset);
+     if (position.line >= itemStartPosition.line && position.line <= itemEndPosition.line) {
+@@ -173,89 +111,5 @@ export async function runSingleTest() {
+ 
+   if (!testFunction) return window.showErrorMessage('Test not found');
+ 
+-  // Everything the terminal launcher used to do for the single test, in place.
+-  const workspaceUri = Uri.parse(workspace.root).toString();
+-  const relativeFileUri = document.uri.replace(`${workspaceUri}/`, '');
+-  let testFile = '';
+-  if (framework === 'pytest') {
+-    testFile = relativeFileUri.split('/').join(path.sep);
+-  } else {
+-    testFile = relativeFileUri.replace(/.py$/, '').split('/').join('.');
+-  }
+-
+-  const pythonPath = PythonSettings.getInstance().pythonPath;
+-
+-  // Does the testing framework resolve on this interpreter?
+-  // First: does python even know about importlib.machinery.PathFinder?
+-  let pySupportsPathFinder = false;
+-  try {
+-    const versionProcess = child_process.spawnSync(
+-      pythonPath,
+-      ['-c', 'from sys import version_info; exit(0) if (version_info[0] >= 3 and version_info[1] >= 4) else exit(1)'],
+-      { encoding: 'utf8' },
+-    );
+-    if (versionProcess.error) {
+-      pySupportsPathFinder = false;
+-    } else {
+-      pySupportsPathFinder = versionProcess.status === 0;
+-    }
+-  } catch (_ex) {
+-    pySupportsPathFinder = false;
+-  }
+-
+-  let moduleProbeArgs: string[];
+-  if (pySupportsPathFinder) {
+-    moduleProbeArgs = [
+-      '-c',
+-      `from importlib.machinery import PathFinder; assert PathFinder.find_spec("${framework}") is not None`,
+-    ];
+-  } else {
+-    moduleProbeArgs = ['-m', framework, '--help'];
+-  }
+-  let moduleUsable = false;
+-  try {
+-    const moduleProcess = child_process.spawnSync(pythonPath, moduleProbeArgs, { encoding: 'utf8' });
+-    if (moduleProcess.error) {
+-      moduleUsable = false;
+-    } else {
+-      moduleUsable = moduleProcess.status === 0;
+-    }
+-  } catch (_ex) {
+-    moduleUsable = false;
+-  }
+-  if (!moduleUsable) return window.showErrorMessage(`${framework} does not exist!`);
+-
+-  if (terminal) {
+-    if (terminal.bufnr) {
+-      await workspace.nvim.command(`bd! ${terminal.bufnr}`);
+-    }
+-    terminal.dispose();
+-    terminal = undefined;
+-  }
+-
+-  terminal = await window.createTerminal({ name: framework, cwd: workspace.root });
+-  const args: string[] = [];
+-
+-  const testArgs = workspace.getConfiguration('pyright').get<string[]>(`testing.${framework}Args`, []);
+-  if (testArgs && Array.isArray(testArgs)) {
+-    for (const item of testArgs) {
+-      args.push(item);
+-    }
+-  }
+-
+-  // MEMO: pytest is string concatenation with '::'
+-  // MEMO: unittest is string concatenation with '.'
+-  let sep: string;
+-  if (framework === 'pytest') {
+-    sep = '::';
+-  } else {
+-    sep = '.';
+-  }
+-  if (testFunction) {
+-    args.push(testFile + sep + testFunction);
+-  } else {
+-    args.push(testFile);
+-  }
+-
+-  terminal.sendText(`${pythonPath} -m ${framework} ${args.join(' ')}`);
++  runTest(document.uri, testFunction);
+ }
+diff --git a/src/features/formatters/baseFormatter.ts b/src/features/formatters/baseFormatter.ts
+index 3a33423..55f2997 100644
+--- a/src/features/formatters/baseFormatter.ts
++++ b/src/features/formatters/baseFormatter.ts
+@@ -2,10 +2,9 @@ import {
+   type CancellationToken,
+   type FormattingOptions,
+   type OutputChannel,
+-  type Position,
+-  Range,
++  type Range,
+   type TextDocument,
+-  TextEdit,
++  type TextEdit,
+   type Thenable,
+   Uri,
+   window,
+@@ -13,11 +12,11 @@ import {
+ } from 'coc.nvim';
+ import fs from 'node:fs';
+ import md5 from 'md5';
+-import { EOL } from 'node:os';
+ import path from 'node:path';
+ import which from 'which';
+ import { isNotInstalledError, PythonExecutionService } from '../../processService';
+-import type { FormatterId, IPythonSettings } from '../../types';
++import type { ExecutionInfo, FormatterId, IPythonSettings } from '../../types';
++import { getTextEditsFromPatch } from '../../utils';
+ 
+ function getTempFileWithDocumentContents(document: TextDocument): Promise<string> {
+   return new Promise<string>((resolve, reject) => {
+@@ -65,6 +64,17 @@ export abstract class BaseFormatter {
+     return Uri.file(workspace.root);
+   }
+ 
++  private getExecutionInfo(args: string[]): ExecutionInfo {
++    let moduleName: string | undefined;
++    let execPath = this.pythonSettings.formatting[`${this.Id}Path`] as string;
++    execPath = which.sync(execPath, { nothrow: true }) || execPath;
++    if (path.basename(execPath) === execPath) {
++      moduleName = execPath;
++    }
++
++    return { execPath, moduleName, args };
++  }
++
+   protected async provideDocumentFormattingEdits(
+     document: TextDocument,
+     _options: FormattingOptions,
+@@ -81,218 +91,78 @@ export abstract class BaseFormatter {
+     // to be done here in node (extension), i.e. extension CPU, i.e. less responsive solution.
+     const filepath = Uri.parse(document.uri).fsPath;
+     const tempFile = await this.createTempFile(document);
+-    if (token?.isCancellationRequested) {
+-      this.outputChannel.appendLine(`${'#'.repeat(10)} ${this.Id} formatting action is canceled on start`);
+-      if (filepath !== tempFile) {
+-        fs.promises.unlink(tempFile).catch(() => {});
+-      }
++    if (this.checkCancellation(filepath, tempFile, 'start', token)) {
+       return [];
+     }
+     args.push(tempFile);
+ 
+-    // Resolve the formatter executable. If it is a bare name rather than a path,
+-    // it will be run through the python interpreter as a module instead.
+-    let moduleName: string | undefined;
+-    let execPath = this.pythonSettings.formatting[`${this.Id}Path`] as string;
+-    execPath = which.sync(execPath, { nothrow: true }) || execPath;
+-    if (path.basename(execPath) === execPath) {
+-      moduleName = execPath;
+-    }
+-
+-    const executionInfo = { execPath, moduleName, args };
++    const executionInfo = this.getExecutionInfo(args);
+     this.outputChannel.appendLine(`execPath:   ${executionInfo.execPath}`);
+     this.outputChannel.appendLine(`moduleName: ${executionInfo.moduleName}`);
+     this.outputChannel.appendLine(`args:       ${executionInfo.args}`);
+ 
+     const cwd = root?.length ? root : Uri.file(workspace.root).fsPath;
+     const pythonToolsExecutionService = new PythonExecutionService();
+-    try {
+-      const output = await pythonToolsExecutionService.exec(executionInfo, { cwd, throwOnStdErr: false, token });
+-      if (output.stderr) {
+-        throw new Error(output.stderr);
+-      }
+-      const data = output.stdout;
+-
+-      this.outputChannel.appendLine('');
+-      this.outputChannel.appendLine(`${'#'.repeat(10)} ${this.Id} output:`);
+-      this.outputChannel.appendLine(data);
+-      if (token?.isCancellationRequested) {
+-        this.outputChannel.appendLine(`${'#'.repeat(10)} ${this.Id} formatting action is canceled on success`);
+-        if (filepath !== tempFile) {
+-          fs.promises.unlink(tempFile).catch(() => {});
+-        }
+-        return [] as TextEdit[];
+-      }
+-
+-      // Turn the formatter's unified diff into workspace edits, in place:
+-      // read the hunk headers, then replay every +/-/space line against the
+-      // original document text.
+-      const documentContents = document.getText();
+-      const textEdits: TextEdit[] = [];
+-      let patchBody = data;
+-      if (patchBody.startsWith('---')) {
+-        // Strip the first two lines; the patch proper starts at the first hunk.
+-        patchBody = patchBody.substring(patchBody.indexOf('@@'));
+-      }
+-      if (patchBody.length > 0) {
+-        // Remove the text added by unified_diff
+-        // # Work around missing newline (http://bugs.python.org/issue2142).
+-        patchBody = patchBody.replace(/\\ No newline at end of file[\r\n]/, '');
+-        const dmp = require('diff-match-patch') as typeof import('diff-match-patch');
+-        const patchLines = patchBody.split(/[\r\n]/);
+-        const blocks: { originLine: number; ops: [number, string][] }[] = [];
+-        let cursor = 0;
+-        while (cursor < patchLines.length) {
+-          const header = patchLines[cursor].match(/^@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@$/);
+-          if (!header) {
+-            throw new Error(`Invalid patch string: ${patchLines[cursor]}`);
+-          }
+-          const block = { originLine: 0, ops: [] as [number, string][] };
+-          blocks.push(block);
+-          block.originLine = parseInt(header[1], 10);
+-          if (header[2] === '' || header[2] !== '0') {
+-            block.originLine -= 1;
+-          }
+-          cursor += 1;
+-          while (cursor < patchLines.length) {
+-            const sign = patchLines[cursor].charAt(0);
+-            let bodyLine: string;
+-            try {
+-              bodyLine = patchLines[cursor].substring(1);
+-            } catch (_ex) {
+-              throw new Error('Illegal escape in patch_fromText');
+-            }
+-            if (sign === '-') {
+-              block.ops.push([dmp.DIFF_DELETE, bodyLine]);
+-            } else if (sign === '+') {
+-              block.ops.push([dmp.DIFF_INSERT, bodyLine]);
+-            } else if (sign === ' ') {
+-              block.ops.push([dmp.DIFF_EQUAL, bodyLine]);
+-            } else if (sign === '@') {
+-              break;
+-            } else if (sign !== '') {
+-              throw new Error(`Invalid patch mode '${sign}' in: ${bodyLine}`);
+-            }
+-            cursor += 1;
+-          }
++    const promise = pythonToolsExecutionService
++      .exec(executionInfo, { cwd, throwOnStdErr: false, token })
++      .then((output) => {
++        if (output.stderr) {
++          throw new Error(output.stderr);
+         }
+-        if (blocks.length === 0) {
+-          throw new Error('Unable to parse Patch string');
++        return output.stdout;
++      })
++      .then((data) => {
++        this.outputChannel.appendLine('');
++        this.outputChannel.appendLine(`${'#'.repeat(10)} ${this.Id} output:`);
++        this.outputChannel.appendLine(data);
++        if (this.checkCancellation(filepath, tempFile, 'success', token)) {
++          return [] as TextEdit[];
+         }
+-
+-        for (const block of blocks) {
+-          // wider diffs are built line-relative, so restore the line feeds
+-          for (const op of block.ops) {
+-            op[1] += EOL;
+-          }
+-
+-          // Where does this block anchor in the document? Find the character
+-          // offset of its origin line by walking the head of the document.
+-          let walkLine = block.originLine;
+-          let walkCharacter = 0;
+-          if (walkLine > 0) {
+-            const headLines = documentContents.split(/\r?\n/g).filter((_l, i) => i < walkLine);
+-            for (const headLine of headLines) {
+-              walkCharacter += headLine.length + EOL.length;
+-            }
+-          }
+-
+-          // 0 = kept text turned into a deletion, 1 = insertion, 2 = both (replace)
+-          let pendingKind = -1;
+-          let pendingFrom: Position = { line: 0, character: 0 };
+-          let pendingTo: Position = { line: 0, character: 0 };
+-          let pendingText = '';
+-          for (let i = 0; i < block.ops.length; i += 1) {
+-            const opStart = { line: walkLine, character: walkCharacter };
+-            // advance the caret over the text this op replaces
+-            for (let cursorAt = 0; cursorAt < block.ops[i][1].length; cursorAt += 1) {
+-              if (block.ops[i][1][cursorAt] !== '\n') {
+-                walkCharacter += 1;
+-              } else {
+-                walkCharacter = 0;
+-                walkLine += 1;
+-              }
+-            }
+-
+-            switch (block.ops[i][0]) {
+-              case dmp.DIFF_DELETE:
+-                if (pendingKind === -1) {
+-                  pendingKind = 0;
+-                  pendingFrom = opStart;
+-                  pendingText = '';
+-                } else if (pendingKind !== 0) {
+-                  throw new Error('cannot format due to an internal error.');
+-                }
+-                pendingTo = { line: walkLine, character: walkCharacter };
+-                break;
+-
+-              case dmp.DIFF_INSERT:
+-                if (pendingKind === -1) {
+-                  pendingKind = 1;
+-                  pendingFrom = opStart;
+-                } else if (pendingKind === 0) {
+-                  pendingKind = 2;
+-                }
+-                // the diff is relative to the original document, so put the
+-                // caret back where this run of ops started
+-                walkLine = opStart.line;
+-                walkCharacter = opStart.character;
+-                pendingText += block.ops[i][1];
+-                break;
+-
+-              case dmp.DIFF_EQUAL:
+-                if (pendingKind !== -1) {
+-                  if (pendingKind === 1) {
+-                    textEdits.push(TextEdit.insert(pendingFrom, pendingText));
+-                  } else if (pendingKind === 0) {
+-                    textEdits.push(TextEdit.del(Range.create(pendingFrom, pendingTo)));
+-                  } else {
+-                    textEdits.push(TextEdit.replace(Range.create(pendingFrom, pendingTo), pendingText));
+-                  }
+-                  pendingKind = -1;
+-                }
+-                break;
+-            }
+-          }
+-          if (pendingKind !== -1) {
+-            if (pendingKind === 1) {
+-              textEdits.push(TextEdit.insert(pendingFrom, pendingText));
+-            } else if (pendingKind === 0) {
+-              textEdits.push(TextEdit.del(Range.create(pendingFrom, pendingTo)));
+-            } else {
+-              textEdits.push(TextEdit.replace(Range.create(pendingFrom, pendingTo), pendingText));
+-            }
+-          }
++        const edits = getTextEditsFromPatch(document.getText(), data);
++        if (edits.length) window.showInformationMessage(`Formatted with ${this.Id}`);
++        return edits;
++      })
++      .catch((error) => {
++        this.handleError(this.Id, error).catch(() => {});
++        if (this.checkCancellation(filepath, tempFile, 'error', token)) {
++          return [] as TextEdit[];
+         }
+-      }
++        return [] as TextEdit[];
++      })
++      .finally(() => {
++        this.deleteTempFile(filepath, tempFile).catch(() => {});
++      });
++    return promise;
++  }
+ 
+-      if (textEdits.length) window.showInformationMessage(`Formatted with ${this.Id}`);
+-      return textEdits;
+-    } catch (error: any) {
+-      this.outputChannel.appendLine(`${'#'.repeat(10)} Formatting with ${this.Id} failed`);
+-      this.outputChannel.appendLine(error.message);
++  protected async handleError(_expectedFileName: string, error: Error) {
++    this.outputChannel.appendLine(`${'#'.repeat(10)} Formatting with ${this.Id} failed`);
++    this.outputChannel.appendLine(error.message);
+ 
+-      let customError = `Formatting with ${this.Id} failed`;
+-      if (isNotInstalledError(error)) {
+-        customError = `${customError}: ${this.Id} module is not installed.`;
+-      }
+-      window.showWarningMessage(customError);
+-
+-      if (token?.isCancellationRequested) {
+-        this.outputChannel.appendLine(`${'#'.repeat(10)} ${this.Id} formatting action is canceled on error`);
+-        if (filepath !== tempFile) {
+-          fs.promises.unlink(tempFile).catch(() => {});
+-        }
+-      }
+-      return [] as TextEdit[];
+-    } finally {
+-      if (filepath !== tempFile) {
+-        fs.promises.unlink(tempFile).catch(() => {});
+-      }
++    let customError = `Formatting with ${this.Id} failed`;
++    if (isNotInstalledError(error)) {
++      customError = `${customError}: ${this.Id} module is not installed.`;
+     }
++    window.showWarningMessage(customError);
+   }
+ 
+   protected createTempFile(document: TextDocument): Promise<string> {
+     return getTempFileWithDocumentContents(document);
+   }
++
++  private deleteTempFile(originalFile: string, tempFile: string): Promise<any> {
++    if (originalFile !== tempFile) {
++      return fs.promises.unlink(tempFile);
++    }
++    return Promise.resolve();
++  }
++
++  private checkCancellation(originalFile: string, tempFile: string, state: string, token?: CancellationToken): boolean {
++    if (token?.isCancellationRequested) {
++      this.outputChannel.appendLine(`${'#'.repeat(10)} ${this.Id} formatting action is canceled on ${state}`);
++      this.deleteTempFile(originalFile, tempFile).catch(() => {});
++      return true;
++    }
++    return false;
++  }
+ }
+diff --git a/src/features/inlayHints.ts b/src/features/inlayHints.ts
+index 84751af..518c5f4 100644
+--- a/src/features/inlayHints.ts
++++ b/src/features/inlayHints.ts
+@@ -16,6 +16,7 @@ import {
+ } from 'coc.nvim';
+ 
+ import * as parser from '../parsers';
++import { positionInRange } from '../utils';
+ 
+ export class TypeInlayHintsProvider implements InlayHintsProvider {
+   private readonly _onDidChangeInlayHints = new Emitter<void>();
+@@ -45,111 +46,34 @@ export class TypeInlayHintsProvider implements InlayHintsProvider {
+     const walker = new parser.TypeInlayHintsWalker(parsed);
+     walker.walk(parsed.parserOutput.parseTree);
+ 
+-    // Is the position inside the requested range? (start <= position <= end)
+-    const positionInSelectedRange = (position: Position): boolean => {
+-      if (position.line < range.start.line) return false;
+-      if (position.line === range.start.line && position.character < range.start.character) return false;
+-      if (position.line > range.end.line) return false;
+-      if (position.line === range.end.line && position.character > range.end.character) return false;
+-      return true;
+-    };
+-
+     const featureItems = walker.featureItems
+-      .filter((item) => workspace.getConfiguration('pyright').get(`inlayHints.${item.hintType}Types`, true))
++      .filter((item) => this.enableForType(item.hintType))
+       .filter((item) => {
+         const startPosition = document.positionAt(item.startOffset);
+         const endPosition = document.positionAt(item.endOffset);
+-        return positionInSelectedRange(startPosition) || positionInSelectedRange(endPosition);
++        return positionInRange(startPosition, range) === 0 || positionInRange(endPosition, range) === 0;
+       });
+     if (featureItems.length === 0) return [];
+ 
+     for (const item of featureItems) {
+       const startPosition = document.positionAt(item.startOffset);
+       const endPosition = document.positionAt(item.endOffset);
+-      // Ask pyright what sits under the cursor — both probes race a 200ms timer.
+       const hover =
+-        item.hintType === 'parameter'
+-          ? null
+-          : await Promise.race([
+-              this.client.sendRequest<Hover>(
+-                'textDocument/hover',
+-                { textDocument: { uri: document.uri }, position: startPosition },
+-                token,
+-              ),
+-              new Promise<null>((resolve) => {
+-                setTimeout(() => {
+-                  resolve(null);
+-                }, 200);
+-              }),
+-            ]);
++        item.hintType === 'parameter' ? null : await this.getHoverAtPosition(document, startPosition, token);
+       const signatureHelp =
+-        item.hintType === 'parameter'
+-          ? await Promise.race([
+-              this.client.sendRequest<SignatureHelp>(
+-                'textDocument/signatureHelp',
+-                { textDocument: { uri: document.uri }, position: startPosition },
+-                token,
+-              ),
+-              new Promise<null>((resolve) => {
+-                setTimeout(() => {
+-                  resolve(null);
+-                }, 200);
+-              }),
+-            ])
+-          : null;
++        item.hintType === 'parameter' ? await this.getSignatureHelpAtPosition(document, startPosition, token) : null;
+ 
+       let inlayHintLabelValue: string | undefined;
+       switch (item.hintType) {
+-        case 'variable': {
+-          if (hover) {
+-            const contents = hover.contents as MarkupContent;
+-            if (contents.value.includes('(variable)') && !contents.value.includes('(variable) def')) {
+-              const firstIdx = contents.value.indexOf(': ');
+-              if (firstIdx > -1) {
+-                const text = contents.value
+-                  .substring(firstIdx + 2)
+-                  .split('\n')[0]
+-                  .trim();
+-                if (text !== 'Any' && !text.startsWith('Literal[')) {
+-                  inlayHintLabelValue = `: ${text}`;
+-                }
+-              }
+-            }
+-          }
++        case 'variable':
++          inlayHintLabelValue = this.getVariableHintFromHover(hover);
+           break;
+-        }
+-        case 'functionReturn': {
+-          if (hover) {
+-            const contents = hover.contents as MarkupContent;
+-            if (contents && (contents.value.includes('(function)') || contents.value.includes('(method)'))) {
+-              const retvalIdx = contents.value.indexOf('->') + 2;
+-              const text = contents.value.substring(retvalIdx).split('\n')[0].trim();
+-              inlayHintLabelValue = `-> ${text}`;
+-            }
+-          }
++        case 'functionReturn':
++          inlayHintLabelValue = this.getFunctionReturnHintFromHover(hover);
+           break;
+-        }
+-        case 'parameter': {
+-          if (signatureHelp) {
+-            const sig = signatureHelp.signatures[0];
+-            if (
+-              typeof sig.activeParameter === 'number' &&
+-              sig.parameters &&
+-              sig.parameters.length >= sig.activeParameter
+-            ) {
+-              const param = sig.parameters[sig.activeParameter];
+-              if (typeof param.label === 'string') {
+-                inlayHintLabelValue = param.label;
+-              } else {
+-                const label = sig.label.substring(param.label[0], param.label[1]).split(':')[0];
+-                if (!label.startsWith('__')) {
+-                  inlayHintLabelValue = `${label}: `;
+-                }
+-              }
+-            }
+-          }
++        case 'parameter':
++          inlayHintLabelValue = this.getParameterHintFromSignature(signatureHelp);
+           break;
+-        }
+         default:
+           break;
+       }
+@@ -190,4 +114,93 @@ export class TypeInlayHintsProvider implements InlayHintsProvider {
+ 
+     return inlayHints;
+   }
++
++  private async getHoverAtPosition(document: LinesTextDocument, position: Position, token: CancellationToken) {
++    const params = {
++      textDocument: { uri: document.uri },
++      position,
++    };
++
++    const result = await Promise.race([
++      this.client.sendRequest<Hover>('textDocument/hover', params, token),
++      new Promise<null>((resolve) => {
++        setTimeout(() => {
++          resolve(null);
++        }, 200);
++      }),
++    ]);
++    return result;
++  }
++
++  private getVariableHintFromHover(hover: Hover | null): string | undefined {
++    if (!hover) return;
++    const contents = hover.contents as MarkupContent;
++    if (contents.value.includes('(variable)')) {
++      if (contents.value.includes('(variable) def')) {
++        return;
++      }
++      const firstIdx = contents.value.indexOf(': ');
++      if (firstIdx > -1) {
++        const text = contents.value
++          .substring(firstIdx + 2)
++          .split('\n')[0]
++          .trim();
++        if (text === 'Any' || text.startsWith('Literal[')) {
++          return;
++        }
++        return `: ${text}`;
++      }
++    }
++  }
++
++  private getFunctionReturnHintFromHover(hover: Hover | null): string | undefined {
++    if (!hover) return;
++    const contents = hover.contents as MarkupContent;
++    if (contents && (contents.value.includes('(function)') || contents.value.includes('(method)'))) {
++      const retvalIdx = contents.value.indexOf('->') + 2;
++      const text = contents.value.substring(retvalIdx).split('\n')[0].trim();
++      return `-> ${text}`;
++    }
++  }
++
++  private async getSignatureHelpAtPosition(document: LinesTextDocument, position: Position, token: CancellationToken) {
++    const params = {
++      textDocument: { uri: document.uri },
++      position,
++    };
++
++    const result = await Promise.race([
++      this.client.sendRequest<SignatureHelp>('textDocument/signatureHelp', params, token),
++      new Promise<null>((resolve) => {
++        setTimeout(() => {
++          resolve(null);
++        }, 200);
++      }),
++    ]);
++    return result;
++  }
++
++  private getParameterHintFromSignature(signatureInfo: SignatureHelp | null): string | undefined {
++    if (!signatureInfo) return;
++    const sig = signatureInfo.signatures[0];
++    if (typeof sig.activeParameter !== 'number') {
++      return;
++    }
++    if (!sig.parameters || sig.parameters.length < sig.activeParameter) {
++      return;
++    }
++    const param = sig.parameters[sig.activeParameter];
++    if (typeof param.label === 'string') {
++      return param.label;
++    }
++    const label = sig.label.substring(param.label[0], param.label[1]).split(':')[0];
++    if (label.startsWith('__')) {
++      return;
++    }
++    return `${label}: `;
++  }
++
++  private enableForType(inlayHintType: string) {
++    return workspace.getConfiguration('pyright').get(`inlayHints.${inlayHintType}Types`, true);
++  }
+ }
+diff --git a/src/features/linters/flake8.ts b/src/features/linters/flake8.ts
+index fb3e936..ecee1ed 100644
+--- a/src/features/linters/flake8.ts
++++ b/src/features/linters/flake8.ts
+@@ -1,26 +1,9 @@
+-import { type CancellationToken, type OutputChannel, type TextDocument, Uri, workspace } from 'coc.nvim';
+-import { spawn } from 'node:child_process';
+-import namedRegexp from 'named-js-regexp';
+-import path from 'node:path';
+-import which from 'which';
+-import { PythonExecutionService } from '../../processService';
+-import { LintMessageSeverity, type ILinterInfo, type ILintMessage, type LinterId, Product } from '../../types';
++import { type CancellationToken, type OutputChannel, type TextDocument, Uri } from 'coc.nvim';
++import type { ILinterInfo, ILintMessage } from '../../types';
+ import { BaseLinter } from './baseLinter';
+ 
+ const COLUMN_OFF_SET = 1;
+ 
+-// Allow negative column numbers (https://github.com/PyCQA/pylint/issues/1822)
+-const FLAKE8_REGEX = '(?<line>\\d+),(?<column>-?\\d+),(?<type>\\w+),(?<code>\\w+\\d+):(?<message>.*)\\r?(\\n|$)';
+-
+-interface IRegexGroup {
+-  line: number;
+-  column: number;
+-  code: string;
+-  message: string;
+-  type: string;
+-  file?: string;
+-}
+-
+ export class Flake8 extends BaseLinter {
+   constructor(info: ILinterInfo, outputChannel: OutputChannel) {
+     super(info, outputChannel, COLUMN_OFF_SET);
+@@ -29,144 +12,15 @@ export class Flake8 extends BaseLinter {
+   protected async runLinter(document: TextDocument, cancellation: CancellationToken): Promise<ILintMessage[]> {
+     const fsPath = Uri.parse(document.uri).fsPath;
+     const args = ['--format=%(row)d,%(col)d,%(code).1s,%(code)s:%(text)s', '--exit-zero'];
+-    const lintingSettings = this.pythonSettings.linting as any;
+-    if (lintingSettings['flake8Stdin']) {
++    if (this.info.stdinSupport) {
+       args.push('--stdin-display-name', fsPath, '-');
+     } else {
+       args.push(fsPath);
+     }
+-
+-    if (!lintingSettings['flake8Enabled']) {
+-      return [];
+-    }
+-
+-    try {
+-      // Where is the flake8 binary, and with which arguments do we run it?
+-      const configuredCmd = workspace.expand(lintingSettings['flake8Path']);
+-      const execPath = which.sync(configuredCmd, { nothrow: true }) || configuredCmd;
+-      const configArgs = Array.isArray(lintingSettings['flake8Args']) ? lintingSettings['flake8Args'] : [];
+-      const execArgs = configArgs.concat(args);
+-      let moduleName: string | undefined;
+-
+-      // If path information is not available, then treat it as a module,
+-      if (path.basename(execPath) === execPath) {
+-        moduleName = execPath;
+-      }
+-      const executionInfo = { execPath, moduleName, args: execArgs, product: Product.flake8 };
+-
+-      this.outputChannel.appendLine(`${'#'.repeat(10)} Run linter flake8:`);
+-      this.outputChannel.appendLine(JSON.stringify(executionInfo));
+-      this.outputChannel.appendLine('');
+-
+-      let result = '';
+-      if (lintingSettings['flake8Stdin']) {
+-        // Feed the document through stdin instead of pointing at a file.
+-        let command = executionInfo.execPath;
+-        let childArgs = executionInfo.args;
+-        if (executionInfo.moduleName) {
+-          command = this.pythonSettings.pythonPath;
+-          childArgs = ['-m', executionInfo.moduleName, ...executionInfo.args];
+-        }
+-        const child = spawn(command, childArgs, { cwd: workspace.root });
+-        result = await new Promise((resolve) => {
+-          child.stdin.setDefaultEncoding('utf8');
+-          child.stdin.write(document.getText());
+-          child.stdin.end();
+-
+-          let resultText = '';
+-          child.stdout.on('data', (data) => {
+-            resultText += data.toString('utf-8').trim();
+-          });
+-          child.on('close', () => {
+-            resolve(resultText);
+-          });
+-        });
+-      } else {
+-        const service = new PythonExecutionService();
+-        result = (
+-          await service.exec(executionInfo, { cwd: workspace.root, token: cancellation, mergeStdOutErr: false })
+-        ).stdout;
+-      }
+-
+-      this.outputChannel.append(`${'#'.repeat(10)} Linting Output - flake8 ${'#'.repeat(10)}\n`);
+-      this.outputChannel.append(result);
+-      this.outputChannel.appendLine('');
+-
+-      // Decode the flake8 output, line by line, against the format strings above.
+-      const messages: ILintMessage[] = [];
+-      const outputLines = result.split(/\r?\n/g);
+-      for (const line of outputLines) {
+-        try {
+-          const compiledRegexp = namedRegexp(FLAKE8_REGEX, 'g');
+-          const rawMatch = compiledRegexp.exec(line);
+-          let lineMatch: IRegexGroup | undefined;
+-          if (rawMatch) {
+-            // @ts-expect-error
+-            lineMatch = rawMatch.groups() as IRegexGroup;
+-          }
+-          if (!lineMatch) {
+-            continue;
+-          }
+-
+-          lineMatch.line = Number(lineMatch.line as any);
+-          lineMatch.column = Number(lineMatch.column as any);
+-
+-          messages.push({
+-            code: lineMatch.code,
+-            message: lineMatch.message,
+-            column: Number.isNaN(lineMatch.column) || lineMatch.column <= 0 ? 0 : lineMatch.column - this.columnOffset,
+-            line: lineMatch.line,
+-            type: lineMatch.type,
+-            provider: 'flake8' as LinterId,
+-            file: lineMatch.file,
+-          });
+-          if (messages.length >= this.pythonSettings.linting.maxNumberOfProblems) {
+-            break;
+-          }
+-        } catch (err) {
+-          this.outputChannel.appendLine(`${'#'.repeat(10)} Linter flake8 failed to parse the line:`);
+-          this.outputChannel.appendLine(line);
+-          if (typeof err === 'string') {
+-            this.outputChannel.appendLine(err);
+-          } else if (err instanceof Error) {
+-            this.outputChannel.appendLine(err.message);
+-          }
+-        }
+-      }
+-
+-      // Name the severity that flake8 wants for this type of message.
+-      const severityFor = (errorType: string): LintMessageSeverity => {
+-        const categorySeverity = (this.pythonSettings.linting as any).flake8CategorySeverity;
+-        if (categorySeverity[errorType]) {
+-          const severityName = categorySeverity[errorType];
+-          switch (severityName) {
+-            case 'Error':
+-              return LintMessageSeverity.Error;
+-            case 'Hint':
+-              return LintMessageSeverity.Hint;
+-            case 'Information':
+-              return LintMessageSeverity.Information;
+-            case 'Warning':
+-              return LintMessageSeverity.Warning;
+-            default: {
+-              if (LintMessageSeverity[severityName]) {
+-                return LintMessageSeverity[severityName] as any as LintMessageSeverity;
+-              }
+-            }
+-          }
+-        }
+-        return LintMessageSeverity.Information;
+-      };
+-      for (const msg of messages) {
+-        msg.severity = severityFor(msg.type);
+-      }
+-      return messages;
+-    } catch (error) {
+-      this.outputChannel.appendLine('Linting with flake8 failed:');
+-      if (error instanceof Error) {
+-        this.outputChannel.appendLine(error.message.toString());
+-      }
+-      return [];
++    const messages = await this.run(args, document, cancellation);
++    for (const msg of messages) {
++      msg.severity = this.parseMessagesSeverity(msg.type, this.pythonSettings.linting.flake8CategorySeverity);
+     }
++    return messages;
+   }
+ }
+diff --git a/src/features/linters/lintingEngine.ts b/src/features/linters/lintingEngine.ts
+index e37c20c..9ddd78e 100644
+--- a/src/features/linters/lintingEngine.ts
++++ b/src/features/linters/lintingEngine.ts
+@@ -106,37 +106,11 @@ export class LintingEngine {
+     this.diagnosticCollection.set(document.uri, []);
+ 
+     // Check if we need to lint this document
+-    const initialSettings = this.configService;
+-    if (!initialSettings.linting.enabled) {
+-      this.outputChannel.appendLine(`${'#'.repeat(5)} linting is disabled by python.linting.enabled`);
+-      return;
+-    }
+-
+-    if (document.languageId !== PYTHON.language) {
++    if (!this.shouldLintDocument(document)) {
+       return;
+     }
+ 
+     const fsPath = Uri.parse(document.uri).fsPath;
+-    if (initialSettings.stdLibs.some((p) => fsPath.startsWith(p))) {
+-      return;
+-    }
+-
+-    const relativeFileName = path.relative(workspace.root, fsPath);
+-    // { dot: true } is important so dirs like `.venv` will be matched by globs
+-    const ignoreMinmatches = initialSettings.linting.ignorePatterns.map(
+-      (pattern) => new Minimatch(pattern, { dot: true }),
+-    );
+-    if (ignoreMinmatches.some((matcher) => matcher.match(fsPath) || matcher.match(relativeFileName))) {
+-      this.outputChannel.appendLine(`${'#'.repeat(5)} linting is ignored by python.linting.ignorePatterns`);
+-      return;
+-    }
+-
+-    const fileExists = fs.existsSync(fsPath);
+-    if (!fileExists) {
+-      this.outputChannel.appendLine(`${'#'.repeat(5)} linting is disabled because file is not exists: ${fsPath}`);
+-      return;
+-    }
+-
+     if (this.pendingLintings.has(fsPath)) {
+       this.pendingLintings.get(fsPath)!.cancel();
+       this.pendingLintings.delete(fsPath);
+@@ -155,49 +129,7 @@ export class LintingEngine {
+     const promises: Promise<ILintMessage[]>[] = activeLinters.map(async (info: ILinterInfo) => {
+       this.outputChannel.appendLine(`Using python from ${this.configService.pythonPath}\n`);
+       this.outputChannel.appendLine(`${'#'.repeat(10)} active linter: ${info.id}`);
+-      // Build the linter right here instead of asking the factory for it.
+-      let linter: ILinter;
+-      if (!this.configService.linting.enabled) {
+-        linter = new DisabledLinter(this.configService);
+-      } else {
+-        switch (info.product) {
+-          case Product.bandit:
+-            linter = new Bandit(info, this.outputChannel);
+-            break;
+-          case Product.flake8:
+-            linter = new Flake8(info, this.outputChannel);
+-            break;
+-          case Product.pylint:
+-            linter = new Pylint(info, this.outputChannel);
+-            break;
+-          case Product.mypy:
+-            linter = new MyPy(info, this.outputChannel);
+-            break;
+-          case Product.prospector:
+-            linter = new Prospector(info, this.outputChannel);
+-            break;
+-          case Product.pylama:
+-            linter = new Pylama(info, this.outputChannel);
+-            break;
+-          case Product.pydocstyle:
+-            linter = new PyDocStyle(info, this.outputChannel);
+-            break;
+-          case Product.pycodestyle:
+-            linter = new PyCodeStyle(info, this.outputChannel);
+-            break;
+-          case Product.pytype:
+-            linter = new Pytype(info, this.outputChannel);
+-            break;
+-          case Product.pyflakes:
+-            linter = new Pyflakes(info, this.outputChannel);
+-            break;
+-          case Product.ruff:
+-            linter = new Ruff(info, this.outputChannel);
+-            break;
+-          default:
+-            throw new Error('Linter manager: Unknown linter');
+-        }
+-      }
++      const linter = await this.createLinter(info, this.outputChannel);
+       const promise = linter.lint(document, cancelToken.token);
+       return promise;
+     });
+@@ -228,33 +160,7 @@ export class LintingEngine {
+           ) {
+             continue;
+           }
+-          let start = Position.create(m.line > 0 ? m.line - 1 : 0, m.column);
+-          const endLine = m.endLine ?? m.line;
+-          const endColumn = m.endColumn ?? m.column + 1;
+-          let end = Position.create(endLine > 0 ? endLine - 1 : 0, endColumn);
+-
+-          const ms = /['"](.*?)['"]/g.exec(m.message);
+-          if (ms && ms.length > 0) {
+-            const line = workspace.getDocument(document.uri)?.getline(m.line - 1);
+-            if (line?.includes(ms[1])) {
+-              const s = m.column > line.indexOf(ms[1]) ? m.column : line.indexOf(ms[1]);
+-              start = Position.create(m.line - 1, s);
+-              end = Position.create(m.line - 1, s + ms[1].length);
+-            }
+-          }
+-
+-          const range = Range.create(start, end);
+-          const severity = lintSeverityToVSSeverity.get(m.severity!)!;
+-          const diagnostic = Diagnostic.create(range, m.message, severity);
+-          diagnostic.code = m.code;
+-          if (m.url) {
+-            diagnostic.codeDescription = { href: m.url };
+-          }
+-          diagnostic.source = m.provider;
+-          // @ts-expect-error
+-          diagnostic.fix = m.fix;
+-          diagnostic.tags = m.tags;
+-          diagnostics.push(diagnostic);
++          diagnostics.push(this.createDiagnostics(m, document));
+         }
+         // Limit the number of messages to the max value.
+         diagnostics = diagnostics.filter((_value, index) => index <= settings.linting.maxNumberOfProblems);
+@@ -264,6 +170,68 @@ export class LintingEngine {
+     this.diagnosticCollection.set(document.uri, diagnostics);
+   }
+ 
++  private createDiagnostics(message: ILintMessage, document: TextDocument): Diagnostic {
++    let start = Position.create(message.line > 0 ? message.line - 1 : 0, message.column);
++    const endLine = message.endLine ?? message.line;
++    const endColumn = message.endColumn ?? message.column + 1;
++    let end = Position.create(endLine > 0 ? endLine - 1 : 0, endColumn);
++
++    const ms = /['"](.*?)['"]/g.exec(message.message);
++    if (ms && ms.length > 0) {
++      const line = workspace.getDocument(document.uri)?.getline(message.line - 1);
++      if (line?.includes(ms[1])) {
++        const s = message.column > line.indexOf(ms[1]) ? message.column : line.indexOf(ms[1]);
++        start = Position.create(message.line - 1, s);
++        end = Position.create(message.line - 1, s + ms[1].length);
++      }
++    }
++
++    const range = Range.create(start, end);
++    const severity = lintSeverityToVSSeverity.get(message.severity!)!;
++    const diagnostic = Diagnostic.create(range, message.message, severity);
++    diagnostic.code = message.code;
++    if (message.url) {
++      diagnostic.codeDescription = { href: message.url };
++    }
++    diagnostic.source = message.provider;
++    // @ts-expect-error
++    diagnostic.fix = message.fix;
++    diagnostic.tags = message.tags;
++    return diagnostic;
++  }
++
++  private shouldLintDocument(document: TextDocument): boolean {
++    const settings = this.configService;
++    if (!settings.linting.enabled) {
++      this.outputChannel.appendLine(`${'#'.repeat(5)} linting is disabled by python.linting.enabled`);
++      return false;
++    }
++
++    if (document.languageId !== PYTHON.language) {
++      return false;
++    }
++
++    const fsPath = Uri.parse(document.uri).fsPath;
++    if (settings.stdLibs.some((p) => fsPath.startsWith(p))) {
++      return false;
++    }
++
++    const relativeFileName = path.relative(workspace.root, fsPath);
++    // { dot: true } is important so dirs like `.venv` will be matched by globs
++    const ignoreMinmatches = settings.linting.ignorePatterns.map((pattern) => new Minimatch(pattern, { dot: true }));
++    if (ignoreMinmatches.some((matcher) => matcher.match(fsPath) || matcher.match(relativeFileName))) {
++      this.outputChannel.appendLine(`${'#'.repeat(5)} linting is ignored by python.linting.ignorePatterns`);
++      return false;
++    }
++
++    const exists = fs.existsSync(fsPath);
++    if (!exists) {
++      this.outputChannel.appendLine(`${'#'.repeat(5)} linting is disabled because file is not exists: ${fsPath}`);
++      return false;
++    }
++    return true;
++  }
++
+   public getAllLinterInfos(): ILinterInfo[] {
+     return this.linters;
+   }
+@@ -279,4 +247,38 @@ export class LintingEngine {
+   public getActiveLinters(resource?: Uri): ILinterInfo[] {
+     return this.linters.filter((x) => x.isEnabled(resource));
+   }
++
++  public async createLinter(info: ILinterInfo, outputChannel: OutputChannel): Promise<ILinter> {
++    if (!this.configService.linting.enabled) {
++      return new DisabledLinter(this.configService);
++    }
++    const error = 'Linter manager: Unknown linter';
++    switch (info.product) {
++      case Product.bandit:
++        return new Bandit(info, outputChannel);
++      case Product.flake8:
++        return new Flake8(info, outputChannel);
++      case Product.pylint:
++        return new Pylint(info, outputChannel);
++      case Product.mypy:
++        return new MyPy(info, outputChannel);
++      case Product.prospector:
++        return new Prospector(info, outputChannel);
++      case Product.pylama:
++        return new Pylama(info, outputChannel);
++      case Product.pydocstyle:
++        return new PyDocStyle(info, outputChannel);
++      case Product.pycodestyle:
++        return new PyCodeStyle(info, outputChannel);
++      case Product.pytype:
++        return new Pytype(info, outputChannel);
++      case Product.pyflakes:
++        return new Pyflakes(info, outputChannel);
++      case Product.ruff:
++        return new Ruff(info, outputChannel);
++      default:
++        break;
++    }
++    throw new Error(error);
++  }
+ }
+diff --git a/src/features/sortImports.ts b/src/features/sortImports.ts
+index fe042f3..ec5bcb3 100644
+--- a/src/features/sortImports.ts
++++ b/src/features/sortImports.ts
+@@ -1,18 +1,51 @@
+-import { type OutputChannel, type Position, Range, TextEdit, Uri, commands, window, workspace } from 'coc.nvim';
+-import { spawn } from 'node:child_process';
++import { type OutputChannel, type TextDocument, commands, window, workspace } from 'coc.nvim';
+ import fs from 'node:fs';
+-import md5 from 'md5';
+-import { EOL, homedir } from 'node:os';
+-import path from 'node:path';
+-import * as iconv from 'iconv-lite';
+ import which from 'which';
+ import { PythonSettings } from '../configSettings';
++import { PythonExecutionService } from '../processService';
++import type { ExecutionInfo } from '../types';
++import { getTempFileWithDocumentContents, getTextEditsFromPatch } from '../utils';
+ 
+ type SortProvider = 'pyright' | 'isort' | 'ruff';
++function getSortProviderInfo(provider: SortProvider): ExecutionInfo {
++  const pythonSettings = PythonSettings.getInstance();
++  const modulePath = provider === 'isort' ? pythonSettings.sortImports.path : pythonSettings.linting.ruffPath;
++  const execPath = which.sync(workspace.expand(modulePath), { nothrow: true }) || '';
++  let args: string[] = [];
++  if (provider === 'isort') {
++    args = ['--diff'];
++    for (const item of pythonSettings.sortImports.args) {
++      args.push(workspace.expand(item));
++    }
++  } else if (provider === 'ruff') {
++    args = ['check', '--diff'].concat(['--quiet', '--select', 'I001']);
++  }
++
++  return { execPath, args };
++}
++
++async function generateImportsDiff(
++  provider: SortProvider,
++  document: TextDocument,
++  outputChannel: OutputChannel,
++): Promise<string> {
++  const tempFile = await getTempFileWithDocumentContents(document);
++
++  const executionInfo = getSortProviderInfo(provider);
++  executionInfo.args.push(tempFile);
++
++  outputChannel.appendLine(`${'#'.repeat(10)} sortImports`);
++  outputChannel.appendLine(`execPath:   ${executionInfo.execPath}`);
++  outputChannel.appendLine(`args:       ${executionInfo.args.join(' ')} `);
+ 
+-// One block of the sorter's unified diff, kept in the shape the diff library
+-// uses for parsed patches (diffs are [op, text] pairs).
+-type SorterHunk = { diffs: [number, string][]; start1: number; start2: number; length1: number; length2: number };
++  try {
++    const pythonToolsExecutionService = new PythonExecutionService();
++    const result = await pythonToolsExecutionService.exec(executionInfo, { throwOnStdErr: true });
++    return result.stdout;
++  } finally {
++    await fs.promises.unlink(tempFile);
++  }
++}
+ 
+ export async function sortImports(outputChannel: OutputChannel): Promise<void> {
+   const doc = await workspace.document;
+@@ -27,244 +60,12 @@ export async function sortImports(outputChannel: OutputChannel): Promise<void> {
+   }
+ 
+   try {
+-    const document = doc.textDocument;
+-
+-    // Copy the buffer next to the original so the sorter picks up workspace
+-    // configuration. Don't create it in the temp folder: external utilities are
+-    // not able to find custom rules saved in a random disk location.
+-    const fsPath = Uri.parse(document.uri).fsPath;
+-    const ext = path.extname(fsPath);
+-    const fileName = `${fsPath.slice(0, -3)}${md5(document.uri)}${ext}`;
+-    const tempFile = await new Promise<string>((resolve, reject) => {
+-      fs.writeFile(fileName, document.getText(), (writeError) => {
+-        if (writeError) {
+-          reject(new Error(`Failed to create a temporary file, ${writeError.message}`));
+-        }
+-        resolve(fileName);
+-      });
+-    });
+-
+-    // Which sorter binary to talk to, and with which arguments.
+-    const pythonSettings = PythonSettings.getInstance();
+-    const modulePath = provider === 'isort' ? pythonSettings.sortImports.path : pythonSettings.linting.ruffPath;
+-    const execPath = which.sync(workspace.expand(modulePath), { nothrow: true }) || '';
+-    let sortArgs: string[] = [];
+-    if (provider === 'isort') {
+-      sortArgs = ['--diff'];
+-      for (const item of pythonSettings.sortImports.args) {
+-        sortArgs.push(workspace.expand(item));
+-      }
+-    } else if (provider === 'ruff') {
+-      sortArgs = ['check', '--diff'].concat(['--quiet', '--select', 'I001']);
+-    }
+-    sortArgs.push(tempFile);
+-
+-    outputChannel.appendLine(`${'#'.repeat(10)} sortImports`);
+-    outputChannel.appendLine(`execPath:   ${execPath}`);
+-    outputChannel.appendLine(`args:       ${sortArgs.join(' ')} `);
+-
+-    // Run the sorter the same way the python execution service does for a bare
+-    // executable: unbuffered environment, both streams captured, and any
+-    // stderr at all treated as a failure.
+-    const execEnv = { ...process.env };
+-    execEnv.PYTHONUNBUFFERED = '1';
+-    if (!execEnv.PYTHONIOENCODING) {
+-      execEnv.PYTHONIOENCODING = 'utf-8';
+-    }
+-    let sorterStdout: string;
+-    try {
+-      const proc = spawn(execPath.startsWith('~/') ? execPath.replace('~', homedir()) : execPath, sortArgs, {
+-        env: execEnv,
+-      });
+-      const stdoutBuffers: Buffer[] = [];
+-      const stderrBuffers: Buffer[] = [];
+-      proc.stdout!.on('data', (data: Buffer) => stdoutBuffers.push(data));
+-      proc.stderr!.on('data', (data: Buffer) => stderrBuffers.push(data));
+-      sorterStdout = await new Promise<string>((resolve, reject) => {
+-        proc.once('close', () => {
+-          const stderr = stderrBuffers.length === 0 ? undefined : iconv.decode(Buffer.concat(stderrBuffers), 'utf8');
+-          if (stderr && stderr.length > 0) {
+-            reject(new Error(stderr));
+-          } else {
+-            resolve(iconv.decode(Buffer.concat(stdoutBuffers), 'utf8'));
+-          }
+-        });
+-        proc.once('error', (ex) => {
+-          console.error('once error:', ex);
+-          reject(ex);
+-        });
+-      });
+-    } finally {
+-      await fs.promises.unlink(tempFile);
+-    }
+-
+-    // The sorter answers with a unified diff. Walk it directly and translate it
+-    // into workspace edits: first decode the hunks, then replay them against
+-    // the original contents of the document.
+-    const originalContents = doc.getDocumentContent();
+-    let diffText = sorterStdout;
+-    if (diffText.startsWith('---')) {
+-      diffText = diffText.substring(diffText.indexOf('@@'));
+-    }
+-
+-    const textEdits: TextEdit[] = [];
+-    if (diffText.length > 0) {
+-      // Remove the text added by unified_diff
+-      // # Work around missing newline (http://bugs.python.org/issue2142).
+-      diffText = diffText.replace(/\\ No newline at end of file[\r\n]/, '');
+-      const dmp = require('diff-match-patch') as typeof import('diff-match-patch');
+-      const diffLines = diffText.split(/[\r\n]/);
+-      const hunks: SorterHunk[] = [];
+-      let linePointer = 0;
+-      while (linePointer < diffLines.length) {
+-        const m = diffLines[linePointer].match(/^@@ -(\d+),?(\d*) \+(\d+),?(\d*) @@$/);
+-        if (!m) {
+-          throw new Error(`Invalid patch string: ${diffLines[linePointer]}`);
+-        }
+-        const hunk: SorterHunk = { diffs: [], start1: 0, start2: 0, length1: 0, length2: 0 };
+-        hunks.push(hunk);
+-        hunk.start1 = parseInt(m[1], 10);
+-        if (m[2] === '') {
+-          hunk.start1 -= 1;
+-          hunk.length1 = 1;
+-        } else if (m[2] === '0') {
+-          hunk.length1 = 0;
+-        } else {
+-          hunk.start1 -= 1;
+-          hunk.length1 = parseInt(m[2], 10);
+-        }
+-        hunk.start2 = parseInt(m[3], 10);
+-        if (m[4] === '') {
+-          hunk.start2 -= 1;
+-          hunk.length2 = 1;
+-        } else if (m[4] === '0') {
+-          hunk.length2 = 0;
+-        } else {
+-          hunk.start2 -= 1;
+-          hunk.length2 = parseInt(m[4], 10);
+-        }
+-        linePointer += 1;
+-        while (linePointer < diffLines.length) {
+-          const sign = diffLines[linePointer].charAt(0);
+-          let bodyLine: string;
+-          try {
+-            // For some reason the patch generated by python files don't encode any characters
+-            // And this patch module (code from Google) is expecting the text to be encoded!!
+-            // Temporary solution, disable decoding
+-            // Issue #188
+-            bodyLine = diffLines[linePointer].substring(1);
+-          } catch (_ex) {
+-            throw new Error('Illegal escape in patch_fromText');
+-          }
+-          if (sign === '-') {
+-            hunk.diffs.push([dmp.DIFF_DELETE, bodyLine]);
+-          } else if (sign === '+') {
+-            hunk.diffs.push([dmp.DIFF_INSERT, bodyLine]);
+-          } else if (sign === ' ') {
+-            hunk.diffs.push([dmp.DIFF_EQUAL, bodyLine]);
+-          } else if (sign === '@') {
+-            break;
+-          } else if (sign === '') {
+-            // Blank line?  Whatever.
+-          } else {
+-            throw new Error(`Invalid patch mode '${sign}' in: ${bodyLine}`);
+-          }
+-          linePointer += 1;
+-        }
+-      }
+-      if (hunks.length === 0) {
+-        throw new Error('Unable to parse Patch string');
+-      }
+-
+-      for (const hunk of hunks) {
+-        // line feeds are added back when replaying the diff below
+-        for (const diff of hunk.diffs) {
+-          diff[1] += EOL;
+-        }
+-
+-        // Where in the original document does this hunk start?
+-        let cursorLine = hunk.start1;
+-        let cursorCharacter = 0;
+-        if (cursorLine > 0) {
+-          const prefixLines = originalContents.split(/\r?\n/g).filter((_l, i) => i < cursorLine);
+-          for (const l of prefixLines) {
+-            cursorCharacter += l.length + EOL.length;
+-          }
+-        }
+-
+-        // Replay every op of the hunk: 0=delete, 1=insert, 2=delete+insert (replace).
+-        let pendingAction = -1;
+-        let pendingStart: Position = { line: 0, character: 0 };
+-        let pendingEnd: Position = { line: 0, character: 0 };
+-        let pendingText = '';
+-        const flushPendingEdit = () => {
+-          if (pendingAction === 1) {
+-            textEdits.push(TextEdit.insert(pendingStart, pendingText));
+-          } else if (pendingAction === 0) {
+-            textEdits.push(TextEdit.del(Range.create(pendingStart, pendingEnd)));
+-          } else if (pendingAction === 2) {
+-            textEdits.push(TextEdit.replace(Range.create(pendingStart, pendingEnd), pendingText));
+-          } else {
+-            textEdits.push({ range: Range.create(0, 0, 0, 0), newText: '' });
+-          }
+-        };
+-        for (let i = 0; i < hunk.diffs.length; i += 1) {
+-          const start = { line: cursorLine, character: cursorCharacter };
+-          // Compute the line/character after the op is applied.
+-          for (let curr = 0; curr < hunk.diffs[i][1].length; curr += 1) {
+-            if (hunk.diffs[i][1][curr] !== '\n') {
+-              cursorCharacter += 1;
+-            } else {
+-              cursorCharacter = 0;
+-              cursorLine += 1;
+-            }
+-          }
+-
+-          switch (hunk.diffs[i][0]) {
+-            case dmp.DIFF_DELETE:
+-              if (pendingAction === -1) {
+-                pendingAction = 0;
+-                pendingStart = start;
+-                pendingText = '';
+-              } else if (pendingAction !== 0) {
+-                throw new Error('cannot format due to an internal error.');
+-              }
+-              pendingEnd = { line: cursorLine, character: cursorCharacter };
+-              break;
+-
+-            case dmp.DIFF_INSERT:
+-              if (pendingAction === -1) {
+-                pendingAction = 1;
+-                pendingStart = start;
+-              } else if (pendingAction === 0) {
+-                pendingAction = 2;
+-              }
+-              // insert and replace edits are all relative to the original state
+-              // of the document, so inserts should reset the current line/character
+-              // position to the start.
+-              cursorLine = start.line;
+-              cursorCharacter = start.character;
+-              pendingText += hunk.diffs[i][1];
+-              break;
+-
+-            case dmp.DIFF_EQUAL:
+-              if (pendingAction !== -1) {
+-                flushPendingEdit();
+-                pendingAction = -1;
+-              }
+-              break;
+-          }
+-        }
+-        if (pendingAction !== -1) {
+-          flushPendingEdit();
+-        }
+-      }
+-    }
+-
+-    await doc.applyEdits(textEdits);
++    const patch = await generateImportsDiff(provider, doc.textDocument, outputChannel);
++    const edits = getTextEditsFromPatch(doc.getDocumentContent(), patch);
++    await doc.applyEdits(edits);
+ 
+     outputChannel.appendLine(`${'#'.repeat(10)} sortImports Output ${'#'.repeat(10)}`);
+-    outputChannel.appendLine(sorterStdout);
++    outputChannel.appendLine(patch);
+   } catch (err) {
+     let message = '';
+     if (typeof err === 'string') {

@@ -1,0 +1,180 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The rubric requires exactly ONE function to directly mutate the audit fields, with all other callers delegating to that single owner. The agent's patch instead introduces NINE separate owner functions, each directly mutating audit fields in its own body: android_audit_stamp (app->auditStampMs = ...), android_audit_tag (app->auditLastStage = stage), android_audit_fold (app->auditSuppressed += 1), android_audit_count (app->auditLastStage = stage; app->auditTransitions += 1), android_audit_count_if_stamped (app->auditLastStage = stage; app->auditTransitions += app->auditStampMs ? 1 : 0), android_audit_fold_duplicate (app->auditTransitions += 1 / app->auditSuppressed += 1; app->auditLastStage = stage), android_audit_fold_poll (app->auditSuppressed += ...; app->auditLastStage = stage), android_audit_clear_suppressed (app->auditLastStage = stage; app->auditSuppressed = 0), and android_audit_reset (app->auditLastStage = stage; app->auditTransitions = 0; app->auditSuppressed = 0). While the former inlined call sites now delegate to these helpers, the mutations are spread across nine functions rather than funneled through one, so the 'exactly one function performs the mutations' requirement is not met.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the change, exactly one function anywhere in the repository directly mutates the activity audit record fields (the audit-prefixed fields on struct android_app: auditLastStage, auditTransitions, auditStampMs, auditSuppressed) through assignment, compound assignment, or increment/decrement in its own body; every other function that touches the record does so only by delegating to that single owner.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch does not consolidate protocol decisions into one owner body. It adds a family of owner functions whose names encode the policy, and call sites still pre-decide count vs fold vs tag vs timestamp vs reset by choosing among them. Examples: android_app_pre_exec_cmd uses android_audit_stamp()+android_audit_count for INIT_WINDOW, android_audit_fold_duplicate for PAUSE/STOP, android_audit_count for CONFIG/DESTROY; android_app_post_exec_cmd uses android_audit_tag()+android_audit_fold for TERM_WINDOW and android_audit_clear_suppressed for RESUME; android_app_entry uses android_audit_reset()+android_audit_stamp; android_app_create chooses AUDIT_STAGE_RESTORED vs LAUNCH via android_audit_count; WebViewPostMessage branches \"if(initial) android_audit_count ... else tag+fold\". Thus changing a policy such as whether a step counts or folds would still require editing many call sites, the exact per-site policy branching the rubric says must move into the single owner.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The protocol decisions live inside that single owner: the classification of a step (the stage the caller reports), the count-versus-fold decision for entries, the timestamping, and the reset-on-fresh-launch/restore policy are made in the owner's body, so that changing any of those policies requires editing only that one function.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent converted every recording site listed in smell.diff to use the new android_audit_* helpers, leaving no site with old inlined mutation. Command-pipe handling: android_app_read_cmd uses android_audit_fold_poll/android_audit_tag+android_audit_fold; android_app_write_cmd, android_app_set_input/window/activity_state, process_cmd all call android_audit_count/android_audit_stamp. The x=x+1 variant in post_exec_cmd APP_CMD_SAVE_STATE and the boolean-add variant in onWindowFocusChanged (auditTransitions += auditStampMs ? 1 : 0) are both replaced by android_audit_count and android_audit_count_if_stamped respectively. Both sides of the UI-thread handoff are converted: RunCallbackOnUIThread and process_ui both call android_audit_count(gapp, AUDIT_STAGE_UI_DISPATCH). USB sites in android_usb_devices.c (DisconnectUSB, RequestPermissionOrGetConnectionFD permission round and refused-permission fold) use android_audit_count/android_audit_fold. All WebView sites in webview_native_activity.h (WebViewCreate, WebViewGetProgress, WebViewPostMessage, WebViewRequestRenderToCanvas, WebViewNativeGetPixels, WebViewExecuteJavascript, WebViewGetLastWindowTitle) are converted to android_audit_count/fold/tag. Lifecycle callbacks (onDestroy, onStart, onResume, onPause, onStop, onSaveInstanceState, onConfigurationChanged, onLowMemory, onNativeWindowCreated/Destroyed, onInputQueueCreated/Destroyed, onNativeWindowRedrawNeeded) all use the helpers. No remaining direct audit field writes appear in the patch.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The sweep is complete rather than partial: no recording site keeps its old inlined mutation while others were converted. In particular the repair cannot stop at the obvious lifecycle/callback sites and leave the glue's command-pipe handling, the main-thread request/acknowledgement helpers, either side of the UI-thread handoff, the USB connection and permission-round recording, or the WebView implementation block recording in their previous inlined form.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Every pre-refactor recording site is preserved as an android_audit_* call. The named low-signal entries survive: empty-command-pipe in android_app_read_cmd's else branch calls android_audit_tag(app, AUDIT_STAGE_ANOMALOUS) + android_audit_fold(app); window-redraw fold in onNativeWindowRedrawNeeded calls android_audit_fold(...); rejected-permission branch in RequestPermissionOrGetConnectionFD calls android_audit_fold(gapp); WebView progress poll in WebViewGetProgress calls android_audit_fold(gapp). Other steps (free_saved_state, read_cmd poll, pre/post_exec_cmd cases, process_cmd, lifecycle callbacks, USB connect/disconnect, WebView create/post/render/pixels/js/title, UI dispatch) are each replaced by equivalent android_audit_count/tag/fold/fold_duplicate/fold_poll/clear_suppressed/reset/stamp calls, so no recorded step was dropped.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The recording feature itself survives the refactor: every step that filed an entry before the change still files one after it, including the low-signal entries — the empty-command-pipe condition, the window-redraw fold, the rejected-permission branch of the USB round, and the WebView progress poll.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch preserves the audit feature rather than dismantling it: it does not delete the audit fields from struct android_app and adds helper functions that still update them, e.g. android_audit_count sets app->auditLastStage and increments app->auditTransitions, android_audit_fold increments app->auditSuppressed, android_audit_stamp sets app->auditStampMs, and android_audit_tag sets app->auditLastStage. All original recording sites continue to file entries through these helpers, including free_saved_state, android_app_read_cmd, process_cmd, android_app_entry, onDestroy/onStart/onResume, USB DisconnectUSB/RequestPermissionOrGetConnectionFD, and WebView create/post/render/pixels/JS/title sites. Thus counting, folding, and timestamp semantics remain intact.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not dismantle the audit feature to satisfy consolidation: deleting the record fields or emptying all recording sites (recording nothing) is not an acceptable resolution, and neither is reducing the record to a stage-tag-only field by discarding the counting, folding, and timestamp semantics.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch defines the audit owner functions in android_native_app_glue.c (android_audit_count/tag/fold/stamp/etc.) and exposes prototypes in android_native_app_glue.h, making them externally visible rather than static to the glue .c file. All three recording scopes are converted to call them: glue.c sites such as process_cmd, onStart, and onNativeWindowCreated; android_usb_devices.c in DisconnectUSB and RequestPermissionOrGetConnectionFD; and webview_native_activity.h in WebViewCreate, WebViewPostMessage, and others. No direct audit field writes remain at the previously-recording sites, and the shared header placement makes the owner reachable from the USB and WebView contexts that already include it for gapp/AUDIT_STAGE_*.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The single owner is reachable from every recording context: code compiled through the native activity glue (app-thread command handling and main-thread callbacks), the USB device helper translation unit, and the WebView implementation block can all call it, and the whole repository builds with every previously-recording site converted.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch funnels audit writes through android_audit_* helpers but preserves distinct stage tags per site: onWindowFocusChanged passes focused ? APP_CMD_GAINED_FOCUS : APP_CMD_LOST_FOCUS; window create/destroy and android_app_set_window use APP_CMD_INIT_WINDOW vs APP_CMD_TERM_WINDOW; android_app_create uses savedState != NULL ? AUDIT_STAGE_RESTORED : AUDIT_STAGE_LAUNCH; USB, WebView, and UI dispatch retain AUDIT_STAGE_USB_EVENT, AUDIT_STAGE_WEBVIEW_EVENT, and AUDIT_STAGE_UI_DISPATCH; the empty-pipe branch still files AUDIT_STAGE_ANOMALOUS. No owner call collapses these into a constant stage.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Steps that were distinguishable in the transcript before the change remain distinguishable after it: recorded focus-gain versus focus-loss, window initialization versus window teardown, cold launch versus restore-from-saved-state, input-queue changes, USB events versus WebView events versus UI-thread dispatch, and the anomalous-empty-pipe entry all still reach the record as distinct observable stages (tag values may be renumbered or renamed).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "All audit helpers take `struct android_app * app` and write only per-instance fields (`app->auditLastStage`, `app->auditTransitions`, `app->auditStampMs`, `app->auditSuppressed`); no static/global audit state is introduced. The header comment states the audit fields stay on struct android_app, and the struct fields are not replaced. `android_app_entry` calls `android_audit_reset(android_app, AUDIT_STAGE_LAUNCH)` then `android_audit_stamp`, zeroing transitions/suppressed for a fresh frame, while `android_app_create` files `AUDIT_STAGE_RESTORED` or `AUDIT_STAGE_LAUNCH` on the newly allocated app, so new incarnations do not accumulate prior entries.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The record remains a per-activity record carried on struct android_app: it is not replaced by process-global bookkeeping, the fields keep their meanings (most-recent stage tag, counted-entries counter, millisecond timestamp, folded-entries counter), and a fresh launch or restore still starts a fresh record rather than accumulating entries across activity incarnations.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes all inline audit field writes and inline struct timespec/clock_gettime blocks from former sites (e.g. APP_CMD_INIT_WINDOW, android_app_destroy, process_cmd, android_app_entry, onNativeWindowCreated) and routes them through new android_audit_* helpers. The only remaining timestamp code is inside android_audit_stamp, which is called. No commented-out old record writes, no orphaned timestamp blocks, no audit-only leftover locals, and no superseded duplicate filing function is retained; all new helpers are declared and used.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No dead or orphaned residue of the replaced inlined protocol is left behind: no commented-out copies of the old record writes, no unused `struct timespec`/`clock_gettime` timestamp blocks orphaned at former sites, no leftover local variables that existed only to compute record updates, and no second audit-filing function superseded but retained next to the new path.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The CLOCK_MONOTONIC-to-ms computation now appears only in the consolidated owner `android_audit_stamp()`; the previous site-local timestamp blocks in `APP_CMD_INIT_WINDOW`, `android_app_destroy`, `process_cmd`, `android_app_entry`, and `onNativeWindowCreated` were removed and replaced with `android_audit_stamp(...)` calls.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The CLOCK_MONOTONIC-to-milliseconds computation exists in exactly one place after the change (inside the consolidated owner), not as separate restated blocks at individual recording sites.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The patch leaves many site-local protocol comments in place at converted call sites, e.g. in android_native_app_glue.c: \"Lifecycle steps only count when the recorded stage actually moves; repeated pauses otherwise inflate the audit.\" before android_audit_fold_duplicate; \"The app-thread echo of a window teardown is folded, not counted, otherwise every window churn is double-represented.\" before android_audit_tag/android_audit_fold; and in webview_native_activity.h: \"Pixel reads used to be folded; field support asked for them counted.\" before android_audit_count. These still explain why the site counts/folds and describe old mechanics, rather than only stating which stage is recorded.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Comments at converted sites no longer assert site-local protocol authority: per-site explanations of how the protocol works (why this site counts while that site folds, how the fold is keyed, when to reset) are removed or rewritten as statements of which stage the site records, rather than left describing the old inlined mechanics.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only adds audit helper functions and replaces inline audit field writes with calls to them; all non-audit sequencing is preserved. Examples: android_app_set_input still runs the while(pthread_cond_wait) loop, audits, then pthread_mutex_unlock; android_app_write_cmd still calls write() after auditing; onSaveInstanceState still locks, audits, sets stateSaved=0, writes APP_CMD_SAVE_STATE, and waits; process_cmd still calls android_app_pre_exec_cmd/onAppCmd/android_app_post_exec_cmd in order; no NativeActivity callback registrations, pipe writes, mutex/cond sequencing, or saved-state/input/window handoff lines were reordered or dropped.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The refactor introduces no observable behavior change into the application: the command-pipe protocol, mutex and condition-variable sequencing, saved-state handover, input-queue attach/detach ordering, window handoff, UI-thread dispatch mechanics, and the NativeActivity callback registrations behave exactly as before; nothing outside the record's bookkeeping was reordered, added, or dropped alongside the consolidation.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "All audit field reads are confined to the new android_audit_* owner functions (e.g., android_audit_count_if_stamped reads app->auditStampMs, android_audit_fold_duplicate/fold_poll read app->auditLastStage). Call sites only invoke these owners and do not branch on audit fields to steer behavior: onWindowFocusChanged delegates to android_audit_count_if_stamped then unconditionally calls android_app_write_cmd; onSaveInstanceState calls android_audit_fold_duplicate then unconditionally writes APP_CMD_SAVE_STATE; android_app_read_cmd switches on cmd, not audit state.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No observable control-flow decision newly depends on record contents: the consolidated owner may branch on record values internally (fold decisions), but no code path outside the record's own bookkeeping may read the record fields to steer application behavior.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch to android_native_app_glue.h contains a single hunk that adds audit helper function declarations (android_audit_stamp, android_audit_tag, android_audit_fold, android_audit_count, etc.) after the AUDIT_STAGE enum block. It does not modify the struct android_app definition at all — no fields are reshuffled, renamed, repurposed, or retyped. The pre-existing fields (pendingWindow, pendingContentRect, and everything before them) and even the smell-injected audit fields retain their existing positions, types, and order, so application code compiled against this public header remains source-compatible.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The struct android_app layout keeps its documented pre-existing fields (the callback pointers, activity/config pointers, saved state, loopers, input queue, window, content rect, activity state, destroy request and the private glue section) with unchanged types and order, so application code already compiled against this glue continues to work without source changes.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch replaces every direct audit-field write with calls to newly declared/defined helper functions (android_audit_count, android_audit_tag, android_audit_fold, android_audit_stamp, android_audit_fold_duplicate, android_audit_fold_poll, android_audit_clear_suppressed, android_audit_reset, android_audit_count_if_stamped) whose bodies reproduce the exact original semantics: e.g., android_audit_count does app->auditLastStage=stage; app->auditTransitions+=1; android_audit_fold_poll does app->auditSuppressed += (app->auditLastStage==stage); app->auditLastStage=stage; android_audit_count_if_stamped does app->auditLastStage=stage; app->auditTransitions += app->auditStampMs?1:0. Each transformed call site is behaviorally identical to the smell version (free_saved_state, read_cmd success/error, pre/post_exec_cmd cases, process_cmd, android_app_entry reset+stamp, create ternary, set_window ternary, onSaveInstanceState fold_duplicate, onWindowFocusChanged count_if_stamped, USB and WebView sites). The helpers are declared in android_native_app_glue.h (which already provides the struct/enum used by android_usb_devices.c and webview_native_activity.h, so the declarations are visible there) and defined non-static in android_native_app_glue.c before first use, preserving external linkage and the existing #include <time.h> for clock_gettime. No lifecycle sequencing, command-pipe, window/input handoff, or UI-dispatch logic was altered—only the bookkeeping writes were funneled through equivalent functions—so no new compile or test failures are introduced.",
+      "valid": true,
+      "attempts": 4,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repaired repository must compile and pass the same full build-and-test run that passes before the change, with no new failures.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.6666666666666666,
+    "associated_changes": 1,
+    "core_resolution": 0.6
+  },
+  "valid_count": 15,
+  "pass_count": 12,
+  "must_have_pass": false,
+  "macro_score": 0.8166666666666667
+}

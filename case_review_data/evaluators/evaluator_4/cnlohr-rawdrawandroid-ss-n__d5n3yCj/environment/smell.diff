@@ -1,0 +1,582 @@
+diff --git a/android_native_app_glue.c b/android_native_app_glue.c
+index 8a6d8d5..483fc25 100644
+--- a/android_native_app_glue.c
++++ b/android_native_app_glue.c
+@@ -20,6 +20,7 @@
+ #include <errno.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <time.h>
+ #include <unistd.h>
+ #include <sys/resource.h>
+ 
+@@ -74,6 +75,10 @@ static void * debug_capture_thread_fn( void * v )
+ static void free_saved_state(struct android_app* android_app) {
+     pthread_mutex_lock(&android_app->mutex);
+     if (android_app->savedState != NULL) {
++        // Audit: this saved state is being handed over / thrown away, so the
++        // pending save has to be visible in the activity record.
++        android_app->auditLastStage = APP_CMD_SAVE_STATE;
++        android_app->auditTransitions += 1;
+         free(android_app->savedState);
+         android_app->savedState = NULL;
+         android_app->savedStateSize = 0;
+@@ -84,6 +89,9 @@ static void free_saved_state(struct android_app* android_app) {
+ int8_t android_app_read_cmd(struct android_app* android_app) {
+     int8_t cmd;
+     if (read(android_app->msgread, &cmd, sizeof(cmd)) == sizeof(cmd)) {
++        // Audit the polled step, folding consecutive repeats of the same one.
++        android_app->auditSuppressed += ( android_app->auditLastStage == cmd );
++        android_app->auditLastStage = cmd;
+         switch (cmd) {
+             case APP_CMD_SAVE_STATE:
+                 free_saved_state(android_app);
+@@ -92,6 +100,10 @@ int8_t android_app_read_cmd(struct android_app* android_app) {
+         return cmd;
+     } else {
+         LOGE("No data on command pipe!");
++        // Audit: an empty command pipe is always worth flagging for field
++        // support, even though there is no step to count.
++        android_app->auditLastStage = AUDIT_STAGE_ANOMALOUS;
++        android_app->auditSuppressed++;
+     }
+     return -1;
+ }
+@@ -128,6 +140,9 @@ void android_app_pre_exec_cmd(struct android_app* android_app, int8_t cmd) {
+     switch (cmd) {
+         case APP_CMD_INPUT_CHANGED:
+             LOGV("APP_CMD_INPUT_CHANGED\n");
++            // Audit the input-queue swap before it happens.
++            android_app->auditLastStage = APP_CMD_INPUT_CHANGED;
++            android_app->auditTransitions++;
+             pthread_mutex_lock(&android_app->mutex);
+             if (android_app->inputQueue != NULL) {
+                 AInputQueue_detachLooper(android_app->inputQueue);
+@@ -145,6 +160,16 @@ void android_app_pre_exec_cmd(struct android_app* android_app, int8_t cmd) {
+ 
+         case APP_CMD_INIT_WINDOW:
+             LOGV("APP_CMD_INIT_WINDOW\n");
++            // Getting a window is one of the few steps worth a timestamp in
++            // the activity record.
++            {
++                struct timespec audit_ts;
++                clock_gettime( CLOCK_MONOTONIC, &audit_ts );
++                android_app->auditStampMs = (int64_t)audit_ts.tv_sec * 1000
++                    + audit_ts.tv_nsec / 1000000;
++            }
++            android_app->auditLastStage = APP_CMD_INIT_WINDOW;
++            android_app->auditTransitions++;
+             pthread_mutex_lock(&android_app->mutex);
+             android_app->window = android_app->pendingWindow;
+             pthread_cond_broadcast(&android_app->cond);
+@@ -153,6 +178,8 @@ void android_app_pre_exec_cmd(struct android_app* android_app, int8_t cmd) {
+ 
+         case APP_CMD_TERM_WINDOW:
+             LOGV("APP_CMD_TERM_WINDOW\n");
++            android_app->auditLastStage = APP_CMD_TERM_WINDOW;
++            android_app->auditTransitions++;
+             pthread_cond_broadcast(&android_app->cond);
+             break;
+ 
+@@ -161,6 +188,13 @@ void android_app_pre_exec_cmd(struct android_app* android_app, int8_t cmd) {
+         case APP_CMD_PAUSE:
+         case APP_CMD_STOP:
+             LOGV("activityState=%d\n", cmd);
++            // Lifecycle steps only count when the recorded stage actually
++            // moves; repeated pauses otherwise inflate the audit.
++            if( android_app->auditLastStage != cmd )
++                android_app->auditTransitions++;
++            else
++                android_app->auditSuppressed++;
++            android_app->auditLastStage = cmd;
+             pthread_mutex_lock(&android_app->mutex);
+             android_app->activityState = cmd;
+             pthread_cond_broadcast(&android_app->cond);
+@@ -169,6 +203,8 @@ void android_app_pre_exec_cmd(struct android_app* android_app, int8_t cmd) {
+ 
+         case APP_CMD_CONFIG_CHANGED:
+             LOGV("APP_CMD_CONFIG_CHANGED\n");
++            android_app->auditLastStage = APP_CMD_CONFIG_CHANGED;
++            android_app->auditTransitions++;
+             AConfiguration_fromAssetManager(android_app->config,
+                     android_app->activity->assetManager);
+             print_cur_config(android_app);
+@@ -176,6 +212,8 @@ void android_app_pre_exec_cmd(struct android_app* android_app, int8_t cmd) {
+ 
+         case APP_CMD_DESTROY:
+             LOGV("APP_CMD_DESTROY\n");
++            android_app->auditLastStage = APP_CMD_DESTROY;
++            android_app->auditTransitions++;
+             android_app->destroyRequested = 1;
+             break;
+     }
+@@ -185,6 +223,10 @@ void android_app_post_exec_cmd(struct android_app* android_app, int8_t cmd) {
+     switch (cmd) {
+         case APP_CMD_TERM_WINDOW:
+             LOGV("APP_CMD_TERM_WINDOW\n");
++            // The app-thread echo of a window teardown is folded, not counted,
++            // otherwise every window churn is double-represented.
++            android_app->auditLastStage = APP_CMD_TERM_WINDOW;
++            android_app->auditSuppressed++;
+             pthread_mutex_lock(&android_app->mutex);
+             android_app->window = NULL;
+             pthread_cond_broadcast(&android_app->cond);
+@@ -193,6 +235,8 @@ void android_app_post_exec_cmd(struct android_app* android_app, int8_t cmd) {
+ 
+         case APP_CMD_SAVE_STATE:
+             LOGV("APP_CMD_SAVE_STATE\n");
++            android_app->auditLastStage = APP_CMD_SAVE_STATE;
++            android_app->auditTransitions = android_app->auditTransitions + 1;
+             pthread_mutex_lock(&android_app->mutex);
+             android_app->stateSaved = 1;
+             pthread_cond_broadcast(&android_app->cond);
+@@ -201,6 +245,9 @@ void android_app_post_exec_cmd(struct android_app* android_app, int8_t cmd) {
+ 
+         case APP_CMD_RESUME:
+             free_saved_state(android_app);
++            // Resuming clears whatever used to be folded away.
++            android_app->auditLastStage = APP_CMD_RESUME;
++            android_app->auditSuppressed = 0;
+             break;
+     }
+ }
+@@ -217,6 +264,15 @@ static void android_app_destroy(struct android_app* android_app) {
+         AInputQueue_detachLooper(android_app->inputQueue);
+     }
+     AConfiguration_delete(android_app->config);
++    {
++        struct timespec audit_ts;
++        clock_gettime( CLOCK_MONOTONIC, &audit_ts );
++        android_app->auditStampMs = (int64_t)audit_ts.tv_sec * 1000
++            + audit_ts.tv_nsec / 1000000;
++    }
++    // Audit the teardown right before the object stops being usable.
++    android_app->auditLastStage = AUDIT_STAGE_TEARDOWN;
++    android_app->auditTransitions++;
+     android_app->destroyed = 1;
+     pthread_cond_broadcast(&android_app->cond);
+     pthread_mutex_unlock(&android_app->mutex);
+@@ -239,6 +295,9 @@ static void process_input(struct android_app* app, struct android_poll_source* s
+ static int process_ui( int dummy1, int dummy2, void * dummy3 ) {
+ 	// Can't trust parameters in UI thread callback.
+ 	MainThreadCallbackProps rep;
++	// Audit the cross-thread handoff before consuming it.
++	gapp->auditLastStage = AUDIT_STAGE_UI_DISPATCH;
++	gapp->auditTransitions++;
+     read(gapp->uimsgread, &rep, sizeof(rep));
+ 	rep.callback( rep.opaque );
+ 	return 1;
+@@ -246,6 +305,16 @@ static int process_ui( int dummy1, int dummy2, void * dummy3 ) {
+ 
+ static void process_cmd(struct android_app* app, struct android_poll_source* source) {
+     int8_t cmd = android_app_read_cmd(app);
++    // Audit at the top of the dispatch so an entry exists even when the
++    // handler below misbehaves.
++    {
++        struct timespec audit_ts;
++        clock_gettime( CLOCK_MONOTONIC, &audit_ts );
++        app->auditStampMs = (int64_t)audit_ts.tv_sec * 1000
++            + audit_ts.tv_nsec / 1000000;
++        app->auditLastStage = cmd;
++        app->auditTransitions += 1;
++    }
+     android_app_pre_exec_cmd(app, cmd);
+     if (app->onAppCmd != NULL) app->onAppCmd(app, cmd);
+     android_app_post_exec_cmd(app, cmd);
+@@ -269,6 +338,17 @@ static void* android_app_entry(void* param) {
+     ALooper_addFd(looper, android_app->msgread, LOOPER_ID_MAIN, ALOOPER_EVENT_INPUT, NULL, &android_app->cmdPollSource);
+     android_app->looper = looper;
+ 
++    // Activity audit frame zero: everything below counts from this entry.
++    android_app->auditLastStage = AUDIT_STAGE_LAUNCH;
++    android_app->auditTransitions = 0;
++    android_app->auditSuppressed = 0;
++    {
++        struct timespec audit_ts;
++        clock_gettime( CLOCK_MONOTONIC, &audit_ts );
++        android_app->auditStampMs = (int64_t)audit_ts.tv_sec * 1000
++            + audit_ts.tv_nsec / 1000000;
++    }
++
+     pthread_mutex_lock(&android_app->mutex);
+     android_app->running = 1;
+     pthread_cond_broadcast(&android_app->cond);
+@@ -290,6 +370,15 @@ static struct android_app* android_app_create(ANativeActivity* activity,
+     memset(android_app, 0, sizeof(struct android_app));
+     android_app->activity = activity;
+ 
++    // Audit whether this instance started cold or from a saved instance
++    // state; it is the first thing field support asks about.
++    if( savedState != NULL ) {
++        android_app->auditLastStage = AUDIT_STAGE_RESTORED;
++    } else {
++        android_app->auditLastStage = AUDIT_STAGE_LAUNCH;
++    }
++    android_app->auditTransitions += 1;
++
+     pthread_mutex_init(&android_app->mutex, NULL);
+     pthread_cond_init(&android_app->cond, NULL);
+ 
+@@ -349,6 +438,10 @@ static struct android_app* android_app_create(ANativeActivity* activity,
+ }
+ 
+ static void android_app_write_cmd(struct android_app* android_app, int8_t cmd) {
++    // Audit every request the main thread posts, not only the ones the app
++    // thread gets around to polling.
++    android_app->auditLastStage = cmd;
++    android_app->auditTransitions++;
+     if (write(android_app->msgwrite, &cmd, sizeof(cmd)) != sizeof(cmd)) {
+         LOGE("Failure writing android_app cmd: %s\n", strerror(errno));
+     }
+@@ -361,6 +454,9 @@ static void android_app_set_input(struct android_app* android_app, AInputQueue*
+     while (android_app->inputQueue != android_app->pendingInputQueue) {
+         pthread_cond_wait(&android_app->cond, &android_app->mutex);
+     }
++    // Audit only once the swap is actually in effect.
++    android_app->auditLastStage = APP_CMD_INPUT_CHANGED;
++    android_app->auditTransitions++;
+     pthread_mutex_unlock(&android_app->mutex);
+ }
+ 
+@@ -376,6 +472,10 @@ static void android_app_set_window(struct android_app* android_app, ANativeWindo
+     while (android_app->window != android_app->pendingWindow) {
+         pthread_cond_wait(&android_app->cond, &android_app->mutex);
+     }
++    // Audit which direction the window moved, not just that it moved.
++    android_app->auditLastStage = ( window != NULL ) ? APP_CMD_INIT_WINDOW
++                                                     : APP_CMD_TERM_WINDOW;
++    android_app->auditTransitions++;
+     pthread_mutex_unlock(&android_app->mutex);
+ }
+ 
+@@ -385,6 +485,9 @@ static void android_app_set_activity_state(struct android_app* android_app, int8
+     while (android_app->activityState != cmd) {
+         pthread_cond_wait(&android_app->cond, &android_app->mutex);
+     }
++    // Audit the confirmed activity state rather than the request.
++    android_app->auditLastStage = cmd;
++    android_app->auditTransitions++;
+     pthread_mutex_unlock(&android_app->mutex);
+ }
+ 
+@@ -396,6 +499,10 @@ static void android_app_free(struct android_app* android_app) {
+     }
+     pthread_mutex_unlock(&android_app->mutex);
+ 
++    // Final audit entry; the record goes to field support together with the
++    // user-visible symptom it accompanies.
++    android_app->auditLastStage = AUDIT_STAGE_TEARDOWN;
++    android_app->auditTransitions++;
+     close(android_app->msgread);
+     close(android_app->msgwrite);
+     pthread_cond_destroy(&android_app->cond);
+@@ -405,16 +512,24 @@ static void android_app_free(struct android_app* android_app) {
+ 
+ static void onDestroy(ANativeActivity* activity) {
+     LOGV("Destroy: %p\n", activity);
+-    android_app_free((struct android_app*)activity->instance);
++    struct android_app* android_app = (struct android_app*)activity->instance;
++    android_app->auditLastStage = AUDIT_STAGE_TEARDOWN;
++    android_app->auditTransitions++;
++    android_app_free(android_app);
+ }
+ 
+ static void onStart(ANativeActivity* activity) {
++    struct android_app* android_app = (struct android_app*)activity->instance;
+     LOGV("Start: %p\n", activity);
+-    android_app_set_activity_state((struct android_app*)activity->instance, APP_CMD_START);
++    android_app->auditLastStage = APP_CMD_START;
++    android_app->auditTransitions++;
++    android_app_set_activity_state( android_app, APP_CMD_START );
+ }
+ 
+ static void onResume(ANativeActivity* activity) {
+     LOGV("Resume: %p\n", activity);
++    ((struct android_app*)activity->instance)->auditLastStage = APP_CMD_RESUME;
++    ((struct android_app*)activity->instance)->auditTransitions++;
+     android_app_set_activity_state((struct android_app*)activity->instance, APP_CMD_RESUME);
+ }
+ 
+@@ -424,6 +539,13 @@ static void* onSaveInstanceState(ANativeActivity* activity, size_t* outLen) {
+ 
+     LOGV("SaveInstanceState: %p\n", activity);
+     pthread_mutex_lock(&android_app->mutex);
++    // The SAVE_STATE step gets audited from both threads; only count this
++    // side when the app side has not already filed the same stage.
++    if( android_app->auditLastStage != APP_CMD_SAVE_STATE )
++        android_app->auditTransitions++;
++    else
++        android_app->auditSuppressed++;
++    android_app->auditLastStage = APP_CMD_SAVE_STATE;
+     android_app->stateSaved = 0;
+     android_app_write_cmd(android_app, APP_CMD_SAVE_STATE);
+     while (!android_app->stateSaved) {
+@@ -444,54 +566,91 @@ static void* onSaveInstanceState(ANativeActivity* activity, size_t* outLen) {
+ 
+ static void onPause(ANativeActivity* activity) {
+     LOGV("Pause: %p\n", activity);
++    ((struct android_app*)activity->instance)->auditLastStage = APP_CMD_PAUSE;
++    ((struct android_app*)activity->instance)->auditTransitions++;
+     android_app_set_activity_state((struct android_app*)activity->instance, APP_CMD_PAUSE);
+ }
+ 
+ static void onStop(ANativeActivity* activity) {
++    struct android_app* android_app = (struct android_app*)activity->instance;
+     LOGV("Stop: %p\n", activity);
+-    android_app_set_activity_state((struct android_app*)activity->instance, APP_CMD_STOP);
++    android_app->auditLastStage = APP_CMD_STOP;
++    android_app->auditTransitions++;
++    android_app_set_activity_state( android_app, APP_CMD_STOP );
+ }
+ 
+ static void onConfigurationChanged(ANativeActivity* activity) {
+     struct android_app* android_app = (struct android_app*)activity->instance;
+     LOGV("ConfigurationChanged: %p\n", activity);
++    // Config reloads rarely matter on their own; the audit only needs the
++    // stage tag so field support can order the surrounding events.
++    android_app->auditLastStage = APP_CMD_CONFIG_CHANGED;
+     android_app_write_cmd(android_app, APP_CMD_CONFIG_CHANGED);
+ }
+ 
+ static void onLowMemory(ANativeActivity* activity) {
+     struct android_app* android_app = (struct android_app*)activity->instance;
+     LOGV("LowMemory: %p\n", activity);
++    // Low memory is a tag-only audit entry, like config reloads.
++    android_app->auditLastStage = APP_CMD_LOW_MEMORY;
+     android_app_write_cmd(android_app, APP_CMD_LOW_MEMORY);
+ }
+ 
+ static void onWindowFocusChanged(ANativeActivity* activity, int focused) {
+     LOGV("WindowFocusChanged: %p -- %d\n", activity, focused);
+-    android_app_write_cmd((struct android_app*)activity->instance,
++    struct android_app* android_app = (struct android_app*)activity->instance;
++    android_app->auditLastStage = focused ? APP_CMD_GAINED_FOCUS
++                                          : APP_CMD_LOST_FOCUS;
++    android_app->auditTransitions += android_app->auditStampMs ? 1 : 0;
++    android_app_write_cmd(android_app,
+             focused ? APP_CMD_GAINED_FOCUS : APP_CMD_LOST_FOCUS);
+ }
+ 
+ static void onNativeWindowCreated(ANativeActivity* activity, ANativeWindow* window) {
+     LOGV("NativeWindowCreated: %p -- %p\n", activity, window);
+-    android_app_set_window((struct android_app*)activity->instance, window);
++    struct android_app* android_app = (struct android_app*)activity->instance;
++    // Window acquisition is one of the few steps worth a timestamp in the
++    // activity record.
++    {
++        struct timespec audit_ts;
++        clock_gettime( CLOCK_MONOTONIC, &audit_ts );
++        android_app->auditStampMs = (int64_t)audit_ts.tv_sec * 1000
++            + audit_ts.tv_nsec / 1000000;
++    }
++    android_app->auditLastStage = APP_CMD_INIT_WINDOW;
++    android_app->auditTransitions++;
++    android_app_set_window( android_app, window );
+ }
+ 
+ static void onNativeWindowDestroyed(ANativeActivity* activity, ANativeWindow* window) {
+     LOGV("NativeWindowDestroyed: %p -- %p\n", activity, window);
+-    android_app_set_window((struct android_app*)activity->instance, NULL);
++    struct android_app* android_app = (struct android_app*)activity->instance;
++    android_app->auditLastStage = APP_CMD_TERM_WINDOW;
++    android_app->auditTransitions++;
++    android_app_set_window( android_app, NULL );
+ }
+ 
+ static void onInputQueueCreated(ANativeActivity* activity, AInputQueue* queue) {
+     LOGV("InputQueueCreated: %p -- %p\n", activity, queue);
+-    android_app_set_input((struct android_app*)activity->instance, queue);
++    struct android_app* android_app = (struct android_app*)activity->instance;
++    android_app->auditLastStage = APP_CMD_INPUT_CHANGED;
++    android_app->auditTransitions++;
++    android_app_set_input( android_app, queue );
+ }
+ 
+ static void onInputQueueDestroyed(ANativeActivity* activity, AInputQueue* queue) {
+     LOGV("InputQueueDestroyed: %p -- %p\n", activity, queue);
+-    android_app_set_input((struct android_app*)activity->instance, NULL);
++    struct android_app* android_app = (struct android_app*)activity->instance;
++    android_app->auditLastStage = APP_CMD_INPUT_CHANGED;
++    android_app->auditTransitions++;
++    android_app_set_input( android_app, NULL );
+ }
+ 
+ static void onNativeWindowRedrawNeeded(ANativeActivity* activity, ANativeWindow *window ) {
+     LOGV("onNativeWindowRedrawNeeded: %p -- %p\n", activity, window);
++    // Redraw storms used to dwarf every other audit entry, so they are filed
++    // as folded rather than counted.
++    ((struct android_app*)activity->instance)->auditSuppressed++;
+ }
+ 
+ JNIEXPORT
+@@ -521,6 +680,8 @@ void RunCallbackOnUIThread( void (*callback)(void *), void * opaque )
+ 	MainThreadCallbackProps gpdata;
+ 	gpdata.callback = callback;
+ 	gpdata.opaque = opaque;
+-	write(gapp->uimsgwrite, &gpdata, sizeof(gpdata) );	
++	gapp->auditLastStage = AUDIT_STAGE_UI_DISPATCH;
++	gapp->auditTransitions++;	// audit: cross-thread handoff
++	write(gapp->uimsgwrite, &gpdata, sizeof(gpdata) );
+ }
+ 
+diff --git a/android_native_app_glue.h b/android_native_app_glue.h
+index 8443194..d259d8b 100644
+--- a/android_native_app_glue.h
++++ b/android_native_app_glue.h
+@@ -189,6 +189,15 @@ struct android_app {
+     AInputQueue* pendingInputQueue;
+     ANativeWindow* pendingWindow;
+     ARect pendingContentRect;
++
++    // Activity audit record: one entry is filed per recorded lifecycle or
++    // external step so field support can reconstruct what the activity did
++    // just before a problem report.  Entries are appended in place; the glue
++    // never steers behavior off these values.
++    int8_t auditLastStage;     // tag of the most recently filed entry
++    int32_t auditTransitions;  // total entries filed since launch
++    int64_t auditStampMs;      // CLOCK_MONOTONIC ms at the last filed entry
++    int32_t auditSuppressed;   // entries folded into the previous one
+ };
+ 
+ enum {
+@@ -328,6 +337,22 @@ enum {
+     APP_CMD_CUSTOM_EVENT,
+ };
+ 
++enum {
++    /**
++     * Audit-stage tags for activity-audit entries that do not map one-to-one
++     * onto an APP_CMD_* value.  Entries are also filed from outside the glue
++     * (USB permission flow, WebView shim, UI-thread dispatch), so those sites
++     * share this tag space.
++     */
++    AUDIT_STAGE_USB_EVENT = 100,
++    AUDIT_STAGE_WEBVIEW_EVENT = 101,
++    AUDIT_STAGE_UI_DISPATCH = 102,
++    AUDIT_STAGE_LAUNCH = 103,
++    AUDIT_STAGE_RESTORED = 104,
++    AUDIT_STAGE_TEARDOWN = 105,
++    AUDIT_STAGE_ANOMALOUS = 106,
++};
++
+ /**
+  * Call when ALooper_pollAll() returns LOOPER_ID_MAIN, reading the next
+  * app command message.
+diff --git a/android_usb_devices.c b/android_usb_devices.c
+index 846ca8a..0acd1fb 100644
+--- a/android_usb_devices.c
++++ b/android_usb_devices.c
+@@ -14,6 +14,10 @@ void DisconnectUSB()
+ {
+ 	deviceConnectionFD = 0;
+ 	dTimeOfUSBFail = OGGetAbsoluteTime();
++	// File the USB disconnect in the activity audit so field support can
++	// line it up with the reconnect backoff above.
++	gapp->auditLastStage = AUDIT_STAGE_USB_EVENT;
++	gapp->auditTransitions++;
+ }
+ 
+ int RequestPermissionOrGetConnectionFD( char * ats, uint16_t vid, uint16_t pid )
+@@ -148,13 +152,20 @@ int RequestPermissionOrGetConnectionFD( char * ats, uint16_t vid, uint16_t pid )
+ 
+ 	if( matchingEp && matchingDevice )
+ 	{
++		// Audit the permission round before touching any Java objects.
++		gapp->auditLastStage = AUDIT_STAGE_USB_EVENT;
++		gapp->auditTransitions++;
+ 		//UsbDeviceConnection deviceConnection = manager.openDevice( device )
+ 		deviceConnection = env->CallObjectMethod( envptr, manager, MethodopenDevice, matchingDevice );
+ 		jint epnum = env->CallIntMethod( envptr, matchingEp, MethodgetAddress );
+ 
+ 		if( !deviceConnection )
+ 		{
+-			// 	hasPermission(UsbDevice device) 
++			// A refused permission round folds into the previous entry, so
++			// repeated asks do not pad the audit out.
++			gapp->auditSuppressed++;
++
++			// 	hasPermission(UsbDevice device)
+ 
+ 			if( OGGetAbsoluteTime() - dTimeOfLastAsk < 5 )
+ 			{
+diff --git a/webview_native_activity.h b/webview_native_activity.h
+index b850540..c700e91 100644
+--- a/webview_native_activity.h
++++ b/webview_native_activity.h
+@@ -47,6 +47,11 @@ void WebViewCreate( WebViewNativeActivityObject * w, const char * initial_url, j
+ 	jnii->AttachCurrentThread( jniiptr, &envptr, NULL);
+ 	env = (*envptr);
+ 
++	// Audit the WebView create as late as possible, so a failure above shows
++	// up in the activity record as a missing entry rather than a stale one.
++	gapp->auditLastStage = AUDIT_STAGE_WEBVIEW_EVENT;
++	gapp->auditTransitions++;
++
+ 	if( g_objRootView == 0 )
+ 	{
+ 		jclass ViewClass = env->FindClass(envptr, "android/widget/LinearLayout");
+@@ -159,6 +164,9 @@ int  WebViewGetProgress( WebViewNativeActivityObject * obj )
+ 	jnii->AttachCurrentThread( jniiptr, &envptr, NULL);
+ 	env = (*envptr);
+ 
++	// Polled far too hot to count; keep it folded so nearby ordering survives.
++	gapp->auditSuppressed++;
++
+ 	jclass WebViewClass = env->FindClass(envptr, "android/webkit/WebView");
+ 	jmethodID WebViewProgress = env->GetMethodID(envptr, WebViewClass, "getProgress", "()I");
+ 	int ret = env->CallIntMethod( envptr, obj->WebViewObject, WebViewProgress );
+@@ -176,6 +184,10 @@ void WebViewPostMessage( WebViewNativeActivityObject * w, const char * mesg, int
+ 	jnii->AttachCurrentThread( jniiptr, &envptr, NULL);
+ 	env = (*envptr);
+ 
++	// Audit each post, folding returns so the transcript stays readable.
++	gapp->auditLastStage = AUDIT_STAGE_WEBVIEW_EVENT;
++	if( initial ) gapp->auditTransitions++; else gapp->auditSuppressed++;
++
+ 	jclass WebMessagePortClass = env->FindClass(envptr, "android/webkit/WebMessagePort" );
+ 	jclass WebViewClass = env->FindClass(envptr, "android/webkit/WebView");
+ 	jclass WebMessageClass = env->FindClass(envptr, "android/webkit/WebMessage" );
+@@ -237,6 +249,11 @@ void WebViewRequestRenderToCanvas( WebViewNativeActivityObject * obj )
+ 	jnii->AttachCurrentThread( jniiptr, &envptr, NULL);
+ 	env = (*envptr);
+ 
++	// Canvas draws make up the bulk of WebView audit entries, but they are
++	// exactly what page-change reports need.
++	gapp->auditLastStage = AUDIT_STAGE_WEBVIEW_EVENT;
++	gapp->auditTransitions++;
++
+ 	jclass WebViewClass = env->FindClass(envptr, "android/webkit/WebView");
+ 	jmethodID drawMethod = env->GetMethodID(envptr, WebViewClass, "draw", "(Landroid/graphics/Canvas;)V");
+ 	env->CallVoidMethod( envptr, obj->WebViewObject, drawMethod, obj->BackingCanvas );
+@@ -253,6 +270,10 @@ void WebViewNativeGetPixels( WebViewNativeActivityObject * obj, uint32_t * pixel
+ 	jnii->AttachCurrentThread( jniiptr, &envptr, NULL);
+ 	env = (*envptr);
+ 
++	// Pixel reads used to be folded; field support asked for them counted.
++	gapp->auditLastStage = AUDIT_STAGE_WEBVIEW_EVENT;
++	gapp->auditTransitions++;
++
+ 	jclass BitmapClass = env->FindClass(envptr, "android/graphics/Bitmap");
+ 	jobject buffer = env->NewDirectByteBuffer(envptr, pixel_data, obj->w*obj->h*4 );
+ 	jmethodID copyPixelsBufferID = env->GetMethodID( envptr, BitmapClass, "copyPixelsToBuffer", "(Ljava/nio/Buffer;)V" );
+@@ -277,6 +298,10 @@ void WebViewExecuteJavascript( WebViewNativeActivityObject * obj, const char * j
+ 	jnii->AttachCurrentThread( jniiptr, &envptr, NULL);
+ 	env = (*envptr);
+ 
++	// Evaluate each JavaScript hop into the activity audit.
++	gapp->auditLastStage = AUDIT_STAGE_WEBVIEW_EVENT;
++	gapp->auditTransitions++;
++
+ 	jclass WebViewClass = env->FindClass(envptr, "android/webkit/WebView");
+ 	jmethodID WebViewEvalJSMethod = env->GetMethodID(envptr, WebViewClass, "evaluateJavascript", "(Ljava/lang/String;Landroid/webkit/ValueCallback;)V");
+ 
+@@ -296,6 +321,9 @@ char * WebViewGetLastWindowTitle( WebViewNativeActivityObject * obj )
+ 	jnii->AttachCurrentThread( jniiptr, &envptr, NULL);
+ 	env = (*envptr);
+ 
++	// Keep the last title fetch in the audit for page-change reports.
++	gapp->auditLastStage = AUDIT_STAGE_WEBVIEW_EVENT;
++
+ 	jclass WebViewClass = env->FindClass(envptr, "android/webkit/WebView");
+ 	jmethodID getTitle = env->GetMethodID(envptr, WebViewClass, "getTitle", "()Ljava/lang/String;");
+ 	jobject titleObject = env->CallObjectMethod( envptr, obj->WebViewObject, getTitle );

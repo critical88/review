@@ -1,0 +1,160 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "The patch dissolves the single `FileIo` trait into five focused traits: `FileRead` (sequential reads), `FileWrite` (sequential writes), `FileSync` (fsync_all/fsync_data/f_truncate — durability/truncation only), `FileSeek` (f_cursor/f_seek_start — position only), and `FileLength` (f_len — length only). No trait bundles three or more directions; each covers at most one direction category. One-sided handles implement only the traits they honor: `Vec<u8>` implements `FileWrite`+`FileSync`+`FileLength` (no `FileRead`/`FileSeek`), `BufferedReader` implements `FileRead`+`FileSeek`+`FileLength` (no `FileWrite`/`FileSync`), and `BufferedWriter` implements `FileWrite`+`FileSync` (no `FileRead`/`FileSeek`/`FileLength`), removing the runtime 'Unsupported' refusals. Consumers declare focused combinations, e.g. `SdssFile<S, F: FileRead + FileSeek + FileLength>` for `read_full` and `F: FileWrite + FileSync` for `fsynced_write`, confirming every capability remains reachable through individually implementable traits.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, no single trait in the storage engine's file-abstraction module obligates a file handle to accept three or more of the I/O directions (sequential read, sequential write, durability/truncation, position/length access) at the same time, and every file-handle capability the engine uses is still reachable through focused, individually implementable traits.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "Agent.patch removes the unsupported refusal arms for BufferedReader and BufferedWriter, but for the in-memory buffer it retains no-op durability shims: `impl FileSync for Vec<u8>` still has `fn fsync_all(&mut self) -> IoResult<()> { Ok(()) }` and `fn fsync_data(&mut self) -> IoResult<()> { Ok(()) }`, the same no-op shims introduced under `impl FileIo for Vec<u8>` in smell.diff. Since one of the three direction-specialized handles still carries no-op durability methods, the required behavior is not fully present.",
+      "valid": true,
+      "attempts": 4,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The three direction-specialized handle types in the file-abstraction module — the buffered read-side wrapper, the buffered write-side wrapper, and the in-memory grow-only buffer handle — no longer contain capability methods that unconditionally reject the direction they stand for (the runtime-'unsupported' refusal arms and no-op durability shims demanded by the bundling trait are gone); whatever remains of each handle is backed by real behavior.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The refactor request targets the merged interface that forced handles to answer every direction and refuse unsupported ones at runtime. The patch replaces `FileIo` with focused traits and narrows consumer bounds: in sdss_r1/mod.rs `_write_metadata` changes from `impl FileIo` to `impl FileWrite`; in sdss_r1/rw.rs `SdssFile` accessors are split so `read_buffer` requires `FileRead`, `file_cursor`/`seek_from_start` require `FileSeek`, `file_length` requires `FileLength`, `read_full` requires `FileRead + FileSeek + FileLength`, `write_buffer` requires `FileWrite`, `fsync_all`/`truncate` require `FileSync`, and `fsynced_write` requires `FileWrite + FileSync`; v1/raw/rw.rs `SDSSFileIO` is split analogously. These bounds demand only the capabilities each body exercises.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every accessor and generic writer in the shared file-spec metadata path and in both tracked reader/writer wrapper families (the shared one and the legacy raw one) demands from its handle parameter only the focused capability trait(s) whose members its body actually exercises, so a partial-capability handle satisfies each accessor it legitimately can.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes the merged `FileIo` trait entirely and replaces it with five narrow traits (`FileRead`, `FileWrite`, `FileSync`, `FileSeek`, `FileLength`), with no supertrait, alias, or re-export bundling them. One-sided handles implement only the traits they honor: `Vec<u8>` implements `FileWrite + FileSync + FileLength` (no read/seek stubs), `BufferedReader` implements `FileRead + FileSeek + FileLength` (no write/sync stubs), `BufferedWriter` implements `FileWrite + FileSync` (no read/seek/length stubs). Crucially, composite bounds are minimal and match the body's actual usage rather than restating the full conjunction: `read_full` is gated by `FileRead + FileSeek + FileLength` (exactly what it calls), `fsynced_write` by `FileWrite + FileSync`, and single-purpose methods like `read_buffer`, `file_cursor`, `write_buffer`, `fsync_all` carry single-trait bounds. This avoids the forbidden failure mode of restating a single parameter's bound as the conjunction of every focused trait while exercising a subset.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not preserve the bundling obligation in disguise: keeping the merged trait as a supertrait/alias/re-export that still requires every direction of its implementors, or restating a single parameter's bound as the conjunction of every focused trait while the body still exercises a subset, does not resolve the instance.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch splits the merged FileIo back into narrow traits and keeps non-disk handles usable: Vec<u8> implements FileWrite, FileSync, and FileLength without read/seek refusal stubs, and _write_metadata is changed to require impl FileWrite, so the in-memory buffer can still serve metadata-header encoding. BufferedReader implements FileRead/FileSeek/FileLength and BufferedWriter implements FileWrite/FileSync, while consumer bounds are narrowed (e.g. read_buffer requires FileRead, write_buffer requires FileWrite, fsynced_write requires FileWrite + FileSync), so one-sided handles can be used for the directions they support.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Non-disk handles remain usable for the directions they genuinely support: in particular the in-memory buffer continues to satisfy every demand currently placed on it by the metadata-header encoding paths, and plain readable or writable std types can still act as file handles wherever the storage code needs only those directions.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent.patch carries the local/virtual `AnyFile` bridge through the new segmentation by replacing the single `impl<Lf: FileIo> FileIo for AnyFile<Lf>` with separate `#[cfg(test)]` impls for `FileRead`, `FileWrite`, `FileSync`, `FileLength`, and `FileSeek`. Each impl delegates to `Self::Local(lf)` or `VirtualFS::instance().read().with_file_mut(&vf.0, |f| ...)`/`with_file(...)`, preserving both the real-disk and virtual-file test surfaces per direction.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The local/virtual test-context bridge in the file-abstraction module is carried through the new segmentation, implementing the focused capabilities per direction so the same storage code keeps running against both the real disk and the virtual file system used by the crash and journal recovery tests.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch reintroduces focused traits in fs.rs (FileRead, FileWrite, FileSync, FileSeek, FileLength) and updates every consumer that smell.diff had moved to FileIo: vfs.rs doc link now references FileWrite; sdss_r1/mod.rs imports FileRead/FileWrite and bounds _write_metadata by FileWrite; sdss_r1/rw.rs imports FileLength/FileRead/FileSeek/FileSync/FileWrite and splits SdssFile impl blocks by capability; upgrades.rs imports FileSeek/FileWrite; v1/raw/rw.rs imports FileLength/FileRead/FileSeek/FileSync/FileWrite and splits SDSSFileIO impls; v2/raw/journal/raw/mod.rs imports FileSeek/FileSync; recovery.rs imports FileLength/FileSync/FileWrite. No remaining FileIo imports or bounds appear in the patched consumer modules.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Every module that previously imported the bundling trait name — the tracked reader/writer modules, the file-spec module, the file-format upgrade path, the v2 raw journal, and the imports used by the journal recovery tests — now depends only on focused capability traits that exist in the final design.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch reintroduces narrow traits (FileRead, FileWrite, FileSync, FileSeek, FileLength) in fs.rs and updates the rustdoc cross-reference in vfs.rs from the removed bundle `fs::FileIo::fwrite_all_count` to the existing `fs::FileWrite::fwrite_all_count`, so the doc link points to an abstraction that exists after the repair rather than dangling.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Documentation references that pointed at the bundling trait — including the rustdoc cross-reference in the crash-injecting virtual file system utility — reference abstractions that exist after the repair instead of dangling links to the removed bundle.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch fully removes the bundled `FileIo` trait and leaves no residue: (1) No unused imports of `FileIo` remain — every affected file updates its imports (e.g., vfs.rs changes `FileIo::fwrite_all_count` to `FileWrite::fwrite_all_count`; sdss_r1/mod.rs changes `{File, FileIo}` to `{File, FileRead, FileWrite}`; v2/raw/journal/raw/mod.rs changes to `{File, FileSystem, FileSeek, FileSync}`). (2) No empty impl blocks — each split impl block carries its relevant methods (e.g., `impl FileRead for BufferedReader` has `fread_exact`; `impl FileSeek for BufferedReader` has `f_cursor`/`f_seek_start`; `impl FileLength for BufferedReader` has `f_len`). (3) No unreachable trait members or helper impls — the `Vec<u8>` handle drops the refused read/seek methods entirely instead of keeping no-op stubs, and `SdssFile`/`SDSSFileIO` methods are redistributed to impls with the minimal trait bounds needed (e.g., `truncate` moved to `impl<F: FileSync>`, `fsynced_write` to `impl<F: FileWrite + FileSync>`).",
+      "valid": true,
+      "attempts": 4,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The rework leaves no residue of the bundling design in the affected modules: no unused imports of the removed trait name, no empty impl blocks, and no trait members or helper impls that became unreachable when the bundle was split but were kept anyway.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the bundled `FileIo` trait and replaces it with focused traits `FileRead`, `FileWrite`, `FileSync`, `FileSeek`, and `FileLength`. All touched modules update imports and bounds to these narrow capabilities (e.g., `rw.rs` imports `FileLength, FileRead, FileSeek, FileSync, FileWrite` and splits `SdssFile` impls by capability). No `FileIo` alias, re-export, forwarding shim, or blanket impl preserving the old bundled name is introduced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "No identifier in the crate continues to denote the four-direction bundle after the repair: if the old bundling trait's name is reused, it now names a single focused capability, and no module keeps aliases, forwarding blanket impls, or compatibility shims whose only purpose is to keep the old bundling name alive.",
+      "passes": true
+    },
+    {
+      "id": "R11",
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The repository's full test suite passes after the repair, run the way the repository normally runs it (single-threaded test-harness binary, freshly built), with no skipped or attributed tests.",
+      "rationale": "The instance preserves behavior on both storage generations; the green suite is the primary behavioral anchor for that claim.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "Judge HTTP or response failure: 504",
+      "attempts": 6
+    },
+    {
+      "result": 1,
+      "evidence": "The patch replaces the merged FileIo with narrow FileRead/FileWrite/FileSync/FileSeek/FileLength traits and updates shown call sites to require only the capabilities they use. Successful delegations are preserved: BufferedReader implements FileRead/FileSeek/FileLength with the same self.f.* bodies; BufferedWriter implements FileWrite/FileSync with the same self.f.fwrite/fsync_*/f_truncate delegation; Vec<u8> retains FileWrite/FileSync/FileLength with append/no-op/truncate/len. SdssFile and SDSSFileIO split methods by capability but keep bodies (e.g., read_full under FileRead+FileSeek+FileLength, fsynced_write under FileWrite+FileSync). The injected Unsupported stubs on one-sided handles are removed, not moved into previously-working paths, so no successful operation becomes a runtime rejection or no-op.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No capability operation that succeeds before the repair starts failing or silently changing semantics afterwards: buffered reads and position/length queries on read-side handles, buffered writes with flush and downgrade on write-side handles, tracked checksummed reads/writes in both storage generations, metadata header encode/decode, the upgrade path's length/durability usage, and journal open and recovery must all keep working; nothing that succeeds in the injected state may begin returning runtime-rejection errors or no-op results.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The AnyFile test bridge still routes every capability to the virtual filesystem rather than disabling it: the patch adds separate #[cfg(test)] impls of FileRead, FileWrite, FileSync, FileLength, and FileSeek for AnyFile<Lf>, each with a Self::Virtual(vf) arm calling VirtualFS::instance().read().with_file_mut(...). No bridge method is converted to a no-op Ok(()) or Unsupported return. Recovery/journal callers still import the needed capabilities (recovery.rs imports FileLength, FileSync, FileWrite; journal/raw/mod.rs imports FileSeek, FileSync), and the crash-injection doc still points to FileWrite::fwrite_all_count, whose AnyFile impl dispatches virtual writes through VirtualFS.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair does not restrict the local/virtual test-context switching to a subset of capabilities in a way that silently stops the existing crash-injection and journal recovery scenarios from exercising the virtual file system, and does not convert any previously covered test path into a no-op success.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 0.75
+  },
+  "valid_count": 12,
+  "pass_count": 11,
+  "must_have_pass": false,
+  "macro_score": 0.9375
+}

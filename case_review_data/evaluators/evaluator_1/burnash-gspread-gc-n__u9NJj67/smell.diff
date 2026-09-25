@@ -1,0 +1,925 @@
+diff --git a/gspread/auth.py b/gspread/auth.py
+index b1f4254..c640df0 100644
+--- a/gspread/auth.py
++++ b/gspread/auth.py
+@@ -4,38 +4,30 @@ gspread.auth
+ 
+ Simple authentication with OAuth.
+ 
++The authentication entry points live on :class:`gspread.client.Client`.
++This module keeps the historical ``gspread.auth`` API working by
++forwarding every call to the client.
++
+ """
+ 
+-import json
+ import os
+ from pathlib import Path
+-from typing import Any, Dict, Iterable, Mapping, Optional, Protocol, Tuple, Union
++from typing import Any, Dict, Iterable, Mapping, Optional, Tuple, Union
+ 
+ from google.auth.credentials import Credentials
+-
+-try:
+-    from google.auth.api_key import Credentials as APIKeyCredentials
+-
+-    GOOGLE_AUTH_API_KEY_AVAILABLE = True
+-except ImportError:
+-    GOOGLE_AUTH_API_KEY_AVAILABLE = False
+-from google.oauth2.credentials import Credentials as OAuthCredentials
+-from google.oauth2.service_account import Credentials as SACredentials
+-from google_auth_oauthlib.flow import InstalledAppFlow
+ from requests import Session
+ 
+-from .client import Client
++from .client import Client, FlowCallable
+ from .http_client import HTTPClient, HTTPClientType
+ 
+-DEFAULT_SCOPES = [
+-    "https://www.googleapis.com/auth/spreadsheets",
+-    "https://www.googleapis.com/auth/drive",
+-]
+-
+-READONLY_SCOPES = [
+-    "https://www.googleapis.com/auth/spreadsheets.readonly",
+-    "https://www.googleapis.com/auth/drive.readonly",
+-]
++# default scopes / file locations are provided by the client
++DEFAULT_SCOPES = Client.DEFAULT_SCOPES
++READONLY_SCOPES = Client.READONLY_SCOPES
++DEFAULT_CONFIG_DIR: Path = Client.DEFAULT_CONFIG_DIR
++DEFAULT_CREDENTIALS_FILENAME: Path = Client.DEFAULT_CREDENTIALS_FILENAME
++DEFAULT_AUTHORIZED_USER_FILENAME: Path = Client.DEFAULT_AUTHORIZED_USER_FILENAME
++DEFAULT_SERVICE_ACCOUNT_FILENAME: Path = Client.DEFAULT_SERVICE_ACCOUNT_FILENAME
++GOOGLE_AUTH_API_KEY_AVAILABLE: bool = Client.GOOGLE_AUTH_API_KEY_AVAILABLE
+ 
+ 
+ def get_config_dir(
+@@ -48,17 +40,9 @@ def get_config_dir(
+         * `~/.config/gspread` everywhere else
+ 
+     """
+-    if os_is_windows:
+-        return Path(os.environ["APPDATA"], config_dir_name)
+-    else:
+-        return Path(Path.home(), ".config", config_dir_name)
+-
+-
+-DEFAULT_CONFIG_DIR = get_config_dir()
+-
+-DEFAULT_CREDENTIALS_FILENAME = DEFAULT_CONFIG_DIR / "credentials.json"
+-DEFAULT_AUTHORIZED_USER_FILENAME = DEFAULT_CONFIG_DIR / "authorized_user.json"
+-DEFAULT_SERVICE_ACCOUNT_FILENAME = DEFAULT_CONFIG_DIR / "service_account.json"
++    return Client.get_config_dir(
++        config_dir_name=config_dir_name, os_is_windows=os_is_windows
++    )
+ 
+ 
+ def authorize(
+@@ -84,20 +68,14 @@ def authorize(
+     :rtype: :class:`gspread.client.Client`
+     """
+ 
+-    return Client(auth=credentials, session=session, http_client=http_client)
+-
+-
+-class FlowCallable(Protocol):
+-    """Protocol for OAuth flow callables."""
+-
+-    def __call__(
+-        self, client_config: Mapping[str, Any], scopes: Iterable[str], port: int = 0
+-    ) -> OAuthCredentials: ...
++    return Client.authorize(
++        credentials=credentials, http_client=http_client, session=session
++    )
+ 
+ 
+ def local_server_flow(
+     client_config: Mapping[str, Any], scopes: Iterable[str], port: int = 0
+-) -> OAuthCredentials:
++) -> Credentials:
+     """Run an OAuth flow using a local server strategy.
+ 
+     Creates an OAuth flow and runs `google_auth_oauthlib.flow.InstalledAppFlow.run_local_server <https://google-auth-oauthlib.readthedocs.io/en/latest/reference/google_auth_oauthlib.flow.html#google_auth_oauthlib.flow.InstalledAppFlow.run_local_server>`_.
+@@ -107,27 +85,23 @@ def local_server_flow(
+     Pass this function to ``flow`` parameter of :meth:`~gspread.oauth` to run
+     a local server flow.
+     """
+-    flow = InstalledAppFlow.from_client_config(client_config, scopes)
+-    return flow.run_local_server(port=port)
++    return Client.local_server_flow(
++        client_config=client_config, scopes=scopes, port=port
++    )
+ 
+ 
+ def load_credentials(
+     filename: Path = DEFAULT_AUTHORIZED_USER_FILENAME,
+ ) -> Optional[Credentials]:
+-    if filename.exists():
+-        return OAuthCredentials.from_authorized_user_file(filename)
+-
+-    return None
++    return Client.load_credentials(filename=filename)
+ 
+ 
+ def store_credentials(
+-    creds: OAuthCredentials,
++    creds: Credentials,
+     filename: Path = DEFAULT_AUTHORIZED_USER_FILENAME,
+     strip: str = "token",
+ ) -> None:
+-    filename.parent.mkdir(parents=True, exist_ok=True)
+-    with filename.open("w") as f:
+-        f.write(creds.to_json(strip))
++    Client.store_credentials(creds=creds, filename=filename, strip=strip)
+ 
+ 
+ def oauth(
+@@ -144,14 +118,6 @@ def oauth(
+ 
+         gc = gspread.oauth()
+ 
+-    Another option is to run a console strategy. This way, the user is
+-    instructed to open the authorization URL in their browser. Once the
+-    authorization is complete, the user must then copy & paste the
+-    authorization code into the application::
+-
+-        gc = gspread.oauth(flow=gspread.auth.console_flow)
+-
+-
+     ``scopes`` parameter defaults to read/write scope available in
+     ``gspread.auth.DEFAULT_SCOPES``. It's read/write for Sheets
+     and Drive API::
+@@ -162,55 +128,16 @@ def oauth(
+         ]
+ 
+     You can also use ``gspread.auth.READONLY_SCOPES`` for read only access.
+-    Obviously any method of ``gspread`` that updates a spreadsheet
+-    **will not work** in this case::
+-
+-        gc = gspread.oauth(scopes=gspread.auth.READONLY_SCOPES)
+-
+-        sh = gc.open("A spreadsheet")
+-        sh.sheet1.update_acell('A1', '42')   # <-- this will not work
+-
+-    If you're storing your user credentials in a place other than the
+-    default, you may provide a path to that file like so::
+-
+-        gc = gspread.oauth(
+-            credentials_filename='/alternative/path/credentials.json',
+-            authorized_user_filename='/alternative/path/authorized_user.json',
+-        )
+-
+-    :param list scopes: The scopes used to obtain authorization.
+-    :param function flow: OAuth flow to use for authentication.
+-        Defaults to :meth:`~gspread.auth.local_server_flow`
+-    :param str credentials_filename: Filepath (including name) pointing to a
+-        credentials `.json` file.
+-        Defaults to DEFAULT_CREDENTIALS_FILENAME:
+-
+-            * `%APPDATA%\gspread\credentials.json` on Windows
+-            * `~/.config/gspread/credentials.json` everywhere else
+-    :param str authorized_user_filename: Filepath (including name) pointing to
+-        an authorized user `.json` file.
+-        Defaults to DEFAULT_AUTHORIZED_USER_FILENAME:
+-
+-            * `%APPDATA%\gspread\authorized_user.json` on Windows
+-            * `~/.config/gspread/authorized_user.json` everywhere else
+-    :type http_client: :class:`gspread.http_client.HTTPClient`
+-    :param http_client: A factory function that returns a client class.
+-        Defaults to :class:`gspread.http_client.HTTPClient` (but could also use
+-        :class:`gspread.http_client.BackOffHTTPClient` to avoid rate limiting)
+ 
+     :rtype: :class:`gspread.client.Client`
+     """
+-
+-    authorized_user_filename = Path(authorized_user_filename)
+-    creds = load_credentials(filename=authorized_user_filename)
+-
+-    if not isinstance(creds, Credentials):
+-        with open(credentials_filename) as json_file:
+-            client_config = json.load(json_file)
+-        creds = flow(client_config=client_config, scopes=scopes)
+-        store_credentials(creds, filename=authorized_user_filename)
+-
+-    return Client(auth=creds, http_client=http_client)
++    return Client.oauth(
++        scopes=scopes,
++        flow=flow,
++        credentials_filename=credentials_filename,
++        authorized_user_filename=authorized_user_filename,
++        http_client=http_client,
++    )
+ 
+ 
+ def oauth_from_dict(
+@@ -222,79 +149,27 @@ def oauth_from_dict(
+ ) -> Tuple[Client, Dict[str, Any]]:
+     r"""Authenticate with OAuth Client ID.
+ 
+-    By default this function will use the local server strategy and open
+-    the authorization URL in the user's browser::
+-
+-        gc = gspread.oauth_from_dict()
+-
+-    Another option is to run a console strategy. This way, the user is
+-    instructed to open the authorization URL in their browser. Once the
+-    authorization is complete, the user must then copy & paste the
+-    authorization code into the application::
+-
+-        gc = gspread.oauth_from_dict(flow=gspread.auth.console_flow)
+-
+-
+-    ``scopes`` parameter defaults to read/write scope available in
+-    ``gspread.auth.DEFAULT_SCOPES``. It's read/write for Sheets
+-    and Drive API::
+-
+-        DEFAULT_SCOPES =[
+-            'https://www.googleapis.com/auth/spreadsheets',
+-            'https://www.googleapis.com/auth/drive'
+-        ]
+-
+-    You can also use ``gspread.auth.READONLY_SCOPES`` for read only access.
+-    Obviously any method of ``gspread`` that updates a spreadsheet
+-    **will not work** in this case::
+-
+-        gc = gspread.oauth_from_dict(scopes=gspread.auth.READONLY_SCOPES)
+-
+-        sh = gc.open("A spreadsheet")
+-        sh.sheet1.update_acell('A1', '42')   # <-- this will not work
+-
+     This function requires you to pass the credentials directly as
+     a python dict. After the first authentication the function returns
+     the authenticated user info, this can be passed again to authenticate
+     the user without the need to run the flow again.
+ 
+-    ..
+-        code block below must be explicitly announced using code-block
+-
+     .. code-block:: python
+ 
+-        gc = gspread.oauth_from_dict(
+-                credentials=my_creds,
+-                authorized_user_info=my_auth_user
++        gc, authorized_user_info = gspread.oauth_from_dict(
++            credentials=my_creds,
++            authorized_user_info=my_auth_user
+         )
+ 
+-    :param dict credentials: The credentials from google cloud platform
+-    :param dict authorized_user_info: The authenticated user
+-        if already authenticated.
+-    :param list scopes: The scopes used to obtain authorization.
+-    :param function flow: OAuth flow to use for authentication.
+-        Defaults to :meth:`~gspread.auth.local_server_flow`
+-    :type http_client: :class:`gspread.http_client.HTTPClient`
+-    :param http_client: A factory function that returns a client class.
+-        Defaults to :class:`gspread.http_client.HTTPClient` (but could also use
+-        :class:`gspread.http_client.BackOffHTTPClient` to avoid rate limiting)
+-
+     :rtype: (:class:`gspread.client.Client`, str)
+     """
+-
+-    if authorized_user_info is not None:
+-        creds = OAuthCredentials.from_authorized_user_info(authorized_user_info, scopes)
+-    elif credentials is not None:
+-        creds = flow(client_config=credentials, scopes=scopes)
+-    else:
+-        raise ValueError("no credentials object supplied")
+-
+-    client = Client(auth=creds, http_client=http_client)
+-
+-    # must return the creds to the user
+-    # must strip the token an use the dedicated method from Credentials
+-    # to return a dict "safe to store".
+-    return (client, creds.to_json("token"))
++    return Client.oauth_from_dict(
++        credentials=credentials,
++        authorized_user_info=authorized_user_info,
++        scopes=scopes,
++        flow=flow,
++        http_client=http_client,
++    )
+ 
+ 
+ def service_account(
+@@ -313,21 +188,11 @@ def service_account(
+             'https://www.googleapis.com/auth/drive'
+         ]
+ 
+-    You can also use ``gspread.auth.READONLY_SCOPES`` for read only access.
+-    Obviously any method of ``gspread`` that updates a spreadsheet
+-    **will not work** in this case.
+-
+-    :param str filename: The path to the service account json file.
+-    :param list scopes: The scopes used to obtain authorization.
+-    :type http_client: :class:`gspread.http_client.HTTPClient`
+-    :param http_client: A factory function that returns a client class.
+-        Defaults to :class:`gspread.HTTPClient` (but could also use
+-        :class:`gspread.BackOffHTTPClient` to avoid rate limiting)
+-
+     :rtype: :class:`gspread.client.Client`
+     """
+-    creds = SACredentials.from_service_account_file(filename, scopes=scopes)
+-    return Client(auth=creds, http_client=http_client)
++    return Client.service_account(
++        filename=filename, scopes=scopes, http_client=http_client
++    )
+ 
+ 
+ def service_account_from_dict(
+@@ -337,33 +202,11 @@ def service_account_from_dict(
+ ) -> Client:
+     """Authenticate using a service account (json).
+ 
+-    ``scopes`` parameter defaults to read/write scope available in
+-    ``gspread.auth.DEFAULT_SCOPES``. It's read/write for Sheets
+-    and Drive API::
+-
+-        DEFAULT_SCOPES =[
+-            'https://www.googleapis.com/auth/spreadsheets',
+-            'https://www.googleapis.com/auth/drive'
+-        ]
+-
+-    You can also use ``gspread.auth.READONLY_SCOPES`` for read only access.
+-    Obviously any method of ``gspread`` that updates a spreadsheet
+-    **will not work** in this case.
+-
+-    :param info (Mapping[str, str]): The service account info in Google format
+-    :param list scopes: The scopes used to obtain authorization.
+-    :type http_client: :class:`gspread.http_client.HTTPClient`
+-    :param http_client: A factory function that returns a client class.
+-        Defaults to :class:`gspread.http_client.HTTPClient` (but could also use
+-        :class:`gspread.http_client.BackOffHTTPClient` to avoid rate limiting)
+-
+     :rtype: :class:`gspread.client.Client`
+     """
+-    creds = SACredentials.from_service_account_info(
+-        info=info,
+-        scopes=scopes,
++    return Client.service_account_from_dict(
++        info=info, scopes=scopes, http_client=http_client
+     )
+-    return Client(auth=creds, http_client=http_client)
+ 
+ 
+ def api_key(token: str, http_client: HTTPClientType = HTTPClient) -> Client:
+@@ -376,19 +219,6 @@ def api_key(token: str, http_client: HTTPClientType = HTTPClient) -> Client:
+        This method only allows you to open public spreadsheet files.
+        It does not work for private spreadsheet files.
+ 
+-    :param token str: The actual API key to use
+-    :type http_client: :class:`gspread.http_client.HTTPClient`
+-    :param http_client: A factory function that returns a client class.
+-        Defaults to :class:`gspread.http_client.HTTPClient` (but could also use
+-        :class:`gspread.http_client.BackOffHTTPClient` to avoid rate limiting)
+-
+     :rtype: :class:`gspread.client.Client`
+-
+     """
+-    if GOOGLE_AUTH_API_KEY_AVAILABLE is False:
+-        raise NotImplementedError(
+-            "api_key is only available with package google.auth>=2.15.0. "
+-            'Install it with "pip install google-auth>=2.15.0".'
+-        )
+-    creds = APIKeyCredentials(token)
+-    return Client(auth=creds, http_client=http_client)
++    return Client.api_key(token=token, http_client=http_client)
+diff --git a/gspread/client.py b/gspread/client.py
+index 957088b..dbc9274 100644
+--- a/gspread/client.py
++++ b/gspread/client.py
+@@ -6,40 +6,393 @@ This module contains Client class responsible for managing spreadsheet files
+ 
+ """
+ 
++import json
++import os
+ from datetime import datetime
+ from http import HTTPStatus
+-from typing import Any, Dict, List, Optional, Tuple, Union
++from pathlib import Path
++from typing import (
++    Any,
++    Dict,
++    Iterable,
++    List,
++    Mapping,
++    Optional,
++    Protocol,
++    Tuple,
++    Union,
++)
+ 
+ from google.auth.credentials import Credentials
++from google.oauth2.credentials import Credentials as OAuthCredentials
++from google.oauth2.service_account import Credentials as SACredentials
++from google_auth_oauthlib.flow import InstalledAppFlow
+ from requests import Response, Session
+ 
++try:
++    from google.auth.api_key import Credentials as APIKeyCredentials
++
++    GOOGLE_AUTH_API_KEY_AVAILABLE = True
++except ImportError:
++    GOOGLE_AUTH_API_KEY_AVAILABLE = False
++
+ from .exceptions import APIError, SpreadsheetNotFound
+ from .http_client import HTTPClient, HTTPClientType, ParamsType
+ from .spreadsheet import Spreadsheet
+-from .urls import DRIVE_FILES_API_V3_COMMENTS_URL, DRIVE_FILES_API_V3_URL
+-from .utils import ExportFormat, MimeType, extract_id_from_url, finditem
+-
+-
+-class Client:
++from .urls import (
++    DRIVE_FILES_API_V3_COMMENTS_URL,
++    DRIVE_FILES_API_V3_URL,
++    SPREADSHEET_VALUES_URL,
++)
++from .utils import (
++    ExportFormat,
++    MimeType,
++    ValueInputOption,
++    extract_id_from_url,
++    finditem,
++    quote,
++)
++
++
++class FlowCallable(Protocol):
++    """Protocol for OAuth flow callables."""
++
++    def __call__(
++        self, client_config: Mapping[str, Any], scopes: Iterable[str], port: int = 0
++    ) -> OAuthCredentials: ...
++
++
++class Client(HTTPClient):
+     """An instance of this class Manages Spreadsheet files
+ 
+     It is used to:
+         - open/create/list/delete spreadsheets
++        - authenticate with OAuth2, service accounts or API keys
++        - store, load and convert credentials
++        - send the HTTP requests to the Google API
+         - create/delete/list spreadsheet permission
+         - etc
+ 
+     It is the gspread entry point.
+     It will handle creating necessary :class:`~gspread.models.Spreadsheet` instances.
++
++    Because it is the single object every user holds, it carries the whole
++    session: the credentials, the HTTP transport and the spreadsheet
++    registry are all part of the same class.
+     """
+ 
++    DEFAULT_SCOPES = [
++        "https://www.googleapis.com/auth/spreadsheets",
++        "https://www.googleapis.com/auth/drive",
++    ]
++
++    READONLY_SCOPES = [
++        "https://www.googleapis.com/auth/spreadsheets.readonly",
++        "https://www.googleapis.com/auth/drive.readonly",
++    ]
++
++    GOOGLE_AUTH_API_KEY_AVAILABLE = GOOGLE_AUTH_API_KEY_AVAILABLE
++
++    @staticmethod
++    def get_config_dir(
++        config_dir_name: str = "gspread", os_is_windows: bool = os.name == "nt"
++    ) -> Path:
++        r"""Construct a config dir path.
++
++        By default:
++            * `%APPDATA%\gspread` on Windows
++            * `~/.config/gspread` everywhere else
++
++        """
++        if os_is_windows:
++            return Path(os.environ["APPDATA"], config_dir_name)
++        else:
++            return Path(Path.home(), ".config", config_dir_name)
++
++    DEFAULT_CONFIG_DIR = get_config_dir()
++
++    DEFAULT_CREDENTIALS_FILENAME = DEFAULT_CONFIG_DIR / "credentials.json"
++    DEFAULT_AUTHORIZED_USER_FILENAME = DEFAULT_CONFIG_DIR / "authorized_user.json"
++    DEFAULT_SERVICE_ACCOUNT_FILENAME = DEFAULT_CONFIG_DIR / "service_account.json"
++
+     def __init__(
+         self,
+         auth: Credentials,
+         session: Optional[Session] = None,
+         http_client: HTTPClientType = HTTPClient,
+     ) -> None:
++        # The client holds the transport state itself (session, auth,
++        # timeout) and, for backward compatibility with callers passing
++        # their own transport, a fully functional transport instance.
++        super().__init__(auth=auth, session=session)
+         self.http_client = http_client(auth, session)
+ 
++    @staticmethod
++    def local_server_flow(
++        client_config: Mapping[str, Any],
++        scopes: Iterable[str],
++        port: int = 0,
++    ) -> OAuthCredentials:
++        """Run an OAuth flow using a local server strategy.
++
++        Creates an OAuth flow and runs `google_auth_oauthlib.flow.InstalledAppFlow.run_local_server <https://google-auth-oauthlib.readthedocs.io/en/latest/reference/google_auth_oauthlib.flow.html#google_auth_oauthlib.flow.InstalledAppFlow.run_local_server>`_.
++        This will start a local web server and open the authorization URL in
++        the user's browser.
++        """
++        flow = InstalledAppFlow.from_client_config(client_config, scopes)
++        return flow.run_local_server(port=port)
++
++    @staticmethod
++    def load_credentials(
++        filename: Path = DEFAULT_AUTHORIZED_USER_FILENAME,
++    ) -> Optional[Credentials]:
++        if filename.exists():
++            return OAuthCredentials.from_authorized_user_file(filename)
++
++        return None
++
++    @staticmethod
++    def store_credentials(
++        creds: OAuthCredentials,
++        filename: Path = DEFAULT_AUTHORIZED_USER_FILENAME,
++        strip: str = "token",
++    ) -> None:
++        filename.parent.mkdir(parents=True, exist_ok=True)
++        with filename.open("w") as f:
++            f.write(creds.to_json(strip))
++
++    @classmethod
++    def convert_credentials(cls, credentials: Credentials) -> Credentials:
++        module = credentials.__module__
++        cls_name = credentials.__class__.__name__
++        if "oauth2client" in module and cls_name == "ServiceAccountCredentials":
++            return cls._convert_service_account(credentials)
++        elif "oauth2client" in module and cls_name in (
++            "OAuth2Credentials",
++            "AccessTokenCredentials",
++            "GoogleCredentials",
++        ):
++            return cls._convert_oauth(credentials)
++        elif isinstance(credentials, Credentials):
++            return credentials
++
++        raise TypeError(
++            "Credentials need to be from either oauth2client or from google-auth."
++        )
++
++    @staticmethod
++    def _convert_oauth(credentials: Any) -> Credentials:
++        return OAuthCredentials(
++            credentials.access_token,
++            credentials.refresh_token,
++            credentials.id_token,
++            credentials.token_uri,
++            credentials.client_id,
++            credentials.client_secret,
++            credentials.scopes,
++        )
++
++    @staticmethod
++    def _convert_service_account(credentials: Any) -> Credentials:
++        data = credentials.serialization_data
++        data["token_uri"] = credentials.token_uri
++        scopes = credentials._scopes.split() or [
++            "https://www.googleapis.com/auth/drive",
++            "https://spreadsheets.google.com/feeds",
++        ]
++
++        return SACredentials.from_service_account_info(data, scopes=scopes)
++
++    @classmethod
++    def authorize(
++        cls,
++        credentials: Credentials,
++        http_client: HTTPClientType = HTTPClient,
++        session: Optional[Session] = None,
++    ) -> "Client":
++        """Login to Google API using OAuth2 credentials.
++        This is a shortcut/helper factory which instantiates a client
++        using `http_client`.
++        """
++        return cls(auth=credentials, http_client=http_client, session=session)
++
++    @classmethod
++    def oauth(
++        cls,
++        scopes: Iterable[str] = DEFAULT_SCOPES,
++        flow: FlowCallable = local_server_flow,
++        credentials_filename: Union[str, Path] = DEFAULT_CREDENTIALS_FILENAME,
++        authorized_user_filename: Union[str, Path] = DEFAULT_AUTHORIZED_USER_FILENAME,
++        http_client: HTTPClientType = HTTPClient,
++    ) -> "Client":
++        r"""Authenticate with OAuth Client ID.
++
++        By default this method will use the local server strategy and open
++        the authorization URL in the user's browser::
++
++            gc = gspread.oauth()
++
++        ``scopes`` parameter defaults to read/write scope available in
++        ``gspread.auth.DEFAULT_SCOPES``. It's read/write for Sheets
++        and Drive API::
++
++            DEFAULT_SCOPES =[
++                'https://www.googleapis.com/auth/spreadsheets',
++                'https://www.googleapis.com/auth/drive'
++            ]
++
++        You can also use ``gspread.auth.READONLY_SCOPES`` for read only access.
++        Obviously any method of ``gspread`` that updates a spreadsheet
++        **will not work** in this case::
++
++            gc = gspread.oauth(scopes=gspread.auth.READONLY_SCOPES)
++
++            sh = gc.open("A spreadsheet")
++            sh.sheet1.update_acell('A1', '42')   # <-- this will not work
++
++        If you're storing your user credentials in a place other than the
++        default, you may provide a path to that file like so::
++
++            gc = gspread.oauth(
++                credentials_filename='/alternative/path/credentials.json',
++                authorized_user_filename='/alternative/path/authorized_user.json',
++            )
++
++        :rtype: :class:`gspread.client.Client`
++        """
++        creds = cls.load_credentials(filename=Path(authorized_user_filename))
++
++        if not isinstance(creds, Credentials):
++            with open(credentials_filename) as json_file:
++                client_config = json.load(json_file)
++            creds = flow(client_config=client_config, scopes=scopes)
++            cls.store_credentials(
++                creds, filename=Path(authorized_user_filename)
++            )
++
++        return cls(auth=creds, http_client=http_client)
++
++    @classmethod
++    def oauth_from_dict(
++        cls,
++        credentials: Optional[Mapping[str, Any]] = None,
++        authorized_user_info: Optional[Mapping[str, Any]] = None,
++        scopes: Iterable[str] = DEFAULT_SCOPES,
++        flow: FlowCallable = local_server_flow,
++        http_client: HTTPClientType = HTTPClient,
++    ) -> Tuple["Client", Dict[str, Any]]:
++        r"""Authenticate with OAuth Client ID.
++
++        This method requires you to pass the credentials directly as
++        a python dict. After the first authentication the method returns
++        the authenticated user info, this can be passed again to authenticate
++        the user without the need to run the flow again.
++
++        .. code-block:: python
++
++            gc, authorized_user_info = Client.oauth_from_dict(
++                credentials=my_creds,
++                authorized_user_info=my_auth_user
++            )
++
++        :rtype: (:class:`gspread.client.Client`, str)
++        """
++        if authorized_user_info is not None:
++            creds = OAuthCredentials.from_authorized_user_info(
++                authorized_user_info, scopes
++            )
++        elif credentials is not None:
++            creds = flow(client_config=credentials, scopes=scopes)
++        else:
++            raise ValueError("no credentials object supplied")
++
++        client = cls(auth=creds, http_client=http_client)
++
++        # must return the creds to the user
++        # must strip the token an use the dedicated method from Credentials
++        # to return a dict "safe to store".
++        return (client, creds.to_json("token"))
++
++    @classmethod
++    def service_account(
++        cls,
++        filename: Union[Path, str] = DEFAULT_SERVICE_ACCOUNT_FILENAME,
++        scopes: Iterable[str] = DEFAULT_SCOPES,
++        http_client: HTTPClientType = HTTPClient,
++    ) -> "Client":
++        """Authenticate using a service account.
++
++        ``scopes`` parameter defaults to read/write scope available in
++        ``gspread.auth.DEFAULT_SCOPES``. It's read/write for Sheets
++        and Drive API::
++
++            DEFAULT_SCOPES =[
++                'https://www.googleapis.com/auth/spreadsheets',
++                'https://www.googleapis.com/auth/drive'
++            ]
++
++        :param str filename: The path to the service account json file.
++        :param list scopes:
++        :type http_client: :class:`gspread.http_client.HTTPClient`
++        :param http_client: A factory function that returns a client class.
++            Defaults to :class:`gspread.http_client.HTTPClient` (but could also use
++            :class:`gspread.http_client.BackOffHTTPClient` to avoid rate limiting)
++
++        :rtype: :class:`gspread.client.Client`
++        """
++        creds = SACredentials.from_service_account_file(filename, scopes=scopes)
++        return cls(auth=creds, http_client=http_client)
++
++    @classmethod
++    def service_account_from_dict(
++        cls,
++        info: Mapping[str, Any],
++        scopes: Iterable[str] = DEFAULT_SCOPES,
++        http_client: HTTPClientType = HTTPClient,
++    ) -> "Client":
++        """Authenticate using a service account (json).
++
++        :param info (Mapping[str, str]): The service account info in Google format
++        :param list scopes:
++        :type http_client: :class:`gspread.http_client.HTTPClient`
++        :param http_client: A factory function that returns a client class.
++            Defaults to :class:`gspread.http_client.HTTPClient` (but could also use
++            :class:`gspread.http_client.BackOffHTTPClient` to avoid rate limiting)
++
++        :rtype: :class:`gspread.client.Client`
++        """
++        creds = SACredentials.from_service_account_info(
++            info=info,
++            scopes=scopes,
++        )
++        return cls(auth=creds, http_client=http_client)
++
++    @classmethod
++    def api_key(cls, token: str, http_client: HTTPClientType = HTTPClient) -> "Client":
++        """Authenticate using an API key.
++
++        Allows you to open public spreadsheet files.
++
++        .. warning::
++
++           This method only allows you to open public spreadsheet files.
++           It does not work for private spreadsheet files.
++
++        :param token str: The actual API key to use
++        :type http_client: :class:`gspread.http_client.HTTPClient`
++        :param http_client: A factory function that returns a client class.
++            Defaults to :class:`gspread.http_client.HTTPClient` (but could also use
++            :class:`gspread.http_client.BackOffHTTPClient` to avoid rate limiting)
++
++        """
++        if cls.GOOGLE_AUTH_API_KEY_AVAILABLE is False:
++            raise NotImplementedError(
++                "api_key is only available with package google.auth>=2.15.0. "
++                'Install it with "pip install google-auth>=2.15.0".'
++            )
++        creds = APIKeyCredentials(token)
++        return cls(auth=creds, http_client=http_client)
++
+     @property
+     def expiry(self) -> Optional[datetime]:
+         """Returns the expiry date of the curenlty loaded credentials
+@@ -72,6 +425,61 @@ class Client:
+         """
+         return self.http_client.get_file_drive_metadata(id)
+ 
++    def get_spreadsheet_values(
++        self,
++        spreadsheet_id: str,
++        range_name: str,
++        params: Optional[ParamsType] = None,
++    ) -> List[List[str]]:
++        """Get the values of a range of cells from the given spreadsheet.
++
++        Reads the values from the given spreadsheet without opening the
++        spreadsheet nor one of its worksheets first: only the spreadsheet
++        ID, as found in the URL, is needed.
++
++        :param str spreadsheet_id: The spreadsheet ID.
++        :param str range_name: The range to read, in A1 notation (the sheet
++            name may be provided using the absolute A1 notation).
++        :param dict params: (optional) The HTTP params for the GET request.
++        :returns: The matrix of values, as a list of rows.
++        """
++        url = SPREADSHEET_VALUES_URL % (spreadsheet_id, quote(range_name))
++        response = self.http_client.request(
++            "get", url, params=params or {"majorDimension": "ROWS"}
++        )
++        return response.json().get("values", [])
++
++    def update_spreadsheet_values(
++        self,
++        spreadsheet_id: str,
++        range_name: str,
++        values: List[List[Any]],
++        params: Optional[ParamsType] = None,
++    ) -> Any:
++        """Write the given values to a range of cells of the given spreadsheet.
++
++        Writes the values to the given spreadsheet without opening the
++        spreadsheet nor one of its worksheets first: only the spreadsheet
++        ID, as found in the URL, is needed.
++
++        :param str spreadsheet_id: The spreadsheet ID.
++        :param str range_name: The range to update, in A1 notation (the sheet
++            name may be provided using the absolute A1 notation).
++        :param list values: The matrix of values to write, as a list of rows.
++        :param dict params: (optional) The HTTP params for the PUT request.
++            Defaults to the ``RAW`` value input option.
++        :returns: The response body of the update.
++        """
++        url = SPREADSHEET_VALUES_URL % (spreadsheet_id, quote(range_name))
++        body: Dict[str, Any] = {"values": values}
++        response = self.http_client.request(
++            "put",
++            url,
++            params=params or {"valueInputOption": ValueInputOption.raw},
++            json=body,
++        )
++        return response.json()
++
+     def list_spreadsheet_files(
+         self, title: Optional[str] = None, folder_id: Optional[str] = None
+     ) -> List[Dict[str, Any]]:
+@@ -212,7 +620,6 @@ class Client:
+         """Creates a new spreadsheet.
+ 
+         :param str title: A title of a new spreadsheet.
+-
+         :param str folder_id: Id of the folder where we want to save
+             the spreadsheet.
+ 
+diff --git a/gspread/utils.py b/gspread/utils.py
+index 1256196..98786d5 100644
+--- a/gspread/utils.py
++++ b/gspread/utils.py
+@@ -29,8 +29,6 @@ from typing import (
+ from urllib.parse import quote as uquote
+ 
+ from google.auth.credentials import Credentials as Credentials
+-from google.oauth2.credentials import Credentials as UserCredentials
+-from google.oauth2.service_account import Credentials as ServiceAccountCredentials
+ 
+ from .exceptions import IncorrectCellLabel, InvalidInputValue, NoValidUrlKeyFound
+ 
+@@ -176,45 +174,12 @@ class TableDirection(StrEnum):
+ 
+ 
+ def convert_credentials(credentials: Credentials) -> Credentials:
+-    module = credentials.__module__
+-    cls = credentials.__class__.__name__
+-    if "oauth2client" in module and cls == "ServiceAccountCredentials":
+-        return _convert_service_account(credentials)
+-    elif "oauth2client" in module and cls in (
+-        "OAuth2Credentials",
+-        "AccessTokenCredentials",
+-        "GoogleCredentials",
+-    ):
+-        return _convert_oauth(credentials)
+-    elif isinstance(credentials, Credentials):
+-        return credentials
+-
+-    raise TypeError(
+-        "Credentials need to be from either oauth2client or from google-auth."
+-    )
+-
+-
+-def _convert_oauth(credentials: Any) -> Credentials:
+-    return UserCredentials(
+-        credentials.access_token,
+-        credentials.refresh_token,
+-        credentials.id_token,
+-        credentials.token_uri,
+-        credentials.client_id,
+-        credentials.client_secret,
+-        credentials.scopes,
+-    )
+-
+-
+-def _convert_service_account(credentials: Any) -> Credentials:
+-    data = credentials.serialization_data
+-    data["token_uri"] = credentials.token_uri
+-    scopes = credentials._scopes.split() or [
+-        "https://www.googleapis.com/auth/drive",
+-        "https://spreadsheets.google.com/feeds",
+-    ]
++    # credentials are owned by the client, the conversion happens there.
++    # lazy import: importing the client from here at module level would be
++    # circular, the client imports this module.
++    from .client import Client
+ 
+-    return ServiceAccountCredentials.from_service_account_info(data, scopes=scopes)
++    return Client.convert_credentials(credentials)
+ 
+ 
+ T = TypeVar("T")

@@ -1,0 +1,199 @@
+diff --git a/archiver.go b/archiver.go
+index 2d0c732..5c91d4f 100644
+--- a/archiver.go
++++ b/archiver.go
+@@ -110,7 +110,7 @@ func (m ArchiveManager) FilesFromDisk(options *FromDiskOptions, filenames map[st
+ 				return err
+ 			}
+ 
+-			nameInArchive := m.nameOnDiskToNameInArchive(filename, rootOnDisk, rootInArchive)
++			nameInArchive := nameOnDiskToNameInArchive(filename, rootOnDisk, rootInArchive)
+ 			// this is the root folder and we are adding its contents to target rootInArchive
+ 			if info.IsDir() && nameInArchive == "" {
+ 				return nil
+@@ -163,16 +163,11 @@ func (m ArchiveManager) FilesFromDisk(options *FromDiskOptions, filenames map[st
+ }
+ 
+ // nameOnDiskToNameInArchive converts a filename from disk to a name in an
+-// archive, applying the default manager's name mangling rules.
++// archive, respecting the rules defined by FilesFromDisk. nameOnDisk is the
++// full filename on disk which is expected to be prefixed by rootOnDisk
++// (according to fs.WalkDirFunc godoc) and which will be placed into a folder
++// rootInArchive in the archive.
+ func nameOnDiskToNameInArchive(nameOnDisk, rootOnDisk, rootInArchive string) string {
+-	return DefaultArchiveManager.nameOnDiskToNameInArchive(nameOnDisk, rootOnDisk, rootInArchive)
+-}
+-
+-// nameOnDiskToNameInArchive converts a filename from disk to a name in an archive,
+-// respecting rules defined by FilesFromDisk. nameOnDisk is the full filename on disk
+-// which is expected to be prefixed by rootOnDisk (according to fs.WalkDirFunc godoc)
+-// and which will be placed into a folder rootInArchive in the archive.
+-func (m ArchiveManager) nameOnDiskToNameInArchive(nameOnDisk, rootOnDisk, rootInArchive string) string {
+ 	// These manipulations of rootInArchive could be done just once instead of on
+ 	// every walked file since they don't rely on nameOnDisk which is the only
+ 	// variable that changes during the walk, but combining all the logic into this
+@@ -296,17 +291,10 @@ func isSymlink(info fs.FileInfo) bool {
+ 	return info.Mode()&os.ModeSymlink != 0
+ }
+ 
+-// streamSizeBySeeking determines the size of a stream using the default
+-// manager's seeking logic.
++// streamSizeBySeeking determines the size of the stream by seeking to the
++// end, then back again, so the resulting seek position upon returning is
++// the same as when called (assuming no errors).
+ func streamSizeBySeeking(s io.Seeker) (int64, error) {
+-	return DefaultArchiveManager.streamSizeBySeeking(s)
+-}
+-
+-// streamSizeBySeeking determines the size of the stream by
+-// seeking to the end, then back again, so the resulting
+-// seek position upon returning is the same as when called
+-// (assuming no errors).
+-func (m ArchiveManager) streamSizeBySeeking(s io.Seeker) (int64, error) {
+ 	currentPosition, err := s.Seek(0, io.SeekCurrent)
+ 	if err != nil {
+ 		return 0, fmt.Errorf("getting current offset: %w", err)
+diff --git a/formats.go b/formats.go
+index 055f070..e2a4dad 100644
+--- a/formats.go
++++ b/formats.go
+@@ -162,17 +162,10 @@ func (m ArchiveManager) identifyOne(ctx context.Context, format Format, filename
+ 	return mr, err
+ }
+ 
+-// readAtMost reads at most n bytes from the stream using the default
+-// manager's sniffing logic. A nil, empty, or short stream is not an error.
+-// The returned slice of bytes may have length < n without an error.
+-func readAtMost(stream io.Reader, n int) ([]byte, error) {
+-	return DefaultArchiveManager.readAtMost(stream, n)
+-}
+-
+ // readAtMost reads at most n bytes from the stream. A nil, empty, or short
+ // stream is not an error. The returned slice of bytes may have length < n
+ // without an error.
+-func (m ArchiveManager) readAtMost(stream io.Reader, n int) ([]byte, error) {
++func readAtMost(stream io.Reader, n int) ([]byte, error) {
+ 	if stream == nil || n <= 0 {
+ 		return []byte{}, nil
+ 	}
+diff --git a/fs.go b/fs.go
+index c96b092..cbf09e8 100644
+--- a/fs.go
++++ b/fs.go
+@@ -107,7 +107,7 @@ func (m ArchiveManager) FileSystem(ctx context.Context, filename string, stream
+ 
+ 		// determine size -- we know that the stream value we get back from
+ 		// Identify is the same type as what we input because it is a Seeker
+-		size, err := m.streamSizeBySeeking(stream)
++		size, err := streamSizeBySeeking(stream)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("seeking for size: %w", err)
+ 		}
+diff --git a/manager.go b/manager.go
+index 10d82b0..f2311c1 100644
+--- a/manager.go
++++ b/manager.go
+@@ -13,35 +13,22 @@ import (
+ 	"strings"
+ )
+ 
+-// ArchiveManager is the package's high-level coordinator. It provides the
+-// facade that most programs actually want: one value that owns the registry
+-// of supported formats and performs every common archiving task — snarfing
+-// files from disk, detecting the format of an archive or compressed file,
+-// creating archives (optionally compressed), extracting archives to disk, and
+-// presenting archive contents through the io/fs interfaces.
+-//
+-// Because the manager owns its own format registry and its own operational
+-// policies, embedding programs can create isolated managers that support
+-// only a subset of the formats (or their own custom formats) instead of
+-// relying on package-global state. All package-level convenience functions
+-// (Identify, FileSystem, FilesFromDisk, and RegisterFormat) delegate to
+-// DefaultArchiveManager, which is pre-registered with every built-in format.
+-type ArchiveManager struct {
+-	// formats is the registry of formats this manager supports, keyed by
+-	// the format extension without the leading dot.
+-	formats map[string]Format
+-
+-	// FollowSymlinks and ClearAttributes are the on-disk gathering
+-	// defaults used when no FromDiskOptions are supplied. They mirror
+-	// the options of the same names; see FromDiskOptions.
+-	FollowSymlinks  bool
+-	ClearAttributes bool
+-
++// ArchiveOptions configures how an ArchiveFolder operation writes an
++// archive. It is a cohesive, operation-scoped policy: the choices here only
++// affect the archive-creation path, so callers (and the manager, when it
++// applies its defaults) can reason about them in isolation from gathering,
++// extraction, or file-system policy.
++type ArchiveOptions struct {
+ 	// ImplicitTopLevelFolder causes ArchiveFolder to nest the contents of
+ 	// a single gathered folder into a folder of the same name inside the
+ 	// archive, so that extracting the archive yields that folder.
+ 	ImplicitTopLevelFolder bool
++}
+ 
++// ExtractOptions configures how an ExtractToFolder operation writes archive
++// entries to disk. Like ArchiveOptions, it is a cohesive, operation-scoped
++// policy: these choices only affect the extraction path.
++type ExtractOptions struct {
+ 	// OverwriteExisting allows ExtractToFolder to replace files that
+ 	// already exist on disk; by default existing files are preserved and
+ 	// the extraction of that file fails.
+@@ -51,11 +38,52 @@ type ArchiveManager struct {
+ 	// fail on) individual file write errors and continue with the rest
+ 	// of the archive.
+ 	ContinueOnError bool
++}
++
++// ArchiveManager is the package's high-level coordinator. It owns the
++// registry of supported formats and performs every common archiving task —
++// detecting the format of an archive or compressed file, creating archives
++// (optionally compressed), extracting archives to disk, gathering files from
++// disk, and presenting archive contents through the io/fs interfaces — by
++// selecting the right registered format and handing off to it.
++//
++// Coordination is the manager's only structural responsibility: the format
++// registry plus the thin one-call operations that dispatch to it. The tunable
++// behavior of each operation lives in its own cohesive option type —
++// FromDiskOptions (gathering), ArchiveOptions (ArchiveFolder), and
++// ExtractOptions (ExtractToFolder) — which the manager embeds as that
++// operation's defaults. To override a policy, set the field on the manager
++// (for example m.ExtractOptions.OverwriteExisting = true, or the equivalent
++// promoted m.OverwriteExisting); the flat field access is preserved for
++// compatibility. Prefix defaults the rooting of the file systems that
++// FileSystem returns.
++//
++// Because the manager owns its own format registry, embedding programs can
++// create isolated managers that support only a subset of the formats (or their
++// own custom formats) instead of relying on package-global state. All
++// package-level convenience functions (Identify, FileSystem, FilesFromDisk,
++// and RegisterFormat) delegate to DefaultArchiveManager, which is
++// pre-registered with every built-in format.
++type ArchiveManager struct {
++	// formats is the registry of formats this manager supports, keyed by
++	// the format extension without the leading dot.
++	formats map[string]Format
++
++	// FromDiskOptions are the on-disk gathering defaults applied by
++	// FilesFromDisk (and thus ArchiveFolder) when a caller does not supply
++	// its own FromDiskOptions. See FromDiskOptions for field semantics.
++	FromDiskOptions
++
++	// ArchiveOptions are the defaults applied by ArchiveFolder.
++	ArchiveOptions
++
++	// ExtractOptions are the defaults applied by ExtractToFolder.
++	ExtractOptions
+ 
+-	// Prefix is the subdirectory that returned virtual file systems are
+-	// rooted in by default; it mirrors ArchiveFS.Prefix. An empty Prefix
+-	// roots file systems at the archive root, which preserves the
+-	// historical behavior.
++	// Prefix is the subdirectory that FileSystem roots the virtual file
++	// systems it returns in by default; it mirrors ArchiveFS.Prefix. An
++	// empty Prefix roots file systems at the archive root, which preserves
++	// the historical behavior.
+ 	Prefix string
+ }
+ 

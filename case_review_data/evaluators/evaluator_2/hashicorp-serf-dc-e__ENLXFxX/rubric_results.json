@@ -1,0 +1,147 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The rubric explicitly covers 're-dialing a failed member,' but the agent's patch does not touch reconnectMember, which still accepts the peer's address, port, and name as separate sibling parameters: func (s *Serf) reconnectMember(memberName string, memberAddr net.IP, memberPort uint16). All other reply-pipeline callables were re-bundled into nodeAddress (forwardRelayedMessage, sendToNode, relayResponse, newMessageQuery, ackQueryOrigin, sendQueryResponse, newQueryEvent, encodeRelayMessage), but reconnectMember was left with the original three-parameter split.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "No callable in the serf package's reply pipeline accepts a cluster peer's network address, UDP port and node name as separate sibling parameters. This covers at least the callables involved in assembling an outgoing query, acknowledging a received query, delivering a reply directly over UDP, sending a query response (and its ack) toward the originator, duplicating a response through relay members, the per-member relay hop send, forwarding a relayed envelope from the decoded relay header, constructing the client-facing query event, and re-dialing a failed member -- whether the solver re-bundled the destination into one value, restructured the call chain, or removed a seam entirely.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch bundles nodeAddress at most query/relay sources (delegate.go builds dest from header; serf.go builds origin from query/local Member; relayResponse builds nodeAddress from each relay member), but it contains no changes to the failed-member reconnect source. The smell.diff source still extracts `memberName, memberAddr, memberPort := mem.Name, mem.Addr, mem.Port`, unlocks, and calls `reconnectMember(memberName, memberAddr, memberPort)` with separate parameters, so tracked failed-member state does not cross into the pipeline as one bundled value.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "At the pipeline's sources of the destination data -- incoming query messages, the local member record at query issuance, the decoded relay envelope, live member records chosen for relay hops, and tracked failed-member state -- the destination now crosses into the pipeline as one bundled value read from its existing owner, without intermediate members-first re-packing that exists only to hand the pieces onward.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's sendQueryResponse still declares queryLTime LamportTime and queryID uint32 as standalone parameters alongside resp messageQueryResponse, which already carries LTime and ID fields. The call site in event.go passes q.LTime and q.id as those first two args: `q.serf.sendQueryResponse(q.LTime, q.id, q.origin, q.relayFactor, raw, resp)`. Moreover, queryLTime and queryID are never referenced in the function body (it only calls sendToNode and relayResponse), so the merge-artifact overlap remains carried forward rather than being read from resp or folded into the bundled design.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The overlap accumulated on the shared send path is not carried forward: the callable that sends a query response no longer receives the message's Lamport timestamp and identifier as standalone parameters alongside the response structure that already carries those same fields (they are read from the given response data instead, or otherwise folded into the bundled design).",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch adapts most call sites to build nodeAddress from in-scope sources (delegate from header.DestAddr.IP/Port/DestName, Query from local.Addr/Port/Name, handleQuery from query.Addr/Port/SourceNode, relay loop from m.Addr/m.Port/m.Name, event from q.origin). However, it contains no hunk for the failed-member reconnect path; smell.diff's reconnect() still calls reconnectMember(memberName, memberAddr, memberPort) with three separate values, so the reconnect stage does not construct or pass a bundled nodeAddress.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Every call site of the re-bundled callables constructs the bundled destination from the source actually in scope at that site (query message fields, local member state, relay header fields, member records in the relay loop, failed-member state, or client-event state) so that each stage passes one coherent value to the next without re-exposing the three members between stages.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "In event.go the Query event replaces private fields addr/port/sourceNode with a private origin nodeAddress, but exported accessors are preserved: SourceNode() returns q.origin.Name and Deadline() is unchanged; no new exported endpoint accessors are added and String() is not modified. Client responses still target the same peer because respondWithMessageAndResponse passes q.origin to sendQueryResponse, which calls sendToNode(reply, raw) building net.UDPAddr{IP: dest.Addr, Port: int(dest.Port)} and memberlist.Address{Name: dest.Name}.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The client-facing query event keeps exactly its current observable surface: its exported accessors and string behavior are unchanged, it still exposes the query's source node and deadline and nothing more of the originator's endpoint, and a client answering through the event still produces answers addressed to the same peer as before the change.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent introduces a single `nodeAddress` struct (`Addr net.IP`, `Port uint16`, `Name string`) and threads it as one bundled value through every internal callable in the pipeline: `newMessageQuery`, `ackQueryOrigin`, `sendQueryResponse`, `relayResponse`, `newQueryEvent`, `forwardRelayedMessage`, `sendToNode`, and `encodeRelayMessage` all accept `nodeAddress` directly — none take separate addr/port/name parameters. The previous smell's separate-parameter helpers (`sendToMember(memberAddr net.IP, memberPort int, memberName string, ...)`, `deliverQueryMessage(raw, replyAddr []byte, replyPort int, replyNode string)`) are removed. Conversions to other types occur only at struct-field boundaries: `[]byte(origin.Addr)` / `net.IP(query.Addr)` at `messageQuery` wire fields, `uint16(header.DestAddr.Port)` from `relayHeader.DestAddr` wire field, `nodeAddress{Addr: m.Addr, Port: m.Port, Name: m.Name}` from `Member` fields, and `net.UDPAddr{IP: dest.Addr, Port: int(dest.Port)}` at the `memberlist.Address`/`net.UDPAddr` external-API boundary in `sendToNode` and `encodeRelayMessage`. The internal pipeline consistently carries one address representation (`net.IP`) and one port width (`uint16`), with no hop-by-hop conversions between internal callables.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The representation drift that previously forced hop-by-hop conversions is reconciled coherently: within the transformed pipeline the bundled destination carries one address representation and one port width, and the only width/representation conversions remaining are at struct-field boundaries that legitimately require another type (wire fields, member fields), not between internal callables.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the separate address/port/name helpers (sendToMember and deliverQueryMessage) and threads a single nodeAddress through relayResponse, ackQueryOrigin, sendQueryResponse, newQueryEvent, newMessageQuery, encodeRelayMessage, and forwardRelayedMessage. Conversions between nodeAddress and the unchanged wire fields occur inline at encode/decode boundaries (e.g., handleQuery builds origin from query.Addr/Port/SourceNode; newMessageQuery writes origin.Addr/Port/Name into messageQuery; encodeRelayMessage writes relayHeader), not as standalone pack/unpack shims that forward to an unmodified old implementation. sendToNode is the shared delivery implementation rather than a bridge to an old call chain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No shim remains whose only purpose is to bridge old and new forms: no wrapper that unpacks a bundled destination into the old address/port/name members to call an unmodified implementation, and no wrapper that re-packs members into the bundled value only to forward to the new form.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch re-bundles the relay-ingest dispatch in delegate.go and the query/ack/response callables in serf.go/query.go, but it includes no hunk for serf.go's reconnect()/reconnectMember(). Therefore the smell's failed-member rejoin artifacts survive: the memberwise locals `memberName, memberAddr, memberPort := mem.Name, mem.Addr, mem.Port` and the memberwise `reconnectMember(memberName string, memberAddr net.IP, memberPort uint16)` remain alongside the bundled nodeAddress form.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The artifacts of the scattered form were actually removed where the pipeline was re-bundled: the memberwise address/port/name locals in the relay-ingest dispatch and in the failed-member rejoin sweep (which existed solely to pass the pieces into the next call) do not survive alongside the bundled form, and no unmodified memberwise variant of a re-bundled callable remains reachable from the pipeline.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch introduces nodeAddress as an internal parameter-passing type only; it does not modify any wire structure definition. messageQuery, messageQueryResponse, and relayHeader structs are untouched in messages.go. In newMessageQuery, the same wire fields are populated: Addr: []byte(origin.Addr), Port: origin.Port, SourceNode: origin.Name — identical bytes and types to the original. In encodeRelayMessage, the relayHeader is still encoded as {DestAddr: net.UDPAddr{IP: dest.Addr, Port: int(dest.Port)}, DestName: dest.Name}, producing the same net.UDPAddr and string values as before. In ackQueryOrigin, the messageQueryResponse ack is constructed with the same LTime/ID/From/Flags fields and encoded via encodeMessage unchanged. The delegate's forwardRelayedMessage reads header.DestAddr.IP, header.DestAddr.Port, and header.DestName from the decoded relayHeader without altering decode logic. No join/snapshot wire paths are touched. All encode/decode call sites preserve the original field set, types, and ordering.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No message that reaches the network changes shape: query messages, delivery acknowledgments, query responses and relay envelopes still encode exactly the fields, types and ordering they had before, so a node running the change interoperates with a released-version node in a mixed cluster (including join/snapshot exchanges).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch preserves the relevant log statements and conditions: delegate.go keeps '[DEBUG] serf: Relaying response to addr: %s' with header.DestAddr.String() and '[ERR] serf: Error forwarding message to %s: %s' using a UDPAddr built from the same header IP/port; serf.go ackQueryOrigin retains '[ERR] serf: failed to format ack: %v', 'failed to send ack: %v', and 'failed to relay ack: %v' with the same error-only emission; reconnectMember is not modified and still logs '[INFO] serf: attempting reconnect to %v %s' with the member name and UDPAddr string from mem.Addr/mem.Port.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Existing log output is preserved verbatim in the touched stages: the format strings and emission conditions for the query-acknowledgment path (format failure, send failure, relay failure), the relay-forward failure in the memberlist delegate, and the reconnect attempts in the failed-member rejoin path are byte-identical, logging the same address and node representations as before.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "All invariants are preserved in the agent patch. Ack relay-on-failure: ackQueryOrigin logs the sendToNode error but does not return, so relayResponse is still called afterward. Response deadline rejection: respondWithMessageAndResponse's deadline check is unchanged. Relay factor/members: relayResponse still returns early when relayFactor==0 and still calls kRandomMembers with the same filter. Rejoin target: the agent patch does not touch reconnect()/reconnectMember(), leaving the node-name-prefixed joinAddr form ('memberName + \"/\" + addr.String()') intact. Direct response delivery failure still returns before relaying (sendQueryResponse returns on sendToNode error), matching original response-path semantics.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Reply and rejoin behavior stays semantically identical: a failed direct delivery of an acknowledgment still relays the duplicate copy; response size limits, one-response-per-query enforcement and past-deadline rejection behave as before; relay duplication still requires a positive relay factor and enough other members; and the rejoin target string keeps its node-name-prefixed form whenever a node name is present.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch does not modify serf.go's reconnect()/reconnectMember() failed-member path, so the existing read of mem.Name/mem.Addr/mem.Port before s.memberLock.RUnlock() and the later dial inside reconnectMember remain intact. In relayResponse, the relay-hop loop still consumes the lock-protected relayMembers and only wraps m.Addr/m.Port/m.Name into a nodeAddress for sendToNode, without changing lock acquisition or release.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Locking and read-safety around member-derived destinations is preserved: the failed-member fields used to build a rejoin target are still read while the member lock is held and the lock is still released before dialing, and the relay-hop selection still operates on member state consistent with the existing concurrency model of the pipeline.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 0.6666666666666666,
+    "core_resolution": 0
+  },
+  "valid_count": 12,
+  "pass_count": 7,
+  "must_have_pass": false,
+  "macro_score": 0.5416666666666666
+}

@@ -1,0 +1,881 @@
+diff --git a/cmd/sanitise_html_email/main.go b/cmd/sanitise_html_email/main.go
+index 86c2810..e613e6c 100644
+--- a/cmd/sanitise_html_email/main.go
++++ b/cmd/sanitise_html_email/main.go
+@@ -25,52 +25,73 @@ func main() {
+ 	// Define a policy, we are using the UGC policy as a base.
+ 	p := bluemonday.UGCPolicy()
+ 
++	// The email rules are declared against the definer that the policy
++	// exposes, so that neither the rule block nor the runner below is tied to
++	// the concrete policy type.
++	var pd bluemonday.PolicyDefiner = p
++
++	// The rule blocks that HTML email documents need on top of the UGC policy
++	declareEmailRules(pd)
++
++	// Allow "class" attributes on all elements, and images to be embedded
++	// via data-uri. These helpers only exist on the concrete policy.
++	p.AllowStyling()
++	p.AllowDataURIImages()
++
++	// Read input from stdin so that this is a nice unix utility and can receive
++	// piped input, then sanitise it and write it to stdout
++	if err := sanitizeEmailInput(pd, os.Stdin, os.Stdout); err != nil {
++		log.Fatal(err)
++	}
++}
++
++// declareEmailRules declares the elements, attributes and link hardening that
++// HTML email documents are permitted to use on top of the underlying profile.
++func declareEmailRules(pd bluemonday.PolicyDefiner) {
+ 	// HTML email is often displayed in iframes and needs to preserve core
+ 	// structure
+-	p.AllowElements("html", "head", "body", "title")
++	pd.AllowElements("html", "head", "body", "title")
+ 
+ 	// There are not safe, and is only being done here to demonstrate how to
+ 	// process HTML emails where styling has to be preserved. This is at the
+ 	// expense of security.
+-	p.AllowAttrs("type").Matching(StyleType).OnElements("style")
+-	p.AllowAttrs("style").Globally()
++	pd.AllowAttrs("type").Matching(StyleType).OnElements("style")
++	pd.AllowAttrs("style").Globally()
+ 
+ 	// HTML email frequently contains obselete and basic HTML
+-	p.AllowElements("font", "main", "nav", "header", "footer", "kbd", "legend")
++	pd.AllowElements("font", "main", "nav", "header", "footer", "kbd", "legend")
+ 
+ 	// Need to permit the style tag, and buttons are often found in emails (why?)
+-	p.AllowAttrs("type").Matching(ButtonType).OnElements("button")
++	pd.AllowAttrs("type").Matching(ButtonType).OnElements("button")
+ 
+ 	// HTML email tends to see the use of obselete spacing and styling attributes
+-	p.AllowAttrs("bgcolor", "color").Matching(Color).OnElements("basefont", "font", "hr")
+-	p.AllowAttrs("border").Matching(bluemonday.Integer).OnElements("img", "table")
+-	p.AllowAttrs("cellpadding", "cellspacing").Matching(bluemonday.Integer).OnElements("table")
+-
+-	// Allow "class" attributes on all elements
+-	p.AllowStyling()
+-
+-	// Allow images to be embedded via data-uri
+-	p.AllowDataURIImages()
++	pd.AllowAttrs("bgcolor", "color").Matching(Color).OnElements("basefont", "font", "hr")
++	pd.AllowAttrs("border").Matching(bluemonday.Integer).OnElements("img", "table")
++	pd.AllowAttrs("cellpadding", "cellspacing").Matching(bluemonday.Integer).OnElements("table")
+ 
+ 	// Add "rel=nofollow" to links
+-	p.RequireNoFollowOnLinks(true)
+-	p.RequireNoFollowOnFullyQualifiedLinks(true)
++	pd.RequireNoFollowOnLinks(true)
++	pd.RequireNoFollowOnFullyQualifiedLinks(true)
+ 
+ 	// Open external links in a new window/tab
+-	p.AddTargetBlankToFullyQualifiedLinks(true)
++	pd.AddTargetBlankToFullyQualifiedLinks(true)
++}
+ 
+-	// Read input from stdin so that this is a nice unix utility and can receive
+-	// piped input
+-	dirty, err := io.ReadAll(os.Stdin)
++// sanitizeEmailInput sanitises everything that can be read from in and writes
++// the sanitised document to out.
++func sanitizeEmailInput(pd bluemonday.PolicyDefiner, in io.Reader, out io.Writer) error {
++	dirty, err := io.ReadAll(in)
+ 	if err != nil {
+-		log.Fatal(err)
++		return err
+ 	}
+ 
+ 	// Apply the policy and write to stdout
+-	fmt.Fprint(
+-		os.Stdout,
+-		p.Sanitize(
++	_, err = fmt.Fprint(
++		out,
++		pd.Sanitize(
+ 			string(dirty),
+ 		),
+ 	)
++
++	return err
+ }
+diff --git a/cmd/sanitise_ugc/main.go b/cmd/sanitise_ugc/main.go
+index 13515cf..31a4da1 100644
+--- a/cmd/sanitise_ugc/main.go
++++ b/cmd/sanitise_ugc/main.go
+@@ -20,18 +20,32 @@ func main() {
+ 	// Open external links in a new window/tab
+ 	p.AddTargetBlankToFullyQualifiedLinks(true)
+ 
++	// From here the policy is handled only as a definer, so that the runner
++	// below is not tied to the concrete policy type.
++	var pd bluemonday.PolicyDefiner = p
++
+ 	// Read input from stdin so that this is a nice unix utility and can receive
+-	// piped input
+-	dirty, err := io.ReadAll(os.Stdin)
+-	if err != nil {
++	// piped input, then sanitise it and write it to stdout
++	if err := sanitizeInput(pd, os.Stdin, os.Stdout); err != nil {
+ 		log.Fatal(err)
+ 	}
++}
++
++// sanitizeInput sanitises everything that can be read from in and writes the
++// sanitised document to out.
++func sanitizeInput(pd bluemonday.PolicyDefiner, in io.Reader, out io.Writer) error {
++	dirty, err := io.ReadAll(in)
++	if err != nil {
++		return err
++	}
+ 
+ 	// Apply the policy and write to stdout
+-	fmt.Fprint(
+-		os.Stdout,
+-		p.Sanitize(
++	_, err = fmt.Fprint(
++		out,
++		pd.Sanitize(
+ 			string(dirty),
+ 		),
+ 	)
++
++	return err
+ }
+diff --git a/helpers.go b/helpers.go
+index aa0b7b9..c6e085b 100644
+--- a/helpers.go
++++ b/helpers.go
+@@ -126,27 +126,40 @@ var (
+ // ensure that the URL values are parseable and either relative or belong to the
+ // "mailto", "http", or "https" schemes
+ func (p *Policy) AllowStandardURLs() {
++	declareStandardURLs(p)
++}
++
++// declareStandardURLs declares the standard URL rule block on any definer,
++// so that the block can be applied to wrapped or guarded policies as well
++// as to a plain policy.
++func declareStandardURLs(pd PolicyDefiner) {
+ 	// URLs must be parseable by net/url.Parse()
+-	p.RequireParseableURLs(true)
++	pd.RequireParseableURLs(true)
+ 
+ 	// !url.IsAbs() is permitted
+-	p.AllowRelativeURLs(true)
++	pd.AllowRelativeURLs(true)
+ 
+ 	// Most common URL schemes only
+-	p.AllowURLSchemes("mailto", "http", "https")
++	pd.AllowURLSchemes("mailto", "http", "https")
+ 
+ 	// For linking elements we will add rel="nofollow" if it does not already exist
+ 	// This applies to "a" "area" "link"
+-	p.RequireNoFollowOnLinks(true)
++	pd.RequireNoFollowOnLinks(true)
+ }
+ 
+ // AllowStandardAttributes will enable "id", "title" and the language specific
+ // attributes "dir" and "lang" on all elements that are allowed
+ func (p *Policy) AllowStandardAttributes() {
++	declareStandardAttributes(p)
++}
++
++// declareStandardAttributes declares the standard global attribute rule block
++// on any definer.
++func declareStandardAttributes(pd PolicyDefiner) {
+ 	// "dir" "lang" are permitted as both language attributes affect charsets
+ 	// and direction of text.
+-	p.AllowAttrs("dir").Matching(Direction).Globally()
+-	p.AllowAttrs(
++	pd.AllowAttrs("dir").Matching(Direction).Globally()
++	pd.AllowAttrs(
+ 		"lang",
+ 	).Matching(regexp.MustCompile(`[a-zA-Z]{2,20}`)).Globally()
+ 
+@@ -155,12 +168,12 @@ func (p *Policy) AllowStandardAttributes() {
+ 	// This does create a risk that JavaScript and CSS within your web page
+ 	// might identify the wrong elements. Ensure that you select things
+ 	// accurately
+-	p.AllowAttrs("id").Matching(
++	pd.AllowAttrs("id").Matching(
+ 		regexp.MustCompile(`[a-zA-Z0-9\:\-_\.]+`),
+ 	).Globally()
+ 
+ 	// "title" is permitted as it improves accessibility.
+-	p.AllowAttrs("title").Matching(Paragraph).Globally()
++	pd.AllowAttrs("title").Matching(Paragraph).Globally()
+ }
+ 
+ // AllowStyling presently enables the class attribute globally.
+@@ -168,24 +181,34 @@ func (p *Policy) AllowStandardAttributes() {
+ // Note: When bluemonday ships a CSS parser and we can safely sanitise that,
+ // this will also allow sanitized styling of elements via the style attribute.
+ func (p *Policy) AllowStyling() {
++	declareStyling(p)
++}
+ 
++// declareStyling declares the styling rule block on any definer.
++func declareStyling(pd PolicyDefiner) {
+ 	// "class" is permitted globally
+-	p.AllowAttrs("class").Matching(SpaceSeparatedTokens).Globally()
++	pd.AllowAttrs("class").Matching(SpaceSeparatedTokens).Globally()
+ }
+ 
+ // AllowImages enables the img element and some popular attributes. It will also
+ // ensure that URL values are parseable. This helper does not enable data URI
+ // images, for that you should also use the AllowDataURIImages() helper.
+ func (p *Policy) AllowImages() {
++	declareImages(p)
++}
+ 
++// declareImages declares the image rule block on any definer. The standard
++// URL rules are declared as part of this block, exactly as they are when
++// the helper is used.
++func declareImages(pd PolicyDefiner) {
+ 	// "img" is permitted
+-	p.AllowAttrs("align").Matching(ImageAlign).OnElements("img")
+-	p.AllowAttrs("alt").Matching(Paragraph).OnElements("img")
+-	p.AllowAttrs("height", "width").Matching(NumberOrPercent).OnElements("img")
++	pd.AllowAttrs("align").Matching(ImageAlign).OnElements("img")
++	pd.AllowAttrs("alt").Matching(Paragraph).OnElements("img")
++	pd.AllowAttrs("height", "width").Matching(NumberOrPercent).OnElements("img")
+ 
+ 	// Standard URLs enabled
+-	p.AllowStandardURLs()
+-	p.AllowAttrs("src").OnElements("img")
++	declareStandardURLs(pd)
++	pd.AllowAttrs("src").OnElements("img")
+ }
+ 
+ // AllowDataURIImages permits the use of inline images defined in RFC2397
+@@ -204,12 +227,16 @@ func (p *Policy) AllowImages() {
+ // http://palizine.plynt.com/issues/2010Oct/bypass-xss-filters/
+ // https://capec.mitre.org/data/definitions/244.html
+ func (p *Policy) AllowDataURIImages() {
++	declareDataURIImages(p)
++}
+ 
++// declareDataURIImages declares the data URI image rule block on any definer.
++func declareDataURIImages(pd PolicyDefiner) {
+ 	// URLs must be parseable by net/url.Parse()
+-	p.RequireParseableURLs(true)
++	pd.RequireParseableURLs(true)
+ 
+ 	// Supply a function to validate images contained within data URI
+-	p.AllowURLSchemeWithCustomPolicy(
++	pd.AllowURLSchemeWithCustomPolicy(
+ 		"data",
+ 		func(url *url.URL) (allowUrl bool) {
+ 			if url.RawQuery != "" || url.Fragment != "" {
+@@ -230,71 +257,87 @@ func (p *Policy) AllowDataURIImages() {
+ // AllowLists will enabled ordered and unordered lists, as well as definition
+ // lists
+ func (p *Policy) AllowLists() {
++	declareLists(p)
++}
++
++// declareLists declares the definition list rule block on any definer.
++func declareLists(pd PolicyDefiner) {
+ 	// "ol" "ul" are permitted
+-	p.AllowAttrs("type").Matching(ListType).OnElements("ol", "ul")
++	pd.AllowAttrs("type").Matching(ListType).OnElements("ol", "ul")
+ 
+ 	// "li" is permitted
+-	p.AllowAttrs("type").Matching(ListType).OnElements("li")
+-	p.AllowAttrs("value").Matching(Integer).OnElements("li")
++	pd.AllowAttrs("type").Matching(ListType).OnElements("li")
++	pd.AllowAttrs("value").Matching(Integer).OnElements("li")
+ 
+ 	// "dl" "dt" "dd" are permitted
+-	p.AllowElements("dl", "dt", "dd")
++	pd.AllowElements("dl", "dt", "dd")
+ }
+ 
+ // AllowTables will enable a rich set of elements and attributes to describe
+ // HTML tables
+ func (p *Policy) AllowTables() {
++	declareTables(p)
++}
+ 
++// declareTables declares the table rule block on any definer.
++func declareTables(pd PolicyDefiner) {
+ 	// "table" is permitted
+-	p.AllowAttrs("height", "width").Matching(NumberOrPercent).OnElements("table")
+-	p.AllowAttrs("summary").Matching(Paragraph).OnElements("table")
++	pd.AllowAttrs("height", "width").Matching(NumberOrPercent).OnElements("table")
++	pd.AllowAttrs("summary").Matching(Paragraph).OnElements("table")
+ 
+ 	// "caption" is permitted
+-	p.AllowElements("caption")
++	pd.AllowElements("caption")
+ 
+ 	// "col" "colgroup" are permitted
+-	p.AllowAttrs("align").Matching(CellAlign).OnElements("col", "colgroup")
+-	p.AllowAttrs("height", "width").Matching(
++	pd.AllowAttrs("align").Matching(CellAlign).OnElements("col", "colgroup")
++	pd.AllowAttrs("height", "width").Matching(
+ 		NumberOrPercent,
+ 	).OnElements("col", "colgroup")
+-	p.AllowAttrs("span").Matching(Integer).OnElements("colgroup", "col")
+-	p.AllowAttrs("valign").Matching(
++	pd.AllowAttrs("span").Matching(Integer).OnElements("colgroup", "col")
++	pd.AllowAttrs("valign").Matching(
+ 		CellVerticalAlign,
+ 	).OnElements("col", "colgroup")
+ 
+ 	// "thead" "tr" are permitted
+-	p.AllowAttrs("align").Matching(CellAlign).OnElements("thead", "tr")
+-	p.AllowAttrs("valign").Matching(CellVerticalAlign).OnElements("thead", "tr")
++	pd.AllowAttrs("align").Matching(CellAlign).OnElements("thead", "tr")
++	pd.AllowAttrs("valign").Matching(CellVerticalAlign).OnElements("thead", "tr")
+ 
+ 	// "td" "th" are permitted
+-	p.AllowAttrs("abbr").Matching(Paragraph).OnElements("td", "th")
+-	p.AllowAttrs("align").Matching(CellAlign).OnElements("td", "th")
+-	p.AllowAttrs("colspan", "rowspan").Matching(Integer).OnElements("td", "th")
+-	p.AllowAttrs("headers").Matching(
++	pd.AllowAttrs("abbr").Matching(Paragraph).OnElements("td", "th")
++	pd.AllowAttrs("align").Matching(CellAlign).OnElements("td", "th")
++	pd.AllowAttrs("colspan", "rowspan").Matching(Integer).OnElements("td", "th")
++	pd.AllowAttrs("headers").Matching(
+ 		SpaceSeparatedTokens,
+ 	).OnElements("td", "th")
+-	p.AllowAttrs("height", "width").Matching(
++	pd.AllowAttrs("height", "width").Matching(
+ 		NumberOrPercent,
+ 	).OnElements("td", "th")
+-	p.AllowAttrs(
++	pd.AllowAttrs(
+ 		"scope",
+ 	).Matching(
+ 		regexp.MustCompile(`(?i)(?:row|col)(?:group)?`),
+ 	).OnElements("td", "th")
+-	p.AllowAttrs("valign").Matching(CellVerticalAlign).OnElements("td", "th")
+-	p.AllowAttrs("nowrap").Matching(
++	pd.AllowAttrs("valign").Matching(CellVerticalAlign).OnElements("td", "th")
++	pd.AllowAttrs("nowrap").Matching(
+ 		regexp.MustCompile(`(?i)|nowrap`),
+ 	).OnElements("td", "th")
+ 
+ 	// "tbody" "tfoot"
+-	p.AllowAttrs("align").Matching(CellAlign).OnElements("tbody", "tfoot")
+-	p.AllowAttrs("valign").Matching(
++	pd.AllowAttrs("align").Matching(CellAlign).OnElements("tbody", "tfoot")
++	pd.AllowAttrs("valign").Matching(
+ 		CellVerticalAlign,
+ 	).OnElements("tbody", "tfoot")
+ }
+ 
++// AllowIFrames will enable the iframe element and ensure that the sandbox
++// attribute is present and filtered to the provided values
+ func (p *Policy) AllowIFrames(vals ...SandboxValue) {
+-	p.AllowAttrs("sandbox").OnElements("iframe")
++	declareIFrames(p, vals...)
++}
++
++// declareIFrames declares the iframe rule block on any definer.
++func declareIFrames(pd PolicyDefiner, vals ...SandboxValue) {
++	pd.AllowAttrs("sandbox").OnElements("iframe")
+ 
+-	p.RequireSandboxOnIFrame(vals...)
++	pd.RequireSandboxOnIFrame(vals...)
+ }
+diff --git a/policies.go b/policies.go
+index 570bba8..665c2ed 100644
+--- a/policies.go
++++ b/policies.go
+@@ -30,6 +30,9 @@
+ package bluemonday
+ 
+ import (
++	"bytes"
++	"io"
++	"net/url"
+ 	"regexp"
+ )
+ 
+@@ -44,6 +47,183 @@ func StripTagsPolicy() *Policy {
+ 	return StrictPolicy()
+ }
+ 
++// ugcConformanceGuard is the definer through which the user generated
++// content profile is declared. Every rule declaration for the profile goes
++// through this guard so that the profile's standards are enforced in one
++// place regardless of which component is declaring rules: declarations that
++// the profile does not support never reach the underlying policy.
++//
++// The UGC profile never permits unsafe parsing, comments, data attributes,
++// iframes, custom URL policies, or content toggles. When one of those
++// declarations is made through the guard it is discarded and the policy is
++// handed back unchanged, so a caller cannot accidentally loosen a UGC
++// policy. Declaring through the guard also keeps the profile assembly
++// interchangeable with any other definer, which is why the guard carries
++// the whole definer surface even though the profile only uses part of it.
++type ugcConformanceGuard struct {
++	p *Policy
++}
++
++// Running a policy is not part of declaring the UGC profile, but the guard
++// still runs the underlying policy for callers that hold a definer.
++
++func (g ugcConformanceGuard) Sanitize(s string) string {
++	return g.p.Sanitize(s)
++}
++
++func (g ugcConformanceGuard) SanitizeBytes(b []byte) []byte {
++	return g.p.SanitizeBytes(b)
++}
++
++func (g ugcConformanceGuard) SanitizeReader(r io.Reader) *bytes.Buffer {
++	return g.p.SanitizeReader(r)
++}
++
++func (g ugcConformanceGuard) SanitizeReaderToWriter(
++	r io.Reader,
++	w io.Writer,
++) error {
++	return g.p.SanitizeReaderToWriter(r, w)
++}
++
++// The UGC profile allows a fixed set of whitelisted elements only, so
++// regex-scoped elements are ignored.
++
++func (g ugcConformanceGuard) AllowElementsMatching(regex *regexp.Regexp) *Policy {
++	// The UGC profile does not define any regex scoped elements.
++	return g.p
++}
++
++func (g ugcConformanceGuard) AllowElements(names ...string) *Policy {
++	return g.p.AllowElements(names...)
++}
++
++// The UGC profile always drops the content of disallowed elements according
++// to the default skip rules, so changes to element content handling are
++// ignored.
++
++func (g ugcConformanceGuard) AllowElementsContent(names ...string) *Policy {
++	// The UGC profile retains the default content handling.
++	return g.p
++}
++
++func (g ugcConformanceGuard) SkipElementsContent(names ...string) *Policy {
++	// The UGC profile retains the default content handling.
++	return g.p
++}
++
++// Attribute declarations are the core of the profile and are passed through.
++
++func (g ugcConformanceGuard) AllowAttrs(attrNames ...string) *attrPolicyBuilder {
++	return g.p.AllowAttrs(attrNames...)
++}
++
++func (g ugcConformanceGuard) AllowNoAttrs() *attrPolicyBuilder {
++	// The UGC profile never makes element attributes optional wholesale,
++	// so the returned builder binds nothing.
++	return &attrPolicyBuilder{p: g.p}
++}
++
++// The UGC profile does not sanitise inline CSS, so style declarations are
++// captured and never bound by the returned builder.
++
++func (g ugcConformanceGuard) AllowStyles(propertyNames ...string) *stylePolicyBuilder {
++	return &stylePolicyBuilder{p: g.p}
++}
++
++// The standard URL schemes and parseable URL rules are part of the profile,
++// the remaining URL declarations are not.
++
++func (g ugcConformanceGuard) AllowURLSchemes(schemes ...string) *Policy {
++	return g.p.AllowURLSchemes(schemes...)
++}
++
++func (g ugcConformanceGuard) AllowURLSchemesMatching(r *regexp.Regexp) *Policy {
++	// The UGC profile allows a fixed scheme list only.
++	return g.p
++}
++
++func (g ugcConformanceGuard) AllowURLSchemeWithCustomPolicy(
++	scheme string,
++	urlPolicy func(url *url.URL) (allowUrl bool),
++) *Policy {
++	// The UGC profile does not delegate URL decisions to custom policies.
++	return g.p
++}
++
++func (g ugcConformanceGuard) RequireParseableURLs(require bool) *Policy {
++	return g.p.RequireParseableURLs(require)
++}
++
++func (g ugcConformanceGuard) AllowRelativeURLs(require bool) *Policy {
++	return g.p.AllowRelativeURLs(require)
++}
++
++func (g ugcConformanceGuard) RewriteSrc(fn urlRewriter) *Policy {
++	// The UGC profile does not rewrite resource locations.
++	return g.p
++}
++
++// Hardening beyond rel="nofollow" on links is not part of the profile, so
++// those declarations are ignored.
++
++func (g ugcConformanceGuard) RequireNoFollowOnLinks(require bool) *Policy {
++	return g.p.RequireNoFollowOnLinks(require)
++}
++
++func (g ugcConformanceGuard) RequireNoFollowOnFullyQualifiedLinks(require bool) *Policy {
++	// The UGC profile only hardens links with rel="nofollow".
++	return g.p
++}
++
++func (g ugcConformanceGuard) RequireNoReferrerOnLinks(require bool) *Policy {
++	// The UGC profile only hardens links with rel="nofollow".
++	return g.p
++}
++
++func (g ugcConformanceGuard) RequireNoReferrerOnFullyQualifiedLinks(
++	require bool,
++) *Policy {
++	// The UGC profile only hardens links with rel="nofollow".
++	return g.p
++}
++
++func (g ugcConformanceGuard) RequireCrossOriginAnonymous(require bool) *Policy {
++	// The UGC profile does not harden embedded content.
++	return g.p
++}
++
++func (g ugcConformanceGuard) AddTargetBlankToFullyQualifiedLinks(require bool) *Policy {
++	// The UGC profile does not force external links into new tabs.
++	return g.p
++}
++
++func (g ugcConformanceGuard) RequireSandboxOnIFrame(vals ...SandboxValue) {
++	// The UGC profile does not permit iframes, so no sandbox values are
++	// recorded.
++}
++
++func (g ugcConformanceGuard) AllowComments() {
++	// The UGC profile does not permit comments, so enabling them here is
++	// discarded.
++}
++
++func (g ugcConformanceGuard) AllowDataAttributes() {
++	// The UGC profile does not permit data attributes, so enabling them
++	// here is discarded.
++}
++
++func (g ugcConformanceGuard) AllowUnsafe(allowUnsafe bool) *Policy {
++	// The UGC profile is never permitted to allow unsafe parsing, so the
++	// request is discarded and the policy is returned unchanged.
++	return g.p
++}
++
++func (g ugcConformanceGuard) AddSpaceWhenStrippingTag(allow bool) *Policy {
++	// The UGC profile strips tags without adding whitespace.
++	return g.p
++}
++
+ // UGCPolicy returns a policy aimed at user generated content that is a result
+ // of HTML WYSIWYG tools and Markdown conversions.
+ //
+@@ -55,6 +235,11 @@ func UGCPolicy() *Policy {
+ 
+ 	p := NewPolicy()
+ 
++	// All rule declarations for the profile are made through the
++	// conformance guard, which discards the declarations that the UGC
++	// profile does not support.
++	g := ugcConformanceGuard{p: p}
++
+ 	///////////////////////
+ 	// Global attributes //
+ 	///////////////////////
+@@ -62,13 +247,13 @@ func UGCPolicy() *Policy {
+ 	// "class" is not permitted as we are not allowing users to style their own
+ 	// content
+ 
+-	p.AllowStandardAttributes()
++	declareStandardAttributes(g)
+ 
+ 	//////////////////////////////
+ 	// Global URL format policy //
+ 	//////////////////////////////
+ 
+-	p.AllowStandardURLs()
++	declareStandardURLs(g)
+ 
+ 	////////////////////////////////
+ 	// Declarations and structure //
+@@ -83,30 +268,30 @@ func UGCPolicy() *Policy {
+ 	//////////////////////////
+ 
+ 	// "article" and "aside" are permitted and takes no attributes
+-	p.AllowElements("article", "aside")
++	g.AllowElements("article", "aside")
+ 
+ 	// "body" is not permitted as we are expecting user generated content to be a fragment
+ 	// of HTML and not a full document.
+ 
+ 	// "details" is permitted, including the "open" attribute which can either
+ 	// be blank or the value "open".
+-	p.AllowAttrs(
++	g.AllowAttrs(
+ 		"open",
+ 	).Matching(regexp.MustCompile(`(?i)^(|open)$`)).OnElements("details")
+ 
+ 	// "fieldset" is not permitted as we are not allowing forms to be created.
+ 
+ 	// "figure" is permitted and takes no attributes
+-	p.AllowElements("figure")
++	g.AllowElements("figure")
+ 
+ 	// "nav" is not permitted as it is assumed that the site (and not the user)
+ 	// has defined navigation elements
+ 
+ 	// "section" is permitted and takes no attributes
+-	p.AllowElements("section")
++	g.AllowElements("section")
+ 
+ 	// "summary" is permitted and takes no attributes
+-	p.AllowElements("summary")
++	g.AllowElements("summary")
+ 
+ 	//////////////////////////
+ 	// Headings and footers //
+@@ -116,13 +301,13 @@ func UGCPolicy() *Policy {
+ 	// not structural to this extent
+ 
+ 	// "h1" through "h6" are permitted and take no attributes
+-	p.AllowElements("h1", "h2", "h3", "h4", "h5", "h6")
++	g.AllowElements("h1", "h2", "h3", "h4", "h5", "h6")
+ 
+ 	// "header" is not permitted as we expect user content to be a fragment and
+ 	// not structural to this extent
+ 
+ 	// "hgroup" is permitted and takes no attributes
+-	p.AllowElements("hgroup")
++	g.AllowElements("hgroup")
+ 
+ 	/////////////////////////////////////
+ 	// Content grouping and separating //
+@@ -130,32 +315,32 @@ func UGCPolicy() *Policy {
+ 
+ 	// "blockquote" is permitted, including the "cite" attribute which must be
+ 	// a standard URL.
+-	p.AllowAttrs("cite").OnElements("blockquote")
++	g.AllowAttrs("cite").OnElements("blockquote")
+ 
+ 	// "br" "div" "hr" "p" "span" "wbr" are permitted and take no attributes
+-	p.AllowElements("br", "div", "hr", "p", "span", "wbr")
++	g.AllowElements("br", "div", "hr", "p", "span", "wbr")
+ 
+ 	///////////
+ 	// Links //
+ 	///////////
+ 
+ 	// "a" is permitted
+-	p.AllowAttrs("href").OnElements("a")
++	g.AllowAttrs("href").OnElements("a")
+ 
+ 	// "area" is permitted along with the attributes that map image maps work
+-	p.AllowAttrs("name").Matching(
++	g.AllowAttrs("name").Matching(
+ 		regexp.MustCompile(`^([\p{L}\p{N}_-]+)$`),
+ 	).OnElements("map")
+-	p.AllowAttrs("alt").Matching(Paragraph).OnElements("area")
+-	p.AllowAttrs("coords").Matching(
++	g.AllowAttrs("alt").Matching(Paragraph).OnElements("area")
++	g.AllowAttrs("coords").Matching(
+ 		regexp.MustCompile(`^([0-9]+,)+[0-9]+$`),
+ 	).OnElements("area")
+-	p.AllowAttrs("href").OnElements("area")
+-	p.AllowAttrs("rel").Matching(SpaceSeparatedTokens).OnElements("area")
+-	p.AllowAttrs("shape").Matching(
++	g.AllowAttrs("href").OnElements("area")
++	g.AllowAttrs("rel").Matching(SpaceSeparatedTokens).OnElements("area")
++	g.AllowAttrs("shape").Matching(
+ 		regexp.MustCompile(`(?i)^(default|circle|rect|poly)$`),
+ 	).OnElements("area")
+-	p.AllowAttrs("usemap").Matching(
++	g.AllowAttrs("usemap").Matching(
+ 		regexp.MustCompile(`(?i)^#[\p{L}\p{N}_-]+$`),
+ 	).OnElements("img")
+ 
+@@ -166,14 +351,14 @@ func UGCPolicy() *Policy {
+ 	/////////////////////
+ 
+ 	// The following are all inline phrasing elements
+-	p.AllowElements("abbr", "acronym", "cite", "code", "dfn", "em",
++	g.AllowElements("abbr", "acronym", "cite", "code", "dfn", "em",
+ 		"figcaption", "mark", "s", "samp", "strong", "sub", "sup", "var")
+ 
+ 	// "q" is permitted and "cite" is a URL and handled by URL policies
+-	p.AllowAttrs("cite").OnElements("q")
++	g.AllowAttrs("cite").OnElements("q")
+ 
+ 	// "time" is permitted
+-	p.AllowAttrs("datetime").Matching(ISO8601).OnElements("time")
++	g.AllowAttrs("datetime").Matching(ISO8601).OnElements("time")
+ 
+ 	////////////////////
+ 	// Style elements //
+@@ -181,7 +366,7 @@ func UGCPolicy() *Policy {
+ 
+ 	// block and inline elements that impart no semantic meaning but style the
+ 	// document
+-	p.AllowElements("b", "i", "pre", "small", "strike", "tt", "u")
++	g.AllowElements("b", "i", "pre", "small", "strike", "tt", "u")
+ 
+ 	// "style" is not permitted as we are not yet sanitising CSS and it is an
+ 	// XSS attack vector
+@@ -191,30 +376,30 @@ func UGCPolicy() *Policy {
+ 	//////////////////////
+ 
+ 	// "bdi" "bdo" are permitted
+-	p.AllowAttrs("dir").Matching(Direction).OnElements("bdi", "bdo")
++	g.AllowAttrs("dir").Matching(Direction).OnElements("bdi", "bdo")
+ 
+ 	// "rp" "rt" "ruby" are permitted
+-	p.AllowElements("rp", "rt", "ruby")
++	g.AllowElements("rp", "rt", "ruby")
+ 
+ 	///////////////////////////
+ 	// HTML5 Change tracking //
+ 	///////////////////////////
+ 
+ 	// "del" "ins" are permitted
+-	p.AllowAttrs("cite").Matching(Paragraph).OnElements("del", "ins")
+-	p.AllowAttrs("datetime").Matching(ISO8601).OnElements("del", "ins")
++	g.AllowAttrs("cite").Matching(Paragraph).OnElements("del", "ins")
++	g.AllowAttrs("datetime").Matching(ISO8601).OnElements("del", "ins")
+ 
+ 	///////////
+ 	// Lists //
+ 	///////////
+ 
+-	p.AllowLists()
++	declareLists(g)
+ 
+ 	////////////
+ 	// Tables //
+ 	////////////
+ 
+-	p.AllowTables()
++	declareTables(g)
+ 
+ 	///////////
+ 	// Forms //
+@@ -227,7 +412,7 @@ func UGCPolicy() *Policy {
+ 	// "textarea" "optgroup" "option" are all not permitted
+ 
+ 	// "meter" is permitted
+-	p.AllowAttrs(
++	g.AllowAttrs(
+ 		"value",
+ 		"min",
+ 		"max",
+@@ -237,7 +422,7 @@ func UGCPolicy() *Policy {
+ 	).Matching(Number).OnElements("meter")
+ 
+ 	// "progress" is permitted
+-	p.AllowAttrs("value", "max").Matching(Number).OnElements("progress")
++	g.AllowAttrs("value", "max").Matching(Number).OnElements("progress")
+ 
+ 	//////////////////////
+ 	// Embedded content //
+@@ -247,7 +432,7 @@ func UGCPolicy() *Policy {
+ 	// "audio" "canvas" "embed" "iframe" "object" "param" "source" "svg" "track"
+ 	// "video" are all not permitted
+ 
+-	p.AllowImages()
++	declareImages(g)
+ 
+ 	return p
+ }
+diff --git a/policy.go b/policy.go
+index b4f0987..7a259a1 100644
+--- a/policy.go
++++ b/policy.go
+@@ -32,6 +32,8 @@ package bluemonday
+ //TODO sgutzwiller create map of styles to default handlers
+ //TODO sgutzwiller create handlers for various attributes
+ import (
++	"bytes"
++	"io"
+ 	"net/url"
+ 	"regexp"
+ 	"strings"
+@@ -207,6 +209,71 @@ type urlPolicy func(url *url.URL) (allowUrl bool)
+ 
+ type urlRewriter func(*url.URL)
+ 
++// PolicyDefiner is the single seam through which anything that defines a
++// sanitization policy declares its rules, and through which a policy is run.
++//
++// Every component that contributes rules to a policy, whether that is one of
++// the bundled rule blocks shipped with bluemonday, one of the command line
++// tools, or an embedding application, is written against a PolicyDefiner
++// rather than against the concrete policy type. This keeps all rule
++// definitions interchangeable: wrapper policies, conformance guards, and
++// future definition sources can be swapped in without touching the callers,
++// and policy definitions remain portable between policies built in different
++// places.
++//
++// *Policy implements PolicyDefiner directly, as do any policy wrappers, so
++// callers can keep working with the concrete type where they have one and
++// hand it to anything that expects a definer.
++type PolicyDefiner interface {
++	// Running a policy over untrusted input:
++	Sanitize(s string) string
++	SanitizeBytes(b []byte) []byte
++	SanitizeReader(r io.Reader) *bytes.Buffer
++	SanitizeReaderToWriter(r io.Reader, w io.Writer) error
++
++	// Declaring which elements are permitted, and whether their content is
++	// kept or dropped when the element itself is not allowed:
++	AllowElements(names ...string) *Policy
++	AllowElementsMatching(regex *regexp.Regexp) *Policy
++	AllowElementsContent(names ...string) *Policy
++	SkipElementsContent(names ...string) *Policy
++
++	// Declaring which attributes are permitted on the allowed elements:
++	AllowAttrs(attrNames ...string) *attrPolicyBuilder
++	AllowNoAttrs() *attrPolicyBuilder
++
++	// Declaring which CSS properties are permitted in style attributes:
++	AllowStyles(propertyNames ...string) *stylePolicyBuilder
++
++	// Declaring which URL schemes and URL shapes are permitted:
++	AllowURLSchemes(schemes ...string) *Policy
++	AllowURLSchemesMatching(r *regexp.Regexp) *Policy
++	AllowURLSchemeWithCustomPolicy(
++		scheme string,
++		urlPolicy func(url *url.URL) (allowUrl bool),
++	) *Policy
++	RequireParseableURLs(require bool) *Policy
++	AllowRelativeURLs(require bool) *Policy
++	RewriteSrc(fn urlRewriter) *Policy
++
++	// Declaring the hardening that is applied to links and embedded
++	// content:
++	RequireNoFollowOnLinks(require bool) *Policy
++	RequireNoFollowOnFullyQualifiedLinks(require bool) *Policy
++	RequireNoReferrerOnLinks(require bool) *Policy
++	RequireNoReferrerOnFullyQualifiedLinks(require bool) *Policy
++	RequireCrossOriginAnonymous(require bool) *Policy
++	AddTargetBlankToFullyQualifiedLinks(require bool) *Policy
++	RequireSandboxOnIFrame(vals ...SandboxValue)
++
++	// Declaring how comments, data attributes, unsafe content, and
++	// stripped tags are handled:
++	AllowComments()
++	AllowDataAttributes()
++	AllowUnsafe(allowUnsafe bool) *Policy
++	AddSpaceWhenStrippingTag(allow bool) *Policy
++}
++
+ type SandboxValue int64
+ 
+ const (

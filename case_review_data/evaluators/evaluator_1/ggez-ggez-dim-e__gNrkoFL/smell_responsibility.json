@@ -1,0 +1,136 @@
+{
+  "schema_version": "smellbench.smell_check_manifest.v1",
+  "checker_backend": "Dylint",
+  "smell_type": "deeply_inlined_method",
+  "rule": {
+    "id": "deeply-inlined-method",
+    "description": "A method whose sub-method implementations were copied into its own body, leaving one contiguous function that spans several responsibility layers of the graphics stack and duplicates the absorbed helper bodies of its sibling methods."
+  },
+  "smell_entries": [
+    {
+      "id": "E1",
+      "file_path": "src/graphics/internal_canvas.rs",
+      "class_name": "InternalCanvas",
+      "function_name": "draw_mesh"
+    },
+    {
+      "id": "E2",
+      "file_path": "src/graphics/internal_canvas.rs",
+      "class_name": "InternalCanvas",
+      "function_name": "draw_mesh_instances"
+    },
+    {
+      "id": "E3",
+      "file_path": "src/graphics/internal_canvas.rs",
+      "class_name": "InternalCanvas",
+      "function_name": "draw_bounded_text"
+    },
+    {
+      "id": "E4",
+      "file_path": "src/graphics/internal_canvas3d.rs",
+      "class_name": "InternalCanvas3d",
+      "function_name": "draw_mesh"
+    },
+    {
+      "id": "E5",
+      "file_path": "src/graphics/internal_canvas3d.rs",
+      "class_name": "InternalCanvas3d",
+      "function_name": "draw_mesh_instances"
+    }
+  ],
+  "injected_match_count": 5,
+  "checks": [
+    {
+      "id": "deeply-inlined-helper-chain",
+      "description": "Flags a method whose body has absorbed the implementations of its sub-methods: a contiguous span of at least 300 source lines, calling methods of at least 5 distinct low-level operation families (device-object creation, bind-group-layout creation, bind-group creation, render-pass driving, lazy cache population, arena allocation, bind-group shaping, queue submission), and sharing at least 40 duplicated method-call shapes with another large function in the crate.",
+      "detected_relation": "draw-entry-point -> inlined bodies of pipeline selection, bind-group shaping, uniform-arena allocation, image/text cache population and (for text) glyph measurement and queueing",
+      "why_this_is_the_smell": "The three structural signals together are only reachable by copying complete helper implementations into the caller: pure delegation chains never span 300 lines, one responsibility layer touches at most a couple of the listed operation families, and the call-shape duplication exists precisely because sibling draw paths absorbed the same helpers.",
+      "matches": [
+        {
+          "file": "src/graphics/internal_canvas.rs",
+          "symbol": "InternalCanvas::draw_mesh",
+          "entry_ids": ["E1"],
+          "evidence": "Absorbs pipeline selection (shader-type dispatch, pipeline-cache lookup and creation), bind-group layout and group cache population, dummy empty bind-group construction, pipeline-layout hashing, per-draw uniform-arena bump with growth fallback, and the image bind-group slow path (sampler cache plus per-image bind-group construction).",
+          "measurement": {
+            "line": 319,
+            "end_line": 837,
+            "lines": 519,
+            "statements": 71,
+            "shared_call_shapes_with_sibling": 157,
+            "operation_families": 5
+          }
+        },
+        {
+          "file": "src/graphics/internal_canvas.rs",
+          "symbol": "InternalCanvas::draw_mesh_instances",
+          "entry_ids": ["E2"],
+          "evidence": "Same absorbed chain as draw_mesh plus instance ordered-pipeline selection: shader-type dispatch for instances, pipeline construction, bind-group layout/group cache population, uniform-arena bump with growth fallback, and image bind-group slow path, ending in an indexed instanced draw.",
+          "measurement": {
+            "line": 839,
+            "end_line": 1366,
+            "lines": 528,
+            "statements": 71,
+            "shared_call_shapes_with_sibling": 157,
+            "operation_families": 5
+          }
+        },
+        {
+          "file": "src/graphics/internal_canvas.rs",
+          "symbol": "InternalCanvas::draw_bounded_text",
+          "entry_ids": ["E3"],
+          "evidence": "Absorbs glyph-layout measurement and bounds computation, text section assembly and queueing, text-image bind-group shaping, text-uniform bind-group construction, the queue-time text pipeline selection/hoist, and the render-pass driving for the text draw, alongside its own mesh-style pipeline construction.",
+          "measurement": {
+            "line": 1368,
+            "end_line": 1905,
+            "lines": 538,
+            "statements": 61,
+            "shared_call_shapes_with_sibling": 137,
+            "operation_families": 5
+          }
+        },
+        {
+          "file": "src/graphics/internal_canvas3d.rs",
+          "symbol": "InternalCanvas3d::draw_mesh",
+          "entry_ids": ["E4"],
+          "evidence": "3D variant: absorbs shader-type dispatch (Draw/Instance arms only), depth-tested back-face-culling pipeline construction, bind-group layout and group cache population, image bind-group construction, and render-pass driving over the depth-triangles pipeline; takes its uniform via the existing allocator rather than a local arena scan.",
+          "measurement": {
+            "line": 293,
+            "end_line": 742,
+            "lines": 450,
+            "statements": 51,
+            "shared_call_shapes_with_sibling": 136,
+            "operation_families": 5
+          }
+        },
+        {
+          "file": "src/graphics/internal_canvas3d.rs",
+          "symbol": "InternalCanvas3d::draw_mesh_instances",
+          "entry_ids": ["E5"],
+          "evidence": "3D instanced variant: absorbs the same pipeline/bind-group chain under instance ordering and additionally performs the uniform-arena bump with alignment arithmetic, buffer scan/reuse and new-buffer fallback inline.",
+          "measurement": {
+            "line": 744,
+            "end_line": 1241,
+            "lines": 498,
+            "statements": 68,
+            "shared_call_shapes_with_sibling": 153,
+            "operation_families": 5
+          }
+        }
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "candidate": "Image::to_pixels / Image::encode (src/graphics/image.rs)",
+      "reason": "These clean-tree functions already perform single-level device work inline (buffer creation, copy, map, submit); the largest reaches well under every gate threshold and they hold no multi-level helper chain to absorb."
+    },
+    {
+      "candidate": "InternalCanvas::flush_text and the canvas state setters",
+      "reason": "Small single-purpose bodies in the clean tree (a flush orchestrator behind a queueing sentinel and one-line state writes); nothing below them to absorb."
+    },
+    {
+      "candidate": "Uniform-allocator and cache-owner methods (GrowingBufferArena::allocate, BindGroupCache/PipelineCache/SamplerCache internals)",
+      "reason": "They are the lowest responsibility layer; the draw entry points absorb them rather than the reverse. The rule flags the absorbing draw methods, not the retained low-level owners."
+    }
+  ]
+}

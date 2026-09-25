@@ -1,0 +1,526 @@
+diff --git a/pkg/installpackage/cargo.go b/pkg/installpackage/cargo.go
+index 5f72bb7e..05309cc2 100644
+--- a/pkg/installpackage/cargo.go
++++ b/pkg/installpackage/cargo.go
+@@ -19,6 +19,10 @@ type CargoPackageInstaller interface {
+ 
+ type CargoPackageInstallerImpl struct {
+ 	exec Executor
++	// installer is the coordinator that owns the crate installation. It is
++	// bound by the installer's constructor so the command runs with the
++	// installer's own runtime configuration.
++	installer *Installer
+ }
+ 
+ func NewCargoPackageInstallerImpl(exec Executor) *CargoPackageInstallerImpl {
+@@ -27,7 +31,12 @@ func NewCargoPackageInstallerImpl(exec Executor) *CargoPackageInstallerImpl {
+ 	}
+ }
+ 
+-func getCargoArgs(version string, opts *registry.Cargo) []string {
++func (is *CargoPackageInstallerImpl) Install(ctx context.Context, logger *slog.Logger, crate, version, root string, opts *registry.Cargo) error {
++	return is.installer.runCargoInstall(ctx, logger, crate, version, root, opts)
++}
++
++// cargoArgs renders the cargo command line arguments for a crate installation.
++func (is *Installer) cargoArgs(version string, opts *registry.Cargo) []string {
+ 	args := []string{"install", "--version", version}
+ 	if opts != nil {
+ 		if opts.AllFeatures {
+@@ -42,8 +51,10 @@ func getCargoArgs(version string, opts *registry.Cargo) []string {
+ 	return args
+ }
+ 
+-func (is *CargoPackageInstallerImpl) Install(ctx context.Context, logger *slog.Logger, crate, version, root string, opts *registry.Cargo) error {
+-	args := getCargoArgs(version, opts)
++// runCargoInstall installs a crate with cargo, removing the install directory
++// when the installation fails.
++func (is *Installer) runCargoInstall(ctx context.Context, logger *slog.Logger, crate, version, root string, opts *registry.Cargo) error {
++	args := is.cargoArgs(version, opts)
+ 	if _, err := is.exec.ExecStderr(osexec.Command(ctx, "cargo", append(args, "--root", root, crate)...)); err != nil {
+ 		// Clean up root
+ 		logger := logger.With("install_dir", root)
+diff --git a/pkg/installpackage/checksum.go b/pkg/installpackage/checksum.go
+index b2d43c31..c0e845d2 100644
+--- a/pkg/installpackage/checksum.go
++++ b/pkg/installpackage/checksum.go
+@@ -25,33 +25,75 @@ func hasChecksumSignatureVerification(chksum *registry.Checksum) bool {
+ 	return chksum.GetCosign() != nil || chksum.GetMinisign() != nil || chksum.GetGitHubArtifactAttestations() != nil
+ }
+ 
+-func (is *Installer) newChecksumVerifiers(pkg *config.Package, assetName string) []FileVerifier {
++// newFileVerifiers builds the signature verifiers that guard a single
++// download. When checksumFile is true the policy is read from the package's
++// checksum configuration instead of the asset configuration, and SLSA
++// verification is skipped because the checksum file itself isn't signed with a
++// provenance.
++func (is *Installer) newFileVerifiers(pkg *config.Package, assetName string, checksumFile bool) []FileVerifier {
+ 	pkgInfo := pkg.PackageInfo
++	if checksumFile {
++		return []FileVerifier{
++			&gitHubArtifactAttestationsVerifier{
++				disabled:    is.gaaDisabled,
++				gaa:         pkgInfo.Checksum.GetGitHubArtifactAttestations(),
++				pkg:         pkg,
++				ghInstaller: is.ghInstaller,
++				installer:   is,
++			},
++			&cosignVerifier{
++				disabled:      is.cosignDisabled,
++				cosign:        pkgInfo.Checksum.GetCosign(),
++				pkg:           pkg,
++				toolInstaller: is.cosignInstaller,
++				runtime:       is.runtime,
++				asset:         assetName,
++				installer:     is,
++			},
++			&minisignVerifier{
++				pkg:           pkg,
++				minisign:      pkgInfo.Checksum.GetMinisign(),
++				toolInstaller: is.minisignInstaller,
++				runtime:       is.runtime,
++				realRuntime:   is.realRuntime,
++				asset:         assetName,
++				installer:     is,
++			},
++		}
++	}
+ 	return []FileVerifier{
+ 		&gitHubArtifactAttestationsVerifier{
+ 			disabled:    is.gaaDisabled,
+-			gaa:         pkgInfo.Checksum.GetGitHubArtifactAttestations(),
++			gaa:         pkgInfo.GitHubArtifactAttestations,
+ 			pkg:         pkg,
+ 			ghInstaller: is.ghInstaller,
+-			ghVerifier:  is.ghVerifier,
++			installer:   is,
+ 		},
+ 		&cosignVerifier{
+-			disabled:  is.cosignDisabled,
+-			cosign:    pkgInfo.Checksum.GetCosign(),
+-			pkg:       pkg,
+-			installer: is.cosignInstaller,
+-			verifier:  is.cosign,
+-			runtime:   is.runtime,
+-			asset:     assetName,
++			disabled:      is.cosignDisabled,
++			cosign:        pkgInfo.Cosign,
++			pkg:           pkg,
++			toolInstaller: is.cosignInstaller,
++			runtime:       is.runtime,
++			asset:         assetName,
++			installer:     is,
++		},
++		&slsaVerifier{
++			disabled:      is.slsaDisabled,
++			pkg:           pkg,
++			toolInstaller: is.slsaVerifierInstaller,
++			runtime:       is.runtime,
++			asset:         assetName,
++			installer:     is,
+ 		},
+ 		&minisignVerifier{
+-			pkg:         pkg,
+-			minisign:    pkgInfo.Checksum.GetMinisign(),
+-			installer:   is.minisignInstaller,
+-			verifier:    is.minisignVerifier,
+-			runtime:     is.runtime,
+-			realRuntime: is.realRuntime,
+-			asset:       assetName,
++			pkg:           pkg,
++			toolInstaller: is.minisignInstaller,
++			runtime:       is.runtime,
++			realRuntime:   is.realRuntime,
++			asset:         assetName,
++			minisign:      pkgInfo.Minisign,
++			installer:     is,
+ 		},
+ 	}
+ }
+@@ -91,7 +133,7 @@ func (is *Installer) dlAndExtractChecksum(ctx context.Context, logger *slog.Logg
+ }
+ 
+ func (is *Installer) VerifyChecksumFileContent(ctx context.Context, logger *slog.Logger, pkg *config.Package, assetName string, content []byte) error {
+-	verifiers, err := is.filterVerifiers(logger, is.newChecksumVerifiers(pkg, assetName))
++	verifiers, err := is.filterVerifiers(logger, is.newFileVerifiers(pkg, assetName, true))
+ 	if err != nil {
+ 		return fmt.Errorf("filter verifiers: %w", err)
+ 	}
+diff --git a/pkg/installpackage/dedicated_installer.go b/pkg/installpackage/dedicated_installer.go
+index 00ef3bb6..ed3996d7 100644
+--- a/pkg/installpackage/dedicated_installer.go
++++ b/pkg/installpackage/dedicated_installer.go
+@@ -27,6 +27,13 @@ func newDedicatedInstaller(installer *Installer, pkg func() *config.Package, che
+ }
+ 
+ func (di *DedicatedInstaller) install(ctx context.Context, logger *slog.Logger) error {
++	return di.installer.installDedicatedTool(ctx, logger, di)
++}
++
++// installDedicatedTool installs a verification tool (cosign, slsa-verifier,
++// minisign, gh) on the host runtime, serializing concurrent installations with
++// the tool's own mutex.
++func (is *Installer) installDedicatedTool(ctx context.Context, logger *slog.Logger, di *DedicatedInstaller) error {
+ 	di.mutex.Lock()
+ 	defer di.mutex.Unlock()
+ 
+@@ -37,11 +44,11 @@ func (di *DedicatedInstaller) install(ctx context.Context, logger *slog.Logger)
+ 		"registry", pkg.Package.Registry,
+ 	)
+ 
+-	pkgInfo, err := pkg.PackageInfo.Override(logger, pkg.Package.Version, di.installer.runtime)
++	pkgInfo, err := pkg.PackageInfo.Override(logger, pkg.Package.Version, is.runtime)
+ 	if err != nil {
+ 		return fmt.Errorf("evaluate version constraints: %w", err)
+ 	}
+-	supported, err := pkgInfo.CheckSupported(di.installer.runtime, di.installer.runtime.Env())
++	supported, err := pkgInfo.CheckSupported(is.runtime, is.runtime.Env())
+ 	if err != nil {
+ 		return fmt.Errorf("check if the package is supported in the environment: %w", err)
+ 	}
+@@ -52,7 +59,7 @@ func (di *DedicatedInstaller) install(ctx context.Context, logger *slog.Logger)
+ 
+ 	pkg.PackageInfo = pkgInfo
+ 
+-	if err := di.installer.InstallPackage(ctx, logger, &ParamInstallPackage{
++	if err := is.InstallPackage(ctx, logger, &ParamInstallPackage{
+ 		Pkg:           pkg,
+ 		Checksums:     di.checksums,
+ 		DisablePolicy: true,
+diff --git a/pkg/installpackage/download.go b/pkg/installpackage/download.go
+index 6c3b44c7..2a76a5b1 100644
+--- a/pkg/installpackage/download.go
++++ b/pkg/installpackage/download.go
+@@ -92,41 +92,7 @@ func (is *Installer) download(ctx context.Context, logger *slog.Logger, param *D
+ 		}
+ 	}()
+ 
+-	verifiers := []FileVerifier{
+-		&gitHubArtifactAttestationsVerifier{
+-			disabled:    is.gaaDisabled,
+-			gaa:         pkgInfo.GitHubArtifactAttestations,
+-			pkg:         ppkg,
+-			ghInstaller: is.ghInstaller,
+-			ghVerifier:  is.ghVerifier,
+-		},
+-		&cosignVerifier{
+-			disabled:  is.cosignDisabled,
+-			pkg:       ppkg,
+-			cosign:    pkgInfo.Cosign,
+-			installer: is.cosignInstaller,
+-			verifier:  is.cosign,
+-			runtime:   is.runtime,
+-			asset:     param.Asset,
+-		},
+-		&slsaVerifier{
+-			disabled:  is.slsaDisabled,
+-			pkg:       ppkg,
+-			installer: is.slsaVerifierInstaller,
+-			verifier:  is.slsaVerifier,
+-			runtime:   is.runtime,
+-			asset:     param.Asset,
+-		},
+-		&minisignVerifier{
+-			pkg:         ppkg,
+-			installer:   is.minisignInstaller,
+-			verifier:    is.minisignVerifier,
+-			runtime:     is.runtime,
+-			realRuntime: is.realRuntime,
+-			asset:       param.Asset,
+-			minisign:    pkgInfo.Minisign,
+-		},
+-	}
++	verifiers := is.newFileVerifiers(ppkg, param.Asset, false)
+ 
+ 	var tempFilePath string
+ 	for _, verifier := range verifiers {
+diff --git a/pkg/installpackage/go_build.go b/pkg/installpackage/go_build.go
+index 57f751f0..e94a3705 100644
+--- a/pkg/installpackage/go_build.go
++++ b/pkg/installpackage/go_build.go
+@@ -13,6 +13,10 @@ type GoBuildInstaller interface {
+ 
+ type GoBuildInstallerImpl struct {
+ 	exec Executor
++	// installer is the coordinator that owns the package build. It is bound
++	// by the installer's constructor so the build runs with the installer's
++	// own runtime configuration.
++	installer *Installer
+ }
+ 
+ func NewGoBuildInstallerImpl(exec Executor) *GoBuildInstallerImpl {
+@@ -22,6 +26,11 @@ func NewGoBuildInstallerImpl(exec Executor) *GoBuildInstallerImpl {
+ }
+ 
+ func (is *GoBuildInstallerImpl) Install(ctx context.Context, exePath, exeDir, src string) error {
++	return is.installer.runGoBuild(ctx, exePath, exeDir, src)
++}
++
++// runGoBuild builds a Go package into the given executable path.
++func (is *Installer) runGoBuild(ctx context.Context, exePath, exeDir, src string) error {
+ 	cmd := osexec.Command(ctx, "go", "build", "-o", exePath, src)
+ 	cmd.Dir = exeDir
+ 	if _, err := is.exec.ExecStderr(cmd); err != nil {
+diff --git a/pkg/installpackage/go_install.go b/pkg/installpackage/go_install.go
+index b91d3505..f42cea2a 100644
+--- a/pkg/installpackage/go_install.go
++++ b/pkg/installpackage/go_install.go
+@@ -16,6 +16,10 @@ type GoInstallInstaller interface {
+ 
+ type GoInstallInstallerImpl struct {
+ 	exec Executor
++	// installer is the coordinator that owns the module installation. It is
++	// bound by the installer's constructor so the command runs with the
++	// installer's own runtime configuration.
++	installer *Installer
+ }
+ 
+ func NewGoInstallInstallerImpl(exec Executor) *GoInstallInstallerImpl {
+@@ -25,10 +29,14 @@ func NewGoInstallInstallerImpl(exec Executor) *GoInstallInstallerImpl {
+ }
+ 
+ func (is *GoInstallInstallerImpl) Install(ctx context.Context, path, gobin string) error {
++	return is.installer.runGoInstall(ctx, path, gobin)
++}
++
++// runGoInstall installs a Go module into the given GOBIN directory.
++func (is *Installer) runGoInstall(ctx context.Context, path, gobin string) error {
+ 	cmd := osexec.Command(ctx, "go", "install", path)
+ 	cmd.Env = append(os.Environ(), "GOBIN="+gobin)
+-	_, err := is.exec.ExecStderr(cmd)
+-	if err != nil {
++	if _, err := is.exec.ExecStderr(cmd); err != nil {
+ 		return fmt.Errorf("install a go package: %w", err)
+ 	}
+ 	return nil
+diff --git a/pkg/installpackage/installer.go b/pkg/installpackage/installer.go
+index 998406ac..15170e5c 100644
+--- a/pkg/installpackage/installer.go
++++ b/pkg/installpackage/installer.go
+@@ -46,6 +46,7 @@ type Installer struct {
+ 	goInstallInstaller    GoInstallInstaller
+ 	goBuildInstaller      GoBuildInstaller
+ 	cargoPackageInstaller CargoPackageInstaller
++	exec                  Executor
+ 	runtime               *runtime.Runtime
+ 	realRuntime           *runtime.Runtime
+ 	rootDir               string
+@@ -93,9 +94,29 @@ func New(param *config.Param, downloader download.ClientAPI, rt *runtime.Runtime
+ 		ghattestation.Package,
+ 		ghattestation.Checksums(),
+ 	)
++	installer.absorbInstallerHelpers(goInstallInstaller, goBuildInstaller, cargoPackageInstaller)
+ 	return installer
+ }
+ 
++// absorbInstallerHelpers binds the concrete helper installers to the
++// coordinator so every installation mode flows through this Installer, and
++// takes over the process executor they used to own. Mock installers and other
++// implementations are left untouched and keep their own behavior.
++func (is *Installer) absorbInstallerHelpers(goInstallInstaller GoInstallInstaller, goBuildInstaller GoBuildInstaller, cargoPackageInstaller CargoPackageInstaller) {
++	if impl, ok := goInstallInstaller.(*GoInstallInstallerImpl); ok {
++		impl.installer = is
++		is.exec = impl.exec
++	}
++	if impl, ok := goBuildInstaller.(*GoBuildInstallerImpl); ok {
++		impl.installer = is
++		is.exec = impl.exec
++	}
++	if impl, ok := cargoPackageInstaller.(*CargoPackageInstallerImpl); ok {
++		impl.installer = is
++		is.exec = impl.exec
++	}
++}
++
+ func newInstaller(param *config.Param, downloader download.ClientAPI, rt, realRT *runtime.Runtime, linker Linker, chkDL download.ChecksumDownloader, chkCalc ChecksumCalculator, unarchiver Unarchiver, cosignVerifier CosignVerifier, slsaVerifier SLSAVerifier, minisignVerifier MinisignVerifier, ghVerifier GitHubArtifactAttestationsVerifier, goInstallInstaller GoInstallInstaller, goBuildInstaller GoBuildInstaller, cargoPackageInstaller CargoPackageInstaller, vacuum Vacuum) *Installer {
+ 	return &Installer{
+ 		rootDir:               param.RootDir,
+diff --git a/pkg/installpackage/verify_cosign.go b/pkg/installpackage/verify_cosign.go
+index 55594718..b41aab72 100644
+--- a/pkg/installpackage/verify_cosign.go
++++ b/pkg/installpackage/verify_cosign.go
+@@ -12,13 +12,15 @@ import (
+ )
+ 
+ type cosignVerifier struct {
+-	disabled  bool
+-	pkg       *config.Package
+-	cosign    *registry.Cosign
+-	installer *DedicatedInstaller
+-	verifier  CosignVerifier
+-	runtime   *runtime.Runtime
+-	asset     string
++	disabled      bool
++	pkg           *config.Package
++	cosign        *registry.Cosign
++	toolInstaller *DedicatedInstaller
++	runtime       *runtime.Runtime
++	asset         string
++	// installer is the coordinator that owns the asset verification. It is
++	// bound when the verifier is created by the installer.
++	installer *Installer
+ }
+ 
+ func (c *cosignVerifier) Enabled(logger *slog.Logger) (bool, error) {
+@@ -31,8 +33,14 @@ func (c *cosignVerifier) Enabled(logger *slog.Logger) (bool, error) {
+ }
+ 
+ func (c *cosignVerifier) Verify(ctx context.Context, logger *slog.Logger, file string) error {
++	return c.installer.verifyArtifactCosign(ctx, logger, c, file)
++}
++
++// verifyArtifactCosign verifies a downloaded asset with Cosign, installing
++// cosign first when it isn't installed yet.
++func (is *Installer) verifyArtifactCosign(ctx context.Context, logger *slog.Logger, c *cosignVerifier, file string) error {
+ 	logger.Info("verifying a file with Cosign")
+-	if err := c.installer.install(ctx, logger); err != nil {
++	if err := c.toolInstaller.install(ctx, logger); err != nil {
+ 		return fmt.Errorf("install sigstore/cosign: %w", err)
+ 	}
+ 
+@@ -41,7 +49,7 @@ func (c *cosignVerifier) Verify(ctx context.Context, logger *slog.Logger, file s
+ 
+ 	art := pkg.TemplateArtifact(c.runtime, c.asset)
+ 
+-	if err := c.verifier.Verify(ctx, logger, c.runtime, &download.File{
++	if err := is.cosign.Verify(ctx, logger, c.runtime, &download.File{
+ 		RepoOwner: pkg.PackageInfo.RepoOwner,
+ 		RepoName:  pkg.PackageInfo.RepoName,
+ 		Version:   pkg.Package.Version,
+diff --git a/pkg/installpackage/verify_github_artifact_attestation.go b/pkg/installpackage/verify_github_artifact_attestation.go
+index 14bc5396..09a2f765 100644
+--- a/pkg/installpackage/verify_github_artifact_attestation.go
++++ b/pkg/installpackage/verify_github_artifact_attestation.go
+@@ -20,7 +20,9 @@ type gitHubArtifactAttestationsVerifier struct {
+ 	gaa         *registry.GitHubArtifactAttestations
+ 	pkg         *config.Package
+ 	ghInstaller *DedicatedInstaller
+-	ghVerifier  GitHubArtifactAttestationsVerifier
++	// installer is the coordinator that owns the asset verification. It is
++	// bound when the verifier is created by the installer.
++	installer *Installer
+ }
+ 
+ func (g *gitHubArtifactAttestationsVerifier) Enabled(logger *slog.Logger) (bool, error) {
+@@ -32,12 +34,19 @@ func (g *gitHubArtifactAttestationsVerifier) Enabled(logger *slog.Logger) (bool,
+ }
+ 
+ func (g *gitHubArtifactAttestationsVerifier) Verify(ctx context.Context, logger *slog.Logger, file string) error {
++	return g.installer.verifyArtifactGitHubAttestations(ctx, logger, g, file)
++}
++
++// verifyArtifactGitHubAttestations verifies a downloaded asset with GitHub
++// Artifact Attestations, installing GitHub CLI first when it isn't installed
++// yet.
++func (is *Installer) verifyArtifactGitHubAttestations(ctx context.Context, logger *slog.Logger, g *gitHubArtifactAttestationsVerifier, file string) error {
+ 	logger.Info("verify GitHub Artifact Attestations")
+ 	if err := g.ghInstaller.install(ctx, logger); err != nil {
+ 		return fmt.Errorf("install GitHub CLI: %w", err)
+ 	}
+ 
+-	if err := g.ghVerifier.Verify(ctx, logger, &ghattestation.ParamVerify{
++	if err := is.ghVerifier.Verify(ctx, logger, &ghattestation.ParamVerify{
+ 		Repository:     g.pkg.PackageInfo.RepoOwner + "/" + g.pkg.PackageInfo.RepoName,
+ 		ArtifactPath:   file,
+ 		PredicateType:  g.gaa.PredicateType,
+diff --git a/pkg/installpackage/verify_minisign.go b/pkg/installpackage/verify_minisign.go
+index 11167375..59367920 100644
+--- a/pkg/installpackage/verify_minisign.go
++++ b/pkg/installpackage/verify_minisign.go
+@@ -13,15 +13,17 @@ import (
+ )
+ 
+ type minisignVerifier struct {
+-	pkg       *config.Package
+-	installer *DedicatedInstaller
+-	verifier  MinisignVerifier
+-	runtime   *runtime.Runtime
++	pkg           *config.Package
++	toolInstaller *DedicatedInstaller
++	runtime       *runtime.Runtime
+ 	// realRuntime is the host platform. It can be different from runtime,
+ 	// which AQUA_GOOS and AQUA_GOARCH can change.
+ 	realRuntime *runtime.Runtime
+ 	asset       string
+ 	minisign    *registry.Minisign
++	// installer is the coordinator that owns the asset verification. It is
++	// bound when the verifier is created by the installer.
++	installer *Installer
+ }
+ 
+ func (s *minisignVerifier) Enabled(logger *slog.Logger) (bool, error) {
+@@ -44,8 +46,14 @@ func (s *minisignVerifier) Enabled(logger *slog.Logger) (bool, error) {
+ }
+ 
+ func (s *minisignVerifier) Verify(ctx context.Context, logger *slog.Logger, file string) error {
++	return s.installer.verifyArtifactMinisign(ctx, logger, s, file)
++}
++
++// verifyArtifactMinisign verifies a downloaded asset with minisign, installing
++// minisign first when it isn't installed yet.
++func (is *Installer) verifyArtifactMinisign(ctx context.Context, logger *slog.Logger, s *minisignVerifier, file string) error {
+ 	logger.Info("verify a package with minisign")
+-	if err := s.installer.install(ctx, logger); err != nil {
++	if err := s.toolInstaller.install(ctx, logger); err != nil {
+ 		return fmt.Errorf("install minisign: %w", err)
+ 	}
+ 
+@@ -55,7 +63,7 @@ func (s *minisignVerifier) Verify(ctx context.Context, logger *slog.Logger, file
+ 
+ 	art := pkg.TemplateArtifact(s.runtime, s.asset)
+ 
+-	if err := s.verifier.Verify(ctx, logger, s.runtime, m, art, &download.File{
++	if err := is.minisignVerifier.Verify(ctx, logger, s.runtime, m, art, &download.File{
+ 		RepoOwner: pkgInfo.RepoOwner,
+ 		RepoName:  pkgInfo.RepoName,
+ 		Version:   pkg.Package.Version,
+diff --git a/pkg/installpackage/verify_slsa.go b/pkg/installpackage/verify_slsa.go
+index a6c8c181..e2e306c7 100644
+--- a/pkg/installpackage/verify_slsa.go
++++ b/pkg/installpackage/verify_slsa.go
+@@ -12,12 +12,14 @@ import (
+ )
+ 
+ type slsaVerifier struct {
+-	disabled  bool
+-	pkg       *config.Package
+-	installer *DedicatedInstaller
+-	verifier  SLSAVerifier
+-	runtime   *runtime.Runtime
+-	asset     string
++	disabled      bool
++	pkg           *config.Package
++	toolInstaller *DedicatedInstaller
++	runtime       *runtime.Runtime
++	asset         string
++	// installer is the coordinator that owns the asset verification. It is
++	// bound when the verifier is created by the installer.
++	installer *Installer
+ }
+ 
+ func (s *slsaVerifier) Enabled(logger *slog.Logger) (bool, error) {
+@@ -29,8 +31,14 @@ func (s *slsaVerifier) Enabled(logger *slog.Logger) (bool, error) {
+ }
+ 
+ func (s *slsaVerifier) Verify(ctx context.Context, logger *slog.Logger, file string) error {
++	return s.installer.verifyArtifactSLSA(ctx, logger, s, file)
++}
++
++// verifyArtifactSLSA verifies a downloaded asset with slsa-verifier, installing
++// the verifier tool first when it isn't installed yet.
++func (is *Installer) verifyArtifactSLSA(ctx context.Context, logger *slog.Logger, s *slsaVerifier, file string) error {
+ 	logger.Info("verify a package with slsa-verifier")
+-	if err := s.installer.install(ctx, logger); err != nil {
++	if err := s.toolInstaller.install(ctx, logger); err != nil {
+ 		return fmt.Errorf("install slsa-verifier: %w", err)
+ 	}
+ 
+@@ -43,7 +51,7 @@ func (s *slsaVerifier) Verify(ctx context.Context, logger *slog.Logger, file str
+ 		sourceTag = pkg.Package.Version
+ 	}
+ 
+-	if err := s.verifier.Verify(ctx, logger, s.runtime, pkgInfo.SLSAProvenance, art, &download.File{
++	if err := is.slsaVerifier.Verify(ctx, logger, s.runtime, pkgInfo.SLSAProvenance, art, &download.File{
+ 		RepoOwner: pkgInfo.RepoOwner,
+ 		RepoName:  pkgInfo.RepoName,
+ 		Version:   pkg.Package.Version,

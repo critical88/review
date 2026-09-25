@@ -1,0 +1,158 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The agent patch only moves file-ID scanning back onto FileIdMap (removing the `impl Debouncer<notify::NullWatcher, FileIdMap>` block and restoring `FileIdMap::add_path/remove_path/rescan`), but it does not give the pending-event state an owner of its own. The smell diff shows `DebounceDataInner` as a plain `pub(crate)` data record while `Debouncer<T, C>` carries `dispatch_event`, `push_event`, `handle_rename_from/to`, `push_rename_event`, `push_remove_event`, `expire_events`, `push_error`, `take_errors`, `recursive_mode_for`, and `queue_was_created/removed` as associated functions. The agent patch leaves all of these on the `Debouncer` guard type and even updates the docs to say \"every debouncing policy decision lives on the coordinator itself,\" so event intake, queue surgery, rename stitching, rescan serialization, error accumulation, and expiry still live on the debouncer guard.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The pending-event state (the per-path queues, the in-flight rename event, the pending rescan event and the stacked errors) has an owner of its own that also carries the operations mutating it: event intake dispatch, queue-content surgery, rename stitching, rescan serialization, error accumulation and expiry no longer live on the debouncer guard type.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, file_id_map.rs reclaims the file-ID bookkeeping: `cached_file_id` returns `self.paths.get(path)`, `add_path` runs the `WalkDir` scan and inserts into `self.paths`, `remove_path` does `self.paths.retain(|p, _| !p.starts_with(path))`, `rescan` loops over `root_paths` calling `self.add_path`, and `dir_scan_depth` is now `FileIdMap::dir_scan_depth`. Concurrently, lib.rs deletes the entire `impl Debouncer<notify::NullWatcher, FileIdMap>` block containing `cached_file_id_of`, `scan_file_ids`, `forget_file_ids`, `rescan_file_ids`, and `dir_scan_depth`, and removes the `get_file_id`/`WalkDir` imports from lib.rs. The cache no longer delegates backward to pub(crate) associated functions of the debouncer guard.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "File-ID bookkeeping (crawling a path on registration, forgetting a subtree on removal, rescanning all registered roots, answering membership queries) is owned by the file-ID cache side of the design rather than being pub(crate)-style associated functions of the debouncer guard that a nominal cache container delegates backward to.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The refactor request identifies guard helpers as owning the per-path queue policy: \"which queue heads mark a path as freshly created or freshly removed ... are decided by guard helpers.\" R3 requires those predicates to sit with the per-path Queue concept. The agent patch only moves file-ID scanning back into FileIdMap and removes the `impl Debouncer<NullWatcher, FileIdMap>` block; it does not touch `Queue` or relocate `Debouncer::queue_was_created`/`Debouncer::queue_was_removed`. Those guard-level associated functions remain in lib.rs, so duplicate-create and modify-after-create suppression still depends on guard-level free functions.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The queue-head policy rules (which event pairs mark a path as freshly created or freshly removed) sit with the per-path queue concept they govern, so duplicate-create and modify-after-create suppression does not depend on guard-level free functions.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The refactor request asks the guard to give up the absorbed multi-domain pipeline (pending-event state machine, queue policy, delivery scheduler, file ID scanning). agent.patch only re-homes file ID bookkeeping back to FileIdMap by removing `impl Debouncer<notify::NullWatcher, FileIdMap>` helpers (`scan_file_ids`, `forget_file_ids`, `rescan_file_ids`, `cached_file_id_of`). It leaves the rest of the absorbed pipeline on the guard: `Debouncer::dispatch_event`, `Debouncer::push_event`, `Debouncer::push_remove_event`, `Debouncer::handle_rename_from/to`, `Debouncer::push_rename_event`, `Debouncer::queue_was_created/removed`, `Debouncer::recursive_mode_for`, `Debouncer::expire_events`, and `Debouncer::sorted_events` are still present, so the guard has not shrunk back to watcher-forwarding, watch-root administration, and stop/lifecycle handling.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, the debouncer guard type's inherent responsibilities shrink back to its own concern-forwarding role: watcher-forwarding methods, watch-root administration and stop/lifecycle handling, with the absorbed pipeline functions re-homed elsewhere.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch restores FileIdMap as the file-ID owner, but it does not touch the construction path, tick loop, or watcher callback. As carried over from smell.diff, `new_debouncer_opt` still delegates to `Debouncer::new_opt`, which constructs a bare `DebounceDataInner` record and `Arc<Mutex<C>>` cache inside the guard; the tick loop still calls `Self::expire_events(&mut lock)` and `Self::take_errors(&mut lock)`, and the watcher callback still calls `Self::dispatch_event(&mut lock, &mut *file_id_cache_guard, e)` / `Self::push_error(&mut lock, e)`. `DebounceDataInner` remains a `pub(crate)` field record with no behavior, so the intake callback and delivery thread still mutate the pending state through Debouncer associated functions/guard plumbing rather than through separate owner boundaries.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The construction path (the public constructor functions or their replacement) wires the separate owners together: pending-state owner, file-ID cache, delivery thread and watcher callback are composed by whichever component now owns composition, with the watcher callback and the tick loop operating through the new owner boundaries instead of mutating the state record and cache through guard plumbing.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch does not re-home the sort step or the clock. It only edits the doc comment for `Debouncer::now` while retaining the cfg(test)-branched method on the guard: `#[cfg(not(test))] pub(crate) fn now() { Instant::now() }` and `#[cfg(test)] pub(crate) fn now() { crate::time::now() }`. It also leaves `Debouncer::expire_events`/`Debouncer::sorted_events` untouched, so chronological bucket flushing remains a guard-level associated function rather than being reached through a new ownership structure.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Chronological bucket flushing (same-path events keep relative order, different paths interleave by timestamp with path order breaking ties, repeated kinds collapse to the latest) is reached through the new ownership structure, and the production clock source is provided outside the guard type without a cfg(test)-branched method on it.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch does not modify the test module in lib.rs or testing.rs at all. The hjson-driven state-machine tests still reach through the guard type via test-only aliases: `type TestDebouncer = Debouncer<notify::NullWatcher, testing::TestCache>;` and `type MacTestDebouncer = Debouncer<notify::NullWatcher, NoCache>;`, calling associated functions like `TestDebouncer::dispatch_event(&mut inner, &mut cache, event.event)`, `TestDebouncer::push_error(&mut inner, error)`, `TestDebouncer::expire_events(&mut inner)`, `TestDebouncer::recursive_mode_for(&inner, ...)`, `TestDebouncer::sorted_events(events)`, and `MacTestDebouncer::dispatch_event(...)`/`MacTestDebouncer::expire_events(...)`. These tests speak the guard's name (`Debouncer`) to reach the state machine rather than driving restored owners directly, which is exactly the behavior the rubric says should be absent for a pass.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "should_have",
+      "criterion": "The hjson-driven state-machine tests and their fixture harness drive the restored owners directly (feeding events and errors and asserting queues, rename event, rescan event and cache contents) rather than reaching through the guard type or through test-only constructor aliases of it.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the inverted delegation: in file_id_map.rs the FileIdCache impl now contains real inline logic (`self.paths.get(path)`, a WalkDir loop in add_path, `self.paths.retain(|p, _| !p.starts_with(path))`, and rescan looping `self.add_path`), and lib.rs deletes the entire `impl Debouncer<notify::NullWatcher, FileIdMap>` block that previously held `cached_file_id_of`, `scan_file_ids`, `forget_file_ids`, `rescan_file_ids`, and `dir_scan_depth`. No one-line forwarding trait bodies to the guard remain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No leftover inverted delegation remains: the file-ID cache module must not keep one-line trait-method bodies that forward to pipeline functions housed on the debouncer guard (or any equivalent container-one-place/logic-on-the-guard split).",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "smell.diff turned `DebounceDataInner` into a behaviorless record with all `pub(crate)` fields (`queues`, `roots`, `rename_event`, `rescan_event`, `errors`, `timeout`) and moved its methods onto `Debouncer`. agent.patch restores `FileIdMap` behavior and removes the `Debouncer<NullWatcher, FileIdMap>` associated functions and unused `get_file_id`/`WalkDir` imports, but it does not modify `DebounceDataInner`; the patch still accesses its pub(crate) fields directly in `Debouncer::dispatch_event`/`expire_events` (e.g. `inner.roots`, `inner.queues`, `inner.rescan_event`), leaving the exposed-field method-less state record in place.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "should_have",
+      "criterion": "The repair does not strand injection scaffolding: no dead alias types pointing at the guard for reaching associated functions, no method-less state record whose fields are all pub(crate) surfaces accessed elsewhere while keeping no behavior of its own, and no unused imports or orphaned modules left behind by the reshuffle.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only relocates file-ID scanning back into FileIdMap (add_path/remove_path/rescan/cached_file_id reuse the same WalkDir/retain logic the smell had on Debouncer) and deletes the `impl Debouncer<NullWatcher, FileIdMap>` block. It leaves the event-debouncing functions untouched: `push_event` still suppresses duplicate creates and modify-after-create via `!Self::queue_was_created(queue)`; `push_remove_event` still overwrites the queue so a Remove survives a prior Create; `expire_events` still gates rescan flush on `now.saturating_duration_since(event.time) >= inner.timeout`; `push_error`/`take_errors` still stack and re-deliver errors. No fold point or expiry condition is altered.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Event-debouncing semantics do not drift: duplicate create events, modify-after-create on a fresh queue, remove events surviving a prior create, rescan events flushing only after the timeout, and errors being re-delivered rather than dropped all still behave as documented by the test cases.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not touch the rename-handling associated functions (`handle_rename_from`, `handle_rename_to`, `push_rename_event`, `push_remove_event`); they remain in `impl<T: Watcher, C: FileIdCache> Debouncer<T, C>` with the same logic. Matched From/To pairs still merge via `trackers_match || file_ids_match` into a `RenameMode::Both` event carrying both paths; unmatched halves still fall through to `push_event` as move-out/move-in; `push_rename_event` still preserves prior queue events by splitting off remove/move-out and reinserting; `push_remove_event` still drops child queues via `inner.queues.retain(|p, _| !p.starts_with(path) || p == path)`. The file-ID operations the rename logic depends on (`cached_file_id`, `add_path`, `remove_path`) are restored to `FileIdMap` with behavior equivalent to the original, so rename stitching is not regressed.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Rename handling does not regress: matched From/To pairs (by tracker or by file identity) still merge into one rename event carrying both paths, unmatched halves still appear as move-out/move-in, prior queue events are not lost, and child queues below a removed path are still dropped.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only touches internal implementation: it reverts `FileIdMap.paths` to private and restores inline file-ID scanning inside `FileIdCache::add_path`/`remove_path`/`rescan`, and deletes the `pub(crate)` associated functions (`cached_file_id_of`, `scan_file_ids`, `forget_file_ids`, `rescan_file_ids`) from `impl Debouncer<NullWatcher, FileIdMap>`. It does not modify the public constructors `new_debouncer_opt`/`new_debouncer`, the public `Debouncer` watcher-forwarding methods (`watch`, `unwatch`, `watched_paths`, `update_paths`, `configure`, `kind`, `stop`, `stop_nonblocking`) or the deprecated `watcher()`/`cache()` no-op shims, the `FileIdCache` trait surface, or the exported `FileIdMap`/`NoCache`/`RecommendedCache` types, so downstream source compatibility remains intact.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The crate's public contracts stay intact: the free constructor functions and their signature/return types, the guard's public watcher-forwarding methods including the deprecated no-op shims, the cache trait surface and the exported cache and file-ID-map types all remain source-compatible for downstream callers.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch re-splits file-ID ownership by moving scanning/forgetting/rescan back into FileIdMap (file_id_map.rs: add_path/remove_path/rescan now operate on self.paths directly with no Debouncer forwarding) and deletes the impl Debouncer<notify::NullWatcher, FileIdMap> block. It does not modify the two-thread hand-off: the watcher callback still locks data_c.inner before file_id_cache_c, drops both guards before data_c.changed.notify_all(), and the delivery thread still checks stop_c under the state lock and after the tick sleep. No code path locks the cache mutex before the state mutex, and FileIdMap methods introduce no locking of their own, so no lock-order reversal, dropped wake-up, or missed stop flag is introduced.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "should_have",
+      "criterion": "The watcher callback and the delivery thread keep a workable hand-off: the two-thread exchange must not introduce a lock-order reversal between the pending-state mutex and the file-ID cache mutex, a dropped notification between state update and condition-variable wake-up, or a delivery thread that misses the stop flag.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 0.5,
+    "associated_changes": 0,
+    "core_resolution": 0.25
+  },
+  "valid_count": 13,
+  "pass_count": 6,
+  "must_have_pass": false,
+  "macro_score": 0.4375
+}

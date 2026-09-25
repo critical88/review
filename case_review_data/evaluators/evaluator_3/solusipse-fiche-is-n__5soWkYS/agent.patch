@@ -1,0 +1,484 @@
+diff --git a/fiche.c b/fiche.c
+index 7ef4664..07ee160 100644
+--- a/fiche.c
++++ b/fiche.c
+@@ -196,6 +196,57 @@ static int default_admit_connection(const Fiche_Settings *settings,
+  */
+ unsigned int seed;
+ 
++
++/******************************************************************************
++ * Built-in hook tables and seam resolution
++ *
++ * The engine never calls a host hook blindly. Each seam is resolved through
++ * the helpers below, which fall back to these built-in tables whenever the
++ * host did not register that capability. That is what lets a participant
++ * supply only the seams it can meaningfully support: every capability it
++ * leaves NULL is served by the matching built-in default.
++ */
++
++static const Fiche_Storage_Hooks builtin_storage = {
++    generate_slug,
++    create_directory,
++    save_to_file
++};
++
++static const Fiche_Audit_Hooks builtin_audit = {
++    print_status,
++    print_error,
++    print_separator,
++    log_entry
++};
++
++static const Fiche_Identity_Hooks builtin_identity = {
++    set_domain_name,
++    perform_user_change
++};
++
++static const Fiche_Admission_Hooks builtin_admission = {
++    default_admit_connection
++};
++
++
++static const Fiche_Storage_Hooks *service_storage(const Fiche_Service *s) {
++    return (s->ops && s->ops->storage) ? s->ops->storage : &builtin_storage;
++}
++
++static const Fiche_Audit_Hooks *service_audit(const Fiche_Service *s) {
++    return (s->ops && s->ops->audit) ? s->ops->audit : &builtin_audit;
++}
++
++static const Fiche_Identity_Hooks *service_identity(const Fiche_Service *s) {
++    return (s->ops && s->ops->identity) ? s->ops->identity : &builtin_identity;
++}
++
++static const Fiche_Admission_Hooks *service_admission(const Fiche_Service *s) {
++    return (s->ops && s->ops->admission) ? s->ops->admission : &builtin_admission;
++}
++
++
+ /******************************************************************************
+  * Public fiche functions
+  */
+@@ -237,8 +288,9 @@ void fiche_init(Fiche_Settings *settings) {
+ int fiche_run(Fiche_Settings settings) {
+ 
+     // Legacy entry kept for hosts that embed fiche behind their own
+-    // frontends: the embedded build only needs the default behavior,
+-    // but the hosting contract applies to it as well.
++    // frontends. It serves the built-in behavior by registering an
++    // empty provider; hosts that want to override a capability build
++    // their own Fiche_Provider with only that seam set.
+     Fiche_Provider provider;
+ 
+     fiche_provider_init(&provider);
+@@ -254,31 +306,13 @@ int fiche_run(Fiche_Settings settings) {
+ 
+ void fiche_provider_init(Fiche_Provider *ops) {
+ 
+-    // Storage path: naming, directories and persistence
+-    ops->storage = (Fiche_Storage_Hooks){
+-        generate_slug,
+-        create_directory,
+-        save_to_file
+-    };
+-
+-    // Audit path: reporting and connection logging
+-    ops->audit = (Fiche_Audit_Hooks){
+-        print_status,
+-        print_error,
+-        print_separator,
+-        log_entry
+-    };
+-
+-    // Identity path: link presentation and process ownership
+-    ops->identity = (Fiche_Identity_Hooks){
+-        set_domain_name,
+-        perform_user_change
+-    };
+-
+-    // Admission path: banlist/whitelist policy
+-    ops->admission = (Fiche_Admission_Hooks){
+-        default_admit_connection
+-    };
++    // Start from an empty table: every seam left NULL is served by the
++    // engine's built-in hooks, so a host only fills in the capabilities
++    // it actually wants to change.
++    ops->storage = NULL;
++    ops->audit = NULL;
++    ops->identity = NULL;
++    ops->admission = NULL;
+ 
+ }
+ 
+@@ -287,16 +321,22 @@ int fiche_service_boot(Fiche_Service *service) {
+ 
+     seed = time(NULL);
+ 
++    // Resolve the seams this bootstrap touches. Any capability the host did
++    // not register falls back to its built-in hooks here, so the rest of the
++    // function handles only non-NULL hooks.
++    const Fiche_Audit_Hooks *audit = service_audit(service);
++    const Fiche_Identity_Hooks *identity = service_identity(service);
++
+     // Display welcome message
+     {
+         char date[64];
+         get_date(date);
+-        service->ops->audit.report_status("Starting fiche on %s...", date);
++        audit->report_status("Starting fiche on %s...", date);
+     }
+ 
+     // Try to set requested user
+-    if ( service->ops->identity.adopt_user(&service->settings) != 0) {
+-        service->ops->audit.report_failure("Was not able to change the user!");
++    if ( identity->adopt_user(&service->settings) != 0) {
++        audit->report_failure("Was not able to change the user!");
+         return -1;
+     }
+ 
+@@ -309,7 +349,7 @@ int fiche_service_boot(Fiche_Service *service) {
+         );
+         // - Then we check if we can write there
+         if ( access(service->settings.output_dir_path, W_OK) != 0 ) {
+-            service->ops->audit.report_failure("Output directory not writable!");
++            audit->report_failure("Output directory not writable!");
+             return -1;
+         }
+     }
+@@ -323,15 +363,15 @@ int fiche_service_boot(Fiche_Service *service) {
+ 
+         // Then check if it's accessible
+         if ( access(service->settings.log_file_path, W_OK) != 0 ) {
+-            service->ops->audit.report_failure("Log file not writable!");
++            audit->report_failure("Log file not writable!");
+             return -1;
+         }
+ 
+     }
+ 
+     // Try to set domain name
+-    if ( service->ops->identity.apply_domain(&service->settings) != 0 ) {
+-        service->ops->audit.report_failure("Was not able to set domain name!");
++    if ( identity->apply_domain(&service->settings) != 0 ) {
++        audit->report_failure("Was not able to set domain name!");
+         return -1;
+     }
+ 
+@@ -490,16 +530,18 @@ static int perform_user_change(const Fiche_Settings *settings) {
+ 
+ static int start_server(Fiche_Service *service) {
+ 
++    const Fiche_Audit_Hooks *audit = service_audit(service);
++
+     // Perform socket creation
+     int s = socket(AF_INET, SOCK_STREAM, 0);
+     if (s < 0) {
+-        service->ops->audit.report_failure("Couldn't create a socket!");
++        audit->report_failure("Couldn't create a socket!");
+         return -1;
+     }
+ 
+     // Set socket settings
+     if ( setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &(int){ 1 } , sizeof(int)) != 0 ) {
+-        service->ops->audit.report_failure("Couldn't prepare the socket!");
++        audit->report_failure("Couldn't prepare the socket!");
+         return -1;
+     }
+ 
+@@ -511,20 +553,20 @@ static int start_server(Fiche_Service *service) {
+ 
+     // Bind to port
+     if ( bind(s, (struct sockaddr *) &address, sizeof(address)) != 0) {
+-        service->ops->audit.report_failure("Couldn't bind to the port: %d!",
++        audit->report_failure("Couldn't bind to the port: %d!",
+                 service->settings.port);
+         return -1;
+     }
+ 
+     // Start listening
+     if ( listen(s, 128) != 0 ) {
+-        service->ops->audit.report_failure("Couldn't start listening on the socket!");
++        audit->report_failure("Couldn't start listening on the socket!");
+         return -1;
+     }
+ 
+-    service->ops->audit.report_status("Server started listening on: %s:%d.",
++    audit->report_status("Server started listening on: %s:%d.",
+ 		    service->settings.listen_addr, service->settings.port);
+-    service->ops->audit.write_line();
++    audit->write_line();
+ 
+     // Run dispatching loop
+     while (1) {
+@@ -549,6 +591,8 @@ static int start_server(Fiche_Service *service) {
+ 
+ static void dispatch_connection(int socket, Fiche_Service *service) {
+ 
++    const Fiche_Audit_Hooks *audit = service_audit(service);
++
+     // Create address structs for this socket
+     struct sockaddr_in address;
+     socklen_t addlen = sizeof(address);
+@@ -556,7 +600,7 @@ static void dispatch_connection(int socket, Fiche_Service *service) {
+     // Accept a connection and get a new socket id
+     const int s = accept(socket, (struct sockaddr *) &address, &addlen);
+     if (s < 0 ) {
+-        service->ops->audit.report_failure("Error on accepting connection!");
++        audit->report_failure("Error on accepting connection!");
+         return;
+     }
+ 
+@@ -564,17 +608,17 @@ static void dispatch_connection(int socket, Fiche_Service *service) {
+     const struct timeval timeout = { 5, 0 };
+ 
+     if ( setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0 ) {
+-        service->ops->audit.report_failure("Couldn't set a timeout!");
++        audit->report_failure("Couldn't set a timeout!");
+     }
+ 
+     if ( setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) != 0 ) {
+-        service->ops->audit.report_failure("Couldn't set a timeout!");
++        audit->report_failure("Couldn't set a timeout!");
+     }
+ 
+     // Create an argument for the thread function
+     struct fiche_connection *c = malloc(sizeof(*c));
+     if (!c) {
+-        service->ops->audit.report_failure("Couldn't allocate memory!");
++        audit->report_failure("Couldn't allocate memory!");
+         return;
+     }
+     c->socket = s;
+@@ -585,7 +629,7 @@ static void dispatch_connection(int socket, Fiche_Service *service) {
+     pthread_t id;
+ 
+     if ( pthread_create(&id, NULL, &handle_connection, c) != 0 ) {
+-        service->ops->audit.report_failure("Couldn't spawn a thread!");
++        audit->report_failure("Couldn't spawn a thread!");
+         return;
+     }
+ 
+@@ -601,6 +645,14 @@ static void *handle_connection(void *args) {
+     // Cast args to it's previous type
+     struct fiche_connection *c = (struct fiche_connection *) args;
+ 
++    // Resolve the seams this connection touches. The host only had to
++    // register the capabilities it overrides; any NULL seam is served by
++    // the engine's built-in hooks, so the handling below never sees a
++    // missing function pointer.
++    const Fiche_Audit_Hooks *audit = service_audit(c->service);
++    const Fiche_Storage_Hooks *storage = service_storage(c->service);
++    const Fiche_Admission_Hooks *admission = service_admission(c->service);
++
+     // Get client's IP
+     const char *ip = inet_ntoa(c->address.sin_addr);
+ 
+@@ -618,9 +670,9 @@ static void *handle_connection(void *args) {
+     {
+         char date[64];
+         get_date(date);
+-        c->service->ops->audit.report_status("%s", date);
++        audit->report_status("%s", date);
+ 
+-        c->service->ops->audit.report_status(
++        audit->report_status(
+                 "Incoming connection from: %s (%s).", ip, hostname);
+     }
+ 
+@@ -630,8 +682,8 @@ static void *handle_connection(void *args) {
+ 
+     const int r = recv(c->socket, buffer, sizeof(buffer), MSG_WAITALL);
+     if (r <= 0) {
+-        c->service->ops->audit.report_failure("No data received from the client!");
+-        c->service->ops->audit.write_line();
++        audit->report_failure("No data received from the client!");
++        audit->write_line();
+ 
+         // Close the socket
+         close(c->socket);
+@@ -644,11 +696,10 @@ static void *handle_connection(void *args) {
+     }
+ 
+     // Apply the admission policy (whitelist and banlist live there)
+-    if (!c->service->ops->admission.admit_connection(
+-                &c->service->settings, ip)) {
+-        c->service->ops->audit.report_failure(
++    if (!admission->admit_connection(&c->service->settings, ip)) {
++        audit->report_failure(
+                 "Connection rejected by the admission policy!");
+-        c->service->ops->audit.write_line();
++        audit->write_line();
+ 
+         // Close the socket
+         close(c->socket);
+@@ -670,7 +721,7 @@ static void *handle_connection(void *args) {
+ 
+         // Generate slugs until it's possible to create a directory
+         // with generated slug on disk
+-        c->service->ops->storage.make_slug(
++        storage->make_slug(
+                 &slug, c->service->settings.slug_len, extra);
+ 
+         // Something went wrong in slug generation, break here
+@@ -685,8 +736,8 @@ static void *handle_connection(void *args) {
+         // for sure went wrong. We are closing connection and
+         // killing this thread in such case
+         if (extra > 128) {
+-            c->service->ops->audit.report_failure("Couldn't generate a valid slug!");
+-            c->service->ops->audit.write_line();
++            audit->report_failure("Couldn't generate a valid slug!");
++            audit->write_line();
+ 
+             // Cleanup
+             free(c);
+@@ -697,14 +748,14 @@ static void *handle_connection(void *args) {
+         }
+ 
+     }
+-    while(c->service->ops->storage.make_directory(
++    while(storage->make_directory(
+             c->service->settings.output_dir_path, slug) != 0);
+ 
+ 
+     // Slug generation failed, we have to finish here
+     if (!slug) {
+-        c->service->ops->audit.report_failure("Couldn't generate a slug!");
+-        c->service->ops->audit.write_line();
++        audit->report_failure("Couldn't generate a slug!");
++        audit->write_line();
+ 
+         close(c->socket);
+ 
+@@ -716,10 +767,9 @@ static void *handle_connection(void *args) {
+ 
+ 
+     // Save to file failed, we have to finish here
+-    if ( c->service->ops->storage.store_paste(
+-                &c->service->settings, buffer, slug) != 0 ) {
+-        c->service->ops->audit.report_failure("Couldn't save a file!");
+-        c->service->ops->audit.write_line();
++    if ( storage->store_paste(&c->service->settings, buffer, slug) != 0 ) {
++        audit->report_failure("Couldn't save a file!");
++        audit->write_line();
+ 
+         close(c->socket);
+ 
+@@ -742,13 +792,13 @@ static void *handle_connection(void *args) {
+         write(c->socket, url, len);
+     }
+ 
+-    c->service->ops->audit.report_status(
++    audit->report_status(
+             "Received %d bytes, saved to: %s.", r, slug);
+-    c->service->ops->audit.write_line();
++    audit->write_line();
+ 
+     // Log connection
+     // TODO: log unsuccessful and rejected connections
+-    c->service->ops->audit.note_connection(
++    audit->note_connection(
+             &c->service->settings, ip, hostname, slug);
+ 
+     // Close the connection
+diff --git a/fiche.h b/fiche.h
+index 01fefac..5644517 100644
+--- a/fiche.h
++++ b/fiche.h
+@@ -174,24 +174,37 @@ typedef struct Fiche_Admission_Hooks {
+ 
+ 
+ /**
+- * @brief Uniform provider registration used by every fiche host
++ * @brief Selective capability registration used by every fiche host
+  *
+  * @remarks Fiche is hosted in different environments: the command line
+  *          daemon, long-running frontends and tests all drive the same
+- *          engine. To keep one wiring path for all of them, every host
+- *          registers a single complete provider table. The engine never
+- *          falls back to built-in hooks on its own: a host that did not
+- *          register a provider gets no behavior at all, so no host can
+- *          silently end up with half a configuration.
++ *          engine. Each host registers only the seams it has a reason to
++ *          change; every NULL seam is served by the engine's built-in
++ *          default. A host that leaves the whole provider empty (or sets
++ *          @ref Fiche_Service.ops to NULL) gets the unmodified built-in
++ *          behavior, so no participant is forced to supply a capability
++ *          it cannot meaningfully support.
+  */
+ typedef struct Fiche_Provider {
+-    Fiche_Storage_Hooks storage;
++    /**
++     * @brief Storage seam, or NULL for the built-in paste persistence
++     */
++    const Fiche_Storage_Hooks *storage;
+ 
+-    Fiche_Audit_Hooks audit;
++    /**
++     * @brief Audit seam, or NULL for the built-in reporting and logging
++     */
++    const Fiche_Audit_Hooks *audit;
+ 
+-    Fiche_Identity_Hooks identity;
++    /**
++     * @brief Identity seam, or NULL for the built-in link and user setup
++     */
++    const Fiche_Identity_Hooks *identity;
+ 
+-    Fiche_Admission_Hooks admission;
++    /**
++     * @brief Admission seam, or NULL for the built-in connection policy
++     */
++    const Fiche_Admission_Hooks *admission;
+ } Fiche_Provider;
+ 
+ 
+@@ -199,7 +212,10 @@ typedef struct Fiche_Provider {
+  * @brief Service object carried through every engine seam
+  *
+  * @remarks Bundles the settings with the host-registered provider so
+- *          the whole runtime state travels through the engine as one object.
++ *          the whole runtime state travels through the engine as one
++ *          object. @ref ops may be NULL: the engine then serves every
++ *          seam from its built-in defaults, which is the contract a host
++ *          that overrides nothing relies on.
+  */
+ typedef struct Fiche_Service {
+     Fiche_Settings settings;
+@@ -223,11 +239,12 @@ int fiche_run(Fiche_Settings settings);
+ 
+ 
+ /**
+- *  @brief Fills a provider table with the built-in hooks
++ *  @brief Prepares a provider table for selective registration
+  *
+- *  @remarks Hosts call this first and then override the members they
+- *           want to customize. Registering a complete table is part
+- *           of the hosting contract.
++ *  @remarks Clears every seam so the engine serves the built-in hooks
++ *           for capabilities the host does not override. Set only the
++ *           members you customize; leave the rest NULL. A host that
++ *           changes nothing can boot straight after this call.
+  */
+ void fiche_provider_init(Fiche_Provider *ops);
+ 
+diff --git a/main.c b/main.c
+index b5b69df..ab27125 100644
+--- a/main.c
++++ b/main.c
+@@ -138,11 +138,10 @@ int main(int argc, char **argv) {
+     }
+ 
+ 
+-    // Register this host's provider table. The engine treats the host
+-    // as the sole policy owner: it never falls back to built-in hooks,
+-    // so every host registers a complete Fiche_Provider before booting.
+-    // The command line host only needs the built-in behavior, but the
+-    // hosting contract applies to it like to any other host.
++    // The command line host only needs the built-in behavior, so it
++    // registers an empty provider: every seam left NULL is served by
++    // the engine's built-in hooks. A host that wants to change a
++    // capability sets only that one seam here.
+     Fiche_Provider provider;
+     fiche_provider_init(&provider);
+ 

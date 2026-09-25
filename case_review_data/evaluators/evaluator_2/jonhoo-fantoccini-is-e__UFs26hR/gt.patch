@@ -1,0 +1,414 @@
+diff --git a/src/actions.rs b/src/actions.rs
+index 3d29ddf..6eed82a 100644
+--- a/src/actions.rs
++++ b/src/actions.rs
+@@ -511,16 +511,19 @@ pub struct ActionSequence(pub(crate) WDActions::ActionSequence);
+ /// See [input source](https://www.w3.org/TR/webdriver1/#dfn-input-sources) in the
+ /// WebDriver standard.
+ ///
+-/// Each sequence type implements `InputSource` which provides a `pause()` and a `then()`
+-/// method. Each call to `pause()` or `then()` represents one tick for this sequence.
++/// Every input source supports the general [`pause`](InputSource::pause) and
++/// [`then`](InputSource::then) members, which build the tick-by-tick sequence
++/// for that source. Each call to `pause()` or `then()` represents one tick for
++/// this sequence.
+ ///
+-/// The same trait also carries the unified device vocabulary (`key_down()`,
+-/// `key_up()`, `pointer_down()`, `pointer_up()`, `move_to()`, `scroll()`) so
+-/// that builder chains read identically no matter which device a sequence is
+-/// driving. Input sources that do not produce a given kind of device event
+-/// accept the arguments of the corresponding members without queueing an
+-/// action for them, which keeps the whole vocabulary usable on every source
+-/// type.
++/// Device-specific builders (`key_down`, `pointer_down`, `move_to`, `scroll`,
++/// ...) are offered only by the concrete source types that can produce those
++/// events (e.g. [`KeyActions`] for keyboard events, [`MouseActions`] for
++/// pointer events, [`WheelActions`] for wheel events). A source does not
++/// expose builders for event kinds it cannot generate, so the compiler rejects
++/// an action chain that a given source cannot perform instead of silently
++/// dropping the unsupported steps. Combine sequences from several sources via
++/// [`Actions`] to drive more than one device in a single action chain.
+ pub trait InputSource: Into<ActionSequence> {
+     /// The action type associated with this `InputSource`.
+     type Action;
+@@ -532,75 +535,6 @@ pub trait InputSource: Into<ActionSequence> {
+     /// Add the specified action to the sequence for this input source.
+     #[must_use]
+     fn then(self, action: Self::Action) -> Self;
+-
+-    /// Add a key down action to the sequence for this input source, queueing
+-    /// the key press as one tick.
+-    ///
+-    /// Sources that never produce keyboard events accept the key without
+-    /// queueing an action for it.
+-    #[must_use]
+-    fn key_down(self, key: char) -> Self;
+-
+-    /// Add a key up action to the sequence for this input source, queueing
+-    /// the key release as one tick.
+-    ///
+-    /// Sources that never produce keyboard events accept the key without
+-    /// queueing an action for it.
+-    #[must_use]
+-    fn key_up(self, key: char) -> Self;
+-
+-    /// Add a pointer button down action to the sequence for this input
+-    /// source, queueing the button press as one tick.
+-    ///
+-    /// Sources that never produce pointer events accept the button without
+-    /// queueing an action for it.
+-    #[must_use]
+-    fn pointer_down(self, button: u64) -> Self;
+-
+-    /// Add a pointer button up action to the sequence for this input source,
+-    /// queueing the button release as one tick.
+-    ///
+-    /// Sources that never produce pointer events accept the button without
+-    /// queueing an action for it.
+-    #[must_use]
+-    fn pointer_up(self, button: u64) -> Self;
+-
+-    /// Add a move action for this input source, moving the pointer to the
+-    /// given position relative to the top-left corner of the viewport.
+-    ///
+-    /// Sources that never produce pointer events accept the target position
+-    /// without queueing an action for it.
+-    #[must_use]
+-    fn move_to(self, x: f64, y: f64) -> Self;
+-
+-    /// Add a scroll action to the sequence for this input source, scrolling by
+-    /// the given pixel deltas with the top-left corner of the viewport as
+-    /// origin.
+-    ///
+-    /// Sources that never produce wheel events accept the deltas without
+-    /// queueing an action for them.
+-    #[must_use]
+-    fn scroll(self, delta_x: i64, delta_y: i64) -> Self;
+-
+-    /// Press and release the given pointer button in consecutive ticks.
+-    ///
+-    /// The provided implementation chains the pointer members, so every input
+-    /// source shares the same tapping behavior.
+-    #[must_use]
+-    fn tap(self, button: u64) -> Self {
+-        let this = self.pointer_down(button);
+-        this.pointer_up(button)
+-    }
+-
+-    /// Type the given key by pressing and releasing it in consecutive ticks.
+-    ///
+-    /// The provided implementation chains the key members, so every input
+-    /// source shares the same typing behavior.
+-    #[must_use]
+-    fn type_key(self, key: char) -> Self {
+-        let this = self.key_down(key);
+-        this.key_up(key)
+-    }
+ }
+ 
+ impl InputSource for NullActions {
+@@ -614,39 +548,6 @@ impl InputSource for NullActions {
+         self.actions.push(action);
+         self
+     }
+-
+-    fn key_down(self, _key: char) -> Self {
+-        // Null sources queue no keyboard events; the key press is accepted and
+-        // dropped so that shared builders still type fluently.
+-        self
+-    }
+-
+-    fn key_up(self, _key: char) -> Self {
+-        // Null sources queue no keyboard events.
+-        self
+-    }
+-
+-    fn pointer_down(self, _button: u64) -> Self {
+-        // Null sources queue no pointer events; the button press is accepted
+-        // and dropped so that shared builders still type fluently.
+-        self
+-    }
+-
+-    fn pointer_up(self, _button: u64) -> Self {
+-        // Null sources queue no pointer events.
+-        self
+-    }
+-
+-    fn move_to(self, _x: f64, _y: f64) -> Self {
+-        // Null sources queue no pointer motion.
+-        self
+-    }
+-
+-    fn scroll(self, _delta_x: i64, _delta_y: i64) -> Self {
+-        // Null sources queue no wheel events; the deltas are accepted and
+-        // dropped so that shared builders still type fluently.
+-        self
+-    }
+ }
+ 
+ impl InputSource for KeyActions {
+@@ -660,35 +561,26 @@ impl InputSource for KeyActions {
+         self.actions.push(action);
+         self
+     }
++}
+ 
+-    fn key_down(self, key: char) -> Self {
++impl KeyActions {
++    /// Add a key down action to the sequence, queueing the key press as one tick.
++    #[must_use]
++    pub fn key_down(self, key: char) -> Self {
+         self.then(KeyAction::Down { value: key })
+     }
+ 
+-    fn key_up(self, key: char) -> Self {
++    /// Add a key up action to the sequence, queueing the key release as one tick.
++    #[must_use]
++    pub fn key_up(self, key: char) -> Self {
+         self.then(KeyAction::Up { value: key })
+     }
+ 
+-    fn pointer_down(self, _button: u64) -> Self {
+-        // Keyboard sources queue no pointer events; the button press is
+-        // accepted and dropped so that shared builders still type fluently.
+-        self
+-    }
+-
+-    fn pointer_up(self, _button: u64) -> Self {
+-        // Keyboard sources queue no pointer events.
+-        self
+-    }
+-
+-    fn move_to(self, _x: f64, _y: f64) -> Self {
+-        // Keyboard sources queue no pointer motion.
+-        self
+-    }
+-
+-    fn scroll(self, _delta_x: i64, _delta_y: i64) -> Self {
+-        // Keyboard sources queue no wheel events; the deltas are accepted and
+-        // dropped so that shared builders still type fluently.
+-        self
++    /// Type the given key by pressing and releasing it in consecutive ticks.
++    #[must_use]
++    pub fn type_key(self, key: char) -> Self {
++        let this = self.key_down(key);
++        this.key_up(key)
+     }
+ }
+ 
+@@ -703,27 +595,27 @@ impl InputSource for MouseActions {
+         self.actions.push(action);
+         self
+     }
++}
+ 
+-    fn key_down(self, _key: char) -> Self {
+-        // Mouse sources queue no keyboard events; the key press is accepted
+-        // and dropped so that shared builders still type fluently.
+-        self
+-    }
+-
+-    fn key_up(self, _key: char) -> Self {
+-        // Mouse sources queue no keyboard events.
+-        self
+-    }
+-
+-    fn pointer_down(self, button: u64) -> Self {
++impl MouseActions {
++    /// Add a pointer button down action to the sequence, queueing the button
++    /// press as one tick.
++    #[must_use]
++    pub fn pointer_down(self, button: u64) -> Self {
+         self.then(PointerAction::Down { button })
+     }
+ 
+-    fn pointer_up(self, button: u64) -> Self {
++    /// Add a pointer button up action to the sequence, queueing the button
++    /// release as one tick.
++    #[must_use]
++    pub fn pointer_up(self, button: u64) -> Self {
+         self.then(PointerAction::Up { button })
+     }
+ 
+-    fn move_to(self, x: f64, y: f64) -> Self {
++    /// Add a move action, moving the pointer to the given position relative to
++    /// the top-left corner of the viewport.
++    #[must_use]
++    pub fn move_to(self, x: f64, y: f64) -> Self {
+         self.then(PointerAction::MoveTo {
+             duration: None,
+             x,
+@@ -731,10 +623,11 @@ impl InputSource for MouseActions {
+         })
+     }
+ 
+-    fn scroll(self, _delta_x: i64, _delta_y: i64) -> Self {
+-        // Mouse sources queue no wheel events; the deltas are accepted and
+-        // dropped so that shared builders still type fluently.
+-        self
++    /// Press and release the given pointer button in consecutive ticks.
++    #[must_use]
++    pub fn tap(self, button: u64) -> Self {
++        let this = self.pointer_down(button);
++        this.pointer_up(button)
+     }
+ }
+ 
+@@ -749,27 +642,27 @@ impl InputSource for PenActions {
+         self.actions.push(action);
+         self
+     }
++}
+ 
+-    fn key_down(self, _key: char) -> Self {
+-        // Pen sources queue no keyboard events; the key press is accepted and
+-        // dropped so that shared builders still type fluently.
+-        self
+-    }
+-
+-    fn key_up(self, _key: char) -> Self {
+-        // Pen sources queue no keyboard events.
+-        self
+-    }
+-
+-    fn pointer_down(self, button: u64) -> Self {
++impl PenActions {
++    /// Add a pointer button down action to the sequence, queueing the button
++    /// press as one tick.
++    #[must_use]
++    pub fn pointer_down(self, button: u64) -> Self {
+         self.then(PointerAction::Down { button })
+     }
+ 
+-    fn pointer_up(self, button: u64) -> Self {
++    /// Add a pointer button up action to the sequence, queueing the button
++    /// release as one tick.
++    #[must_use]
++    pub fn pointer_up(self, button: u64) -> Self {
+         self.then(PointerAction::Up { button })
+     }
+ 
+-    fn move_to(self, x: f64, y: f64) -> Self {
++    /// Add a move action, moving the pointer to the given position relative to
++    /// the top-left corner of the viewport.
++    #[must_use]
++    pub fn move_to(self, x: f64, y: f64) -> Self {
+         self.then(PointerAction::MoveTo {
+             duration: None,
+             x,
+@@ -777,10 +670,11 @@ impl InputSource for PenActions {
+         })
+     }
+ 
+-    fn scroll(self, _delta_x: i64, _delta_y: i64) -> Self {
+-        // Pen sources queue no wheel events; the deltas are accepted and
+-        // dropped so that shared builders still type fluently.
+-        self
++    /// Press and release the given pointer button in consecutive ticks.
++    #[must_use]
++    pub fn tap(self, button: u64) -> Self {
++        let this = self.pointer_down(button);
++        this.pointer_up(button)
+     }
+ }
+ 
+@@ -795,27 +689,27 @@ impl InputSource for TouchActions {
+         self.actions.push(action);
+         self
+     }
++}
+ 
+-    fn key_down(self, _key: char) -> Self {
+-        // Touch sources queue no keyboard events; the key press is accepted
+-        // and dropped so that shared builders still type fluently.
+-        self
+-    }
+-
+-    fn key_up(self, _key: char) -> Self {
+-        // Touch sources queue no keyboard events.
+-        self
+-    }
+-
+-    fn pointer_down(self, button: u64) -> Self {
++impl TouchActions {
++    /// Add a pointer button down action to the sequence, queueing the button
++    /// press as one tick.
++    #[must_use]
++    pub fn pointer_down(self, button: u64) -> Self {
+         self.then(PointerAction::Down { button })
+     }
+ 
+-    fn pointer_up(self, button: u64) -> Self {
++    /// Add a pointer button up action to the sequence, queueing the button
++    /// release as one tick.
++    #[must_use]
++    pub fn pointer_up(self, button: u64) -> Self {
+         self.then(PointerAction::Up { button })
+     }
+ 
+-    fn move_to(self, x: f64, y: f64) -> Self {
++    /// Add a move action, moving the pointer to the given position relative to
++    /// the top-left corner of the viewport.
++    #[must_use]
++    pub fn move_to(self, x: f64, y: f64) -> Self {
+         self.then(PointerAction::MoveTo {
+             duration: None,
+             x,
+@@ -823,10 +717,11 @@ impl InputSource for TouchActions {
+         })
+     }
+ 
+-    fn scroll(self, _delta_x: i64, _delta_y: i64) -> Self {
+-        // Touch sources queue no wheel events; the deltas are accepted and
+-        // dropped so that shared builders still type fluently.
+-        self
++    /// Press and release the given pointer button in consecutive ticks.
++    #[must_use]
++    pub fn tap(self, button: u64) -> Self {
++        let this = self.pointer_down(button);
++        this.pointer_up(button)
+     }
+ }
+ 
+@@ -841,35 +736,13 @@ impl InputSource for WheelActions {
+         self.actions.push(action);
+         self
+     }
++}
+ 
+-    fn key_down(self, _key: char) -> Self {
+-        // Wheel sources queue no keyboard events; the key press is accepted
+-        // and dropped so that shared builders still type fluently.
+-        self
+-    }
+-
+-    fn key_up(self, _key: char) -> Self {
+-        // Wheel sources queue no keyboard events.
+-        self
+-    }
+-
+-    fn pointer_down(self, _button: u64) -> Self {
+-        // Wheel sources queue no pointer events; the button press is accepted
+-        // and dropped so that shared builders still type fluently.
+-        self
+-    }
+-
+-    fn pointer_up(self, _button: u64) -> Self {
+-        // Wheel sources queue no pointer events.
+-        self
+-    }
+-
+-    fn move_to(self, _x: f64, _y: f64) -> Self {
+-        // Wheel sources queue no pointer motion.
+-        self
+-    }
+-
+-    fn scroll(self, delta_x: i64, delta_y: i64) -> Self {
++impl WheelActions {
++    /// Add a scroll action, scrolling by the given pixel deltas with the
++    /// top-left corner of the viewport as origin.
++    #[must_use]
++    pub fn scroll(self, delta_x: i64, delta_y: i64) -> Self {
+         self.then(WheelAction::Scroll {
+             duration: None,
+             x: 0,

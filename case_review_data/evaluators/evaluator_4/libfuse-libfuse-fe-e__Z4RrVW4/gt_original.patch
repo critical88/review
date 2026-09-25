@@ -1,0 +1,421 @@
+--- a/lib/fuse_signals.c
++++ b/lib/fuse_signals.c
+@@ -58,22 +58,18 @@
+ #endif
+ }
+ 
+-/*
+- * The teardown signals need the exit request, the wakeup of the
+- * loops parked on mt_finish and the error report to happen as one
+- * transition while still under the signal-handler restrictions, so
+- * perform that step right here instead of going through the
+- * separate session calls.
+- */
+-__attribute__((no_sanitize_thread))
+-static void session_exit_from_signal(struct fuse_session *se, int sig)
++static void exit_handler(int sig)
+ {
+-	if (se->debug)
++	if (fuse_instance == NULL) {
++		fuse_log(FUSE_LOG_ERR, "fuse_instance is NULL\n");
++		return;
++	}
++
++	if (fuse_instance->debug)
+ 		fuse_log(FUSE_LOG_ERR, "exit_handler called with sig %d\n",
+ 			 sig);
+ 
+-	atomic_store_explicit(&se->mt_exited, 1, memory_order_relaxed);
+-	sem_post(&se->mt_finish);
++	fuse_session_exit_with_error(fuse_instance, sig);
+ 
+ 	if (sig < 0) {
+ 		fuse_log(FUSE_LOG_ERR,
+@@ -81,18 +77,6 @@
+ 		dump_stack();
+ 		abort();
+ 	}
+-
+-	se->error = sig;
+-}
+-
+-static void exit_handler(int sig)
+-{
+-	if (fuse_instance == NULL) {
+-		fuse_log(FUSE_LOG_ERR, "fuse_instance is NULL\n");
+-		return;
+-	}
+-
+-	session_exit_from_signal(fuse_instance, sig);
+ }
+ 
+ static void exit_backtrace(int sig)
+--- a/lib/fuse_loop.c
++++ b/lib/fuse_loop.c
+@@ -23,11 +23,7 @@
+ 		.mem = NULL,
+ 	};
+ 
+-	/*
+-	 * The exit flag is polled on every iteration, so read it directly
+-	 * instead of going through fuse_session_exited() in the loop head.
+-	 */
+-	while (!atomic_load_explicit(&se->mt_exited, memory_order_relaxed)) {
++	while (!fuse_session_exited(se)) {
+ 		res = fuse_session_receive_buf_internal(se, &fbuf, NULL);
+ 
+ 		if (res == -EINTR)
+@@ -39,16 +35,8 @@
+ 	}
+ 
+ 	fuse_buf_free(&fbuf);
+-	if(res > 0)
+-		/* No error, just the length of the most recently read
+-		   request */
+-		res = 0;
+-	if(se->error != 0)
+-		res = se->error;
+-
+-	if (se->uring.pool)
+-		fuse_uring_stop(se);
+-	return res;
++
++	return fuse_session_loop_result(se, res);
+ }
+ 
+ /*
+--- a/lib/fuse_loop_mt.c
++++ b/lib/fuse_loop_mt.c
+@@ -365,23 +365,6 @@
+ 	free(w);
+ }
+ 
+-/*
+- * Wait for fuse_session_exit() and take the worker-list lock, so the
+- * loop can cancel the workers right away.
+- * Returns with se->mt_lock held.
+- */
+-static void session_mt_begin_shutdown(struct fuse_session *se)
+-{
+-	while (!atomic_load_explicit(&se->mt_exited, memory_order_relaxed))
+-		sem_wait(&se->mt_finish);
+-
+-	if (se->debug)
+-		fuse_log(FUSE_LOG_DEBUG,
+-			 "fuse: session exited, terminating workers\n");
+-
+-	pthread_mutex_lock(&se->mt_lock);
+-}
+-
+ int fuse_session_loop_mt_312(struct fuse_session *se, struct fuse_loop_config *config);
+ FUSE_SYMVER("fuse_session_loop_mt_312", "fuse_session_loop_mt@@FUSE_3.12")
+ int fuse_session_loop_mt_312(struct fuse_session *se, struct fuse_loop_config *config)
+@@ -419,7 +402,9 @@
+ 	err = fuse_loop_start_thread(&mt);
+ 	pthread_mutex_unlock(&se->mt_lock);
+ 	if (!err) {
+-		session_mt_begin_shutdown(se);
++		fuse_session_wait_worker_exit(se);
++
++		pthread_mutex_lock(&se->mt_lock);
+ 		for (w = mt.main.next; w != &mt.main; w = w->next)
+ 			pthread_cancel(w->thread_id);
+ 		pthread_mutex_unlock(&se->mt_lock);
+--- a/lib/mount.c
++++ b/lib/mount.c
+@@ -601,73 +601,6 @@
+ 	// Note: fds[1] doesn't get FD_CLOEXEC
+ }
+ 
+-/*
+- * Publish a successfully created mount to the session: the channel fd
+- * and the mountpoint belong to the mount result, so finish them here.
+- */
+-void fuse_session_mount_publish(struct fuse_session *se, int fd,
+-				char *mountpoint)
+-{
+-	se->fd = fd;
+-	se->mountpoint = mountpoint;
+-}
+-
+-/*
+- * Finish the mount channel for a session after the direct fsmount() or
+- * the fusermount3 fallback: adopt the auto-unmount comm socket (or
+- * spawn the auto-unmount helper), reap the helper when the socket is
+- * not kept, and invalidate the channel state the session keeps when
+- * the mount failed.
+- *
+- * Returns the fd the session should publish, -1 when the mount failed.
+- */
+-int fuse_session_mount_unwind(struct fuse_session *se,
+-			      const char *mountpoint, int fd, int err,
+-			      int mountfd, int sock_fd, pid_t fusermount_pid)
+-{
+-	if (sock_fd >= 0) {
+-		if (err == 0 && se->mo->auto_unmount) {
+-			/*
+-			 * Under auto_unmount fusermount3 --sync-init stays alive
+-			 * until this socket closes (its unmount trigger), so
+-			 * closing it now would unmount early and waitpid() would
+-			 * hang. Keep it; fuse_session_destroy() closes it.
+-			 */
+-			se->auto_unmount_fd = sock_fd;
+-		} else {
+-			close(sock_fd);
+-			/* Reap fusermount3 child process to prevent zombie */
+-			if (fusermount_pid > 0)
+-				waitpid(fusermount_pid, NULL, 0);
+-		}
+-	} else if (err == 0 && se->mo->auto_unmount) {
+-		/*
+-		 * Direct fsmount(), no fusermount3 in the picture - spawn the
+-		 * helper that unmounts once its socket closes.
+-		 */
+-		se->auto_unmount_fd = setup_auto_unmount(mountpoint, 0);
+-		if (se->auto_unmount_fd < 0) {
+-			fuse_kern_umount_mountfd(mountfd);
+-			err = -EIO;
+-		}
+-	}
+-
+-	if (mountfd >= 0)
+-		close(mountfd);
+-
+-	if (err < 0) {
+-		/* Close fd first to unblock worker thread */
+-		if (fd >= 0)
+-			close(fd);
+-		fd = -1;
+-		se->fd = -1;
+-		se->error = err;
+-		se->is_sync_init = false;
+-	}
+-
+-	return fd;
+-}
+-
+ static int fuse_mount_fusermount(const char *mountpoint, const struct mount_opts *mo,
+ 		const char *opts, int quiet)
+ {
+--- a/lib/mount_i_linux.h
++++ b/lib/mount_i_linux.h
+@@ -13,10 +13,8 @@
+ #include <sys/mount.h>
+ #include <linux/mount.h>
+ #include <stdint.h>
+-#include <sys/types.h>
+ 
+ struct fuse_args;
+-struct fuse_session;
+ 
+ #define FUSERMOUNT_FEATURE_NEW_MOUNT_API (UINT64_C(1) << 0)
+ #define FUSERMOUNT_FEATURE_SYNC_INIT     (UINT64_C(1) << 1)
+@@ -101,41 +99,6 @@
+ 
+ int setup_auto_unmount(const char *mountpoint, int quiet);
+ 
+-/**
+- * @brief Publish a successfully created mount to a session.
+- *
+- * Adopts the channel fd and takes over the mountpoint ownership.
+- *
+- * @param se session the mount was performed for
+- * @param fd open /dev/fuse channel fd
+- * @param mountpoint strdup()ed mountpoint; the session takes ownership
+- */
+-void fuse_session_mount_publish(struct fuse_session *se, int fd,
+-				char *mountpoint);
+-
+-/**
+- * @brief Finish the mount channel of a session after the direct
+- * fsmount() or the fusermount3 fallback.
+- *
+- * Adopts the auto-unmount comm socket when the mount succeeded, reaps
+- * the fusermount helper otherwise, and invalidates the channel state
+- * the session keeps for the next attempt when the mount failed.
+- *
+- * @param se session the mount was attempted for
+- * @param mountpoint mountpoint, used to spawn the auto-unmount helper
+- * @param fd current channel fd, -1 if none was created
+- * @param err 0 when the mount succeeded, negative error otherwise
+- * @param mountfd fsmount() fd or -1 when unused; closed here
+- * @param sock_fd auto-unmount socket from the fusermount fallback or
+- *                -1 when unused
+- * @param fusermount_pid pid of the fusermount3 child, or <=0 when none
+- *
+- * @return the fd the session should publish, -1 when the mount failed
+- */
+-int fuse_session_mount_unwind(struct fuse_session *se,
+-			      const char *mountpoint, int fd, int err,
+-			      int mountfd, int sock_fd, pid_t fusermount_pid);
+-
+ int fuse_fusermount_proceed_mnt(int sock_fd);
+ 
+ /**
+--- a/lib/fuse_i.h
++++ b/lib/fuse_i.h
+@@ -269,6 +269,10 @@
+ 				       const struct fuse_buf *buf,
+ 				       struct fuse_chan *ch);
+ 
++void fuse_session_exit_with_error(struct fuse_session *se, int error);
++void fuse_session_wait_worker_exit(struct fuse_session *se);
++int fuse_session_loop_result(struct fuse_session *se, int res);
++
+ struct fuse *fuse_new_31(struct fuse_args *args, const struct fuse_operations *op,
+ 		      size_t op_size, void *private_data);
+ int fuse_loop_mt_312(struct fuse *f, struct fuse_loop_config *config);
+--- a/lib/fuse_lowlevel.c
++++ b/lib/fuse_lowlevel.c
+@@ -5117,6 +5117,72 @@
+ }
+ 
+ /*
++ * Publish the mount result to the session: the session owns the
++ * channel fd and the mountpoint from here on.
++ */
++static void session_mount_publish(struct fuse_session *se, int fd,
++				  char *mountpoint)
++{
++	se->fd = fd;
++	se->mountpoint = mountpoint;
++}
++
++/*
++ * Finish the mount channel after the direct fsmount() or the
++ * fusermount3 fallback: adopt the auto-unmount comm socket (or spawn
++ * the auto-unmount helper), reap the fusermount3 child when the
++ * socket is not kept, and on failure invalidate the channel state
++ * kept for the next mount attempt.
++ */
++static int session_mount_unwind_channel(struct fuse_session *se,
++					const char *mountpoint, int fd,
++					int err, int mountfd, int sock_fd,
++					pid_t fusermount_pid)
++{
++	if (sock_fd >= 0) {
++		if (err == 0 && se->mo->auto_unmount) {
++			/*
++			 * Under auto_unmount fusermount3 --sync-init stays alive
++			 * until this socket closes (its unmount trigger), so
++			 * closing it now would unmount early and waitpid() would
++			 * hang. Keep it; fuse_session_destroy() closes it.
++			 */
++			se->auto_unmount_fd = sock_fd;
++		} else {
++			close(sock_fd);
++			/* Reap fusermount3 child process to prevent zombie */
++			if (fusermount_pid > 0)
++				waitpid(fusermount_pid, NULL, 0);
++		}
++	} else if (err == 0 && se->mo->auto_unmount) {
++		/*
++		 * Direct fsmount(), no fusermount3 in the picture - spawn the
++		 * helper that unmounts once its socket closes.
++		 */
++		se->auto_unmount_fd = setup_auto_unmount(mountpoint, 0);
++		if (se->auto_unmount_fd < 0) {
++			fuse_kern_umount_mountfd(mountfd);
++			err = -EIO;
++		}
++	}
++
++	if (mountfd >= 0)
++		close(mountfd);
++
++	if (err < 0) {
++		/* Close fd first to unblock worker thread */
++		if (fd >= 0)
++			close(fd);
++		fd = -1;
++		se->fd = -1;
++		se->error = err;
++		se->is_sync_init = false;
++	}
++
++	return fd;
++}
++
++/*
+  * Mount using the new Linux mount API (fsopen/fsconfig/fsmount/move_mount)
+  * Sync-init is only supported with the new API, as the mount might hang
+  * in case of daemon crash during FUSE_INIT. That also means once the sync init
+@@ -5205,13 +5271,8 @@
+ 	}
+ 
+ err:
+-	/*
+-	 * The mount module finishes the channel now: it adopts the
+-	 * auto-unmount socket (or spawns the auto-unmount helper) and
+-	 * invalidates the channel state when the mount failed.
+-	 */
+-	fd = fuse_session_mount_unwind(se, mountpoint, fd, err, mountfd,
+-				       sock_fd, fusermount_pid);
++	fd = session_mount_unwind_channel(se, mountpoint, fd, err, mountfd,
++					  sock_fd, fusermount_pid);
+ 
+ 	/* Wait for synchronous FUSE_INIT to complete */
+ 	if (session_wait_sync_init_completion(se) < 0)
+@@ -5299,7 +5360,7 @@
+ 	}
+ 
+ out:
+-	fuse_session_mount_publish(se, fd, mountpoint);
++	session_mount_publish(se, fd, mountpoint);
+ 	fuse_daemonize_early_set_mounted();
+ 
+ 	return 0;
+@@ -5421,6 +5482,53 @@
+ 	return exited ? 1 : 0;
+ }
+ 
++/*
++ * Exit the session and report the observed failure in one step, for
++ * callers such as the signal handlers that only hold the session.
++ */
++__attribute__((no_sanitize_thread))
++void fuse_session_exit_with_error(struct fuse_session *se, int error)
++{
++	fuse_session_exit(se);
++	se->error = error;
++}
++
++/*
++ * Park the requesting loop until the session is flagged exited; the
++ * mt_finish wakeup that accompanies fuse_session_exit() is session
++ * business and must not be driven from the loops.
++ */
++__attribute__((no_sanitize_thread))
++void fuse_session_wait_worker_exit(struct fuse_session *se)
++{
++	while (!fuse_session_exited(se))
++		sem_wait(&se->mt_finish);
++
++	if (se->debug)
++		fuse_log(FUSE_LOG_DEBUG,
++			 "fuse: session exited, terminating workers\n");
++}
++
++/*
++ * Final request-loop status: normalize the most recent read length,
++ * override it with an error the session observed and tear down
++ * io_uring when it was used.
++ */
++int fuse_session_loop_result(struct fuse_session *se, int res)
++{
++	if (res > 0)
++		/* No error, just the length of the most recently read
++		   request */
++		res = 0;
++	if (se->error != 0)
++		res = se->error;
++
++	if (se->uring.pool)
++		fuse_uring_stop(se);
++
++	return res;
++}
++
+ static void fuse_tt_destruct(struct fuse_timeout_thread *tt)
+ {
+ 	if (tt->eventfd != -1)

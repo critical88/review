@@ -1,0 +1,163 @@
+diff --git a/glava/fifo.c b/glava/fifo.c
+index 8ba46b6..44dd65d 100644
+--- a/glava/fifo.c
++++ b/glava/fifo.c
+@@ -21,20 +21,11 @@ size_t audio_impls_idx = 0;
+ 
+ /* FIFO backend */
+ 
+-/* Align the session geometry with the active renderer requests at
+-   instantiate time, so the FIFO chunking matches what the renderer is
+-   drawing from. */
+-static void fifo_bind_session(struct audio_data* audio, struct glava_renderer* r) {
+-    audio->audio_buf_sz = r->bufsize_request;
+-    audio->sample_sz    = r->samplesize_request;
+-    if (!audio->source && r->audio_source_request &&
+-        strcmp(r->audio_source_request, "auto") != 0) {
+-        audio->source = strdup(r->audio_source_request);
+-    }
+-}
+-
+ static void init(struct audio_data* audio, struct glava_renderer* r) {
+-    fifo_bind_session(audio, r);
++    /* The session arrives already bound to the active renderer's requests
++       via the shared session service; supply the FIFO-specific default
++       source only when the user did not request one. */
++    (void) r;
+     if (!audio->source) {
+         audio->source = strdup("/tmp/mpd.fifo");
+     }
+diff --git a/glava/fifo.h b/glava/fifo.h
+index 7ad865a..3946c2d 100644
+--- a/glava/fifo.h
++++ b/glava/fifo.h
+@@ -6,8 +6,10 @@
+ #include <stdlib.h>
+ #include <stdbool.h>
+ 
+-/* Renderer sessions are handed to the audio input layer at instantiate time,
+-   so each backend can interpret the active renderer requests on its own. */
++/* The audio session is bound to the active renderer's requests by the shared
++   session service before a backend is instantiated; the renderer is still
++   handed to each backend at init time in case it needs to interpret a request
++   of its own. */
+ struct glava_renderer;
+ 
+ struct audio_data {
+diff --git a/glava/glava.c b/glava/glava.c
+index 166148f..1d929d3 100644
+--- a/glava/glava.c
++++ b/glava/glava.c
+@@ -490,26 +490,17 @@ instantiate: {}
+     rb = malloc(rd->bufsize_request * sizeof(float));
+ 
+     audio = (struct audio_data) {
+-        .source = ({
+-                char* src = NULL;
+-                if (rd->audio_source_request && strcmp(rd->audio_source_request, "auto") != 0) {
+-                    src = strdup(rd->audio_source_request);
+-                }
+-                src;
+-            }),
+-        .rate         = (unsigned int) rd->rate_request,
+         .format       = -1,
+         .terminate    = 0,
+-        .channels     = rd->mirror_input ? 1 : 2,
+         .audio_out_r  = b0,
+         .audio_out_l  = b1,
+         .mutex        = PTHREAD_MUTEX_INITIALIZER,
+-        .audio_buf_sz = rd->bufsize_request,
+-        .sample_sz    = rd->samplesize_request,
+         .modified     = false
+     };
+ 
+-    /* clear the session buffers through the shared session service */
++    /* let the shared session service bind the renderer's requests to this
++       session, then clear the buffers it will stream into */
++    rd_audio_bind(&audio, rd);
+     rd_audio_zero(&audio);
+ 
+     impl->init(&audio, rd);
+diff --git a/glava/pulse_input.c b/glava/pulse_input.c
+index 28d1c67..aded830 100644
+--- a/glava/pulse_input.c
++++ b/glava/pulse_input.c
+@@ -11,7 +11,6 @@
+ #include "render.h"
+ 
+ static pa_mainloop* m_pulseaudio_mainloop;
+-static struct glava_renderer* m_session_renderer;
+ 
+ static void cb(__attribute__((unused)) pa_context* pulseaudio_context,
+                const pa_server_info* i,
+@@ -56,24 +55,12 @@ static void pulseaudio_context_state_callback(pa_context* pulseaudio_context, vo
+ }
+ 
+ 
+-/* Interpret the renderer requests for the audio session opened by this
+-   backend. The renderer owns the requests that parameterize the session;
+-   applying them here keeps the recording stream in step with whatever the
+-   renderer was configured with at instantiate time. */
+-static void pulse_apply_session_requests(struct audio_data* audio) {
+-    audio->rate      = (unsigned int) m_session_renderer->rate_request;
+-    audio->sample_sz = m_session_renderer->samplesize_request;
+-    audio->channels = m_session_renderer->mirror_input ? 1 : 2;
+-}
+-
+ static void init(struct audio_data* audio, struct glava_renderer* r) {
+ 
+-    m_session_renderer = r;
+-
+-    /* Re-align the session parameters with the renderer driving this session,
+-       so the stream spec always matches the active renderer requests. */
+-    pulse_apply_session_requests(audio);
+-
++    /* The session arrives already bound to the active renderer's requests via
++       the shared session service; skip device discovery only when the user
++       has already supplied a source. */
++    (void) r;
+     if (audio->source) return;
+ 
+ 	pa_mainloop_api* mainloop_api;
+diff --git a/glava/render.c b/glava/render.c
+index e7bb0ae..e49d3e6 100644
+--- a/glava/render.c
++++ b/glava/render.c
+@@ -102,6 +102,20 @@ static inline void register_wcb(struct gl_wcb* wcb) { wcbs[wcbs_idx++] = wcb; }
+    state that parameterizes it, so every consumer manipulates the session
+    through the same rd_* surface instead of duplicating buffer traversal. */
+ 
++/* Pull the active renderer's requests into the session. The renderer owns the
++   request fields that parameterize the audio session, so binding them here
++   keeps the session aligned with whatever the renderer was configured for,
++   instead of every audio backend re-deriving the same mapping at init time. */
++void rd_audio_bind(struct audio_data* audio, struct glava_renderer* r) {
++    audio->rate         = (unsigned int) r->rate_request;
++    audio->sample_sz    = r->samplesize_request;
++    audio->audio_buf_sz = r->bufsize_request;
++    audio->channels     = r->mirror_input ? 1 : 2;
++    if (r->audio_source_request && strcmp(r->audio_source_request, "auto") != 0) {
++        audio->source = strdup(r->audio_source_request);
++    }
++}
++
+ void rd_audio_zero(struct audio_data* audio) {
+     for (size_t t = 0; t < audio->audio_buf_sz; ++t) {
+         audio->audio_out_l[t] = 0.0F;
+diff --git a/glava/render.h b/glava/render.h
+index 8908bcc..2a8e368 100644
+--- a/glava/render.h
++++ b/glava/render.h
+@@ -70,10 +70,12 @@ struct gl_wcb*   rd_get_wcb        (struct glava_renderer*);
+    operate on the audio session created for the active renderer, so the
+    entry point and the audio input backends can drive session state through
+    a single shared implementation instead of duplicating it.
++     - rd_audio_bind: copy the active renderer's requests into the session
+      - rd_audio_zero: clear the session buffers (used at instantiate time)
+      - rd_audio_shift_write: roll the session window and append one chunk
+      - rd_audio_shift_silence: roll the window and pad it with silence
+      - rd_audio_read: drain the session for one frame (lock-copy-reset)  */
++void    rd_audio_bind         (struct audio_data* audio, struct glava_renderer* r);
+ void    rd_audio_zero         (struct audio_data* audio);
+ void    rd_audio_shift_write  (struct audio_data* audio, const float* l, const float* r);
+ void    rd_audio_shift_silence(struct audio_data* audio);

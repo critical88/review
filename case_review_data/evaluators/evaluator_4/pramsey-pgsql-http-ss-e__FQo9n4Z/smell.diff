@@ -1,0 +1,142 @@
+diff --git a/http.c b/http.c
+index a7d7807..1d61bf2 100644
+--- a/http.c
++++ b/http.c
+@@ -217,10 +217,21 @@ void _PG_init(void);
+ void _PG_fini(void);
+ static size_t http_writeback(void *contents, size_t size, size_t nmemb, void *userp);
+ static size_t http_readback(void *buffer, size_t size, size_t nitems, void *instream);
++static bool curlopt_is_set(CURLoption curlopt);
+ 
+ /* Global variables */
+ static CURL * g_http_handle = NULL;
+ 
++/*
++ * Session connection policy. When the session opts into TCP
++ * keepalive we hold the handle open between requests and allow
++ * network socket re-use, otherwise we force connections closed
++ * after every request. The flag is refreshed at every point
++ * the handle is created, prepared, re-configured or reset by
++ * the session, so it tracks what the user has asked for.
++ */
++static bool g_conn_reuse = false;
++
+ #if PG_VERSION_NUM >= 170000
+ static uint32 wait_event_transfer = 0;
+ #endif
+@@ -461,6 +472,14 @@ void _PG_init(void)
+ 	curl_global_init(CURL_GLOBAL_ALL);
+ #endif
+ 
++	/*
++	 * Warm up a global CURL handle at startup and stamp it with
++	 * the session connection policy, so the first request in this
++	 * backend starts from a correctly configured handle.
++	 */
++	g_http_handle = curl_easy_init();
++	g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE);
++	curl_easy_setopt(g_http_handle, CURLOPT_FORBID_REUSE, g_conn_reuse ? 0L : 1L);
+ 
+ }
+ 
+@@ -999,6 +1018,21 @@ http_get_handle(void)
+ 	/* Set the user agent. If not set, use PG_VERSION as default */
+ 	curl_easy_setopt(handle, CURLOPT_USERAGENT, PG_VERSION_STR);
+ 
++	/*
++	 * Refresh the session connection policy and stamp it onto this
++	 * handle, so cached handles reflect the current keepalive
++	 * preference of the session, and remain restricted to the
++	 * http/https protocols.
++	 */
++	g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE);
++	curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, g_conn_reuse ? 0L : 1L);
++	curl_easy_setopt(handle, CURLOPT_TCP_KEEPALIVE, g_conn_reuse ? 1L : 0L);
++#if LIBCURL_VERSION_NUM >= 0x075400  /* 7.84.0 */
++	curl_easy_setopt(handle, CURLOPT_PROTOCOLS_STR, "http,https");
++#else
++	curl_easy_setopt(handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
++#endif
++
+ 	/* Bring in any options the user has set this session */
+ 	while (opt->curlopt)
+ 	{
+@@ -1025,6 +1059,19 @@ Datum http_reset_curlopt(PG_FUNCTION_ARGS)
+ 	CURL * handle = http_get_handle();
+ 	curl_easy_reset(handle);
+ 
++	/*
++	 * The reset returns the handle to startup defaults, so re-stamp
++	 * the session connection policy and the protocol restriction to
++	 * leave the handle in a known connection state.
++	 */
++	g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE);
++	curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, g_conn_reuse ? 0L : 1L);
++#if LIBCURL_VERSION_NUM >= 0x075400  /* 7.84.0 */
++	curl_easy_setopt(handle, CURLOPT_PROTOCOLS_STR, "http,https");
++#else
++	curl_easy_setopt(handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
++#endif
++
+ 	/* Clean out the settable_curlopts global cache */
+ 	while (opt->curlopt)
+ 	{
+@@ -1125,6 +1172,16 @@ Datum http_set_curlopt(PG_FUNCTION_ARGS)
+ 		{
+ 			if (opt->curlopt_val) guc_free(opt->curlopt_val);
+ 			opt->curlopt_val = guc_strdup(ERROR, value);
++
++			/*
++			 * The user may have just changed the way they want
++			 * connections handled (http.keepalive et al), so refresh
++			 * the session connection policy and stamp it onto the
++			 * handle before applying the new option.
++			 */
++			g_conn_reuse = curlopt_is_set(CURLOPT_TCP_KEEPALIVE);
++			curl_easy_setopt(handle, CURLOPT_FORBID_REUSE, g_conn_reuse ? 0L : 1L);
++
+ 			PG_RETURN_BOOL(set_curlopt(handle, opt));
+ 		}
+ 		opt++;
+@@ -1244,16 +1301,13 @@ Datum http_request(PG_FUNCTION_ARGS)
+ 	CURL_SETOPT(g_http_handle, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+ #endif
+ 
+-	if ( curlopt_is_set(CURLOPT_TCP_KEEPALIVE) )
+-	{
+-		/* Keep sockets held open */
+-		CURL_SETOPT(g_http_handle, CURLOPT_FORBID_REUSE, 0L);
+-	}
+-	else
+-	{
+-		/* Keep sockets from being held open */
+-		CURL_SETOPT(g_http_handle, CURLOPT_FORBID_REUSE, 1L);
+-	}
++	/*
++	 * The connection policy for this request comes from the session
++	 * cache, which is refreshed whenever the handle is prepared or
++	 * the session connection options change, so the cached flag is
++	 * authoritative at this point.
++	 */
++	curl_easy_setopt(g_http_handle, CURLOPT_FORBID_REUSE, g_conn_reuse ? 0L : 1L);
+ 
+ 	/* Set up the write-back function */
+ 	CURL_SETOPT(g_http_handle, CURLOPT_WRITEFUNCTION, http_writeback);
+@@ -1280,7 +1334,7 @@ Datum http_request(PG_FUNCTION_ARGS)
+ 		CURL_SETOPT(g_http_handle, CURLOPT_MAXREDIRS, 5L);
+ 	}
+ 
+-	if ( curlopt_is_set(CURLOPT_TCP_KEEPALIVE) )
++	if ( g_conn_reuse )
+ 	{
+ 		/* Add a keep alive option to the headers to reuse network sockets */
+ 		headers = curl_slist_append(headers, "Connection: Keep-Alive");
+@@ -1537,7 +1591,7 @@ Datum http_request(PG_FUNCTION_ARGS)
+ 
+ 	/* Clean up */
+ 	ReleaseTupleDesc(tup_desc);
+-	if ( ! curlopt_is_set(CURLOPT_TCP_KEEPALIVE) )
++	if ( ! g_conn_reuse )
+ 	{
+ 		curl_easy_cleanup(g_http_handle);
+ 		g_http_handle = NULL;

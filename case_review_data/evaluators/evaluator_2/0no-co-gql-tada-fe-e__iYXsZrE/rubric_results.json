@@ -1,0 +1,136 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "In field-usage.ts, the agent removed the local accumulators (reachModules, reachAreas, reachEntries) and the manual fold over graph.dependents/areaOf/entryPoints, replacing them with `const reach = graph.reach(sourceModules);` and using `reach.modules.length`, `reach.areas`, and `reach.entryPoints.length`. The ModuleGraph class (module-graph.ts) gained a new batch-shaped overload `reach(modules: Iterable<string>): ModuleReach` that unions each seed plus its dependents, computes distinct areas via areaOf, and collects entry-point membership — so the blast-radius analytics are now obtained from the graph class rather than folded in the rule.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The field-usage rule's blast-radius analytics (unioned modules, distinct areas, and entry-point membership over the modules reaching each selected field) is obtained from the module-graph class (packages/cli-utils/src/commands/scan/module-graph.ts), and the rule's collection step no longer folds the graph's dependents closure, per-module areas, and entry-point membership into its own local accumulators.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's fetch-depth.ts patch deletes the rule-side BFS that built a local `distance` map by iterating `graph.entryPoints()` and `graph.importMap()`, and replaces `distance.get(op.module)` with `graph.distanceFromEntry(op.module)`, asking the module-graph class for the entry-point distance. Per-query area labels continue to come from the graph via `graph.areaOf(op.module)`. No rule-side entry-distance table walking raw import edges remains.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The fetch-depth rule places each query by asking the module-graph class for the entry-point distance of its defining module (via the existing per-module distance method or a new owner method), with no rule-side entry-distance table built by walking the graph's entry points and raw import edges; per-query area labels likewise come from the graph class.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the eager rule-local `moduleAreas` Map and its setup-step construction loop over `graph.importMap()` from cross-feature-fragments.ts. At the points of use, it now resolves areas directly through the graph: the visitor's spread-site labelling becomes `areas.add(graph.areaOf(definition.module))` (was `moduleAreas.get(...) ?? graph.areaOf(...)`), and the collection fold's defining-area labelling becomes `const definingArea = graph.areaOf(fragment.module)` (was `moduleAreas.get(...) ?? graph.areaOf(...)`). All three phases (setup, visitor, collection) no longer consult rule-local graph data.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The cross-feature-fragments rule resolves module areas through the module-graph class at the points of use (spread-site labelling in the visitor, defining-area labelling in the collection fold), and the eager rule-local module-to-area index built from the graph's import map in the rule's setup step no longer exists.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes all out-of-graph analytics and routes them through ModuleGraph methods. In fetch-depth.ts, the inline BFS distance walk (frontier/depth loop over graph.importMap()) is deleted and replaced with graph.distanceFromEntry(op.module). In field-usage.ts, the manual reach fold (iterating graph.dependents, building reachModules/reachAreas/reachEntries sets) is deleted and replaced with graph.reach(sourceModules), and the graph's reach() method is extended to accept Iterable<string> and compute the union inside the class. In cross-feature-fragments.ts, the standalone moduleAreas map built by iterating graph.importMap() is deleted, reverting to direct graph.areaOf() calls, with areaOf now memoised via the _areas field on ModuleGraph. No scan-context methods, standalone helpers, or intermediate objects are introduced to carry the computations.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The graph analytics implementations were not merely relocated to another non-owner location: scan-context methods, standalone helper functions, or a newly introduced intermediate object still carry the reach/distance/area computations (graph-walk or fold logic) outside the module-graph class.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch for fetch-depth.ts does not touch the import line, leaving `import type { ScanRule, RuleDatapoint } from '../types';` intact — `RuleDatapoint` was added by the smell solely to support the inlined BFS rewrite. The agent also retains `const datapoints: RuleDatapoint<FetchDepthData>[] = [];`, a local datapoint array introduced by the smell's inlined implementation, rather than reverting to the original `.map()` chain that needed no such import. The rubric explicitly calls out removing this type import from a rule that should no longer declare a local datapoint array. While all consumer call sites now route through the graph class (graph.distanceFromEntry, graph.areaOf, graph.reach), the supporting type import added only for the inlined code was not cleaned up.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every consumer call site of the moved analytics goes through the module-graph class after the change, and type/import declarations that existed only to support the inlined implementations are removed (e.g. a RuleDatapoint type import added to a rule that no longer declares a local datapoint array).",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent added a batch-shaped `reach(Iterable<string>)` overload on ModuleGraph that reuses the class's existing memoised helpers — `this.entryPoints()`, `this.dependents(seed)` (reverse closure), and `this.areaOf(module)` — rather than recomputing the reverse closure or entry-point set per caller; it returns the same `ModuleReach` type as the existing single-module `reach`, fitting the API style. The agent also added a `private readonly _areas` memoisation field to `areaOf`, mirroring the existing `_entryPoints`/`_distance`/`_dependents` private memo fields, so area lookups now integrate with the class's memoised-state pattern instead of repeating path arithmetic.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Any newly added module-graph member that serves the rules' set- or batch-shaped needs fits the class's existing API style and reuses its memoised state (entry-point set, reverse closure, distance map) rather than recomputing graph state independently per caller.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes the inlined analytics from all three rule files rather than leaving them dead: cross-feature-fragments.ts deletes the `moduleAreas` map and reverts usages to `graph.areaOf(...)`; fetch-depth.ts deletes the BFS `distance`/`frontier` walk and uses `graph.distanceFromEntry(op.module)`; field-usage.ts deletes the `reachModules`/`reachAreas`/`reachEntries` accumulators and loops, replacing them with `graph.reach(sourceModules)`. No rule-local distance table, module-to-area map, or dependents/areas/entry-points accumulator is left built-but-unused alongside the new graph calls.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Dead vestiges of the inlined analytics remain in the rule layer after the repair: a rule-local distance table, module-to-area map, or dependents/areas/entry-points accumulator that is built but no longer used, or a leftover folding/walk loop kept alongside the new owner calls.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes all temporary inlining artifacts rather than leaving them stale. In cross-feature-fragments.ts, the rule-local moduleAreas map and its comment ('Resolve the area of every module the graph knows about up front...') are deleted, replaced with a comment describing the graph-owned memoised areaOf. In fetch-depth.ts, the BFS distance-walk code and its comments ('Walk the import graph outwards from the entry points...') are removed, replaced with a call to graph.distanceFromEntry and a comment stating distance is the graph's concern. In field-usage.ts, the manual reach/dependents loop and its comment are removed in favor of graph.reach(sourceModules) with an updated comment. The RuleDatapoint import added by the smell in fetch-depth.ts remains referenced (used in the explicit datapoints array type annotation), so it is not an unused type import.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Obsolete artifacts of the temporary inlining linger in the touched rules: an import of a type that is no longer referenced, or a comment that still describes a rule-local distance/area computation that no longer exists.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent preserves all observable scan output. In fetch-depth it restores `graph.distanceFromEntry(op.module)` (the smell's inline BFS was byte-identical to this per the rationale) and keeps the same message (`'unreachable from any entry point'` / `'%d hop(s) from an entry point'`), weight (`entryDistance ?? undefined`), data (`{ depth: entryDistance ?? null, area, module }`), and sort (`(b.data.depth ?? -1) - (a.data.depth ?? -1)`). In field-usage, `graph.reach(sourceModules)` unions the same modules/areas/entryPoints as the smell's manual `dependents`+`areaOf`+`entryPoints` loop, and the datapoint uses identical sizes (`reach.modules.length`, `reach.areas` already sorted, `reach.entryPoints.length`) and weight (`hasEntryPoints ? reach.entryPoints.length : reach.modules.length`). In cross-feature-fragments, dropping the `moduleAreas` cache and calling `graph.areaOf` directly (now memoised) yields identical area labels. No message text, weight, data field, tie-break, or sort order differs from the pre-repair state.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The scan output changed observable results somewhere: a datapoint's message text, weight, data fields, tie-break or sort order differ from the pre-repair state (for example field-usage ranking by selection count then reach, or fetch-depth ordering by descending distance), so terminal/JSON/graph renderings for the same scanned project are no longer identical.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's fetch-depth.ts restores use of `graph.distanceFromEntry(op.module)` (number|undefined) and preserves unreachable handling exactly: message uses `entryDistance == null ? 'unreachable from any entry point' : ...`, `weight: entryDistance ?? undefined`, `data: { depth: entryDistance ?? null, ... }`, and the sort `(b.data.depth ?? -1) - (a.data.depth ?? -1)` keeps unreachable (null→-1) queries at the same position. No coercion to a number and no skipping of unreachable queries occurs.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Queries (or other definitions) with no route from the import-graph entry points are now reported differently or dropped: their reported depth, the wording for an unknown distance, or their position in the result order changed.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch only touches the three smelly rules and the ModuleGraph class, plus a test. It does not alter rule registration, rule names, datapoint interfaces, the scan traversal/context machinery, or other rules. The graph changes preserve existing behavior: `reach(string)` still returns the seed plus its dependents with sorted areas and entry points (now via an overload that delegates to the same logic), and `areaOf` returns the same directory value (now memoised). No collateral edits outside the consolidation scope are present.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair made collateral edits outside the task's scope: the rule registration table, rule names, datapoint TypeScript interfaces, the scan traversal/context machinery, other scan rules (orphan-fragments, deprecated-usage, operation-complexity, directive usage, input status), or the module-graph class's existing public analytics methods were changed or removed in a way that alters their current behaviour.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0.5,
+    "core_resolution": 1
+  },
+  "valid_count": 11,
+  "pass_count": 10,
+  "must_have_pass": false,
+  "macro_score": 0.875
+}

@@ -1,0 +1,330 @@
+diff --git a/esrally/driver/driver.py b/esrally/driver/driver.py
+index 6c408dd..9a66267 100644
+--- a/esrally/driver/driver.py
++++ b/esrally/driver/driver.py
+@@ -134,13 +134,8 @@ class WorkerIdle:
+ 
+ 
+ class PreparationComplete:
+-    def __init__(self, distribution_flavor, distribution_version, revision, target_id=None, target_platform=None, target_auth_type=None):
+-        self.distribution_flavor = distribution_flavor
+-        self.distribution_version = distribution_version
+-        self.revision = revision
+-        self.target_id = target_id
+-        self.target_platform = target_platform
+-        self.target_auth_type = target_auth_type
++    def __init__(self, target_cluster):
++        self.target_cluster = target_cluster
+ 
+ 
+ class StartWorker:
+@@ -213,9 +208,7 @@ class BenchmarkComplete:
+         self.metrics = metrics
+ 
+ 
+-def remember_target_cluster(
+-    driver_actor, cluster_details, distribution_flavor, distribution_version, revision, target_id, target_platform, target_auth_type
+-):
++def remember_target_cluster(driver_actor, cluster_details, target_cluster):
+     """
+     Stores the identity facts of the cluster that we are benchmarking on the main driver actor.
+ 
+@@ -223,25 +216,16 @@ def remember_target_cluster(
+     still reachable. This keeps the raw cluster info - needed by the actor's child
+     helpers - next to the resolved identity facts that are forwarded to race control
+     once track preparation has completed (see ``DriverActor._after_track_prepared``).
+-    The parameter list matches the one used by the other paths that pass these facts
+-    around (e.g. ``PreparationComplete``), so it stays easy to keep them in sync.
++    The resolved facts are bundled in ``target_cluster`` (see
++    ``esrally.metrics.TargetCluster``), the same value that travels through the other
++    paths that pass these facts around (e.g. ``PreparationComplete``).
+ 
+     :param driver_actor: The main driver actor that remembers the target cluster's facts.
+     :param cluster_details: The raw cluster info response (may be empty if the REST API check was skipped).
+-    :param distribution_flavor: The target cluster's distribution flavor (defaults to ``oss`` for unknown builds).
+-    :param distribution_version: The target cluster's version number.
+-    :param revision: The target cluster's build revision.
+-    :param target_id: Identifies the benchmark target (project ID for serverless, cluster ID for ECH, cluster name for on-prem) if known.
+-    :param target_platform: The platform the target cluster runs on (one of ``serverless``, ``hosted`` or ``on-prem``).
+-    :param target_auth_type: The authentication type Rally used to connect (``api_key`` or ``basic``) if recorded.
++    :param target_cluster: The ``TargetCluster`` carrying the target cluster's resolved identity facts.
+     """
+     driver_actor.cluster_details = cluster_details
+-    driver_actor.distribution_flavor = distribution_flavor
+-    driver_actor.distribution_version = distribution_version
+-    driver_actor.revision = revision
+-    driver_actor.target_id = target_id
+-    driver_actor.target_platform = target_platform
+-    driver_actor.target_auth_type = target_auth_type
++    driver_actor.target_cluster = target_cluster
+ 
+ 
+ class TaskFinished:
+@@ -269,12 +253,7 @@ class DriverActor(actor.RallyActor):
+         self.status = "init"
+         self.post_process_timer = 0
+         self.cluster_details = {}
+-        self.distribution_flavor = None
+-        self.distribution_version = None
+-        self.revision = None
+-        self.target_id = None
+-        self.target_platform = None
+-        self.target_auth_type = None
++        self.target_cluster = None
+ 
+     def receiveMsg_PoisonMessage(self, poisonmsg, sender):
+         self.logger.error("Main driver received a fatal indication from a load generator (%s). Shutting down.", poisonmsg.details)
+@@ -397,14 +376,7 @@ class DriverActor(actor.RallyActor):
+         self.children = []
+         self.send(
+             self.benchmark_actor,
+-            PreparationComplete(
+-                self.distribution_flavor,
+-                self.distribution_version,
+-                self.revision,
+-                target_id=self.target_id,
+-                target_platform=self.target_platform,
+-                target_auth_type=self.target_auth_type,
+-            ),
++            PreparationComplete(self.target_cluster),
+         )
+ 
+     def on_benchmark_complete(self, metrics):
+@@ -838,12 +810,14 @@ class Driver:
+         remember_target_cluster(
+             self.driver_actor,
+             cluster_details,
+-            distribution_flavor,
+-            distribution_version,
+-            revision,
+-            target_id,
+-            target_platform,
+-            target_auth_type,
++            metrics.TargetCluster(
++                distribution_flavor=distribution_flavor,
++                distribution_version=distribution_version,
++                revision=revision,
++                target_id=target_id,
++                target_platform=target_platform,
++                target_auth_type=target_auth_type,
++            ),
+         )
+ 
+         # Avoid issuing any requests to the target cluster when static responses are enabled. The results
+diff --git a/esrally/metrics.py b/esrally/metrics.py
+index bfe71db..99b0624 100644
+--- a/esrally/metrics.py
++++ b/esrally/metrics.py
+@@ -1930,6 +1930,33 @@ def create_race(cfg: types.Config, track, challenge, track_revision=None):
+     )
+ 
+ 
++class TargetCluster:
++    """
++    The identity of the cluster that a race benchmarks.
++
++    Bundles the resolved facts about the benchmark target so that they travel
++    through the preparation and telemetry paths as a single value rather than
++    a long, order-sensitive parameter list: its distribution flavor and
++    version, build revision, the identifier of the target itself (a project ID
++    for serverless, a cluster ID for hosted, a cluster name for on-prem), the
++    platform it runs on (``serverless``, ``hosted`` or ``on-prem``) and the
++    auth style Rally used to connect (``api_key`` or ``basic``).
++
++    ``Driver.prepare_benchmark`` and the ``ClusterEnvironmentInfo`` telemetry
++    device each derive one of these while the candidate is reachable; it is
++    then forwarded (driver -> race control -> ``Race``) and recorded as
++    metrics-store meta-info.
++    """
++
++    def __init__(self, distribution_flavor, distribution_version, revision, target_id=None, target_platform=None, target_auth_type=None):
++        self.distribution_flavor = distribution_flavor
++        self.distribution_version = distribution_version
++        self.revision = revision
++        self.target_id = target_id
++        self.target_platform = target_platform
++        self.target_auth_type = target_auth_type
++
++
+ class Race:
+     def __init__(
+         self,
+@@ -1992,34 +2019,29 @@ class Race:
+         self.target_platform = target_platform
+         self.target_auth_type = target_auth_type
+ 
+-    def record_target_cluster(
+-        self, distribution_flavor, distribution_version, revision, target_id=None, target_platform=None, target_auth_type=None
+-    ):
++    def record_target_cluster(self, target_cluster):
+         """
+         Records the identity facts of the cluster that this race has benchmarked.
+ 
+-        The values arrive via the driver, once track preparation has completed. They are
+-        passed through in the same shape in which they travel through the preparation
+-        path (see ``esrally.driver.driver.DriverActor``), i.e. distribution flavor and
+-        version, build revision, the cluster's id, the platform it runs on and the
+-        authentication type that Rally used to talk to it.
+-
+-        :param distribution_flavor: The target cluster's distribution flavor.
+-        :param distribution_version: The target cluster's version number.
+-        :param revision: The target cluster's build revision.
+-        :param target_id: Identifies the benchmark target if known. ``None`` keeps the current value.
+-        :param target_platform: The platform the target cluster runs on. ``None`` keeps the current value.
+-        :param target_auth_type: The authentication type Rally used to connect. ``None`` keeps the current value.
+-        """
+-        self.distribution_flavor = distribution_flavor
+-        self.distribution_version = distribution_version
+-        self.revision = revision
+-        if target_id is not None:
+-            self.target_id = target_id
+-        if target_platform is not None:
+-            self.target_platform = target_platform
+-        if target_auth_type is not None:
+-            self.target_auth_type = target_auth_type
++        ``target_cluster`` arrives via the driver, once track preparation has
++        completed, as the single ``TargetCluster`` value that carries the same
++        facts through the preparation and telemetry paths (see
++        ``esrally.driver.driver.DriverActor``): distribution flavor and version,
++        build revision, the cluster's id, the platform it runs on and the
++        authentication type that Rally used to talk to it. ``None`` values for
++        the identifier, platform and auth style keep the currently recorded value.
++
++        :param target_cluster: The ``TargetCluster`` describing the cluster that was benchmarked.
++        """
++        self.distribution_flavor = target_cluster.distribution_flavor
++        self.distribution_version = target_cluster.distribution_version
++        self.revision = target_cluster.revision
++        if target_cluster.target_id is not None:
++            self.target_id = target_cluster.target_id
++        if target_cluster.target_platform is not None:
++            self.target_platform = target_cluster.target_platform
++        if target_cluster.target_auth_type is not None:
++            self.target_auth_type = target_cluster.target_auth_type
+ 
+     @property
+     def track_name(self):
+diff --git a/esrally/racecontrol.py b/esrally/racecontrol.py
+index c448afc..2224ab6 100644
+--- a/esrally/racecontrol.py
++++ b/esrally/racecontrol.py
+@@ -142,14 +142,7 @@ class BenchmarkActor(actor.RallyActor):
+ 
+     @actor.no_retry("race control")  # pylint: disable=no-value-for-parameter
+     def receiveMsg_PreparationComplete(self, msg, sender):
+-        self.coordinator.on_preparation_complete(
+-            msg.distribution_flavor,
+-            msg.distribution_version,
+-            msg.revision,
+-            target_id=msg.target_id,
+-            target_platform=msg.target_platform,
+-            target_auth_type=msg.target_auth_type,
+-        )
++        self.coordinator.on_preparation_complete(msg.target_cluster)
+         self.logger.info("Telling driver to start benchmark.")
+         self.send(self.main_driver, driver.StartBenchmark())
+ 
+@@ -257,17 +250,8 @@ class BenchmarkCoordinator:
+         )
+         self.race_store = metrics.race_store(self.cfg)
+ 
+-    def on_preparation_complete(
+-        self, distribution_flavor, distribution_version, revision, target_id=None, target_platform=None, target_auth_type=None
+-    ):
+-        self.race.record_target_cluster(
+-            distribution_flavor=distribution_flavor,
+-            distribution_version=distribution_version,
+-            revision=revision,
+-            target_id=target_id,
+-            target_platform=target_platform,
+-            target_auth_type=target_auth_type,
+-        )
++    def on_preparation_complete(self, target_cluster):
++        self.race.record_target_cluster(target_cluster)
+         # store race initially (without any results) so other components can retrieve full metadata
+         self.race_store.store_race(self.race)
+         if self.race.challenge.auto_generated:
+diff --git a/esrally/telemetry.py b/esrally/telemetry.py
+index 00ee451..7a75268 100644
+--- a/esrally/telemetry.py
++++ b/esrally/telemetry.py
+@@ -1802,42 +1802,29 @@ def flatten_stats_fields(prefix=None, stats=None):
+         return {}
+ 
+ 
+-def store_cluster_environment_info(
+-    metrics_store,
+-    distribution_flavor,
+-    distribution_version,
+-    revision,
+-    target_id,
+-    target_platform,
+-    target_auth_type,
+-):
++def store_cluster_environment_info(metrics_store, target_cluster):
+     """
+     Publishes the target cluster's identity facts as cluster-scoped meta-info.
+ 
+-    The exact same facts are also forwarded by the driver once track preparation
+-    has completed (see ``PreparationComplete`` in ``esrally.driver.driver``), so
+-    this helper's parameter list deliberately mirrors the values that travel
+-    through that path: distribution flavor and version, build revision, the
+-    cluster's id, the platform it runs on and the authentication type Rally
+-    used to talk to it.
++    ``target_cluster`` is the same ``TargetCluster`` value (see
++    ``esrally.metrics``) that the driver forwards once track preparation has
++    completed (see ``PreparationComplete`` in ``esrally.driver.driver``), so the
++    same facts travel through both paths: distribution flavor and version,
++    build revision, the cluster's id, the platform it runs on and the
++    authentication type Rally used to talk to it.
+ 
+     :param metrics_store: The metrics store that records cluster-scoped meta-info.
+-    :param distribution_flavor: The target cluster's distribution flavor (e.g. ``default``, ``oss`` or ``serverless``).
+-    :param distribution_version: The target cluster's version number.
+-    :param revision: The target cluster's build revision.
+-    :param target_id: Identifies the benchmark target (project ID for serverless, cluster ID for ECH, cluster name for on-prem) if known.
+-    :param target_platform: The platform the target cluster runs on (one of ``serverless``, ``hosted`` or ``on-prem``).
+-    :param target_auth_type: The authentication type Rally used to connect (``api_key`` or ``basic``) if recorded.
++    :param target_cluster: The ``TargetCluster`` describing the cluster that was benchmarked.
+     """
+-    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "source_revision", revision)
+-    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "distribution_version", distribution_version)
+-    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "distribution_flavor", distribution_flavor)
++    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "source_revision", target_cluster.revision)
++    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "distribution_version", target_cluster.distribution_version)
++    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "distribution_flavor", target_cluster.distribution_flavor)
+     # Store target ID (project ID for serverless, cluster ID for ECH, cluster name for on-prem)
+-    if target_id:
+-        metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_id", target_id)
+-    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_platform", target_platform)
+-    if target_auth_type:
+-        metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_auth_type", target_auth_type)
++    if target_cluster.target_id:
++        metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_id", target_cluster.target_id)
++    metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_platform", target_cluster.target_platform)
++    if target_cluster.target_auth_type:
++        metrics_store.add_meta_info(metrics.MetaInfoScope.cluster, None, "target_auth_type", target_cluster.target_auth_type)
+ 
+ 
+ class ClusterEnvironmentInfo(InternalTelemetryDevice):
+@@ -1899,12 +1886,14 @@ class ClusterEnvironmentInfo(InternalTelemetryDevice):
+ 
+         store_cluster_environment_info(
+             self.metrics_store,
+-            distribution_flavor,
+-            distribution_version,
+-            revision,
+-            target_id,
+-            target_platform,
+-            target_auth_type,
++            metrics.TargetCluster(
++                distribution_flavor=distribution_flavor,
++                distribution_version=distribution_version,
++                revision=revision,
++                target_id=target_id,
++                target_platform=target_platform,
++                target_auth_type=target_auth_type,
++            ),
+         )
+ 
+ 

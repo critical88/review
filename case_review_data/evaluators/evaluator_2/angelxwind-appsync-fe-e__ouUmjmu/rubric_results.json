@@ -1,0 +1,180 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "agent.patch deletes the inline CS_SuperBlob shape checks from macho_validate (the magic/length/count block with ntohl(sb->magic)==CSMAGIC_EMBEDDED_SIGNATURE, sb->length > cs_datasize, sb->count >= 0x10000, etc.) and deletes the pre-delegation index walk/hash-ranking scan from compute_cdhash_macho, leaving only the container range check and `return csblob_cdhash(...)`. Comments state the signature shape is validated later by the blob parser, and no new one-off shape helper is introduced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In the repaired cdhash.m, the embedded-signature superblob interpretation that the load-command validation walk used to perform inline (reading magic, length, and count of a locally derived CS_SuperBlob to judge the signature window's shape) is no longer re-authored as a Mach-O-side rule: either the walk no longer asks blob-shape questions at all and the existing signature parsing decides them, or the questions are answered by the code whose job is interpreting those records (the superblob/code-directory validation family used as-is or extended). A new one-off helper written next to the walk that keeps its own copy of the shape rules does not satisfy this.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch deletes the entire injected compute_cdhash_macho pre-scan block that walked sb->index, called cs_codedirectory_validate, and ranked SHA1/SHA256/SHA384 by hand. compute_cdhash_macho now keeps only file-level staging: locating LC_CODE_SIGNATURE, deriving cs_data/cs_end from dataoff/datasize, bounds-checking the window, then returning csblob_cdhash(...); the new comment states the blob parser owns superblob validation, index walking, and unsupported hash-type rejection.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In the repaired cdhash.m, the step that stages the signature for parsing (compute_cdhash_macho) no longer scouts ahead of the blob parser with its own index-table walk, its own code-directory candidate selection, and its own copy of the hash-type preference: candidate usability is decided by the blob-owning parse/ranking authority, or the pre-scan is dropped in favor of letting that authority decide as it already does after delegation. Staging keeps only file-level work: locating the signature command, translating dataoff/datasize into a window, and bounding it to the mapped image.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch deletes the duplicated superblob shape checks from macho_validate (magic identity, length vs cs_datasize, count bounds) and deletes the pre-delegation index walk/hash-ranking block from compute_cdhash_macho. The remaining comments state that csblob_cdhash is the one component that owns embedded-signature shape, validates the superblob, walks its index, and declines unsupported hash types, leaving the superblob shape rules and hash-type preference with a single interpretation site in cdhash.m.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, the superblob shape rules (magic identity, length versus available size, index-count bounds) and the hash-type preference for code directories each have exactly one interpretation site in cdhash.m — the signature-blob validation and ranking code — so tightening a bound or changing the preferred flavor is a one-place edit rather than a multi-copy audit.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch modifies only cdhash.m and contains no dump.cpp changes, so the smell.diff's MachHeader::CopyEntitlementData remains: it derives the superblob locally from signature->dataoff/GetBase(), walks super->index, selects CSSLOT_ENTITLEMENTS, and sizes entitlements->length inside the Mach-O image class, leaving the image class with a payload walk of its own.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In the repaired dump.cpp, walking the signature superblob's index table, selecting the entitlement slot, and sizing the payload blob are performed by code that receives those on-disk blob structures as its contract (passed in, not derived as locals by image-walking code), and the Mach-O image class is left with image-level duties only — header identification, load-command walking, and byte-order handling — without a payload walk of its own.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch only edits cdhash.m: it removes the inline superblob shape checks from macho_validate and the pre-delegation index/hash scan from compute_cdhash_macho, leaving csblob_cdhash as the authority. It does not touch dump.cpp, so the smell's CopyEntitlementData still reads raw blob fields directly (super->count, super->index[].type/offset, entitlements->length) instead of delegating to the shared blob interpretation. This leaves the partial state R5 forbids: cdhash delegates while the dumper sibling still interprets raw fields.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every consumer that used to read blob fields inline is fully rewired to the shared authority: the validation walk, the delegation staging, and the entitlement extraction call the surviving interpretation instead of keeping a private reading, and no partial state remains where one site delegates while a sibling site still interprets raw fields.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "agent.patch keeps the image-side window resolution in macho_validate where the header is walked: it reads cs_cmd->dataoff/datasize, forms cs_data/cs_end, and checks `!((uint8_t *)mh < cs_data && cs_data < cs_end && cs_end <= (uint8_t *)mh + size)`, while deleting the superblob shape checks (`ntohl(sb->magic/length/count)`) from that same walk. It also removes compute_cdhash_macho's pre-delegation scan that re-walked sb->index and ranked hashType, leaving `return csblob_cdhash((CS_GenericBlob *)cs_data, cs_end - cs_data, cdhash);` so the blob parser receives the already-resolved region rather than raw header fields. Comments state the signature's own shape is validated later by csblob_cdhash, keeping image-world window bounds separate from blob interpretation.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Image-world translations stay at the image boundary: resolving the signature load command's dataoff/datasize window — including the byte order of those header-world fields and the not-in-front-of-the-header, inside-the-mapped-image window bounds — happens where the header is parsed, and the blob interpretation the repair routes to receives its region already resolved rather than re-deriving it from image fields.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In macho_validate the agent patch retains the first-command-only guard `if (lc_cmd == LC_CODE_SIGNATURE && !checked_cs_cmd)` with `checked_cs_cmd = true;` and the comment \"Only the first code signature command is ever consulted later, so only that one is checked here too,\" so the load-command scan still resolves at most the first LC_CODE_SIGNATURE. The patch also deletes the entire pre-delegation superblob/index walk in compute_cdhash_macho, leaving no repaired path that iterates over signature commands.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Singular-command behavior is preserved: code that scans load commands for the code signature still resolves at most the first LC_CODE_SIGNATURE, and no repaired path starts iterating over every signature command when the surrounding pipeline only ever consumes one.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "compute_cdhash_macho now ends with `return csblob_cdhash((CS_GenericBlob *)cs_data, cs_end - cs_data, cdhash);`, so any rejection by the blob parser propagates as a false return to its caller, and the earlier `if (cs_data == NULL || cs_end <= cs_data) { ERROR(\"Invalid code signature\"); return false; }` remains. macho_validate retains the explicit `return false;` for an out-of-range signature window (`if (!((uint8_t *)mh < cs_data && cs_data < cs_end && cs_end <= (uint8_t *)mh + size)) { return false; }`) and removes only the duplicated blob-shape checks, introducing no fall-through to success.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every decline still lands as an explicit failure at the pipeline's public boundary: accepting/declining functions still translate each rejection into the failure result their callers see (a false return, an error path, or a kCopyEnt failure code), with no fall-through that turns a discarded check into a reported success.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch deletes the duplicated blob-interpretation code rather than stranding it: in macho_validate it removes the CS_SuperBlob magic/length/count shape checks (keeping only the Mach-O range check), and in compute_cdhash_macho it removes the entire pre-delegation index-walking/hash-ranking scan, delegating solely to csblob_cdhash. No commented-out remains or uncalled helpers are left in cdhash.m. The dump.cpp CopyEntitlementData helper remains but is still called by copyEntitlementDataFromFile, so it is not a dead/unreachable remnant.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "No dead interpretation copy is left behind: an uncalled method, accessor, or single-caller helper that still encodes the moved-out blob rules (for instance an image-class payload extractor made unreachable by the repair, or a static shape probe kept defined but no longer called, or its commented-out remains) is present.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the inline blob probing in cdhash.m and rewrites the associated comments rather than leaving stale narration. In macho_validate it replaces the 'look at the embedded code signature ... decline obviously unusable images right here' comment with a range-fit comment, changes 'probed' to 'checked', and deletes the 'same shape requirements' comment along with the superblob shape block. In compute_cdhash_macho it deletes the 'Scan the embedded signature blob from here' block and comment, substituting a note that csblob_cdhash owns the blob shape. No comments describing the removed scouting/probing behavior remain at these touched sites.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Comments that narrate the removed inline behavior survive at the touched sites, describing blob probing or scouting behavior that no longer exists there.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In cdhash.m, the patch deletes the inline superblob/index/code-directory scan from compute_cdhash_macho entirely, removing locals such as sb, sig_size, sb_length, count, best_rank, cd, cd_size, and cd_rank with no leftovers. In macho_validate, the remaining cs_cmd, cs_dataoff, cs_datasize, cs_data, cs_end, and checked_cs_cmd are all still used for the LC_CODE_SIGNATURE range check; no unused or vestigial derived blob pointers, bounds helpers, or early-exit flags remain at the repaired sites.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "Half-moved wiring remains at any repaired site: locals that existed only to support the old inline reading (derived blob pointers, bounds helpers, or early-exit flags) survive unused or vestigial in the calling code.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent removes the duplicated superblob shape checks from macho_validate (magic/length/count validation block) and the entire pre-delegation index-walking/hash-ranking scan from compute_cdhash_macho, delegating all blob validation to csblob_cdhash. The problem statement confirms the blob layer already 'validate[s] and rank[s] superblobs, blob indexes, and code directories,' and the smell's own comments state its checks duplicate 'the same shape requirements the blob parsing applies' and walk 'the blob index exactly like the parser below,' so csblob_cdhash performs the same validation. The agent retains the code signature window bounds check in macho_validate (a Mach-O layer concern). The cdhash computation is unchanged—csblob_cdhash is still called with the same (cs_data, cs_end - cs_data, cdhash) arguments and no data is modified by the removed pre-scan. dump.cpp is not modified, so entitlement extraction (including fat containers via virtual GetBase/Swap) is unchanged. No new decline paths are introduced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The decision boundary is unchanged: every input the pre-repair pipeline declines stays declined (corrupt or out-of-range signature window, unusable superblob shape, no usable candidate hash flavor), every accepted binary yields the same cdhash bytes as before, and entitlement payloads that were extracted before are still extracted byte-identically, including images inside fat containers.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch deletes the smell's pre-parse superblob shape checks from macho_validate (the `ntohl(sb->length) > cs_datasize || ... || ntohl(sb->count) == 0` block) and removes the entire pre-delegation scan in compute_cdhash_macho that re-walked `sb->index` and ranked `hashType` before calling `csblob_cdhash`. No new `return false` is introduced; the only retained early check is the LC_CODE_SIGNATURE file-range bound, which the problem statement identifies as an existing decline (out-of-range signature window) and which does not interpret embedded-signature shape. Thus the repaired pipeline does not add an early path that rejects what the blob parser accepts.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repaired pipeline contains an early (pre-parse) path that newly declines an input the embedded-signature parsing accepts, widening the rejection set beyond what the current pipeline or the signature-blob code rejects.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In cdhash.m the patch deletes the duplicated blob reads that used ntohl(sb->magic/length/count and sb->index[i].type/offset) and leaves header-world fields raw as before (lc_cmd/lc_cmdsize, cs_cmd->dataoff/datasize), so no signature-blob access is re-homed onto the header discipline. No dump.cpp hunk is present, leaving CopyEntitlementData's existing split untouched: member Swap for signature->dataoff and ::Swap for super->count/index/entitlements->length.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Byte-order integrity survives the move in both files: header-world fields (magic, load-command, dataoff) resolve under the detected image swap state they were already resolved with, while on-disk signature-blob fields resolve the way the blob helpers treat them (network order in cdhash.m, the file-static swap in dump.cpp), with no access re-homed to the other discipline.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch only edits the bodies of macho_validate and compute_cdhash_macho in cdhash.m, removing the injected pre-scans; no hunk alters a function signature (the compute_cdhash_macho signature appears only as unchanged hunk-header context), dump.cpp and copyEntitlementDataFromFile are not touched at all, and no kCopyEnt* result code is renamed, renumbered, or reinterpreted.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The public surface is altered: the signatures of compute_cdhash, find_cdhash, or copyEntitlementDataFromFile change, or a kCopyEnt* result code is renamed, renumbered, or reinterpreted so an existing caller would observe a different result.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0.75,
+    "core_resolution": 0.75
+  },
+  "valid_count": 15,
+  "pass_count": 13,
+  "must_have_pass": false,
+  "macro_score": 0.875
+}

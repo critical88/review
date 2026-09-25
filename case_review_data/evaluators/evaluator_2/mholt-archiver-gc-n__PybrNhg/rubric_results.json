@@ -1,0 +1,193 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "In manager.go, the registry-holding type still owns multiple operational policy domains: `ArchiveManager` has `formats map[string]Format` and also embeds `FromDiskOptions`, `ArchiveOptions` (`ImplicitTopLevelFolder`), `ExtractOptions` (`OverwriteExisting`, `ContinueOnError`), and has `Prefix string`. Thus the type that holds the format registry still owns more than one unrelated policy domain, so the required separation is absent.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the change, the type that holds the format registry (the state that format registration writes and detection reads) does not also own any two of these unrelated domains as its own fields/methods: on-disk gathering defaults, archive-creation layout policy, extraction overwrite policy, extraction continue-on-error policy, or virtual-fs mount prefixing.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch keeps detection on the same ArchiveManager receiver that carries non-registry state. manager.go redefines ArchiveManager as `formats map[string]Format` plus embedded `FromDiskOptions`, `ArchiveOptions`, `ExtractOptions`, and `Prefix`; formats.go still has `(m ArchiveManager) identifyOne` and leaves the registration/Identify/listing/ByExtension detection pipeline on that same receiver. Detection is therefore not re-established as a self-contained registry-only owner; it remains shared with unrelated gathering/archive/extraction/prefix domains.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Format detection as a whole — registration, by-filename matching, by-stream matching (including detecting the archive inside a compressed layer), format listing, and choosing a format from a destination filename — is reachable through one cohesive owner whose carried state is only registry state; restricting or extending the supported formats requires changing that owner and nothing else.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch leaves the directory walk as a method on ArchiveManager: archiver.go still has `func (m ArchiveManager) FilesFromDisk(options *FromDiskOptions, filenames map[string]string) ([]FileInfo, error)` and the package-level function delegates to `DefaultArchiveManager.FilesFromDisk`. In manager.go, `ArchiveManager` still holds the registry via `formats map[string]Format` and embeds `ArchiveOptions` and `ExtractOptions` alongside `FromDiskOptions`. Thus on-disk gathering remains owned by the same unit that holds registry state and creation/extraction policies; no separate gathering-only unit was introduced.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "On-disk gathering — the directory walk, symlink follow/preserve handling, attribute stripping, and the disk-name-to-archive-name mapping — is owned by a single unit that holds neither registry state nor creation/extraction policies, and produces the same file list for the same explicit options as before the change.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch keeps the conveniences as instance methods on the omnibus ArchiveManager: manager.go still defines `func (m ArchiveManager) ArchiveFolder(...)` and `func (m ArchiveManager) ExtractToFolder(...)` (unchanged from smell.diff), and ArchiveManager still holds the registry plus all policy state via embedded `FromDiskOptions`, `ArchiveOptions`, `ExtractOptions`, and `Prefix`. ArchiveFolder calls `m.ByExtension`, `m.FilesFromDisk`, and `archival.Archive`; ExtractToFolder calls `m.Identify`, `extraction.Extract`, and `m.writeFileToDisk`. No separate gathering-unit or extraction-writer owners are introduced, so the operations remain methods over one type rather than compositions of explicitly cooperating owners.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The one-call archive-a-folder and extract-an-archive-to-a-directory conveniences still exist (under the same or equivalent public API), but each is now composed from explicitly cooperating owners — the detection/registry owner, the gathering unit, the extraction writer — instead of being an instance method over one type that privately holds all of the policy state.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The final ArchiveManager struct in manager.go still carries all six policy families on one declaration: formats map[string]Format (registry), embedded FromDiskOptions (disk-gathering defaults), embedded ArchiveOptions with ImplicitTopLevelFolder (creation-time layout), embedded ExtractOptions with OverwriteExisting (on-disk overwrite behavior) and ContinueOnError (continue-on-error behavior), and Prefix string (virtual-fs prefixing). This is exactly the fusion the problem statement complains about: 'that value has become the place where everything gets added' and 'keeps the format registry to itself ... walks the disk ... with its own defaults ...'.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No production (non-test) struct type in the package carries, on one declaration, instance state belonging to four or more of these areas: registry, disk-gathering defaults, creation-time layout, on-disk overwrite behavior, continue-on-error behavior, virtual-fs prefixing — regardless of the type's name or how many methods it has.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch does not remove or change the signatures of the package-level exported entry points. No hunk deletes package-level RegisterFormat, Identify, FilesFromDisk, or FileSystem; the fs.go hunk only changes an internal call from m.streamSizeBySeeking to streamSizeBySeeking, and the archiver.go/formats.go hunks revert unexported helpers (nameOnDiskToNameInArchive, streamSizeBySeeking, readAtMost) to package-level functions while leaving the exported API intact. This preserves the frozen package-level compatibility boundary described by the rubric.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every package-level function exported before the maintenance change (format registration, identification, disk gathering, file-system mounting) still exists with its exact name, signature, and documented semantics, so no external caller or in-module CLI usage had to be rewritten.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch restores readAtMost, streamSizeBySeeking, and nameOnDiskToNameInArchive as package-level functions with their original signatures and bodies, removing the injected ArchiveManager method variants and DefaultArchiveManager delegating wrappers. It also updates the two internal call sites that had been switched to methods back to the package-level helpers: ArchiveManager.FilesFromDisk calls nameOnDiskToNameInArchive directly, and FileSystem calls streamSizeBySeeking directly. Existing cross-file call sites in format implementations and tests therefore continue to resolve with unchanged semantics.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The unexported helpers that format implementation files call directly — the header-sniffing read helper (readAtMost) and the stream-sizing helper (streamSizeBySeeking), plus the disk-name mapping helper used by the walk and tests — still resolve with unchanged semantics for all their existing call sites.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent restored real implementation bodies for three internal helpers — nameOnDiskToNameInArchive, streamSizeBySeeking, and readAtMost — removing their DefaultArchiveManager pass-through wrappers and method counterparts, and reverted call sites in archiver.go and fs.go to use the package-level functions directly. However, four package-level functions introduced as pass-through wrappers by the smell remain untouched and still survive solely to reach the singleton: FilesFromDisk ('return DefaultArchiveManager.FilesFromDisk(options, filenames)'), RegisterFormat ('DefaultArchiveManager.RegisterFormat(format)'), Identify ('return DefaultArchiveManager.Identify(ctx, filename, stream)'), and FileSystem ('return DefaultArchiveManager.FileSystem(ctx, filename, stream)'). The rubric's 'no wrapper surviving solely to reach a singleton' condition is therefore not met.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Delegation scaffolding introduced by the maintenance change was cleaned up: package-level functions that existed only as pass-through wrappers to the shared default instance are now real implementations again (or the indirection is otherwise legitimately reduced), with no wrapper surviving solely to reach a singleton.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch preserves the per-instance registry capability: NewArchiveManager() returns ArchiveManager{formats: make(map[string]Format)} (empty registry), and all registry-consulting methods (RegisterFormat, Identify, identifyOne, SupportedFormats, ByExtension, ArchiveFolder, ExtractToFolder, FileSystem) consistently use m.formats. The agent reverted nameOnDiskToNameInArchive, streamSizeBySeeking, and readAtMost from methods back to package-level functions, but these are pure utilities that never consulted the format registry (they do string manipulation, seeking, and byte reading respectively), so reverting them does not create split-brain per-instance registry state. The package-level formats variable remains an alias to DefaultArchiveManager.formats (a reference to the same map), not a separate registry that some methods consult. No operation bypasses m.formats to consult package-global registry state.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The ability to operate on a private/restricted set of formats — constructing a registry owner with a chosen subset or custom formats, without package-global state — either is preserved by the new structure, or was removed deliberately along with every piece of state that existed only to support it; no half-working per-instance registry state (e.g. an instance map that some operations consult and others bypass) remains.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch removes leftover receiver-bound helpers with no independent callers: `(m ArchiveManager) nameOnDiskToNameInArchive`, `(m ArchiveManager) streamSizeBySeeking`, and `(m ArchiveManager) readAtMost` are deleted, and call sites are reverted to package-level functions (`nameInArchive := nameOnDiskToNameInArchive(...)`, `streamSizeBySeeking(stream)`, `readAtMost`). Policy flags are not orphaned: `ImplicitTopLevelFolder`, `OverwriteExisting`, and `ContinueOnError` are moved into `ArchiveOptions`/`ExtractOptions` and embedded in `ArchiveManager`, while surviving methods from smell.diff still read them (`ArchiveFolder` reads `m.ImplicitTopLevelFolder`, `writeFileToDisk` reads `m.OverwriteExisting`, `ExtractToFolder` reads `m.ContinueOnError`); `FollowSymlinks`/`ClearAttributes` are promoted from embedded `FromDiskOptions` and read in `FilesFromDisk`; `formats` and `Prefix` remain used by registry/FileSystem methods.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No struct fields exist whose only reason was the merged design and which no surviving method reads or writes: orphaned policy flags, unused registry maps, or leftover receiver-bound helpers with no callers are removed.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent repaired documentation alongside code changes. In archiver.go, the doc comments for nameOnDiskToNameInArchive and streamSizeBySeeking were restored to remove references to 'the default manager's name mangling rules' and 'the default manager's seeking logic' once those functions were reverted from methods to plain package functions. In formats.go, the readAtMost delegation wrapper and its comment referencing 'the default manager's sniffing logic' were removed. In manager.go, the ArchiveManager type declaration was rewritten: the old 'provides the facade that most programs actually want: one value that owns the registry... and performs every common archiving task' language was replaced with 'Coordination is the manager's only structural responsibility... The tunable behavior of each operation lives in its own cohesive option type — FromDiskOptions, ArchiveOptions, and ExtractOptions,' explicitly acknowledging the split of responsibilities into embedded option types.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Documentation was repaired together with the code: no doc comment still claims that package functions delegate to a default manager instance where none exists, and no type declaration still describes itself as the single high-level entry point if its responsibilities were split away.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "manager.go is retained with declarations that all belong to the ArchiveManager owner: the restructured struct (now embedding FromDiskOptions, ArchiveOptions, ExtractOptions, plus formats and Prefix), NewArchiveManager, DefaultArchiveManager, and the operation methods (SupportedFormats, ByExtension, ArchiveFolder, ExtractToFolder, writeFileToDisk, destinationPath). The import block is unchanged and every import (context, fmt, io, io/fs, log, os, path, path/filepath, sort, strings) remains used by the retained method bodies. No dead wrapper delegations or orphaned identifiers remain in manager.go; the agent also removed the DefaultArchiveManager wrapper trampolines for nameOnDiskToNameInArchive, streamSizeBySeeking, and readAtMost in archiver.go/formats.go, leaving no method bodies tied solely to the omnibus design.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "The file introduced by the maintenance change (the facade for the merged type) is either deleted entirely, or retained only with declarations that belong to one coherent owner after the split, with no unused imports, dead identifiers, or method bodies left whose only ties are to the removed omnibus design.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not modify the registration mechanism. RegisterFormat still delegates to DefaultArchiveManager.RegisterFormat, which checks for duplicate names and panics (unchanged from smell.diff). The formats map alias (var formats = DefaultArchiveManager.formats) and DefaultArchiveManager = NewArchiveManager() are untouched. The struct refactoring in manager.go only changes how policy fields are organized (embedding FromDiskOptions, ArchiveOptions, ExtractOptions) but does not alter the formats registry field, NewArchiveManager initialization, or the init()-time self-registration of built-in formats. No format is dropped, duplicated, or re-ordered.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A failure is present if built-in formats no longer self-register during package initialization in the same way before any use (a format dropped or duplicated, registration order changed so behavior differs, or duplicate-name registration no longer panics).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The smell.diff introduced path-confining extraction logic in destinationPath: cleaned := strings.TrimPrefix(path.Clean(path.Join(\"/\", nameInArchive)), \"/\"); return filepath.Join(destDir, filepath.FromSlash(cleaned)), which neutralizes absolute names and \"..\" traversal. agent.patch does not modify ExtractToFolder, writeFileToDisk, or destinationPath, so extraction-to-disk path confinement survives unchanged.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A failure is present if, wherever extraction-to-disk writing survives, an archive entry name (absolute name, parent-directory traversal, or embedded separator tricks) can cause a write outside the destination directory.",
+      "passes": true
+    },
+    {
+      "id": "R15",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A failure is present if explicitly supplied gathering options are overridden or augmented by leftover merged-design defaults (symlink following, attribute stripping), or if calling the package-level gathering function without options panics or gains behavior changes for ordinary callers.",
+      "rationale": "The merge threaded manager-owned defaults into the options path; the split must restore option precedence exactly, or explicit callers get silently different archives.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    },
+    {
+      "result": 1,
+      "evidence": "The patch does not alter identification semantics: formats.go only reverts readAtMost to a package-level function with the same body, and contains no changes to Identify, identifyOne, NoMatch, rewindReader/rewind handling, or ByExtension compressed-archive resolution. fs.go still detects via m.Identify and merely calls the equivalent package-level streamSizeBySeeking. manager.go only regroups option fields into embedded structs and does not modify the formats registry or detection logic.",
+      "valid": true,
+      "attempts": 3,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A failure is present if the documented identification semantics changed: stream-based matching bytes/rewindability guarantees, filename-only matching when no stream is given, NoMatch routing for unrecognized input, or combined compressed-archive formats no longer resolving to a format that can both extract and create.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0.75,
+    "core_resolution": 0
+  },
+  "valid_count": 15,
+  "pass_count": 9,
+  "must_have_pass": false,
+  "macro_score": 0.6875
+}

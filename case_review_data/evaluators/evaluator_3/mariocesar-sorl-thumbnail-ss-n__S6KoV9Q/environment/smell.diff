@@ -1,0 +1,183 @@
+diff --git a/sorl/thumbnail/base.py b/sorl/thumbnail/base.py
+index 4645078..854ef21 100644
+--- a/sorl/thumbnail/base.py
++++ b/sorl/thumbnail/base.py
+@@ -1,11 +1,14 @@
++import hashlib
+ import logging
+ import os
+ import re
+ 
++from django.utils.encoding import force_str
++
+ from sorl.thumbnail import default
+ from sorl.thumbnail.conf import defaults as default_settings
+ from sorl.thumbnail.conf import settings
+-from sorl.thumbnail.helpers import serialize, tokey
++from sorl.thumbnail.helpers import serialize
+ from sorl.thumbnail.images import DummyImageFile, ImageFile
+ from sorl.thumbnail.parsers import parse_geometry
+ 
+@@ -201,7 +204,11 @@ class ThumbnailBackend:
+         """
+         Computes the destination filename.
+         """
+-        key = tokey(source.key, geometry_string, serialize(options))
++        # Identical geometry, options and source must always map to the same
++        # destination name, so the salt digest is built here where it is used.
++        salt = '||'.join([force_str(arg) for arg in
++                         (source.key, geometry_string, serialize(options))])
++        key = hashlib.md5(salt.encode(), usedforsecurity=False).hexdigest()
+         # make some subdirs
+         path = '%s/%s/%s' % (key[:2], key[2:4], key)
+         return '%s%s.%s' % (settings.THUMBNAIL_PREFIX, path, EXTENSIONS[options['format']])
+diff --git a/sorl/thumbnail/helpers.py b/sorl/thumbnail/helpers.py
+index 24cf740..44752d4 100644
+--- a/sorl/thumbnail/helpers.py
++++ b/sorl/thumbnail/helpers.py
+@@ -1,10 +1,8 @@
+-import hashlib
+ import json
+ import math
+ from importlib import import_module
+ 
+ from django.core.exceptions import ImproperlyConfigured
+-from django.utils.encoding import force_str
+ 
+ 
+ class ThumbnailError(Exception):
+@@ -36,14 +34,6 @@ def toint(number):
+     return int(number)
+ 
+ 
+-def tokey(*args):
+-    """
+-    Computes a unique key from arguments given.
+-    """
+-    salt = '||'.join([force_str(arg) for arg in args])
+-    return hashlib.md5(salt.encode(), usedforsecurity=False).hexdigest()
+-
+-
+ def serialize(obj):
+     return json.dumps(obj, cls=SortedJSONEncoder)
+ 
+diff --git a/sorl/thumbnail/images.py b/sorl/thumbnail/images.py
+index 890a3fa..b9bbebe 100644
+--- a/sorl/thumbnail/images.py
++++ b/sorl/thumbnail/images.py
+@@ -1,3 +1,4 @@
++import hashlib
+ import json
+ import os
+ import platform
+@@ -15,7 +16,7 @@ from django.utils.functional import LazyObject, empty
+ from sorl.thumbnail import default
+ from sorl.thumbnail.conf import settings
+ from sorl.thumbnail.default import storage as default_storage
+-from sorl.thumbnail.helpers import ThumbnailError, deserialize, get_module_class, tokey
++from sorl.thumbnail.helpers import ThumbnailError, deserialize, get_module_class
+ from sorl.thumbnail.parsers import parse_geometry
+ 
+ url_pat = re.compile(r'^(https?|ftp):\/\/')
+@@ -202,7 +203,12 @@ class ImageFile(BaseImageFile):
+ 
+     @property
+     def key(self):
+-        return tokey(self.name, self.serialize_storage(use_backend_name=True))
++        # Identity of this file inside the key value store. Kept local to the
++        # hot path instead of delegating to a helper every time an image is
++        # serialized or looked up.
++        salt = '||'.join([force_str(arg) for arg in
++                          (self.name, self.serialize_storage(use_backend_name=True))])
++        return hashlib.md5(salt.encode(), usedforsecurity=False).hexdigest()
+ 
+     def serialize(self):
+         return serialize_image_file(self)
+diff --git a/sorl/thumbnail/kvstores/base.py b/sorl/thumbnail/kvstores/base.py
+index d658e81..7fefdaf 100644
+--- a/sorl/thumbnail/kvstores/base.py
++++ b/sorl/thumbnail/kvstores/base.py
+@@ -7,20 +7,6 @@ from sorl.thumbnail.helpers import ThumbnailError, deserialize, serialize
+ from sorl.thumbnail.images import deserialize_image_file, serialize_image_file
+ 
+ 
+-def add_prefix(key, identity='image'):
+-    """
+-    Adds prefixes to the key
+-    """
+-    return '||'.join([settings.THUMBNAIL_KEY_PREFIX, identity, key])
+-
+-
+-def del_prefix(key):
+-    """
+-    Removes prefixes from the key
+-    """
+-    return key.split('||')[-1]
+-
+-
+ class KVStoreBase:
+     def __init__(self):
+         if not getattr(self, '_cached_db_kvstore', False):
+@@ -156,7 +142,9 @@ class KVStoreBase:
+         prefix. Use this in emergency situations. Normally you would probably
+         want to use the ``cleanup`` method instead.
+         """
+-        all_keys = self._find_keys_raw(settings.THUMBNAIL_KEY_PREFIX)
++        # Only ever touch the composite keys of this installation, never raw
++        # keys of other applications that happen to share the prefix.
++        all_keys = self._find_keys_raw(settings.THUMBNAIL_KEY_PREFIX + '||')
+         if all_keys:
+             self._delete_raw(*all_keys)
+ 
+@@ -164,7 +152,8 @@ class KVStoreBase:
+         """
+         Deserializing, prefix wrapper for _get_raw
+         """
+-        value = self._get_raw(add_prefix(key, identity))
++        value = self._get_raw('%s||%s||%s' % (
++            settings.THUMBNAIL_KEY_PREFIX, identity, key))
+ 
+         if not value:
+             return None
+@@ -182,22 +171,22 @@ class KVStoreBase:
+             s = serialize_image_file(value)
+         else:
+             s = serialize(value)
+-        self._set_raw(add_prefix(key, identity), s)
++        self._set_raw('||'.join([settings.THUMBNAIL_KEY_PREFIX, identity, key]), s)
+ 
+     def _delete(self, key, identity='image'):
+         """
+         Prefix wrapper for _delete_raw
+         """
+-        self._delete_raw(add_prefix(key, identity))
++        self._delete_raw(f'{settings.THUMBNAIL_KEY_PREFIX}||{identity}||{key}')
+ 
+     def _find_keys(self, identity='image'):
+         """
+         Finds and returns all keys for identity,
+         """
+-        prefix = add_prefix('', identity)
++        prefix = settings.THUMBNAIL_KEY_PREFIX + '||' + identity + '||'
+         raw_keys = self._find_keys_raw(prefix) or []
+         for raw_key in raw_keys:
+-            yield del_prefix(raw_key)
++            yield raw_key.split('||')[-1]
+ 
+     #
+     # Methods which key-value stores need to implement
+diff --git a/sorl/thumbnail/kvstores/cached_db_kvstore.py b/sorl/thumbnail/kvstores/cached_db_kvstore.py
+index 6290c89..95b0b5c 100644
+--- a/sorl/thumbnail/kvstores/cached_db_kvstore.py
++++ b/sorl/thumbnail/kvstores/cached_db_kvstore.py
+@@ -25,7 +25,9 @@ class KVStore(KVStoreBase):
+         We can clear the database more efficiently using the prefix here rather
+         than calling :meth:`_delete_raw`.
+         """
+-        prefix = settings.THUMBNAIL_KEY_PREFIX
++        # Only our own composite keys carry the separator right after the
++        # prefix, so this never deletes rows belonging to other utilities.
++        prefix = settings.THUMBNAIL_KEY_PREFIX + '||'
+         for key in self._find_keys_raw(prefix):
+             self.cache.delete(key)
+         KVStoreModel.objects.filter(key__startswith=prefix).delete()

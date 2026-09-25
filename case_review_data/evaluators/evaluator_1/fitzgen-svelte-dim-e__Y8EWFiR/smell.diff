@@ -1,0 +1,504 @@
+diff --git a/analyze/analyses/dominators/mod.rs b/analyze/analyses/dominators/mod.rs
+index 79d99e1..409bb7d 100644
+--- a/analyze/analyses/dominators/mod.rs
++++ b/analyze/analyses/dominators/mod.rs
+@@ -1,13 +1,13 @@
+-use std::collections::BTreeMap;
++use std::collections::{BTreeMap, BTreeSet};
+ 
+ use regex;
+ 
++use petgraph::visit::Walker;
++
+ use twiggy_ir as ir;
+ use twiggy_opt as opt;
+ use twiggy_traits as traits;
+ 
+-use crate::analyses::garbage;
+-
+ mod emit;
+ 
+ struct DominatorTree {
+@@ -37,40 +37,45 @@ pub fn dominators(
+     let dominator_items = if arguments.is_empty() {
+         vec![items.meta_root()]
+     } else if opts.using_regexps() {
++        // Match every item whose name matches any of the given regular
++        // expressions, then order the survivors by descending retained size.
+         let regexps = regex::RegexSet::new(arguments)?;
+-        let mut sorted_items: Vec<_> = items
+-            .iter()
+-            .filter(|item| regexps.is_match(&item.name()))
+-            .map(|item| item.id())
+-            .collect();
++        let mut sorted_items: Vec<ir::Id> = Vec::new();
++        for item in items.iter() {
++            if regexps.is_match(&item.name()) {
++                sorted_items.push(item.id());
++            }
++        }
+         sorted_items.sort_by_key(|id| -i64::from(items.retained_size(*id)));
+         sorted_items
+     } else {
+-        arguments
+-            .iter()
+-            .filter_map(|name| items.get_item_by_name(name))
+-            .map(|item| item.id())
+-            .collect()
++        // Match by exact name instead of by regular expression.
++        let mut matched_items: Vec<ir::Id> = Vec::new();
++        for name in arguments.iter() {
++            if let Some(item) = items.get_item_by_name(name) {
++                matched_items.push(item.id());
++            }
++        }
++        matched_items
+     };
+ 
+-    let tree = DominatorTree {
+-        tree: items.dominator_tree().clone(),
+-        items: dominator_items,
+-        opts: opts.clone(),
+-        unreachable_items_summary: summarize_unreachable_items(items, opts),
+-    };
+-
+-    Ok(Box::new(tree) as Box<_>)
+-}
+-
+-fn summarize_unreachable_items(
+-    items: &mut ir::Items,
+-    opts: &opt::Dominators,
+-) -> Option<UnreachableItemsSummary> {
+-    let (size, count) = garbage::get_unreachable_items(&items)
+-        .map(|item| item.size())
+-        .fold((0, 0), |(s, c), curr| (s + curr, c + 1));
+-    if opts.items().is_empty() && size > 0 {
++    // Summarize the items that no export or public function reaches. A DFS from
++    // the meta root finds everything retained transitively; everything left over
++    // is unreachable. This is only surfaced when the caller did not name any
++    // item explicitly and there is at least one unreachable byte to report.
++    let mut reachable_set: BTreeSet<ir::Id> = BTreeSet::new();
++    for id in petgraph::visit::Dfs::new(&*items, items.meta_root()).iter(&*items) {
++        reachable_set.insert(id);
++    }
++    let mut size = 0;
++    let mut count = 0;
++    for item in items.iter() {
++        if !reachable_set.contains(&item.id()) {
++            size += item.size();
++            count += 1;
++        }
++    }
++    let unreachable_items_summary = if opts.items().is_empty() && size > 0 {
+         Some(UnreachableItemsSummary {
+             count,
+             size,
+@@ -78,5 +83,14 @@ fn summarize_unreachable_items(
+         })
+     } else {
+         None
+-    }
++    };
++
++    let tree = DominatorTree {
++        tree: items.dominator_tree().clone(),
++        items: dominator_items,
++        opts: opts.clone(),
++        unreachable_items_summary,
++    };
++
++    Ok(Box::new(tree) as Box<_>)
+ }
+diff --git a/analyze/analyses/monos/mod.rs b/analyze/analyses/monos/mod.rs
+index b6c1a3a..ff6ab8a 100644
+--- a/analyze/analyses/monos/mod.rs
++++ b/analyze/analyses/monos/mod.rs
+@@ -16,156 +16,116 @@ struct Monos {
+     monos: Vec<MonosEntry>,
+ }
+ 
+-/// Type alias used to represent a map of generic function names and instantiations.
+-type MonosMap<'a> = BTreeMap<&'a str, Vec<(String, u32)>>;
+-
+-/// Collect the monomorphizations of generic functions into a map, then
+-/// process the entries and sort the resulting vector.
+-fn collect_monomorphizations<'a>(
+-    items: &'a ir::Items,
+-    opts: &opt::Monos,
+-) -> anyhow::Result<MonosMap<'a>> {
++/// Find bloaty monomorphizations of generic functions.
++pub fn monos(items: &mut ir::Items, opts: &opt::Monos) -> anyhow::Result<Box<dyn traits::Emit>> {
+     let args_given = !opts.functions().is_empty();
+     let using_regexps = opts.using_regexps();
+     let regexps = regex::RegexSet::new(opts.functions())?;
+ 
+-    let unsorted_monos: BTreeMap<&'a str, BTreeSet<(String, u32)>> = items
+-        .iter()
+-        .filter_map(|item| {
+-            if let Some(generic) = item.monomorphization_of() {
+-                Some((generic, item))
++    // Gather each generic function and its monomorphizations. Duplicated
++    // instantiations of the same generic are collapsed, then the instantiations
++    // of every generic are sorted by descending size and, on ties, by name.
++    let mut per_generic: BTreeMap<&str, BTreeSet<(String, u32)>> = BTreeMap::new();
++    for item in items.iter() {
++        if let Some(generic) = item.monomorphization_of() {
++            let keep = if args_given {
++                if using_regexps {
++                    regexps.is_match(generic)
++                } else {
++                    opts.functions().iter().any(|name| name == generic)
++                }
+             } else {
+-                None
++                true
++            };
++            if keep {
++                per_generic
++                    .entry(generic)
++                    .or_insert_with(BTreeSet::new)
++                    .insert((item.name().to_string(), item.size()));
+             }
+-        })
+-        .filter(|(generic, _)| match (args_given, using_regexps) {
+-            (true, true) => regexps.is_match(generic),
+-            (true, false) => opts.functions().iter().any(|name| name == generic),
+-            (false, _) => true,
+-        })
+-        .fold(BTreeMap::new(), |mut monos, (generic, inst)| {
+-            monos
+-                .entry(generic)
+-                .or_insert_with(BTreeSet::new)
+-                .insert((inst.name().to_string(), inst.size()));
+-            monos
+-        });
+-
+-    Ok(unsorted_monos
+-        .into_iter()
+-        .map(|(generic, inst_set)| {
+-            let mut insts = inst_set.into_iter().collect::<Vec<_>>();
+-            insts.sort_by(|(a_name, a_size), (b_name, b_size)| {
+-                b_size.cmp(a_size).then(a_name.cmp(b_name))
+-            });
+-            (generic, insts)
+-        })
+-        .collect())
+-}
+-
+-/// Helper function usedd to summarize a sequence of `MonosEntry` objects.
+-/// Returns a tuple representing the number of items summarized, the total
+-/// size of the items, and the total approximate potential savings.
+-fn summarize_entries<'a>(entries: impl Iterator<Item = &'a MonosEntry>) -> (usize, u32, u32) {
+-    entries.fold(
+-        (0, 0, 0),
+-        |(total_cnt, total_size, total_savings),
+-         MonosEntry {
+-             insts, size, bloat, ..
+-         }| {
+-            (
+-                total_cnt + 1 + insts.len(),
+-                total_size + size,
+-                total_savings + bloat,
+-            )
+-        },
+-    )
+-}
+-
+-/// Helper function used to summarize a sequence of tuples representing
+-/// instantiations of a generic function. Returns a tuple representing the
+-/// number of instantiations found, and the total size.
+-fn summarize_insts<'a>(entries: impl Iterator<Item = &'a (String, u32)>) -> (u32, u32) {
+-    entries.fold((0, 0), |(total_cnt, total_size), (_, size)| {
+-        (total_cnt + 1, total_size + size)
+-    })
+-}
++        }
++    }
+ 
+-/// Find the approximate potential savings by calculating the benefits of
+-/// removing the largest instantiation, and the benefits of removing an
+-/// average instantiation. Returns a tuple containing total size, and bloat.
+-fn calculate_total_and_bloat(insts: &[(String, u32)]) -> Option<(u32, u32)> {
+-    if let Some(max) = insts.iter().map(|(_, size)| size).max() {
+-        let total_size = insts.iter().map(|(_, size)| size).sum::<u32>();
+-        let inst_cnt = insts.len() as u32;
+-        let size_per_inst = total_size / inst_cnt;
+-        let avg_savings = size_per_inst * (inst_cnt - 1);
+-        let removing_largest_savings = total_size - max;
+-        let approx_potential_savings = cmp::min(avg_savings, removing_largest_savings);
+-        Some((total_size, approx_potential_savings))
+-    } else {
+-        None
++    let mut monos_map: BTreeMap<&str, Vec<(String, u32)>> = BTreeMap::new();
++    for (generic, inst_set) in per_generic {
++        let mut insts = inst_set.into_iter().collect::<Vec<_>>();
++        insts.sort_by(|(a_name, a_size), (b_name, b_size)| {
++            b_size.cmp(a_size).then(a_name.cmp(b_name))
++        });
++        monos_map.insert(generic, insts);
+     }
+-}
+ 
+-/// Process all of the monorphizations, into a vector of `MonosEntry` objects.
+-fn process_monomorphizations(monos_map: MonosMap, opts: &opt::Monos) -> Vec<MonosEntry> {
+-    let mut monos = monos_map
+-        .into_iter()
+-        .filter_map(|(g, insts)| {
+-            calculate_total_and_bloat(&insts).map(|(total, bloat)| (g, insts, total, bloat))
+-        })
+-        .map(|(g, mut insts, t, b)| {
+-            // Truncate `insts` according to the relevant options before
+-            // we map these values into `MonosEntry` objects.
+-            if opts.only_generics() {
++    // Walk each generic's instantiations, summarizing the bloat and truncating
++    // the list according to the requested options.
++    let only_generics = opts.only_generics();
++    let max_monos = opts.max_monos() as usize;
++    let mut monos: Vec<MonosEntry> = Vec::new();
++    for (generic, mut insts) in monos_map {
++        let max = insts.iter().map(|(_, size)| *size).max();
++        if let Some(max) = max {
++            let total_size = insts.iter().map(|(_, size)| *size).sum::<u32>();
++            let inst_cnt = insts.len() as u32;
++            let size_per_inst = total_size / inst_cnt;
++            let avg_savings = size_per_inst * (inst_cnt - 1);
++            let removing_largest_savings = total_size - max;
++            let approx_potential_savings = cmp::min(avg_savings, removing_largest_savings);
++
++            if only_generics {
+                 insts.truncate(0);
+             } else {
+-                let max_monos = opts.max_monos() as usize;
+-                let (rem_cnt, rem_size) = summarize_insts(insts.iter().skip(max_monos));
++                let mut rem_cnt: u32 = 0;
++                let mut rem_size: u32 = 0;
++                for (_, size) in insts.iter().skip(max_monos) {
++                    rem_cnt += 1;
++                    rem_size += *size;
++                }
+                 insts.truncate(max_monos);
+                 if rem_cnt > 0 {
+                     insts.push((format!("... and {} more.", rem_cnt), rem_size));
+                 }
+-            };
+-            (g, insts, t, b)
+-        })
+-        .map(|(name, insts, size, bloat)| MonosEntry {
+-            name: name.to_string(),
+-            insts,
+-            size,
+-            bloat,
+-        })
+-        .collect::<Vec<_>>();
++            }
++
++            monos.push(MonosEntry {
++                name: generic.to_string(),
++                insts,
++                size: total_size,
++                bloat: approx_potential_savings,
++            });
++        }
++    }
+     monos.sort();
+-    monos
+-}
+ 
+-/// Adds entries to summarize remaining rows that will be truncated, and
+-/// totals for the entire set of monomorphizations.
+-fn add_stats(mut monos: Vec<MonosEntry>, opts: &opt::Monos) -> Vec<MonosEntry> {
++    // Append a row that summarizes the generics we are truncating, plus a row
++    // spanning the totals for the whole set, before truncating the display.
+     let max_generics = opts.max_generics() as usize;
+-
+-    // Create an entry to represent the remaining rows that will be truncated,
+-    // only if there are more generics than we will display.
+-    let remaining: Option<MonosEntry> = {
+-        if monos.len() > max_generics {
+-            let (rem_cnt, rem_size, rem_savings) =
+-                summarize_entries(monos.iter().skip(max_generics));
+-            Some(MonosEntry {
+-                name: format!("... and {} more.", rem_cnt),
+-                size: rem_size,
+-                insts: vec![],
+-                bloat: rem_savings,
+-            })
+-        } else {
+-            None
++    let remaining: Option<MonosEntry> = if monos.len() > max_generics {
++        let mut rem_cnt: usize = 0;
++        let mut rem_size: u32 = 0;
++        let mut rem_savings: u32 = 0;
++        for entry in monos.iter().skip(max_generics) {
++            rem_cnt += 1 + entry.insts.len();
++            rem_size += entry.size;
++            rem_savings += entry.bloat;
+         }
++        Some(MonosEntry {
++            name: format!("... and {} more.", rem_cnt),
++            size: rem_size,
++            insts: vec![],
++            bloat: rem_savings,
++        })
++    } else {
++        None
+     };
+ 
+-    // Create an entry to represent the 'total' summary.
+     let total = {
+-        let (total_cnt, total_size, total_savings) = summarize_entries(monos.iter());
++        let mut total_cnt: usize = 0;
++        let mut total_size: u32 = 0;
++        let mut total_savings: u32 = 0;
++        for entry in monos.iter() {
++            total_cnt += 1 + entry.insts.len();
++            total_size += entry.size;
++            total_savings += entry.bloat;
++        }
+         MonosEntry {
+             name: format!("Σ [{} Total Rows]", total_cnt),
+             size: total_size,
+@@ -174,19 +134,11 @@ fn add_stats(mut monos: Vec<MonosEntry>, opts: &opt::Monos) -> Vec<MonosEntry> {
+         }
+     };
+ 
+-    // Truncate the vector, and add the 'remaining' and 'total' summary entries.
+     monos.truncate(max_generics);
+     if let Some(remaining) = remaining {
+         monos.push(remaining);
+     }
+     monos.push(total);
+-    monos
+-}
+ 
+-/// Find bloaty monomorphizations of generic functions.
+-pub fn monos(items: &mut ir::Items, opts: &opt::Monos) -> anyhow::Result<Box<dyn traits::Emit>> {
+-    let monos_map = collect_monomorphizations(items, opts)?;
+-    let mut monos = process_monomorphizations(monos_map, opts);
+-    monos = add_stats(monos, opts);
+     Ok(Box::new(Monos { monos }) as Box<_>)
+ }
+diff --git a/analyze/analyses/paths/mod.rs b/analyze/analyses/paths/mod.rs
+index 70b84e0..196dda9 100644
+--- a/analyze/analyses/paths/mod.rs
++++ b/analyze/analyses/paths/mod.rs
+@@ -27,74 +27,64 @@ pub fn paths(items: &mut ir::Items, opts: &opt::Paths) -> anyhow::Result<Box<dyn
+ 
+     // Initialize the collection of Id values whose retaining paths we will emit.
+     let opts = opts.clone();
+-    let entries = get_starting_positions(items, &opts)?
+-        .iter()
+-        .map(|id| create_entry(*id, items, &opts, &mut BTreeSet::new()))
+-        .collect();
+-
+-    let paths = Paths { opts, entries };
+ 
+-    Ok(Box::new(paths) as Box<_>)
+-}
+-
+-/// This helper function is used to collect the `ir::Id` values for the top-most
+-/// path entries for the `Paths` object, based on the given options.
+-fn get_starting_positions(items: &ir::Items, opts: &opt::Paths) -> anyhow::Result<Vec<ir::Id>> {
+-    // Collect Id's if no arguments are given and we are ascending the retaining paths.
+-    let get_functions_default = || -> Vec<ir::Id> {
+-        let mut sorted_items = items
+-            .iter()
+-            .filter(|item| item.id() != items.meta_root())
+-            .collect::<Vec<_>>();
+-        sorted_items.sort_by(|a, b| b.size().cmp(&a.size()));
+-        sorted_items.iter().map(|item| item.id()).collect()
+-    };
++    let args_given = !opts.functions().is_empty();
++    let using_regexps = opts.using_regexps();
++    let descending = opts.descending();
+ 
+-    // Collect Id's if no arguments are given and we are descending the retaining paths.
+-    let get_functions_default_desc = || -> Vec<ir::Id> {
++    // Resolve the top-most path entries inline, choosing the strategy that
++    // matches the requested options rather than delegating to a helper that
++    // no other caller needed.
++    let starting_positions: Vec<ir::Id> = if args_given {
++        if using_regexps {
++            // Treat the arguments as regular expressions and collect any item
++            // whose name matches any of them.
++            let regexps = regex::RegexSet::new(opts.functions())?;
++            let mut matches = Vec::new();
++            for item in items.iter() {
++                if regexps.is_match(item.name()) {
++                    matches.push(item.id());
++                }
++            }
++            matches
++        } else {
++            // Treat the arguments as exact names and look each one up.
++            let mut matches = Vec::new();
++            for s in opts.functions().iter() {
++                if let Some(item) = items.get_item_by_name(s) {
++                    matches.push(item.id());
++                }
++            }
++            matches
++        }
++    } else if descending {
++        // No arguments were given and we are descending: start from the meta
++        // root's neighbors, sorted by descending size.
+         let mut roots = items
+             .neighbors(items.meta_root())
+             .map(|id| &items[id])
+             .collect::<Vec<_>>();
+         roots.sort_by(|a, b| b.size().cmp(&a.size()));
+         roots.into_iter().map(|item| item.id()).collect()
+-    };
+-
+-    // Collect Id's if arguments were given that should be used as regular expressions.
+-    let get_regexp_matches = || -> anyhow::Result<Vec<ir::Id>> {
+-        let regexps = regex::RegexSet::new(opts.functions())?;
+-        let matches = items
++    } else {
++        // No arguments were given and we are ascending: start from every item
++        // but the meta root, sorted by descending size.
++        let mut sorted_items = items
+             .iter()
+-            .filter(|item| regexps.is_match(item.name()))
+-            .map(|item| item.id())
+-            .collect();
+-        Ok(matches)
++            .filter(|item| item.id() != items.meta_root())
++            .collect::<Vec<_>>();
++        sorted_items.sort_by(|a, b| b.size().cmp(&a.size()));
++        sorted_items.iter().map(|item| item.id()).collect()
+     };
+ 
+-    // Collect Id's if arguments were given that should be used as exact names.
+-    let get_exact_matches = || -> Vec<ir::Id> {
+-        opts.functions()
+-            .iter()
+-            .filter_map(|s| items.get_item_by_name(s))
+-            .map(|item| item.id())
+-            .collect()
+-    };
++    let entries = starting_positions
++        .iter()
++        .map(|id| create_entry(*id, items, &opts, &mut BTreeSet::new()))
++        .collect();
+ 
+-    // Collect the starting positions based on the relevant options given.
+-    // If arguments were given, search for matches depending on whether or
+-    // not these should be treated as regular expressions. Otherwise, collect
+-    // the starting positions based on the direction we will be traversing.
+-    let args_given = !opts.functions().is_empty();
+-    let using_regexps = opts.using_regexps();
+-    let descending = opts.descending();
+-    let res = match (args_given, using_regexps, descending) {
+-        (true, true, _) => get_regexp_matches()?,
+-        (true, false, _) => get_exact_matches(),
+-        (false, _, true) => get_functions_default_desc(),
+-        (false, _, false) => get_functions_default(),
+-    };
++    let paths = Paths { opts, entries };
+ 
+-    Ok(res)
++    Ok(Box::new(paths) as Box<_>)
+ }
+ 
+ /// Create a `PathsEntry` object for the given item.

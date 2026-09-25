@@ -1,0 +1,153 @@
+{
+  "rubrics": [
+    {
+      "result": 1,
+      "evidence": "In packages/geofire-common/src/index.ts, the agent's patch reverses the split-pair smell: (1) validateLocationParts(latitude, longitude) is removed and validation is merged back into validateLocation(location: Geopoint) which destructures internally; (2) geohashEncodeBits changes from (longitude, latitude, precision) to (location: Geopoint, precision: number), keeping precision as a separate parameter; (3) boundingBoxPoints(latitude, longitude, radius) is removed and its body is inlined into boundingBoxCoordinates(center: Geopoint, radius: number), keeping radius separate; (4) haversineKilometers changes from (latitude1, longitude1, latitude2, longitude2) to (location1: Geopoint, location2: Geopoint). All internal seams now accept one position as a grouped location value, and genuinely independent neighbors (radius, precision) remain ordinary separate parameters.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "In the geofire-common algorithm source, the internal seams that carry one position (validation of the coordinate values, geohash encoding, bounding-box geometry, distance computation) each accept the position as one grouped location value; no such seam still takes one position as separate latitude/longitude scalar parameters, and genuinely independent neighbors (radius, precision, bit count, geohash) remain ordinary separate parameters.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch regroups locations as [latitude, longitude] values and preserves identity at every seam. In geofire-common, geohashEncodeBits now takes `location: Geopoint`, destructures `const [latitude, longitude] = location`, and keeps the bit interleave `const val = even ? longitude : latitude` — the algorithm's slot order is unchanged, so the geohash is identical. boundingBoxCoordinates inlines the points with `const [latitude, longitude] = center` and returns pairs like `[latitude, wrapLongitude(longitude - longDegs)]` in correct order. distanceBetween calls `haversineKilometers(location1, location2)` where each location is destructured separately (`[latitude1, longitude1]`, `[latitude2, longitude2]`), so the two positions travel as two separate grouped values with correctly paired slots, not a flattened container. In geofire, encodeGeoFireObject(location, geohash) stores `'l': [location[0], location[1]]` preserving order; GeoQuery stores `_center: Geopoint` as `[queryCriteria.center[0], queryCriteria.center[1]]`, _updateLocation(key, location) and _distanceToCenter(location) pass whole grouped values, with _distanceToCenter calling `distanceBetween(location, this._center)` as two separate grouped values. No transposition at any boundary.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Grouping preserves location identity: every internal grouped value treated as a location carries [latitude, longitude] in that order (a value reaching one of these seams is never transposed at the boundary), the geohash produced for a given point is unchanged (the bit interleave still applies the slots in the algorithm's order without re-reversing the pair inside the grouped value), and where two positions meet (distance between a tracked point and the query center, or between two locations) they travel as two separate grouped values whose slots are correctly paired - not as one flattened multi-number container and not with the two positions' numbers interchanged.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch replaces the two sibling scalar fields `_centerLat` and `_centerLng` with a single grouped field `private _center: Geopoint` in GeoQuery.ts. The center's consumers now use this one value directly: `_listenForNewGeohashes` calls `geohashQueryBounds(this._center, ...)`, `_distanceToCenter` calls `distanceBetween(location, this._center)`, `updateCriteria` assigns `this._center = [...]`, and the `center()` getter returns from `this._center`. This removes the smell's pattern of rebuilding an array from two separate number members at each boundary.",
+      "valid": true,
+      "attempts": 5,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "GeoQuery holds the query center as one grouped center value rather than as two sibling scalar fields, and the center's consumers (the geohash-bounds recomputation, the public center() getter, criteria updates, and per-key distance measurements against the center) use that one value directly instead of recombining two separate number members at each boundary.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch restores the grouped-location flow on the realtime ingestion path. In _childAddedCallback and _childChangedCallback, the decoded snapshot location is passed as one value: `this._updateLocation(geoFireGetKey(locationDataSnapshot), location)` instead of the smell's `location[0], location[1]`. The _updateLocation seam now takes `(key: string, location: Geopoint)` rather than two scalar params. Inside, it calls `this._distanceToCenter(location)` and `geohashForLocation(location)` with the grouped value, stores `location: [latitude, longitude]` as one array, and dispatches `[latitude, longitude]` to _fireCallbacksForKey. _distanceToCenter itself is restored to `(location: Geopoint)` and calls `distanceBetween(location, this._center)`. The updateCriteria and _removeLocation paths also pass `locationDict.location` / `currentLocation` as one value to _distanceToCenter.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Incoming realtime locations reach the GeoQuery recording/tracking logic as one grouped value on the child-added and child-changed paths: the decoded snapshot location is not split into two scalars that are then passed as separate arguments into the engine's location-update seam, and that recording path stores, compares and dispatches the position as one value.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In packages/geofire/src/GeoFire.ts, the write path now passes the grouped location directly: `newData[key] = encodeGeoFireObject(location, geohash);` (removing the prior `const [latitude, longitude] = location;` destructuring). In packages/geofire/src/databaseUtils.ts, the codec signature is restored to take one grouped value: `export function encodeGeoFireObject(location: Geopoint, geohash: Geohash): Document`, with `validateLocation(location)` and `return { '.priority': geohash, 'g': geohash, 'l': [location[0], location[1]] };`. The codec no longer accepts separate latitude/longitude parameters beside the geohash, and the persisted document shape remains identical.",
+      "valid": true,
+      "attempts": 6,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "On the write path, GeoFire.set passes the validated location to the storage codec as one grouped value, and the storage codec encodes the stored document ({'.priority', 'g', 'l'} with the location field) from that one value without taking the position as separate latitude/longitude parameters beside the derived geohash.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In the agent's patch, the criteria-update loop in updateCriteria calls `this._distanceToCenter(locationDict.location)` passing the tracked record's stored location as a single grouped Geopoint value without destructuring it into scalar locals. The `_distanceToCenter` method signature is now `_distanceToCenter(location: Geopoint)` and internally calls `distanceBetween(location, this._center)`, measuring both the tracked position and the center as grouped values. The center is stored as `this._center: Geopoint` rather than split into `_centerLat`/`_centerLng` scalars. This contrasts with the smell.diff which destructured `const [keyLatitude, keyLongitude] = locationDict.location` and passed them as separate scalar arguments to a scalar `_distanceToCenter(latitude, longitude)` seam.",
+      "valid": true,
+      "attempts": 4,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "During criteria updates, the per-key distance recomputation iterates the tracked locations and measures each tracked position and the new center as grouped values (the tracked record's stored location remains a single grouped value), without destructuring a tracked location into scalar locals only to pass them as separate arguments to a distance seam.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In the smell, the key-removal branch split the removed location: `this._distanceToCenter(currentLocation[0], currentLocation[1])`. The agent's patch changes this to `this._distanceToCenter(currentLocation)`, passing the last known position as one grouped value. The helper was also regrouped to `_distanceToCenter(location: Geopoint)` which calls `distanceBetween(location, this._center)`, so the removal path now computes distance from one grouped position and the grouped center (`this._center`) without taking the removed location apart into two scalars.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The key-removal path (the exited-key distance computation performed when a location is removed, using the last known position) computes its distance from one grouped position and the grouped center value, without taking the removed location apart into two scalars for a helper.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes all split-coordinate seams introduced by the smell. In geofire-common/src/index.ts, the internal helpers validateLocationParts, boundingBoxPoints, and the scalar-signature geohashEncodeBits(longitude, latitude, precision) and haversineKilometers(latitude1, longitude1, latitude2, longitude2) are eliminated; geohashEncodeBits and haversineKilometers now accept grouped Geopoint parameters. In geofire/src/GeoQuery.ts, the two number fields _centerLat/_centerLng are replaced with a single _center: Geopoint, and _updateLocation and _distanceToCenter accept location: Geopoint instead of bare latitude/longitude scalars. In databaseUtils.ts and GeoFire.ts, encodeGeoFireObject accepts location: Geopoint. No residual forwarding helper taking two coordinate scalars or pair of number fields mirroring the center remains.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A seam remains whose only purpose is carrying the split coordinate parts of one position: an internal helper, wrapper or pair of number fields that accepts or persists bare latitude/longitude values for one point and merely repacks them for the grouped code around it (for example a residual forwarding helper taking two coordinate scalars to call a value-oriented function, or two kept number fields mirroring the center).",
+      "passes": true
+    },
+    {
+      "id": "R9",
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The split survives under new names or shapes: positions are still handed around as two scalar parameters (or two primitive number fields) with merely renamed or vocabulary-free names (e.g. a/b, first/second, x/y), or a grouped value is immediately re-split into two scalars at the next seam where the pair is again treated as unrelated numbers.",
+      "rationale": "The cheapest textual dodge for this task keeps two parameters per position and renames them; that change repairs nothing, so its presence must count against cleanup.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch preserves all observable contracts. Public API signatures are restored to their original forms: `encodeGeoFireObject` reverts from `(latitude, longitude, geohash)` back to `(location: Geopoint, geohash: Geohash)`, and `validateLocation`, `geohashForLocation`, `boundingBoxCoordinates`, `distanceBetween` all retain their original `Geopoint`-based signatures. The stored Firebase document shape is unchanged: `{ '.priority': geohash, 'g': geohash, 'l': [location[0], location[1]] }` still stores `l` as a `[latitude, longitude]` array. The GeoQuery callback contract is preserved: `_fireCallbacksForKey` still receives `(key, [latitude, longitude], distanceFromCenter)` for entered/moved/exited events, and the null-distance path `(currentLocation) ? this._distanceToCenter(currentLocation) : null` is maintained. The `center()` method still returns a `Geopoint`. Internal-only helpers (`_updateLocation`, `_distanceToCenter`, `geohashEncodeBits`, `haversineKilometers`, `boundingBoxPoints`) changed signatures but are not exported.",
+      "valid": true,
+      "attempts": 4,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "An observable contract is altered: a public API signature or the exported symbol set of either package changed, the GeoQuery callback contract (key, location, distanceFromCenter with null position/distance where appropriate) or the ready/entered/exited/moved event behavior changed, or the stored Firebase document shape for a location changed.",
+      "passes": true
+    },
+    {
+      "id": "R11",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Partial criteria updates regress: a radius-only (or center-only) update on a query whose center sits at latitude 0 no longer keeps/moves the center exactly as before, extraneous criteria attributes are no longer rejected, or a tracked key is lost (or its in/out-of-query status recomputed wrongly) when the query recomputes for new criteria.",
+      "rationale": "The criteria-update seam is where a regrouped value is easiest to corrupt silently, because the keep-it behavior depends on falsy values (latitude 0) rather than truthiness; the suite covers it only on specific paths.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    },
+    {
+      "id": "R12",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Validation behavior or diagnostics changed: some non-array, wrong-length, non-number, NaN or out-of-range input is no longer rejected the same way, the error message text for an invalid location changed (including how the offending pair is rendered inside the message), or the checks run in a different order in either package.",
+      "rationale": "The validation seam is one of the regrouped callables and formats the offending pair directly into its error text; a repair that changes the rendering, reorders the checks, or drops coordinate-value checks changes observable behavior.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 1,
+    "core_resolution": 1
+  },
+  "valid_count": 9,
+  "pass_count": 9,
+  "must_have_pass": false,
+  "macro_score": 1
+}

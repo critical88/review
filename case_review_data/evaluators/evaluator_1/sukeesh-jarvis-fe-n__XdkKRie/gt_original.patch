@@ -1,0 +1,540 @@
+--- a/jarviscli/packages/memory/record_store.py
++++ b/jarviscli/packages/memory/record_store.py
+@@ -10,8 +10,8 @@
+     Tasks, todo entries, reminders, user tags and named routines were moved
+     from ad hoc JSON keys to named record collections. Each collection keeps
+     one snapshot of its records together with the id handed out next. The
+-    store loads and stores the snapshot; the records themselves are managed
+-    by the plugins.
++    store loads and stores the snapshot and owns every change made to the
++    records it holds.
+     """
+ 
+     def __init__(self, jarvis, item_key, id_key=None):
+@@ -38,6 +38,29 @@
+             else:
+                 self.jarvis.update_data(self.id_key, self.next_id)
+ 
++    def records(self):
++        """The records in their stored order, as a fresh list."""
++        return list(self.items)
++
++    def is_empty(self):
++        """Whether the collection holds no record at all."""
++        return len(self.items) == 0
++
++    def clear(self):
++        """Drop every record and store the emptied collection."""
++        self.items = []
++        self.save()
++
++    def remove_selected(self, indices):
++        """Drop the records at the given positions and return them."""
++        selected = set(indices)
++        removed = [entry for index, entry in enumerate(self.items)
++                   if index in selected]
++        self.items = [entry for index, entry in enumerate(self.items)
++                      if index not in selected]
++        self.save()
++        return removed
++
+     def _record_text(self):
+         return self.items
+ 
+@@ -75,6 +98,72 @@
+             m.update_data(self.item_key, self.items)
+         m.save()
+ 
++    def records(self):
++        """The tasks in their stored order, read fresh from the storage."""
++        self.load()
++        return list(self.items)
++
++    def count(self):
++        """Number of tasks, read fresh from the storage."""
++        self.load()
++        return len(self.items)
++
++    def name(self, index):
++        """Name of the task at the one based position."""
++        self.load()
++        return self.items[index - 1]["name"]
++
++    def add_named(self, new_name):
++        """Append a new task with the given name."""
++        self.load()
++        self.items.append({"name": new_name})
++        self.save()
++
++    def replace_named(self, chosen_name, updated_name):
++        """Give every task called chosen_name the updated name."""
++        self.load()
++        self.items = [{"name": updated_name}
++                      if task["name"] == chosen_name else task
++                      for task in self.items]
++        self.save()
++
++    def set_priority(self, task_name, priority):
++        """Give every task called task_name the given priority."""
++        self.load()
++        self.items = [{"name": task_name, "priority": priority}
++                      if task["name"] == task_name else task
++                      for task in self.items]
++        self.save()
++
++    def remove_named(self, name):
++        """Drop every task called name."""
++        self.load()
++        self.items = [task for task in self.items if task["name"] != name]
++        self.save()
++
++    def ordered(self, strategy):
++        """The tasks sorted by name (strategy 1) or by priority."""
++        self.load()
++
++        def sort_by_priority(task):
++            try:
++                priority = task["priority"]
++                if priority == "High":
++                    return 3
++                elif priority == "Medium":
++                    return 2
++                else:
++                    return 1
++            except BaseException:
++                return 0
++
++        def sort_by_name(task):
++            return task["name"]
++
++        if strategy == 1:
++            return sorted(self.items, key=sort_by_name)
++        return sorted(self.items, key=sort_by_priority, reverse=True)
++
+ 
+ class TagRecordStore(RecordStore):
+     """
+@@ -84,6 +173,19 @@
+     def __init__(self, jarvis):
+         super().__init__(jarvis, "reminder_tags", "reminder_tags_next_id")
+ 
++    def append_tag(self, name):
++        """Add a tag with the next free id and keep the id counter fresh."""
++        self.load()
++        if self.next_id is None:
++            self.next_id = 0
++        new_tag = {
++            "id": self.next_id,
++            "name": name
++        }
++        self.items.append(new_tag)
++        self.next_id = self.next_id + 1
++        self.save()
++
+     def _load_items(self):
+         value = self.jarvis.get_data(self.item_key)
+         if value is None:
+@@ -106,6 +208,17 @@
+     def _record_text(self):
+         return json.dumps(self.items)
+ 
++    def append_entry(self, new_entry):
++        """Add the entry with the next free id and keep the shared id
++        counter fresh."""
++        self.load()
++        if self.next_id is None:
++            self.next_id = 0
++        new_entry['id'] = self.next_id
++        self.items.append(new_entry)
++        self.next_id = self.next_id + 1
++        self.save()
++
+     def _load_items(self):
+         value = self.jarvis.get_data(self.item_key)
+         if value is None:
+@@ -150,5 +263,23 @@
+     def __init__(self, jarvis):
+         super().__init__(jarvis, "routines")
+ 
++    def set_commands(self, name, commands):
++        """Store the commands under the routine name."""
++        self.load()
++        if self.items is None:
++            self.items = {}
++        self.items[name] = commands
++        self.save()
++
++    def has(self, name):
++        """Whether a routine is stored under the name."""
++        self.load()
++        return name in self.items
++
++    def remove(self, name):
++        """Drop the routine stored under the name."""
++        self.items.pop(name)
++        self.save()
++
+     def _load_items(self):
+         return self.jarvis.get_data(self.item_key)
+--- a/jarviscli/plugins/tasks.py
++++ b/jarviscli/plugins/tasks.py
+@@ -22,18 +22,18 @@
+ 
+     def list_all(self, jarvis):
+         jarvis.say("")
+-        task_count = len(self.store.items)
++        task_count = self.store.count()
+         if task_count == 0:
+             jarvis.say("Your Task List Is Empty, Good Job")
+             return
+         jarvis.say("You Have {} {}".format(task_count, "Task" if task_count == 1 else "Tasks"))
+-        for i in range(task_count):
++        for i, task in enumerate(self.store.records()):
+             try:
+-                priority = self.store.items[i]["priority"]
++                priority = task["priority"]
+                 jarvis.say("{}. {} PR: {}".format(
+-                    i + 1, self.store.items[i]["name"], priority), self.get_color_with_priority(priority))
++                    i + 1, task["name"], priority), self.get_color_with_priority(priority))
+             except BaseException:
+-                jarvis.say("{}. {}".format(i + 1, self.store.items[i]["name"]))
++                jarvis.say("{}. {}".format(i + 1, task["name"]))
+ 
+     def get_color_with_priority(self, priority):
+         if priority == "High":
+@@ -45,14 +45,12 @@
+ 
+     def add_task(self, jarvis):
+         new_task = jarvis.input("Enter New Task: ", Fore.GREEN)
+-        self.store.load()
+-        self.store.items.append({"name": new_task})
+-        self.store.save()
++        self.store.add_named(new_task)
+         jarvis.say("Task Was Successfully Added")
+         self.list_all(jarvis)
+ 
+     def choose_task(self, exit_text, input_text, jarvis):
+-        tasks_count = len(self.store.items)
++        tasks_count = self.store.count()
+         self.list_all(jarvis)
+         jarvis.say("{}. {}".format(tasks_count + 1, exit_text))
+         return self.get_choice(input_text, tasks_count, tasks_count + 1, jarvis)
+@@ -61,13 +59,10 @@
+         task_index = self.choose_task("EXIT Editing", "Exit Editing or Choose Which Task To Edit: ", jarvis)
+         if task_index == -1:
+             return
+-        self.store.load()
+-        chosen_task_name = self.store.items[task_index - 1]["name"]
++        chosen_task_name = self.store.name(task_index)
+         jarvis.say("Chosen Task: {}".format(chosen_task_name))
+         updated_task = jarvis.input("Enter Updated Task: ", Fore.GREEN)
+-        new_tasks = map(lambda task: {"name": updated_task} if task["name"] == chosen_task_name else task, self.store.items)
+-        self.store.items = list(new_tasks)
+-        self.store.save()
++        self.store.replace_named(chosen_task_name, updated_task)
+         jarvis.say("Task Was Successfully Updated")
+ 
+     def get_priority(self, jarvis):
+@@ -90,22 +85,15 @@
+         priority = self.get_priority(jarvis)
+         if priority == -1:
+             return
+-        self.store.load()
+-        task_name = self.store.items[task_index - 1]["name"]
+-        new_tasks = map(lambda t: {"name": task_name,
+-                                   "priority": options[priority]} if t["name"] == task_name else t, self.store.items)
+-        self.store.items = list(new_tasks)
+-        self.store.save()
++        task_name = self.store.name(task_index)
++        self.store.set_priority(task_name, options[priority])
+ 
+     def delete_task(self, jarvis):
+         task_index = self.choose_task("EXIT Delete Mode", "Exit Delte Mode or Choose Taks To Delete: ", jarvis)
+         if task_index == -1:
+             return
+-        self.store.load()
+-        chosen_task_name = self.store.items[task_index - 1]["name"]
+-        new_tasks = filter(lambda x: x["name"] != chosen_task_name, self.store.items)
+-        self.store.items = list(new_tasks)
+-        self.store.save()
++        chosen_task_name = self.store.name(task_index)
++        self.store.remove_named(chosen_task_name)
+         jarvis.say("Task Was Successfully Deleted")
+ 
+     def get_sorting_startegy(self, jarvis):
+@@ -119,43 +107,21 @@
+         return self.get_choice("Enter your choice: ", 2, 3, jarvis)
+ 
+     def display_sorted(self, jarvis):
+-        options = {1: "name", 2: "pr"}
+-        tasks_count = len(self.store.items)
++        tasks_count = self.store.count()
+         if tasks_count == 0 | tasks_count == 1:
+             jarvis.say("There is Not Enough Tasks To sort")
+             return
+         strategy = self.get_sorting_startegy(jarvis)
+         if strategy == -1:
+             return
+-
+-        def sort_by_priority(task):
+-            try:
+-                priority = task["priority"]
+-                if priority == "High":
+-                    return 3
+-                elif priority == "Medium":
+-                    return 2
+-                else:
+-                    return 1
+-            except BaseException:
+-                return 0
+-
+-        def sort_by_name(task):
+-            return task["name"]
+-
+-        sorted_tasks = self.store.items.copy()
+-        if options[strategy] == "name":
+-            sorted_tasks.sort(key=sort_by_name)
+-        else:
+-            sorted_tasks.sort(key=sort_by_priority, reverse=True)
+         jarvis.say("")
+-        for i in range(len(sorted_tasks)):
++        for i, task in enumerate(self.store.ordered(strategy)):
+             try:
+-                priority = sorted_tasks[i]["priority"]
++                priority = task["priority"]
+                 color = self.get_color_with_priority(priority)
+-                jarvis.say("{}. {} PR: {}".format(i + 1, sorted_tasks[i]["name"], priority), color)
++                jarvis.say("{}. {} PR: {}".format(i + 1, task["name"], priority), color)
+             except BaseException:
+-                jarvis.say("{}. {}".format(i + 1, sorted_tasks[i]["name"]))
++                jarvis.say("{}. {}".format(i + 1, task["name"]))
+ 
+     def procces_chosen_option(self, option, jarvis):
+         if option == "ann_new":
+--- a/jarviscli/plugins/reminder.py
++++ b/jarviscli/plugins/reminder.py
+@@ -35,7 +35,6 @@
+ 
+ class TagBase:
+     save_key = "reminder_tags"
+-    next_id_key = "reminder_tags_next_id"
+ 
+     def load_tags(self, jarvis):
+         tags = jarvis.get_data(self.save_key)
+@@ -45,21 +44,9 @@
+ 
+         return tags
+ 
+-    def save_tags(self, jarvis, tags):
+-        jarvis.update_data(self.save_key, tags)
+-
+     def add_tag(self, jarvis, name):
+         tags_store = TagRecordStore(jarvis)
+-        tags_store.load()
+-        if tags_store.next_id is None:
+-            tags_store.next_id = 0
+-        new_tag = {
+-            "id": tags_store.next_id,
+-            "name": name
+-        }
+-        tags_store.items.append(new_tag)
+-        tags_store.next_id = tags_store.next_id + 1
+-        tags_store.save()
++        tags_store.append_tag(name)
+ 
+     def get_tag_by_id(self, jarvis, id):
+         tags = self.load_tags(jarvis)
+@@ -70,15 +57,6 @@
+ 
+         return final_tag
+ 
+-    def get_next_id(self, jarvis):
+-        next_id = jarvis.get_data(self.next_id_key)
+-        if next_id is None:
+-            next_id = 0
+-            jarvis.add_data(self.next_id_key, next_id)
+-
+-        jarvis.update_data(self.next_id_key, next_id + 1)
+-        return next_id
+-
+     def clean_up_entry(self, jarvis, entry):
+         id = entry["id"]
+         todos = TodoBase().get_data(jarvis)
+@@ -115,12 +93,12 @@
+     def remove(self, jarvis, s):
+         tags_store = TagRecordStore(jarvis)
+         tags_store.load()
+-        if len(tags_store.items) == 0:
++        if tags_store.is_empty():
+             jarvis.say("Nothing to remove!")
+             return
+ 
+         if s.startswith("everything") or s.startswith("all"):
+-            for entry in tags_store.items:
++            for entry in tags_store.records():
+                 self.clean_up_entry(jarvis, entry)
+ 
+             tags_store.items = []
+@@ -131,23 +109,15 @@
+ 
+         # open selection menu
+         ask_str = []
+-        for entry in tags_store.items:
++        for entry in tags_store.records():
+             ask_str.append(self.format(jarvis, entry))
+ 
+         title = 'Please choose tag to remove (select with space, j and k to move up and down)'
+         selected = pick(ask_str, title, multi_select=True)
+         selected = [entry[1] for entry in selected]
+ 
+-        new_data = []
+-        for index, entry in enumerate(tags_store.items):
+-            entry = tags_store.items[index]
+-            if index not in selected:
+-                new_data.append(entry)
+-            else:
+-                self.clean_up_entry(jarvis, entry)
+-
+-        tags_store.items = new_data
+-        tags_store.save()
++        for entry in tags_store.remove_selected(selected):
++            self.clean_up_entry(jarvis, entry)
+ 
+ 
+ class RemindTodoBase:
+@@ -173,15 +143,6 @@
+     def save_data(self, jarvis, remind_todo_list):
+         jarvis.update_data(self.get_key(), json.dumps(remind_todo_list))
+ 
+-    def get_next_id(self, jarvis):
+-        next_id = jarvis.get_data(self.get_key_next_id())
+-        if next_id is None:
+-            next_id = 0
+-            jarvis.add_data(self.get_key_next_id(), next_id)
+-
+-        jarvis.update_data(self.get_key_next_id(), next_id + 1)
+-        return next_id
+-
+     def remove(self, jarvis, s):
+         store = JsonRecordStore(jarvis, self.get_key(), self.get_key_next_id())
+         store.load()
+@@ -190,39 +151,30 @@
+                 "Could not read Remind / Todo List. Sorry, \
+                         that should not have happend...", Fore.RED)
+ 
+-        if len(store.items) == 0:
++        if store.is_empty():
+             jarvis.say("Nothing to remove!")
+             return
+ 
+         if s.startswith("everything") or s.startswith("all"):
+-            for entry in store.items:
++            for entry in store.records():
+                 self.clean_up_entry(jarvis, entry)
+ 
+-            store.items = []
+-            store.save()
++            store.clear()
+ 
+             jarvis.say("ok")
+             return
+ 
+         # open selection menu
+         ask_str = []
+-        for entry in store.items:
++        for entry in store.records():
+             ask_str.append(self.format(jarvis, entry))
+ 
+         title = 'Please choose task to remove (select with space, j and k to move up and down)'
+         selected = pick(ask_str, title, multi_select=True)
+         selected = [entry[1] for entry in selected]
+ 
+-        new_data = []
+-        for index, entry in enumerate(store.items):
+-            entry = store.items[index]
+-            if index not in selected:
+-                new_data.append(entry)
+-            else:
+-                self.clean_up_entry(jarvis, entry)
+-
+-        store.items = new_data
+-        store.save()
++        for entry in store.remove_selected(selected):
++            self.clean_up_entry(jarvis, entry)
+ 
+     def modify(self, jarvis, modified_entry):
+         modified_id = modified_entry['id']
+@@ -253,20 +205,12 @@
+ 
+     def add(self, jarvis, message, progress="", priority=-1, tags=[]):
+         todo_store = TodoRecordStore(jarvis)
+-        todo_store.load()
+-        next_id = todo_store.next_id
+-        if next_id is None:
+-            next_id = 0
+-        new_entry = {
++        todo_store.append_entry({
+             'message': message,
+             'progress': progress,
+             'priority': priority,
+-            'id': next_id,
+             'tags': []
+-        }
+-        todo_store.items.append(new_entry)
+-        todo_store.next_id = next_id + 1
+-        todo_store.save()
++        })
+ 
+     def clean_up_entry(self, jarvis, entry):
+         self.interact().clean_up_entry(jarvis, entry)
+@@ -393,20 +337,12 @@
+             schedule_id=None,
+             todo_refere_id=None):
+         remind_store = RemindRecordStore(jarvis)
+-        remind_store.load()
+-        next_id = remind_store.next_id
+-        if next_id is None:
+-            next_id = 0
+-        new_entry = {
++        remind_store.append_entry({
+             'message': message,
+             'timestamp': timestamp,
+             'schedule_id': schedule_id,
+-            'todo_refere_id': todo_refere_id,
+-            'id': next_id
+-        }
+-        remind_store.items.append(new_entry)
+-        remind_store.next_id = next_id + 1
+-        remind_store.save()
++            'todo_refere_id': todo_refere_id
++        })
+ 
+     def clean_up_entry(self, jarvis, entry):
+         jarvis.cancel(entry['schedule_id'])
+--- a/jarviscli/plugins/routine.py
++++ b/jarviscli/plugins/routine.py
+@@ -12,11 +12,7 @@
+     :return: Nothing to return.
+     """
+     routine_store = RoutineRecordStore(jarvis)
+-    routine_store.load()
+-    if routine_store.items is None:
+-        routine_store.items = {}
+-    routine_store.items[name] = commands
+-    routine_store.save()
++    routine_store.set_commands(name, commands)
+ 
+ 
+ def execute_routine(jarvis, name):
+@@ -68,9 +64,7 @@
+ @plugin("delete routine")
+ def delete_routines(jarvis, s):
+     routine_store = RoutineRecordStore(jarvis)
+-    routine_store.load()
+-    if s in routine_store.items:
+-        routine_store.items.pop(s)
+-        routine_store.save()
++    if routine_store.has(s):
++        routine_store.remove(s)
+     else:
+         jarvis.say("Invalid routine name")

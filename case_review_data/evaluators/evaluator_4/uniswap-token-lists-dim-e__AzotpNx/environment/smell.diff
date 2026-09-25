@@ -1,0 +1,182 @@
+diff --git a/src/diffTokenLists.ts b/src/diffTokenLists.ts
+index e22872f..be5a28b 100644
+--- a/src/diffTokenLists.ts
++++ b/src/diffTokenLists.ts
+@@ -6,21 +6,6 @@ export type TokenInfoChangeKey = Exclude<
+ >;
+ export type TokenInfoChanges = Array<TokenInfoChangeKey>;
+ 
+-/**
+- * compares two token info key values
+- * this subset of full deep equal functionality does not work on objects or object arrays
+- * @param a comparison item a
+- * @param b comparison item b
+- */
+-function compareTokenInfoProperty(a: unknown, b: unknown): boolean {
+-  if (a === b) return true;
+-  if (typeof a !== typeof b) return false;
+-  if (Array.isArray(a) && Array.isArray(b)) {
+-    return a.every((el, i) => b[i] === el);
+-  }
+-  return false;
+-}
+-
+ /**
+  * Differences between a base list and an updated list.
+  */
+@@ -78,13 +63,32 @@ export function diffTokenLists(
+       if (!baseToken) {
+         memo.added.push(tokenInfo);
+       } else {
+-        const changes: TokenInfoChanges = Object.keys(tokenInfo)
+-          .filter(
+-            (s): s is TokenInfoChangeKey => s !== 'address' && s !== 'chainId'
+-          )
+-          .filter(s => {
+-            return !compareTokenInfoProperty(tokenInfo[s], baseToken[s]);
+-          });
++        // every field of the updated token is compared against the base entry
++        // directly, so a change is any field that is not shallow-equal
++        const changes: TokenInfoChanges = [];
++        for (const field of Object.keys(tokenInfo)) {
++          if (field === 'address' || field === 'chainId') {
++            continue;
++          }
++          const next = tokenInfo[field as TokenInfoChangeKey];
++          const previous = baseToken[field as TokenInfoChangeKey];
++          if (next === previous) {
++            continue;
++          }
++          let valuesMatch = false;
++          if (
++            typeof next === typeof previous &&
++            Array.isArray(next) &&
++            Array.isArray(previous)
++          ) {
++            valuesMatch = (next as unknown[]).every(
++              (element, i) => (previous as unknown[])[i] === element
++            );
++          }
++          if (!valuesMatch) {
++            changes.push(field as TokenInfoChangeKey);
++          }
++        }
+         if (changes.length > 0) {
+           if (!memo.changed[tokenInfo.chainId]) {
+             memo.changed[tokenInfo.chainId] = {};
+diff --git a/src/isVersionUpdate.ts b/src/isVersionUpdate.ts
+index 74fcd9c..bfa1782 100644
+--- a/src/isVersionUpdate.ts
++++ b/src/isVersionUpdate.ts
+@@ -1,9 +1,27 @@
+-import { versionComparator } from './versionComparator';
+ import { Version } from './types';
+ 
+ /**
+  * Returns true if versionB is an update over versionA
+  */
+ export function isVersionUpdate(base: Version, update: Version): boolean {
+-  return versionComparator(base, update) < 0;
++  // ordering is decided one component at a time, most significant first
++  if (update.major < base.major) {
++    return false;
++  }
++  if (update.major > base.major) {
++    return true;
++  }
++  if (update.minor < base.minor) {
++    return false;
++  }
++  if (update.minor > base.minor) {
++    return true;
++  }
++  if (update.patch < base.patch) {
++    return false;
++  }
++  if (update.patch > base.patch) {
++    return true;
++  }
++  return false;
+ }
+diff --git a/src/minVersionBump.ts b/src/minVersionBump.ts
+index ab29b21..0347859 100644
+--- a/src/minVersionBump.ts
++++ b/src/minVersionBump.ts
+@@ -1,4 +1,4 @@
+-import { diffTokenLists } from './diffTokenLists';
++import { TokenInfoChangeKey } from './diffTokenLists';
+ import { VersionUpgrade } from './getVersionUpgrade';
+ import { TokenInfo } from './types';
+ 
+@@ -11,9 +11,67 @@ export function minVersionBump(
+   baseList: TokenInfo[],
+   updatedList: TokenInfo[]
+ ): VersionUpgrade {
+-  const diff = diffTokenLists(baseList, updatedList);
+-  if (diff.removed.length > 0) return VersionUpgrade.MAJOR;
+-  if (diff.added.length > 0) return VersionUpgrade.MINOR;
+-  if (Object.keys(diff.changed).length > 0) return VersionUpgrade.PATCH;
++  // minimum bump is decided in one pass over both lists: the base list is
++  // indexed once by "<chainId>:<address>", then every updated token is
++  // matched against that index so removals, additions and property changes
++  // are all discovered while walking the update.
++  const baseIndex = new Map<string, TokenInfo>();
++  for (const baseToken of baseList) {
++    baseIndex.set(`${baseToken.chainId}:${baseToken.address}`, baseToken);
++  }
++
++  const updatedAddresses = new Set<string>();
++
++  let anyTokenAdded = false;
++  let anyTokenChanged = false;
++
++  for (const updatedToken of updatedList) {
++    const chainAddress = `${updatedToken.chainId}:${updatedToken.address}`;
++    updatedAddresses.add(chainAddress);
++
++    const baseToken = baseIndex.get(chainAddress);
++    if (baseToken === undefined) {
++      anyTokenAdded = true;
++      continue;
++    }
++
++    // walk every updated field of the token next to the base entry
++    for (const field of Object.keys(updatedToken)) {
++      if (field === 'address' || field === 'chainId') {
++        continue;
++      }
++      const previous = baseToken[field as TokenInfoChangeKey];
++      const next = updatedToken[field as TokenInfoChangeKey];
++      if (previous === next) {
++        continue;
++      }
++      if (typeof previous !== typeof next) {
++        anyTokenChanged = true;
++        break;
++      }
++      if (Array.isArray(previous) && Array.isArray(next)) {
++        const sameSequence = (next as unknown[]).every(
++          (element, i) => (previous as unknown[])[i] === element
++        );
++        if (!sameSequence) {
++          anyTokenChanged = true;
++        }
++      } else {
++        anyTokenChanged = true;
++      }
++    }
++  }
++
++  let anyTokenRemoved = false;
++  for (const baseToken of baseList) {
++    if (!updatedAddresses.has(`${baseToken.chainId}:${baseToken.address}`)) {
++      anyTokenRemoved = true;
++      break;
++    }
++  }
++
++  if (anyTokenRemoved) return VersionUpgrade.MAJOR;
++  if (anyTokenAdded) return VersionUpgrade.MINOR;
++  if (anyTokenChanged) return VersionUpgrade.PATCH;
+   return VersionUpgrade.NONE;
+ }

@@ -1,0 +1,257 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "The rubric requires the session lifecycle operations to be defined in the audio input layer (fifo.c/fifo.h) next to the session struct owner. The agent's patch keeps rd_audio_zero, rd_audio_shift_write, rd_audio_shift_silence, and rd_audio_read defined in render.c (unchanged from the smell), and additionally adds rd_audio_bind to render.c with its declaration in render.h. None of these operations were moved to fifo.c, fifo.h, or any audio-input-layer file; instead the patch further centralizes audio-session logic in the render core, the opposite of the required repair.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The shared audio session's lifecycle operations (instantiate-time buffer zeroing, rolling-window append, stall silence padding, and the mutex-guarded per-frame drain) are defined in the audio input layer next to the code that owns the shared session struct (the translated-unit and contract header hosting the named-pipe backend, its session struct, and the backend registry), so the re-homed behavior lives where the data it manipulates lives.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The rubric requires render core to contain no function reading/writing audio session struct members and render.h to no longer declare session-lifecycle entry points on that struct. The agent's patch does the opposite: it ADDS `rd_audio_bind` to render.c, which writes `audio->rate`, `audio->sample_sz`, `audio->audio_buf_sz`, `audio->channels`, and `audio->source` (members of struct audio_data), and adds its declaration to render.h: `void rd_audio_bind(struct audio_data* audio, struct glava_renderer* r);`. Additionally, render.c still retains `rd_audio_zero`, `rd_audio_shift_write`, `rd_audio_shift_silence`, and `rd_audio_read`, all of which read/write audio_data members (e.g. `audio->audio_out_l[t]`, `audio->audio_buf_sz`, `audio->mutex`, `audio->modified`), and render.h still declares all of these session-lifecycle entry points operating on `struct audio_data*`.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "After the repair, the render core (the module defining the renderer struct and the render-side API) contains no function that reads or writes members of the shared audio session struct, and the render-side public API header no longer declares session-lifecycle entry points operating on that struct.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The agent removed both backend helpers that mined renderer fields: fifo.c deletes fifo_bind_session and its init now does `(void) r;` and only sets a default source from `audio->source`; pulse_input.c deletes pulse_apply_session_requests and m_session_renderer and its init now does `(void) r;` and checks `audio->source`. Direct renderer request member access is moved to render.c in rd_audio_bind, so neither audio backend re-derives session parameters from renderer members at attach time.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Neither audio backend retains attach-time code that reads the renderer's request members (rate, sample size, buffer size, audio source, input mirroring) directly to re-derive its session parameters; whatever configuration route the repair keeps (values passed through the attach contract, or render-side accessors) communicates without member access on the audio side.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The shared roll-and-append implementation remains on the render side: agent.patch leaves rd_audio_shift_write and rd_audio_shift_silence defined in render.c and declared in render.h, and adds rd_audio_bind there too. fifo.c and pulse_input.c consume these via rd_audio_* calls, but neither audio backend nor any audio-input-side module provides the shared implementation, so the roll logic was not returned to the audio side as required.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Both audio streaming threads (named-pipe and PulseAudio) consume one shared roll-and-append implementation provided on the audio input side; neither thread's loop retains an inline copy of the buffer-roll choreography.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch does not modify fifo.c's poll-timeout stall path, so it still calls `rd_audio_shift_silence(audio);` as injected in smell.diff. That function remains render-side: render.h still declares `rd_audio_shift_silence` and render.c still defines it; agent.patch only adds `rd_audio_bind` to render.c and does not relocate the shift/pad logic to the audio side. Thus the stall path is not routed through a shared audio-side implementation and the injected render-side call is not replaced.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The named-pipe backend's stall path (poll timeout) still rolls the window and pads it with silence through the shared audio-side implementation, replacing the injected render-side call without losing the padding behavior or inlining a private copy.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch keeps the displaced session behavior on the render side: render.c still defines rd_audio_zero, rd_audio_shift_write, rd_audio_shift_silence, and rd_audio_read, and adds rd_audio_bind there; render.h declares all of them. It only removes fifo_bind_session/pulse_apply_session_requests and centralizes request binding into render.c, so the session functions remain under rd_* names in a non-owning render-side host rather than moving into the audio input layer.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not merely relabel or re-park the displaced session behavior: the render-side session functions are not kept under new names, and their definitions are not stashed in a non-owning host (a render-side or utility header, or a new third translation unit outside the audio input layer) while everything else stays as-is.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only resolves one boundary direction: it moves renderer-request interpretation off the audio side (removes fifo_bind_session from fifo.c and pulse_apply_session_requests from pulse_input.c, adding rd_audio_bind in render.c), but leaves the session services rd_audio_zero, rd_audio_shift_write, rd_audio_shift_silence, and rd_audio_read in render.c without relocating them to the audio side. This is precisely the partial one-directional repair the rubric warns against — fixing the audio-side request interpretation while leaving the session operations on the render side.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "negative",
+      "importance": "important",
+      "criterion": "The repair does not leave the boundary violated in only one direction: it resolves both the render-side session operations and the audio-side renderer-request interpretation, rather than fixing one family (for example only the backend attach plumbing) and leaving the session services on the render side.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The rubric requires the entry point to use 're-homed audio-side operations,' but the agent's patch keeps all session services in the render core: rd_audio_bind, rd_audio_zero, rd_audio_shift_write, rd_audio_shift_silence, and rd_audio_read are all defined in render.c (and declared in render.h). The agent even adds rd_audio_bind to render.c, further entrenching audio-session logic in the render core rather than re-homing it to the audio side. glava.c calls rd_audio_bind/rd_audio_zero/rd_audio_read, but these are render-core functions, not re-homed audio-side operations, so the criterion is not satisfied.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The process entry point uses the re-homed audio-side operations for both instantiate-time zeroing and the per-frame drain, without re-growing inline session internals (no reinstated zero loop and no re-inlined lock/copy/flag-reset block in the main render loop).",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The init callback signature in fifo.h remains `void (*init)(struct audio_data* data, struct glava_renderer* r)`. Both backends match: fifo.c `static void init(struct audio_data* audio, struct glava_renderer* r)` and pulse_input.c `static void init(struct audio_data* audio, struct glava_renderer* r)`. The call site in glava.c calls `impl->init(&audio, rd)` with two args, matching the registry signature. All session-configuration values (rate, sample_sz, audio_buf_sz, channels, source) are bound centrally by `rd_audio_bind(&audio, rd)` in glava.c before `impl->init` is invoked, so both backends receive a fully configured session through the agreed contract; fifo.c and pulse_input.c both mark `r` unused with `(void) r` and no longer re-derive any session values themselves.",
+      "valid": true,
+      "attempts": 4,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The backend attach contract left by the repair is coherent end to end: the registry's init callback signature, both backends' attach implementations, and the composition-root call site all agree, and backends obtain every session-configuration value they need through that agreed contract.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "Both backends are migrated symmetrically: agent.patch removes fifo_bind_session from fifo.c and pulse_apply_session_requests plus m_session_renderer from pulse_input.c, and both init functions reduce to (void) r, relying on the shared rd_audio_bind called in glava.c before impl->init. The streaming threads both use the re-homed rd_audio_* services (fifo calls rd_audio_shift_silence and rd_audio_shift_write; pulse calls rd_audio_shift_write), with no leftover cross-boundary bind in either backend.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "negative",
+      "importance": "important",
+      "criterion": "The two streaming threads do not end up asymmetric after the repair: both adopt the re-homed shared operations, and no thread is switched to the new placement while the other silently keeps its previous cross-boundary call.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "In agent.patch, glava/pulse_input.c removes the module-level handle added by the smell (`-static struct glava_renderer* m_session_renderer;`) and removes its use: `init` no longer sets `m_session_renderer = r;` or calls `pulse_apply_session_requests()`, instead marking the parameter unused with `(void) r;`. Renderer request interpretation is moved to `rd_audio_bind()` in render.c, so the PulseAudio backend no longer keeps or reaches through the module-level renderer handle.",
+      "valid": true,
+      "attempts": 1,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "important",
+      "criterion": "The PulseAudio backend no longer keeps the module-level renderer handle that the feature added solely so attach-time plumbing could mine renderer request fields (an unused handle, or one still used to reach renderer state, fails this item; the pre-existing mainloop handle is unrelated).",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "rd_audio_bind in render.c installs strdup(r->audio_source_request) only when the request is non-NULL and not auto, and glava.c calls rd_audio_bind before backend init instead of setting source in the struct initializer. fifo.c init still falls back to /tmp/mpd.fifo only when audio->source is NULL, and pulse_input.c init still returns early when audio->source is set, so automatic/default selection retains PulseAudio default-sink monitor discovery and the FIFO default path fallback.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "important",
+      "criterion": "Audio-source selection semantics survive the re-homing identically: an explicit non-default source request resolves to the same source string for the same backend, and automatic/default selection keeps the PulseAudio default-sink monitor discovery and the named-pipe backend's default path fallback.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch removes the previously injected backend-local helpers entirely: `fifo_bind_session` is deleted from fifo.c and its call removed; `pulse_apply_session_requests` and `static struct glava_renderer* m_session_renderer` are deleted from pulse_input.c. No declarations for those removed helpers remain in fifo.h or render.h. The affected headers declare only the shared rd_* API: render.h declares `rd_audio_bind`, `rd_audio_zero`, `rd_audio_shift_write`, `rd_audio_shift_silence`, and `rd_audio_read`, each of which is defined in render.c and used in glava.c, fifo.c, or pulse_input.c. fifo.h retains the `struct glava_renderer` forward declaration, which is still used by the `audio_impl.init` function pointer signature. No unreferenced session/request helper definition survives on either side.",
+      "valid": true,
+      "attempts": 1,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "No orphaned declarations or definitions remain: every prototype the affected headers still declare corresponds to a defined and used function, and no unreferenced session/request helper definition survives on either side after the re-homing.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch removes all injected comments that justified interpreting renderer requests in the audio input layer: fifo.c's 'Align the session geometry with the active renderer requests...' (and the fifo_bind_session function it documented), fifo.h's 'Renderer sessions are handed to the audio input layer at instantiate time, so each backend can interpret the active renderer requests on its own.', and pulse_input.c's 'Interpret the renderer requests for the audio session opened by this backend...' and 'Re-align the session parameters with the renderer driving this session...'. The retained injected comments in render.c ('Audio session services... Implementing these operations here keeps the entire session lifecycle next to the renderer state...') and render.h ('Audio session services exposed with the rest of the renderer API...') still describe session lifecycle services as render-side API, but the code still works that way — the rd_audio_* functions remain in render.c and the agent even adds rd_audio_bind there — so the rubric's 'once the code no longer works that way' qualifier is not triggered for those comments. New replacement comments in fifo.c, fifo.h, and pulse_input.c state that 'the session arrives already bound' via the shared session service, which accurately reflects the post-patch code rather than justifying the old arrangement.",
+      "valid": true,
+      "attempts": 5,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "important",
+      "criterion": "The repaired files do not retain the injected narrative comments that justify the misplaced arrangement: no comment still describes session lifecycle services as part of the render-side API, and no comment still tells the reader that renderer objects or requests are handed to the audio input layer to be interpreted there, once the code no longer works that way.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "fifo.h still forward-declares `struct glava_renderer;` because the `audio_impl.init` contract still takes a `struct glava_renderer* r` argument, so the declaration is not dangling. fifo.c and pulse_input.c still `#include \"render.h\"` and consume `rd_audio_shift_write`/`rd_audio_shift_silence`, so the cross-includes are not left without an extern declaration they use.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "positive",
+      "importance": "nice_to_have",
+      "criterion": "Dangling scaffolding is removed with the code it served: the audio backend contract header no longer forward-declares the renderer type if the contract no longer mentions renderer arguments, and neither backend still includes the render-side API header if it is left with no extern declaration it consumes.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch to fifo.c only modifies the init() function (removing fifo_bind_session); the entry() function's decode loop is untouched and retains the same arithmetic as the original: mono uses ((buf[q] + buf[q + 1]) / 2) / (float) 65535 (integer add then integer truncation by /2 then float division), stereo uses buf[q] / (float) 65535 and buf[q+1] / (float) 65535. Results are written to local lbuf[n]/rbuf[n] then copied via rd_audio_shift_write to bl[off+n]/br[off+n] where off = fsz - (ssz/4), matching the original idx = (fsz - (ssz/4)) + n. The agent did not modify rd_audio_shift_write in render.c, so the memmove and append destinations are identical to the smell state, preserving byte-identical effect.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Named-pipe backend sample arithmetic is byte-identical in effect: raw int16 chunks are decoded with the same two-frame channel merge and the same integer truncation order before the division into floats, writing the same values to the same destinations as before the repair.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch moves PulseAudio's request interpretation from pulse_input.c's `pulse_apply_session_requests` into `rd_audio_bind` in render.c, but preserves the identical mapping: `audio->rate = (unsigned int) r->rate_request`, `audio->sample_sz = r->samplesize_request`, `audio->channels = r->mirror_input ? 1 : 2` — the same values the smell's `pulse_apply_session_requests` set. `rd_audio_bind(&audio, rd)` is called in glava.c before `impl->init(&audio, rd)`, so the PulseAudio init receives the same bound session. The entry function in pulse_input.c is not touched by the agent's patch, leaving the per-chunk decode loop and mono merge (`float sample = (buf[i] + buf[i + 1]) / 2` when `audio->channels == 1`) and `rd_audio_shift_write` call unchanged. The struct initializer retains `.format = -1` (native-float spec). Thus rate, channel count, per-chunk size, and merge behavior are all preserved.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "PulseAudio backend stream and merge behavior is unchanged: native-float recording spec (requested rate, two recorded channels), the same per-chunk size, and the same mono merge of two recorded frames into one sample on mirrored input.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The rolling-window helpers are left unchanged by the agent patch: rd_audio_shift_write uses off = fsz - (ssz / 4), memmoves ssz/4 floats, then appends ssz/4 samples; rd_audio_shift_silence uses the same off and memmove and zeroes ssz/4 samples. Both backends still call these helpers (fifo stall path calls rd_audio_shift_silence; fifo and pulse read paths call rd_audio_shift_write). rd_audio_bind preserves the same geometry parameters, setting audio_buf_sz = r->bufsize_request and sample_sz = r->samplesize_request, so chunk size and offset match the prior behavior.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Rolling-window geometry is unchanged everywhere it is used: both backends shift the window by the same one-read-chunk amount, and the stall path silences exactly the same number of new samples, so frames line up at the same offsets as before the repair.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent's patch does not modify the `entry` functions in `fifo.c` or `pulse_input.c`, leaving the `pthread_mutex_lock`/`rd_audio_shift_*`/`pthread_mutex_unlock` critical sections intact for both the chunk append and stall paths. The `rd_audio_read` function in `render.c` and its call in `glava.c` are untouched, preserving the lock, conditional copy, modified-flag reset, and unlock order for the per-frame drain.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The synchronization protocol is unchanged: each streaming thread still performs its roll and append inside one critical section per chunk between lock and unlock, the stall path holds its own mutex window, and the per-frame drain keeps the lock, conditional copy, modified-flag reset, then unlock order.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The patch leaves the mutex discipline intact: glava.c calls rd_audio_bind/rd_audio_zero before impl->init and the per-frame loop, not concurrently with a streaming thread; the fifo.c and pulse_input.c entry functions are untouched and still call rd_audio_shift_write/rd_audio_shift_silence under pthread_mutex_lock(&audio->mutex); rd_audio_read is unchanged and still locks, copies, and resets audio->modified=false under the same mutex. No guarded region around buffer mutation or the modified flag is widened, split, or removed.",
+      "valid": true,
+      "attempts": 4,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "A repair fails this item if it makes the session buffers reachable for mutation by one thread while another is copying them (widening, splitting, or removing the guarded regions), or if it resets the session's modified flag outside the mutex it still uses elsewhere.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch centralizes channel selection in rd_audio_bind (render.c) as `audio->channels = r->mirror_input ? 1 : 2;`, matching the prior semantics in glava.c and pulse_apply_session_requests. The streaming entry points still merge to mono when channels==1 and assign identical left/right samples (fifo.c: `lbuf[n] = sample; rbuf[n] = sample;`; pulse_input.c: `lbuf[n] = sample; rbuf[n] = sample;`), so mirroring still collapses to mono capture with identical frames.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "positive",
+      "importance": "important",
+      "criterion": "Input mirroring stays semantically intact: a mirrored configuration still collapses the session to mono capture and produces identical left and right frames, rather than inverting the stereo/mono selection or dropping the merge.",
+      "passes": true
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch leaves per-frame and streaming-thread flow control untouched: glava.c still drains once per frame via `bool modified = rd_audio_read(&audio, lb, rb, rd->bufsize_request);` and passes `modified` to `rd_update`; fifo.c entry still sets `audio->modified = true` after both `rd_audio_shift_silence` (stall) and `rd_audio_shift_write` (chunk), and still does `close(fd); break;` on terminate; pulse_input.c entry still sets `audio->modified = true` after `rd_audio_shift_write` and `pa_simple_free(s); break;` on terminate. The patch only relocates session binding into `rd_audio_bind` and does not alter drain cadence, flag setting, or resource release.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "important",
+      "criterion": "The repair does not disturb per-frame flow control around the session: the drain is still performed once per rendered frame, the modified flag is still set by the streaming threads for every appended chunk and every silence-padded stall, and the terminate checks still break the loops and release the backend's resources exactly as before.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 1,
+    "artifact_cleanup": 1,
+    "associated_changes": 0.8,
+    "core_resolution": 0.14285714285714285
+  },
+  "valid_count": 22,
+  "pass_count": 15,
+  "must_have_pass": false,
+  "macro_score": 0.7357142857142857
+}

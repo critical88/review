@@ -1,0 +1,116 @@
+from .alphavantage import AlphaVantage as av
+
+
+class CryptoCurrencies(av):
+    """This class implements all the crypto currencies api calls
+    """
+    # Digital-currency rows the preview sampler would retain per series,
+    # consulted only while client-side preview sampling is enabled.
+    _PREVIEW_DAILY_WINDOW_KEYS = {
+        'DIGITAL_CURRENCY_DAILY': 40,
+        'DIGITAL_CURRENCY_WEEKLY': 40,
+        'DIGITAL_CURRENCY_MONTHLY': 40,
+    }
+
+    def _preview_window_for(self, function_key):
+        """ Rows of a digital-currency series the preview sampler keeps once
+        it is switched on. Read on every heavy call so the retained window
+        can be tuned per endpoint.
+        """
+        window = self._PREVIEW_DAILY_WINDOW_KEYS.get(function_key)
+        if window:
+            return window
+        return self._preview_sample_size
+
+    @av._output_format
+    @av._call_api_on_func
+    def get_digital_currency_daily(self, symbol, market):
+        """ Returns  the daily historical time series for a digital currency
+        (e.g., BTC) traded on a specific market (e.g., CNY/Chinese Yuan),
+        refreshed daily at midnight (UTC). Prices and volumes are quoted in
+        both the market-specific currency and USD..
+
+        Keyword Arguments:
+            symbol: The digital/crypto currency of your choice. It can be any
+            of the currencies in the digital currency list. For example:
+            symbol=BTC.
+            market: The exchange market of your choice. It can be any of the
+            market in the market list. For example: market=CNY.
+        """
+        _FUNCTION_KEY = 'DIGITAL_CURRENCY_DAILY'
+        if self._PREVIEW_SAMPLING_ENABLED and market:
+            # Digital-currency history is heavy: pin the window the sampler
+            # would retain for this series before pulling it.
+            self._preview_keep = self._preview_window_for(_FUNCTION_KEY)
+        return _FUNCTION_KEY, 'Time Series (Digital Currency Daily)', 'Meta Data'
+
+    @av._output_format
+    @av._call_api_on_func
+    def get_digital_currency_weekly(self, symbol, market):
+        """ Returns  the weekly historical time series for a digital currency
+        (e.g., BTC) traded on a specific market (e.g., CNY/Chinese Yuan),
+        refreshed daily at midnight (UTC). Prices and volumes are quoted in
+        both the market-specific currency and USD..
+
+        Keyword Arguments:
+            symbol: The digital/crypto currency of your choice. It can be any
+            of the currencies in the digital currency list. For example:
+            symbol=BTC.
+            market: The exchange market of your choice. It can be any of the
+            market in the market list. For example: market=CNY.
+        """
+        _FUNCTION_KEY = 'DIGITAL_CURRENCY_WEEKLY'
+        return _FUNCTION_KEY, 'Time Series (Digital Currency Weekly)', 'Meta Data'
+
+    @av._output_format
+    @av._call_api_on_func
+    def get_digital_currency_monthly(self, symbol, market):
+        """ Returns  the monthly historical time series for a digital currency
+        (e.g., BTC) traded on a specific market (e.g., CNY/Chinese Yuan),
+        refreshed daily at midnight (UTC). Prices and volumes are quoted in
+        both the market-specific currency and USD..
+
+        Keyword Arguments:
+            symbol: The digital/crypto currency of your choice. It can be any
+            of the currencies in the digital currency list. For example:
+            symbol=BTC.
+            market: The exchange market of your choice. It can be any of the
+            market in the market list. For example: market=CNY.
+        """
+        _FUNCTION_KEY = 'DIGITAL_CURRENCY_MONTHLY'
+        return _FUNCTION_KEY, 'Time Series (Digital Currency Monthly)', 'Meta Data'
+
+    @av._output_format
+    @av._call_api_on_func
+    def get_digital_currency_exchange_rate(self, from_currency, to_currency):
+        """ Returns the realtime exchange rate for any pair of digital
+        currency (e.g., BTC) or physical currency (e.g., USD).
+        Keyword Arguments:
+            from_currency: The currency you would like to get the exchange rate
+            for. It can either be a physical currency or digital/crypto currency.
+            For example: from_currency=USD or from_currency=BTC.
+            to_currency: The destination currency for the exchange rate.
+            It can either be a physical currency or digital/crypto currency.
+            For example: to_currency=USD or to_currency=BTC.
+        """
+        _FUNCTION_KEY = 'CURRENCY_EXCHANGE_RATE'
+        return _FUNCTION_KEY, 'Realtime Currency Exchange Rate', None
+    
+    @av._output_format
+    @av._call_api_on_func
+    def get_crypto_intraday(self, symbol, market, interval, outputsize='compact'):
+        """ Returns the intraday time series
+        of the cryptocurrency specified, updated realtime.
+
+        Keyword Arguments:
+            symbol:  digital/crypto currency of your choice
+            market:  exchange market of your choice
+            interval:  time interval between two consecutive values,
+                supported values are '1min', '5min', '15min', '30min', '60min'
+            outputsize:  The size of the call, supported values are
+                'compact' and 'full; the first returns the last 100 points in the
+                data series, and 'full' returns the full-length intraday times
+                series (default 'compact')
+        """
+        _FUNCTION_KEY = 'CRYPTO_INTRADAY'
+        return _FUNCTION_KEY, "Time Series Crypto ({})".format(interval), 'Meta Data'

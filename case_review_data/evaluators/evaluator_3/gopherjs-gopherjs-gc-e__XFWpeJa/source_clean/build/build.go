@@ -1,0 +1,1450 @@
+// Package build implements GopherJS build system.
+//
+// WARNING: This package's API is treated as internal and currently doesn't
+// provide any API stability guarantee, use it at your own risk. If you need a
+// stable interface, prefer invoking the gopherjs CLI tool as a subprocess.
+package build
+
+import (
+	"fmt"
+	"go/ast"
+	"go/build"
+	"go/parser"
+	"go/scanner"
+	"go/token"
+	"go/types"
+	"io/fs"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/fsnotify/fsnotify"
+	log "github.com/sirupsen/logrus"
+	"golang.org/x/tools/go/buildutil"
+
+	"github.com/gopherjs/gopherjs/build/cache"
+	"github.com/gopherjs/gopherjs/compiler"
+	"github.com/gopherjs/gopherjs/compiler/astutil"
+	"github.com/gopherjs/gopherjs/compiler/errlist"
+	"github.com/gopherjs/gopherjs/compiler/incjs"
+	"github.com/gopherjs/gopherjs/compiler/sources"
+	"github.com/gopherjs/gopherjs/internal/sourcemapx"
+	"github.com/gopherjs/gopherjs/internal/testmain"
+)
+
+// DefaultGOROOT is the default GOROOT value for builds.
+//
+// It uses the GOPHERJS_GOROOT environment variable if it is set,
+// or else the default GOROOT value of the system Go distribution.
+var DefaultGOROOT = func() string {
+	if goroot, ok := os.LookupEnv("GOPHERJS_GOROOT"); ok {
+		// GopherJS-specific GOROOT value takes precedence.
+		return goroot
+	}
+	// The usual default GOROOT.
+	return build.Default.GOROOT
+}()
+
+// NewBuildContext creates a build context for building Go packages
+// with GopherJS compiler.
+//
+// Core GopherJS packages (i.e., "github.com/gopherjs/gopherjs/js", "github.com/gopherjs/gopherjs/nosync")
+// are loaded from gopherjspkg.FS virtual filesystem if not present in GOPATH or
+// go.mod.
+func NewBuildContext(installSuffix string, buildTags []string) XContext {
+	e := DefaultEnv()
+	e.InstallSuffix = installSuffix
+	e.BuildTags = buildTags
+	realGOROOT := goCtx(e)
+	return &chainedCtx{
+		primary:   realGOROOT,
+		secondary: gopherjsCtx(e),
+	}
+}
+
+// Import returns details about the Go package named by the import path. If the
+// path is a local import path naming a package that can be imported using
+// a standard import path, the returned package will set p.ImportPath to
+// that path.
+//
+// In the directory containing the package, .go and .inc.js files are
+// considered part of the package except for:
+//
+//   - .go files in package documentation
+//   - files starting with _ or . (likely editor temporary files)
+//   - files with build constraints not satisfied by the context
+//
+// If an error occurs, Import returns a non-nil error and a nil
+// *PackageData.
+func Import(path string, mode build.ImportMode, installSuffix string, buildTags []string) (*PackageData, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		// Getwd may fail if we're in GOOS=js mode. That's okay, handle
+		// it by falling back to empty working directory. It just means
+		// Import will not be able to resolve relative import paths.
+		wd = ""
+	}
+	xctx := NewBuildContext(installSuffix, buildTags)
+	return xctx.Import(path, wd, mode)
+}
+
+// exclude returns files, excluding specified files.
+func exclude(files []string, exclude ...string) []string {
+	var s []string
+Outer:
+	for _, f := range files {
+		for _, e := range exclude {
+			if f == e {
+				continue Outer
+			}
+		}
+		s = append(s, f)
+	}
+	return s
+}
+
+// ImportDir is like Import but processes the Go package found in the named
+// directory.
+func ImportDir(dir string, mode build.ImportMode, installSuffix string, buildTags []string) (*PackageData, error) {
+	xctx := NewBuildContext(installSuffix, buildTags)
+	pkg, err := xctx.Import(".", dir, mode)
+	if err != nil {
+		return nil, err
+	}
+
+	return pkg, nil
+}
+
+// overrideInfo is used by parseAndAugment methods to manage
+// directives and how the overlay and original are merged.
+type overrideInfo struct {
+	// replace indicates that the original code is expected to exist.
+	// If the original code is not present, then error to let us know
+	// the original code has been removed or renamed.
+	// This will be set to false once the original code has been found.
+	replace bool
+
+	// new indicates that the override code is expected to be new.
+	// If the original code is present, then error to let us know
+	// that we are overriding something that we did not expect to replace.
+	// This lets us know of new or renamed code in the original that happens
+	// to collide with our overrides.
+	new bool
+
+	// keepOriginal indicates that the original code should be kept
+	// but the identifier will be prefixed by `_gopherjs_original_foo`.
+	// If false the original code is removed.
+	keepOriginal bool
+
+	// purgeMethods indicates that this info is for a type and if a method has
+	// this type as a receiver then the method should also be removed.
+	// If the method is defined in the overlays and therefore has its
+	// own overrides, this will be ignored.
+	purgeMethods bool
+
+	// overrideSignature is the function definition given in the overlays
+	// that should be used to replace the signature in the originals.
+	// Only receivers, type parameters, parameters, and results will be used.
+	overrideSignature *ast.FuncDecl
+}
+
+// parseAndAugment parses and returns all .go files of given pkg.
+// Standard Go library packages are augmented with files in compiler/natives folder.
+// If isTest is true and pkg.ImportPath has no _test suffix, package is built for running internal tests.
+// If isTest is true and pkg.ImportPath has _test suffix, package is built for running external tests.
+//
+// The native packages are augmented by the contents of natives.FS in the following way.
+// The file names do not matter except the usual `_test` suffix. The files for
+// native overrides get added to the package (even if they have the same name
+// as an existing file from the standard library).
+//
+//   - For function identifiers that exist in the original and the overrides
+//     and have the directive `gopherjs:keep-original`, the original identifier
+//     in the AST gets prefixed by `_gopherjs_original_`.
+//   - For identifiers that exist in the original and the overrides, and have
+//     the directive `gopherjs:purge`, both the original and override are
+//     removed. This is for completely removing something which is currently
+//     invalid for GopherJS. For any purged types any methods with that type as
+//     the receiver are also removed.
+//   - For function identifiers that exist in the original and the overrides,
+//     and have the directive `gopherjs:override-signature`, the overridden
+//     function is removed and the original function's signature is changed
+//     to match the overridden function signature. This allows the receiver,
+//     type parameters, parameter, and return values to be modified as needed.
+//   - Otherwise for identifiers that exist in the original and the overrides,
+//     the original is removed. Use `gopherjs:replace` to ensure that the
+//     original existed so that a replace is made.
+//   - New identifiers that don't exist in original package get added.
+//     Use `gopherjs:new` to ensure that the identifier is new and there was
+//     no original code for it.
+func parseAndAugment(xctx XContext, pkg *PackageData, isTest bool, fileSet *token.FileSet) ([]*ast.File, []incjs.File, error) {
+	jsFiles, overlayFiles := parseOverlayFiles(xctx, pkg, isTest, fileSet)
+
+	originalFiles, err := parserOriginalFiles(pkg, fileSet)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	overrides := make(map[string]overrideInfo)
+	for _, file := range overlayFiles {
+		augmentOverlayFile(file, overrides)
+	}
+	delete(overrides, "init")
+
+	for _, file := range originalFiles {
+		augmentOriginalImports(pkg.ImportPath, file)
+	}
+
+	if len(overrides) > 0 {
+		found := make(map[string]struct{}, len(overrides))
+		for _, file := range originalFiles {
+			augmentOriginalFile(file, overrides, found)
+		}
+		err := checkOverrides(overrides, found, pkg.ImportPath)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	return append(overlayFiles, originalFiles...), jsFiles, nil
+}
+
+// parseOverlayFiles loads and parses overlay files
+// to augment the original files with.
+func parseOverlayFiles(xctx XContext, pkg *PackageData, isTest bool, fileSet *token.FileSet) ([]incjs.File, []*ast.File) {
+	isXTest := strings.HasSuffix(pkg.ImportPath, "_test")
+	importPath := pkg.ImportPath
+	if isXTest {
+		importPath = importPath[:len(importPath)-5]
+	}
+
+	nativesContext := overlayCtx(xctx.Env())
+	nativesPkg, err := nativesContext.Import(importPath, "", 0)
+	if err != nil {
+		return nil, nil
+	}
+
+	jsFiles := nativesPkg.JSFiles
+	var files []*ast.File
+	names := nativesPkg.GoFiles
+	if isTest {
+		names = append(names, nativesPkg.TestGoFiles...)
+	}
+	if isXTest {
+		names = nativesPkg.XTestGoFiles
+	}
+
+	for _, name := range names {
+		fullPath := path.Join(nativesPkg.Dir, name)
+		r, err := nativesContext.bctx.OpenFile(fullPath)
+		if err != nil {
+			panic(err)
+		}
+		// Files should be uniquely named and in the original package directory in order to be
+		// ordered correctly
+		newPath := path.Join(pkg.Dir, "gopherjs__"+name)
+		file, err := parser.ParseFile(fileSet, newPath, r, parser.ParseComments)
+		if err != nil {
+			panic(err)
+		}
+		r.Close()
+
+		files = append(files, file)
+	}
+	return jsFiles, files
+}
+
+// parserOriginalFiles loads and parses the original files to augment.
+func parserOriginalFiles(pkg *PackageData, fileSet *token.FileSet) ([]*ast.File, error) {
+	var files []*ast.File
+	var errList errlist.ErrorList
+	for _, name := range pkg.GoFiles {
+		if !filepath.IsAbs(name) { // name might be absolute if specified directly. E.g., `gopherjs build /abs/file.go`.
+			name = filepath.Join(pkg.Dir, name)
+		}
+
+		r, err := buildutil.OpenFile(pkg.bctx, name)
+		if err != nil {
+			return nil, err
+		}
+
+		file, err := parser.ParseFile(fileSet, name, r, parser.ParseComments)
+		r.Close()
+		if err != nil {
+			if list, isList := err.(scanner.ErrorList); isList {
+				if len(list) > 10 {
+					list = append(list[:10], &scanner.Error{Pos: list[9].Pos, Msg: "too many errors"})
+				}
+				for _, entry := range list {
+					errList = append(errList, entry)
+				}
+				continue
+			}
+			errList = append(errList, err)
+			continue
+		}
+
+		files = append(files, file)
+	}
+
+	if errList != nil {
+		return nil, errList
+	}
+	return files, nil
+}
+
+// augmentOverlayFile is the part of parseAndAugment that processes
+// an overlay file AST to collect information such as compiler directives
+// and perform any initial augmentation needed to the overlay.
+func augmentOverlayFile(file *ast.File, overrides map[string]overrideInfo) {
+	anyChange := false
+	for i, decl := range file.Decls {
+		replaceDecl := astutil.DirectiveReplace(decl)
+		newDecl := astutil.DirectiveNew(decl)
+		purgeDecl := astutil.Purge(decl)
+
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			k := astutil.FuncKey(d)
+			oi := overrideInfo{
+				keepOriginal: astutil.KeepOriginal(d),
+				replace:      replaceDecl,
+				new:          newDecl,
+			}
+			if astutil.OverrideSignature(d) {
+				oi.overrideSignature = d
+				purgeDecl = true
+			}
+			overrides[k] = oi
+		case *ast.GenDecl:
+			for j, spec := range d.Specs {
+				purgeSpec := purgeDecl || astutil.Purge(spec)
+				replaceSpec := replaceDecl || astutil.DirectiveReplace(spec)
+				newSpec := newDecl || astutil.DirectiveNew(spec)
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					overrides[s.Name.Name] = overrideInfo{
+						purgeMethods: purgeSpec,
+						replace:      replaceSpec,
+						new:          newSpec,
+					}
+				case *ast.ValueSpec:
+					for _, name := range s.Names {
+						overrides[name.Name] = overrideInfo{
+							replace: replaceSpec,
+							new:     newSpec,
+						}
+					}
+				}
+				if purgeSpec {
+					anyChange = true
+					d.Specs[j] = nil
+				}
+			}
+		}
+		if purgeDecl {
+			anyChange = true
+			file.Decls[i] = nil
+		}
+	}
+	if anyChange {
+		finalizeRemovals(file)
+		pruneImports(file)
+	}
+}
+
+// augmentOriginalImports is the part of parseAndAugment that processes
+// an original file AST to modify the imports for that file.
+func augmentOriginalImports(importPath string, file *ast.File) {
+	switch importPath {
+	case "crypto/rand", "encoding/gob", "encoding/json", "expvar", "go/token", "log", "math/big", "math/rand", "regexp", "time":
+		for _, spec := range file.Imports {
+			path, _ := strconv.Unquote(spec.Path.Value)
+			if path == "sync" {
+				if spec.Name == nil {
+					spec.Name = ast.NewIdent("sync")
+				}
+				spec.Path.Value = `"github.com/gopherjs/gopherjs/nosync"`
+			}
+		}
+	}
+}
+
+// augmentOriginalFile is the part of parseAndAugment that processes an
+// original file AST to augment the source code using the overrides from
+// the overlay files.
+//
+// The overrides and found maps key with an identifier that uniquely identifies
+// the top-level object being augmented.
+// The overrides map should be populated with the overrides to apply.
+// Found will be populated with the objects that had an override applied.
+func augmentOriginalFile(file *ast.File, overrides map[string]overrideInfo, found map[string]struct{}) {
+	anyChange := false
+	for i, decl := range file.Decls {
+		switch d := decl.(type) {
+		case *ast.FuncDecl:
+			funcKey := astutil.FuncKey(d)
+			if info, ok := overrides[funcKey]; ok {
+				found[funcKey] = struct{}{}
+				anyChange = true
+				removeFunc := true
+				if info.keepOriginal {
+					// Allow overridden function calls
+					// The standard library implementation of foo() becomes _gopherjs_original_foo()
+					d.Name.Name = "_gopherjs_original_" + d.Name.Name
+					removeFunc = false
+				}
+				if overSig := info.overrideSignature; overSig != nil {
+					d.Recv = overSig.Recv
+					d.Type.TypeParams = overSig.Type.TypeParams
+					d.Type.Params = overSig.Type.Params
+					d.Type.Results = overSig.Type.Results
+					removeFunc = false
+				}
+				if removeFunc {
+					file.Decls[i] = nil
+				}
+			} else if recvKey := astutil.FuncReceiverKey(d); len(recvKey) > 0 {
+				// check if the receiver has been purged, if so, remove the method too.
+				if info, ok := overrides[recvKey]; ok && info.purgeMethods {
+					found[recvKey] = struct{}{}
+					anyChange = true
+					file.Decls[i] = nil
+				}
+			}
+		case *ast.GenDecl:
+			for j, spec := range d.Specs {
+				switch s := spec.(type) {
+				case *ast.TypeSpec:
+					if _, ok := overrides[s.Name.Name]; ok {
+						found[s.Name.Name] = struct{}{}
+						anyChange = true
+						d.Specs[j] = nil
+					}
+				case *ast.ValueSpec:
+					if len(s.Names) == len(s.Values) {
+						// multi-value context
+						// e.g. var a, b = 2, foo[int]()
+						// A removal will also remove the value which may be from a
+						// function call. This allows us to remove unwanted statements.
+						// However, if that call has a side effect which still needs
+						// to be run, add the call into the overlay.
+						for k, name := range s.Names {
+							if _, ok := overrides[name.Name]; ok {
+								found[name.Name] = struct{}{}
+								anyChange = true
+								s.Names[k] = nil
+								s.Values[k] = nil
+							}
+						}
+					} else {
+						// single-value context
+						// e.g. var a, b = foo[int]()
+						// If a removal from the overlays makes all returned values unused,
+						// then remove the function call as well. This allows us to stop
+						// unwanted calls if needed. If that call has a side effect which
+						// still needs to be run, add the call into the overlay.
+						nameRemoved := false
+						for _, name := range s.Names {
+							if _, ok := overrides[name.Name]; ok {
+								found[name.Name] = struct{}{}
+								nameRemoved = true
+								name.Name = `_`
+							}
+						}
+						if nameRemoved {
+							removeSpec := true
+							for _, name := range s.Names {
+								if name.Name != `_` {
+									removeSpec = false
+									break
+								}
+							}
+							if removeSpec {
+								anyChange = true
+								d.Specs[j] = nil
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	if anyChange {
+		finalizeRemovals(file)
+		pruneImports(file)
+	}
+}
+
+// checkOverrides performs a final check of the overrides to ensure that
+// all overrides that were expected to be found were found and all overrides
+// that were not expected to be found were not found.
+//
+// The overrides and found maps key with an identifier
+// that uniquely identifies the top-level object being augmented.
+// Found is populated with the objects that had an override applied
+// so the found keys should be a subset of the keys in the overrides map.
+func checkOverrides(overrides map[string]overrideInfo, found map[string]struct{}, pkgPath string) error {
+	el := errlist.ErrorList{}
+	for name, info := range overrides {
+		_, wasFound := found[name]
+		switch {
+		case wasFound && info.new:
+			el = el.Append(fmt.Errorf("gopherjs: original code for %s.%s was found, but override had `new` directive", pkgPath, name))
+		case !wasFound && info.replace:
+			el = el.Append(fmt.Errorf("gopherjs: original code for %s.%s was not found, but override had `replace` directive", pkgPath, name))
+		case !wasFound && info.keepOriginal:
+			el = el.Append(fmt.Errorf("gopherjs: original code for %s.%s was not found, but override had `keep-original` directive", pkgPath, name))
+		case !wasFound && info.purgeMethods:
+			el = el.Append(fmt.Errorf("gopherjs: original code for %s.%s was not found, but override had `purge` directive", pkgPath, name))
+		case !wasFound && info.overrideSignature != nil:
+			el = el.Append(fmt.Errorf("gopherjs: original code for %s.%s was not found, but override had `override-signature` directive", pkgPath, name))
+		}
+	}
+	return el.ErrOrNil()
+}
+
+// isOnlyImports determines if this file is empty except for imports.
+func isOnlyImports(file *ast.File) bool {
+	for _, decl := range file.Decls {
+		if gen, ok := decl.(*ast.GenDecl); ok && gen.Tok == token.IMPORT {
+			continue
+		}
+
+		// The decl was either a FuncDecl or a non-import GenDecl.
+		return false
+	}
+	return true
+}
+
+// pruneImports will remove any unused imports from the file.
+//
+// This will not remove any dot (`.`) or blank (`_`) imports, unless
+// there are no declarations or directives meaning that all the imports
+// should be cleared.
+// If the removal of code causes an import to be removed, the init's from that
+// import may not be run anymore. If we still need to run an init for an import
+// which is no longer used, add it to the overlay as a blank (`_`) import.
+//
+// This uses the given name or guesses at the name using the import path,
+// meaning this doesn't work for packages which have a different package name
+// from the path, including those paths which are versioned
+// (e.g. `github.com/foo/bar/v2` where the package name is `bar`)
+// or if the import is defined using a relative path (e.g. `./..`).
+// Those cases don't exist in the native for Go, so we should only run
+// this pruning when we have native overlays, but not for unknown packages.
+func pruneImports(file *ast.File) {
+	if isOnlyImports(file) && !astutil.HasDirectivePrefix(file, `//go:linkname `) {
+		// The file is empty, remove all imports including any `.` or `_` imports.
+		file.Imports = nil
+		file.Decls = nil
+		return
+	}
+
+	unused := make(map[string]int, len(file.Imports))
+	for i, in := range file.Imports {
+		if name := astutil.ImportName(in); len(name) > 0 {
+			unused[name] = i
+		}
+	}
+
+	// Remove "unused imports" for any import which is used.
+	ast.Inspect(file, func(n ast.Node) bool {
+		if sel, ok := n.(*ast.SelectorExpr); ok {
+			if id, ok := sel.X.(*ast.Ident); ok && id.Obj == nil {
+				delete(unused, id.Name)
+			}
+		}
+		return len(unused) > 0
+	})
+	if len(unused) == 0 {
+		return
+	}
+
+	// Remove "unused imports" for any import used for a directive.
+	directiveImports := map[string]string{
+		`unsafe`: `//go:linkname `,
+		`embed`:  `//go:embed `,
+	}
+	for name, index := range unused {
+		in := file.Imports[index]
+		path, _ := strconv.Unquote(in.Path.Value)
+		directivePrefix, hasPath := directiveImports[path]
+		if hasPath && astutil.HasDirectivePrefix(file, directivePrefix) {
+			// since the import is otherwise unused set the name to blank.
+			in.Name = ast.NewIdent(`_`)
+			delete(unused, name)
+		}
+	}
+	if len(unused) == 0 {
+		return
+	}
+
+	// Remove all unused import specifications
+	isUnusedSpec := map[*ast.ImportSpec]bool{}
+	for _, index := range unused {
+		isUnusedSpec[file.Imports[index]] = true
+	}
+	for _, decl := range file.Decls {
+		if d, ok := decl.(*ast.GenDecl); ok {
+			for i, spec := range d.Specs {
+				if other, ok := spec.(*ast.ImportSpec); ok && isUnusedSpec[other] {
+					d.Specs[i] = nil
+				}
+			}
+		}
+	}
+
+	// Remove the unused import copies in the file
+	for _, index := range unused {
+		file.Imports[index] = nil
+	}
+
+	finalizeRemovals(file)
+}
+
+// finalizeRemovals fully removes any declaration, specification, imports
+// that have been set to nil. This will also remove any unassociated comment
+// groups, including the comments from removed code.
+func finalizeRemovals(file *ast.File) {
+	fileChanged := false
+	for i, decl := range file.Decls {
+		switch d := decl.(type) {
+		case nil:
+			fileChanged = true
+		case *ast.GenDecl:
+			declChanged := false
+			for j, spec := range d.Specs {
+				switch s := spec.(type) {
+				case nil:
+					declChanged = true
+				case *ast.ValueSpec:
+					specChanged := false
+					for _, name := range s.Names {
+						if name == nil {
+							specChanged = true
+							break
+						}
+					}
+					if specChanged {
+						s.Names = astutil.Squeeze(s.Names)
+						s.Values = astutil.Squeeze(s.Values)
+						if len(s.Names) == 0 {
+							declChanged = true
+							d.Specs[j] = nil
+						}
+					}
+				}
+			}
+			if declChanged {
+				d.Specs = astutil.Squeeze(d.Specs)
+				if len(d.Specs) == 0 {
+					fileChanged = true
+					file.Decls[i] = nil
+				}
+			}
+		}
+	}
+	if fileChanged {
+		file.Decls = astutil.Squeeze(file.Decls)
+	}
+
+	file.Imports = astutil.Squeeze(file.Imports)
+
+	file.Comments = nil // clear this first so ast.Inspect doesn't walk it.
+	remComments := []*ast.CommentGroup{}
+	ast.Inspect(file, func(n ast.Node) bool {
+		if cg, ok := n.(*ast.CommentGroup); ok {
+			remComments = append(remComments, cg)
+		}
+		return true
+	})
+	file.Comments = remComments
+}
+
+// Options controls build process behavior.
+type Options struct {
+	Verbose        bool
+	Quiet          bool
+	Watch          bool
+	CreateMapFile  bool
+	MapToLocalDisk bool
+	Minify         bool
+	Color          bool
+	BuildTags      []string
+	TestedPackage  string
+	NoCache        bool
+}
+
+// PrintError message to the terminal.
+func (o *Options) PrintError(format string, a ...any) {
+	if o.Color {
+		format = "\x1B[31m" + format + "\x1B[39m"
+	}
+	fmt.Fprintf(os.Stderr, format, a...)
+}
+
+// PrintSuccess message to the terminal.
+func (o *Options) PrintSuccess(format string, a ...any) {
+	if o.Color {
+		format = "\x1B[32m" + format + "\x1B[39m"
+	}
+	fmt.Fprintf(os.Stderr, format, a...)
+}
+
+// PackageData is an extension of go/build.Package with additional metadata
+// GopherJS requires.
+type PackageData struct {
+	*build.Package
+	JSFiles []incjs.File
+	// IsTest is true if the package is being built for running tests.
+	IsTest     bool
+	SrcModTime time.Time
+	UpToDate   bool
+	// If true, the package does not have a corresponding physical directory on disk.
+	IsVirtual bool
+
+	bctx *build.Context // The original build context this package came from.
+}
+
+func (p PackageData) String() string {
+	return fmt.Sprintf("%s [is_test=%v]", p.ImportPath, p.IsTest)
+}
+
+// FileModTime returns the most recent modification time of the package's source
+// files. This includes all .go and .inc.js that would be included in the build,
+// but excludes any dependencies.
+func (p PackageData) FileModTime() time.Time {
+	newest := time.Time{}
+	for _, file := range p.JSFiles {
+		if file.ModTime.After(newest) {
+			newest = file.ModTime
+		}
+	}
+
+	// Unfortunately, build.Context methods don't allow us to Stat and individual
+	// file, only to enumerate a directory. So we first get mtimes for all files
+	// in the package directory, and then pick the newest for the relevant GoFiles.
+	mtimes := map[string]time.Time{}
+	files, err := buildutil.ReadDir(p.bctx, p.Dir)
+	if err != nil {
+		log.Errorf("Failed to enumerate files in the %q in context %v: %s. Assuming time.Now().", p.Dir, p.bctx, err)
+		return time.Now()
+	}
+	for _, file := range files {
+		mtimes[file.Name()] = file.ModTime()
+	}
+
+	for _, file := range p.GoFiles {
+		t, ok := mtimes[file]
+		if !ok {
+			log.Errorf("No mtime found for source file %q of package %q, assuming time.Now().", file, p.Name)
+			return time.Now()
+		}
+		if t.After(newest) {
+			newest = t
+		}
+	}
+	return newest
+}
+
+// InternalBuildContext returns the build context that produced the package.
+//
+// WARNING: This function is a part of internal API and will be removed in
+// future.
+func (p *PackageData) InternalBuildContext() *build.Context {
+	return p.bctx
+}
+
+// TestPackage returns a variant of the package with "internal" tests.
+func (p *PackageData) TestPackage() *PackageData {
+	return &PackageData{
+		Package: &build.Package{
+			Name:            p.Name,
+			ImportPath:      p.ImportPath,
+			Dir:             p.Dir,
+			GoFiles:         append(p.GoFiles, p.TestGoFiles...),
+			Imports:         append(p.Imports, p.TestImports...),
+			EmbedPatternPos: joinEmbedPatternPos(p.EmbedPatternPos, p.TestEmbedPatternPos),
+		},
+		IsTest:  true,
+		JSFiles: p.JSFiles,
+		bctx:    p.bctx,
+	}
+}
+
+// XTestPackage returns a variant of the package with "external" tests.
+func (p *PackageData) XTestPackage() *PackageData {
+	return &PackageData{
+		Package: &build.Package{
+			Name:            p.Name + "_test",
+			ImportPath:      p.ImportPath + "_test",
+			Dir:             p.Dir,
+			GoFiles:         p.XTestGoFiles,
+			Imports:         p.XTestImports,
+			EmbedPatternPos: p.XTestEmbedPatternPos,
+		},
+		IsTest: true,
+		bctx:   p.bctx,
+	}
+}
+
+// InstallPath returns the path where "gopherjs install" command should place the
+// generated output.
+func (p *PackageData) InstallPath() (string, error) {
+	if p.IsCommand() {
+		name := filepath.Base(p.ImportPath) + ".js"
+
+		// For executable packages, mimic go tool behavior if possible.
+		if gobin := os.Getenv("GOBIN"); gobin != "" {
+			return filepath.Join(gobin, name), nil
+		}
+
+		if gopath := os.Getenv("GOPATH"); gopath != "" {
+			return filepath.Join(gopath, "bin", name), nil
+		}
+
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, "go", "bin", name), nil
+		}
+	}
+
+	if p.PkgObj != "" {
+		return p.PkgObj, nil
+	}
+
+	// The build.Context.Import method stopped populating build.Package.PkgObj
+	// in 1.20 for packages found in the Goroot. Currently we don't use the
+	// build.Package.PkgObj except for a fallback when no other locations
+	// can be found for command packages to install.
+	return "", fmt.Errorf(`no install location available for %q`, p.ImportPath)
+}
+
+// Session manages internal state GopherJS requires to perform a build.
+//
+// This is the main interface to GopherJS build system. Session lifetime is
+// roughly equivalent to a single GopherJS tool invocation.
+type Session struct {
+	options    *Options
+	xctx       XContext
+	buildCache cache.Cache
+
+	// importPaths is a map of the resolved import paths given the
+	// source directory (first key) and the unresolved import path (second key).
+	// This is used to cache the resolved import returned from XContext.Import.
+	// XContent.Import can be slow, so we cache the resolved path that is used
+	// as the map key by parsedPackages and UpToDateArchives.
+	// This makes subsequent lookups faster during compilation when all we have
+	// is the unresolved import path and source directory.
+	importPaths map[string]map[string]string
+
+	// packages caches imported package metadata by resolved import path.
+	// This avoids repeated xctx.Import calls for the same package.
+	packages map[string]*PackageData
+
+	// sources is a map of parsed packages that have been built and augmented.
+	// This is keyed using resolved import paths. This is used to avoid
+	// rebuilding and augmenting packages that are imported by several packages.
+	// The files in these sources haven't been sorted nor simplified yet.
+	sources map[string]*sources.Sources
+
+	// Binary archives produced during the current session and assumed to be
+	// up to date with input sources and dependencies. In the -w ("watch") mode
+	// must be cleared upon entering watching.
+	UpToDateArchives map[string]*compiler.Archive
+	Watcher          *fsnotify.Watcher
+}
+
+// NewSession creates a new GopherJS build session.
+func NewSession(options *Options) (*Session, error) {
+	options.Verbose = options.Verbose || options.Watch
+
+	s := &Session{
+		options:          options,
+		importPaths:      make(map[string]map[string]string),
+		packages:         make(map[string]*PackageData),
+		sources:          make(map[string]*sources.Sources),
+		UpToDateArchives: make(map[string]*compiler.Archive),
+	}
+	s.xctx = NewBuildContext(s.InstallSuffix(), s.options.BuildTags)
+	env := s.xctx.Env()
+
+	// Go distribution version check.
+	if err := compiler.CheckGoVersion(env.GOROOT); err != nil {
+		return nil, err
+	}
+
+	// If the cache is enabled, initialize the build cache.
+	// Disable caching by leaving buildCache set to nil.
+	//
+	// TODO(grantnelson-wf): Currently the build cache is slower than
+	// parsing and augmenting the files, so we disable it for now.
+	// Re-enable it once the cache performance is improved.
+	const disableDefaultCache = true
+	if !s.options.NoCache && !disableDefaultCache {
+		s.buildCache = &cache.BuildCache{
+			GOOS:          env.GOOS,
+			GOARCH:        env.GOARCH,
+			GOROOT:        env.GOROOT,
+			GOPATH:        env.GOPATH,
+			BuildTags:     append([]string{}, env.BuildTags...),
+			TestedPackage: options.TestedPackage,
+			Version:       compiler.Version,
+		}
+	}
+
+	if options.Watch {
+		if out, err := exec.Command("ulimit", "-n").Output(); err == nil {
+			if n, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil && n < 1024 {
+				fmt.Printf("Warning: The maximum number of open file descriptors is very low (%d). Change it with 'ulimit -n 8192'.\n", n)
+			}
+		}
+
+		var err error
+		s.Watcher, err = fsnotify.NewWatcher()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return s, nil
+}
+
+// XContext returns the session's build context.
+func (s *Session) XContext() XContext { return s.xctx }
+
+// InstallSuffix returns the suffix added to the generated output file.
+func (s *Session) InstallSuffix() string {
+	if s.options.Minify {
+		return "min"
+	}
+	return ""
+}
+
+// GoRelease returns Go release version this session is building with.
+func (s *Session) GoRelease() string {
+	return compiler.GoRelease(s.xctx.Env().GOROOT)
+}
+
+// TestBinary returns the testBinary value that is normally passed into
+// cmd/link by a -X option. The testBinary value is defined in the STL at
+// testing/testing.go for the `testing.Testing() bool` function.
+// It is set to "1" if the binary (the JS output in our case) is built
+// with "go test" and "0" otherwise.
+func (s *Session) TestBinary() string {
+	if s.options.TestedPackage != `` {
+		return `1`
+	}
+	return `0`
+}
+
+// BuildFiles passed to the GopherJS tool as if they were a package.
+//
+// A ephemeral package will be created with only the provided files. This
+// function is intended for use with, for example, `gopherjs run main.go`.
+func (s *Session) BuildFiles(filenames []string, pkgObj string, cwd string) error {
+	if len(filenames) == 0 {
+		return fmt.Errorf("no input sources are provided")
+	}
+
+	normalizedDir := func(filename string) string {
+		d := filepath.Dir(filename)
+		if !filepath.IsAbs(d) {
+			d = filepath.Join(cwd, d)
+		}
+		return filepath.Clean(d)
+	}
+
+	// Ensure all source files are in the same directory.
+	dirSet := map[string]bool{}
+	for _, file := range filenames {
+		dirSet[normalizedDir(file)] = true
+	}
+	dirList := []string{}
+	for dir := range dirSet {
+		dirList = append(dirList, dir)
+	}
+	sort.Strings(dirList)
+	if len(dirList) != 1 {
+		return fmt.Errorf("named files must all be in one directory; have: %v", strings.Join(dirList, ", "))
+	}
+
+	root := dirList[0]
+	ctx := build.Default
+	ctx.UseAllFiles = true
+	ctx.ReadDir = func(dir string) ([]fs.FileInfo, error) {
+		n := len(filenames)
+		infos := make([]fs.FileInfo, n)
+		for i := 0; i < n; i++ {
+			info, err := os.Stat(filenames[i])
+			if err != nil {
+				return nil, err
+			}
+			infos[i] = info
+		}
+		return infos, nil
+	}
+	p, err := ctx.Import(".", root, 0)
+	if err != nil {
+		return err
+	}
+	p.Name = "main"
+	p.ImportPath = "main"
+
+	pkg := &PackageData{
+		Package: p,
+		// This ephemeral package doesn't have a unique import path to be used as a
+		// build cache key, so we never cache it.
+		SrcModTime: time.Now().Add(time.Hour),
+		bctx:       &goCtx(s.xctx.Env()).bctx,
+	}
+
+	for _, file := range filenames {
+		jsFile, err := incjs.FromFilename(file)
+		if err != nil {
+			return err
+		}
+		if jsFile != nil {
+			jsFile.Path = filepath.Join(pkg.Dir, filepath.Base(file))
+			pkg.JSFiles = append(pkg.JSFiles, *jsFile)
+		}
+	}
+
+	archive, err := s.BuildProject(pkg)
+	if err != nil {
+		return err
+	}
+	if s.sources["main"].Package.Name() != "main" {
+		return fmt.Errorf("cannot build/run non-main package")
+	}
+	return s.WriteCommandPackage(archive, pkgObj)
+}
+
+// BuildProject builds a command project (one with a main method) or
+// builds a test project (one with a synthesized test main package).
+func (s *Session) BuildProject(pkg *PackageData) (*compiler.Archive, error) {
+	// ensure that runtime for gopherjs is imported
+	pkg.Imports = append(pkg.Imports, `runtime`)
+
+	// Load the project to get the sources for the parsed packages.
+	var rootSrcs *sources.Sources
+	var err error
+	if pkg.IsTest {
+		rootSrcs, err = s.loadTestPackage(pkg)
+	} else {
+		rootSrcs, err = s.LoadPackages(pkg)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// Compile the project into Archives containing the generated JS.
+	return s.prepareAndCompilePackages(rootSrcs)
+}
+
+// GetSortedSources returns the sources sorted by import path.
+// The files in the sources may still not be sorted yet.
+func (s *Session) GetSortedSources() []*sources.Sources {
+	allSources := make([]*sources.Sources, 0, len(s.sources))
+	for _, srcs := range s.sources {
+		allSources = append(allSources, srcs)
+	}
+	sources.SortedSourcesSlice(allSources)
+	return allSources
+}
+
+func (s *Session) loadTestPackage(pkg *PackageData) (*sources.Sources, error) {
+	_, err := s.LoadPackages(pkg.TestPackage())
+	if err != nil {
+		return nil, err
+	}
+	_, err = s.LoadPackages(pkg.XTestPackage())
+	if err != nil {
+		return nil, err
+	}
+
+	// Generate a synthetic testmain package.
+	fset := token.NewFileSet()
+	tests := testmain.TestMain{Package: pkg.Package, Context: pkg.bctx}
+	tests.Scan(fset)
+	mainPkg, mainFile, err := tests.Synthesize(fset)
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate testmain package for %s: %w", pkg.ImportPath, err)
+	}
+
+	// Create the sources for parsed package for the testmain package.
+	srcs := &sources.Sources{
+		ImportPath: mainPkg.ImportPath,
+		Dir:        mainPkg.Dir,
+		Files:      []*ast.File{mainFile},
+		FileSet:    fset,
+	}
+	s.sources[srcs.ImportPath] = srcs
+
+	// Import dependencies for the testmain package.
+	for _, importedPkgPath := range srcs.UnresolvedImports() {
+		_, _, err := s.loadImportPathWithSrcDir(importedPkgPath, pkg.Dir)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return srcs, nil
+}
+
+// loadImportPathWithSrcDir gets the parsed package specified by the import path.
+//
+// Relative import paths are interpreted relative to the passed srcDir.
+// If srcDir is empty, current working directory is assumed.
+func (s *Session) loadImportPathWithSrcDir(path, srcDir string) (*PackageData, *sources.Sources, error) {
+	if pkg, ok := s.cachedPackageFor(path, srcDir); ok {
+		// Cache this srcDir lookup as well, so later getImportPath lookups avoid xctx.Import.
+		s.cacheImportPath(path, srcDir, pkg.ImportPath)
+		srcs, err := s.LoadPackages(pkg)
+		if err != nil {
+			return nil, nil, err
+		}
+		return pkg, srcs, nil
+	}
+
+	pkg, err := s.xctx.Import(path, srcDir, 0)
+	if s.Watcher != nil && pkg != nil { // add watch even on error
+		s.Watcher.Add(pkg.Dir)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s.packages[pkg.ImportPath] = pkg
+	srcs, err := s.LoadPackages(pkg)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	s.cacheImportPath(path, srcDir, pkg.ImportPath)
+	return pkg, srcs, nil
+}
+
+func (s *Session) cachedPackageFor(path, srcDir string) (*PackageData, bool) {
+	if resolved, ok := s.importPaths[srcDir][path]; ok {
+		pkg, found := s.packages[resolved]
+		return pkg, found
+	}
+
+	if !build.IsLocalImport(path) {
+		pkg, found := s.packages[path]
+		return pkg, found
+	}
+
+	return nil, false
+}
+
+// cacheImportPath stores the resolved import path for the build package
+// so we can look it up later without getting the whole build package.
+// The given path and source directly are the ones passed into
+// XContext.Import to the get the build package originally.
+func (s *Session) cacheImportPath(path, srcDir, importPath string) {
+	if paths, ok := s.importPaths[srcDir]; ok {
+		paths[path] = importPath
+	} else {
+		s.importPaths[srcDir] = map[string]string{path: importPath}
+	}
+}
+
+// getExeModTime will determine the mod time of the GopherJS binary
+// the first time this is called and cache the result for subsequent calls.
+var getExeModTime = func() func() time.Time {
+	var (
+		once   sync.Once
+		result time.Time
+	)
+	getTime := func() {
+		gopherjsBinary, err := os.Executable()
+		if err == nil {
+			var fileInfo os.FileInfo
+			fileInfo, err = os.Stat(gopherjsBinary)
+			if err == nil {
+				result = fileInfo.ModTime()
+				return
+			}
+		}
+		os.Stderr.WriteString("Could not get GopherJS binary's modification timestamp. Please report issue.\n")
+		result = time.Now()
+	}
+	return func() time.Time {
+		once.Do(getTime)
+		return result
+	}
+}()
+
+// LoadPackages will recursively load and parse the given package and
+// its dependencies. This will return the sources for the given package.
+// The returned source and sources for the dependencies will be added
+// to the session's sources map.
+func (s *Session) LoadPackages(pkg *PackageData) (*sources.Sources, error) {
+	if srcs, ok := s.sources[pkg.ImportPath]; ok {
+		return srcs, nil
+	}
+
+	if exeModTime := getExeModTime(); exeModTime.After(pkg.SrcModTime) {
+		pkg.SrcModTime = exeModTime
+	}
+
+	for _, importedPkgPath := range pkg.Imports {
+		if importedPkgPath == "unsafe" {
+			continue
+		}
+		importedPkg, _, err := s.loadImportPathWithSrcDir(importedPkgPath, pkg.Dir)
+		if err != nil {
+			return nil, err
+		}
+
+		if impModTime := importedPkg.SrcModTime; impModTime.After(pkg.SrcModTime) {
+			pkg.SrcModTime = impModTime
+		}
+	}
+
+	if fileModTime := pkg.FileModTime(); fileModTime.After(pkg.SrcModTime) {
+		pkg.SrcModTime = fileModTime
+	}
+
+	// Try to load the package from the build cache.
+	var srcs *sources.Sources
+	if s.buildCache != nil {
+		cachedSrcs := &sources.Sources{}
+		if s.buildCache.Load(cachedSrcs, pkg.ImportPath, pkg.SrcModTime) {
+			srcs = cachedSrcs
+		}
+	}
+
+	// If the package was not found in the cache, build the package
+	// by parsing and augmenting the original files with overlay files.
+	if srcs == nil {
+		fileSet := token.NewFileSet()
+		files, overlayJsFiles, err := parseAndAugment(s.xctx, pkg, pkg.IsTest, fileSet)
+		if err != nil {
+			return nil, err
+		}
+		embed, err := embedFiles(pkg, fileSet, files)
+		if err != nil {
+			return nil, err
+		}
+		if embed != nil {
+			files = append(files, embed)
+		}
+
+		srcs = &sources.Sources{
+			ImportPath: pkg.ImportPath,
+			Dir:        pkg.Dir,
+			Files:      files,
+			FileSet:    fileSet,
+			JSFiles:    append(pkg.JSFiles, overlayJsFiles...),
+		}
+
+		// Store the built package in the cache for future use.
+		if s.buildCache != nil {
+			s.buildCache.Store(srcs, srcs.ImportPath, time.Now())
+		}
+	}
+
+	// Add the sources to the session's sources map.
+	s.sources[pkg.ImportPath] = srcs
+
+	// Import dependencies from the augmented files,
+	// whilst skipping any that have been already imported.
+	for _, importedPkgPath := range srcs.UnresolvedImports(pkg.Imports...) {
+		_, _, err := s.loadImportPathWithSrcDir(importedPkgPath, pkg.Dir)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return srcs, nil
+}
+
+func (s *Session) prepareAndCompilePackages(rootSrcs *sources.Sources) (*compiler.Archive, error) {
+	tContext := types.NewContext()
+	allSources := s.GetSortedSources()
+
+	// Prepare and analyze the source code.
+	// This will be performed recursively for all dependencies.
+	if err := compiler.PrepareAllSources(allSources, s.SourcesForImport, tContext); err != nil {
+		return nil, err
+	}
+
+	// Compile all the sources into archives.
+	for _, srcs := range allSources {
+		if _, err := s.compilePackage(srcs, tContext); err != nil {
+			return nil, err
+		}
+	}
+
+	rootArchive, ok := s.UpToDateArchives[rootSrcs.ImportPath]
+	if !ok {
+		// This is confirmation that the root package is in the sources map and got compiled.
+		return nil, fmt.Errorf(`root package %q was not found in archives`, rootSrcs.ImportPath)
+	}
+	return rootArchive, nil
+}
+
+func (s *Session) compilePackage(srcs *sources.Sources, tContext *types.Context) (*compiler.Archive, error) {
+	if archive, ok := s.UpToDateArchives[srcs.ImportPath]; ok {
+		return archive, nil
+	}
+
+	archive, err := compiler.Compile(srcs, tContext, s.options.Minify)
+	if err != nil {
+		return nil, err
+	}
+
+	if s.options.Verbose {
+		fmt.Println(srcs.ImportPath)
+	}
+
+	s.UpToDateArchives[srcs.ImportPath] = archive
+
+	return archive, nil
+}
+
+func (s *Session) getImportPath(path, srcDir string) (string, error) {
+	// If path is for an xtest package, just return it.
+	if strings.HasSuffix(path, "_test") {
+		return path, nil
+	}
+
+	// Check if the import path is already cached.
+	if importPath, ok := s.importPaths[srcDir][path]; ok {
+		return importPath, nil
+	}
+
+	// Fast-path for non-local imports when we already have their metadata.
+	if !build.IsLocalImport(path) {
+		if _, ok := s.sources[path]; ok {
+			// Sources are keyed by canonical import path.
+			s.cacheImportPath(path, srcDir, path)
+			return path, nil
+		}
+		if pkg, ok := s.packages[path]; ok {
+			s.cacheImportPath(path, srcDir, pkg.ImportPath)
+			return pkg.ImportPath, nil
+		}
+	}
+
+	// Fall back to the slow import of the build package.
+	pkg, err := s.xctx.Import(path, srcDir, 0)
+	if err != nil {
+		return ``, err
+	}
+	s.cacheImportPath(path, srcDir, pkg.ImportPath)
+	return pkg.ImportPath, nil
+}
+
+func (s *Session) SourcesForImport(path, srcDir string) (*sources.Sources, error) {
+	importPath, err := s.getImportPath(path, srcDir)
+	if err != nil {
+		return nil, err
+	}
+
+	srcs, ok := s.sources[importPath]
+	if !ok {
+		return nil, fmt.Errorf(`sources for %q not found`, path)
+	}
+
+	return srcs, nil
+}
+
+// ImportResolverFor returns a function which returns a compiled package archive
+// given an import path.
+func (s *Session) ImportResolverFor(srcDir string) func(string) (*compiler.Archive, error) {
+	return func(path string) (*compiler.Archive, error) {
+		importPath, err := s.getImportPath(path, srcDir)
+		if err != nil {
+			return nil, err
+		}
+
+		if archive, ok := s.UpToDateArchives[importPath]; ok {
+			return archive, nil
+		}
+
+		return nil, fmt.Errorf(`archive for %q not found`, importPath)
+	}
+}
+
+// SourceMappingCallback returns a callback for [github.com/gopherjs/gopherjs/compiler.SourceMapFilter]
+// configured for the current build session.
+func (s *Session) EnableMapping(filter *sourcemapx.Filter, jsFileName string) {
+	filter.EnableMapping(jsFileName, s.xctx.Env().GOROOT, s.xctx.Env().GOPATH, s.options.MapToLocalDisk)
+}
+
+// WriteCommandPackage writes the final JavaScript output file at pkgObj path.
+func (s *Session) WriteCommandPackage(archive *compiler.Archive, pkgObj string) error {
+	if err := os.MkdirAll(filepath.Dir(pkgObj), 0o777); err != nil {
+		return err
+	}
+	codeFile, err := os.Create(pkgObj)
+	if err != nil {
+		return err
+	}
+	defer codeFile.Close()
+
+	sourceMapFilter := &sourcemapx.Filter{Writer: codeFile}
+	if s.options.CreateMapFile {
+		s.EnableMapping(sourceMapFilter, filepath.Base(pkgObj))
+
+		mapFile, err := os.Create(pkgObj + ".map")
+		if err != nil {
+			return err
+		}
+
+		defer func() {
+			sourceMapFilter.WriteMappingTo(mapFile)
+			mapFile.Close()
+			fmt.Fprintf(codeFile, "//# sourceMappingURL=%s.map\n", filepath.Base(pkgObj))
+		}()
+	}
+
+	deps, err := compiler.ImportDependencies(archive, s.ImportResolverFor(""))
+	if err != nil {
+		return err
+	}
+	return compiler.WriteProgramCode(deps, sourceMapFilter, s.GoRelease(), s.TestBinary())
+}
+
+// WaitForChange watches file system events and returns if either when one of
+// the source files is modified.
+func (s *Session) WaitForChange() {
+	// Will need to re-validate up-to-dateness of all archives, so flush them from
+	// memory.
+	s.importPaths = map[string]map[string]string{}
+	s.sources = map[string]*sources.Sources{}
+	s.UpToDateArchives = map[string]*compiler.Archive{}
+
+	s.options.PrintSuccess("watching for changes...\n")
+	for {
+		select {
+		case ev := <-s.Watcher.Events:
+			if ev.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Remove|fsnotify.Rename) == 0 || filepath.Base(ev.Name)[0] == '.' {
+				continue
+			}
+			if !strings.HasSuffix(ev.Name, ".go") && !strings.HasSuffix(ev.Name, incjs.Ext) {
+				continue
+			}
+			s.options.PrintSuccess("change detected: %s\n", ev.Name)
+		case err := <-s.Watcher.Errors:
+			s.options.PrintError("watcher error: %s\n", err.Error())
+		}
+		break
+	}
+
+	go func() {
+		for range s.Watcher.Events {
+			// consume, else Close() may deadlock
+		}
+	}()
+	s.Watcher.Close()
+}

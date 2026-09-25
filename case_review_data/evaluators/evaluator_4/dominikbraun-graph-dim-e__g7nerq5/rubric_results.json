@@ -1,0 +1,160 @@
+{
+  "rubrics": [
+    {
+      "result": 0,
+      "evidence": "R1 targets three specific frontier walks: CreatesCycle (paths.go), DFS (traversal.go), and TransitiveReduction's per-successor walk (dag.go). The agent patch only modifies collection.go (adds Len()), adds coverage.txt, and refactors AllPathsBetween in paths.go to use newStack[K]. It does NOT touch dag.go or traversal.go at all, and does not modify CreatesCycle in paths.go. Consequently, all three named walks still keep private inline stack implementations: TransitiveReduction still uses `pending = pending[:len(pending)-1]` with `onPending` map, DFS still uses `frontier = frontier[:len(frontier)-1]` with `queued` map, and CreatesCycle still uses `ancestors = ancestors[:len(ancestors)-1]` with `queued` map. None delegate their open-set discipline to a shared abstraction, so the rubric fails.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Every production graph walk that today consumes its open vertex set with inline slice-end truncation plus a hand-rolled membership map (the frontier walks in the cycle check, the depth-first traversal, and the per-successor walk of the transitive reduction) delegates that open-set discipline to a shared internal abstraction at the package's usual level - the existing generic stack helper, a reintroduced helper, or an equally well-scoped owner - so no walk keeps a private stack implementation in its body.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch does not touch ShortestPath at all: its only paths.go changes are in AllPathsBetween, while ShortestPath still contains the inlined heap mechanics from smell.diff (minHeap[K], onHeap map, heap.Push/heap.Pop/heap.Fix and manual cache insert/delete). Thus the weighted shortest-path search still drives the binary heap and item bookkeeping inline instead of delegating enqueue/dequeue/relax-rebalance to an internal priority-queue abstraction.",
+      "valid": true,
+      "attempts": 3,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The weighted shortest-path search no longer drives the binary heap and its item bookkeeping inline: enqueue, dequeue, and relax-rebalance operations, together with the insert-on-enqueue/delete-on-dequeue cache discipline, are owned by an internal abstraction with a single responsibility (the package's priority queue, a stdlib-backed wrapper, or an equivalent focused helper), while the path-reconstruction phase stays at algorithm level.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch only modifies AllPathsBetween in paths.go (hunk @@ -321,82 +321,63 @@) and adds a Len() method to stack in collection.go; it does not touch StronglyConnectedComponents at all. The smell.diff inlined the SCC walk as an explicit frame/cursor machine inside the public function (frames, cursors, successors slices with the `for len(frames) > 0` loop), and since the agent left that code unchanged, the visiting/lowlink/component-assembly discipline is still owned by the public function body rather than a recursive helper, walker type, or other clean split.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Strongly connected component detection is decomposed so that the walk's visiting, lowlink, and component-assembly discipline is owned by a properly scoped internal structure - a recursive helper carrying shared state, a per-walk iterator/walker type, or another clean split with the public function reading at algorithm level - instead of the single explicit frame/cursor machine living inside the public function body.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent patch does not modify trees.go at all. The spanning-tree construction therefore still contains the smell's inline union-find mechanics: `subtrees := make(map[K]K)` with raw parent-map marches (`for subtrees[sourceSubtree] != sourceSubtree { sourceSubtree = subtrees[sourceSubtree] }`), inline path-compression loops (`for subtrees[shortened] != sourceSubtree { ... }`), and an inline subtree join (`subtrees[targetSubtree] = sourceSubtree`) inside the construction loop, instead of delegating subtree membership to the existing union-find helper, a reintroduced type, or any equivalent focused disjoint-set owner.",
+      "valid": true,
+      "attempts": 1,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The spanning-tree construction tracks subtree membership through a disjoint-set abstraction - the package's existing union-find helper, a reintroduced type, or an equivalent focused owner - instead of performing raw parent-map marches, path compression, and subtree joins inline inside the construction loop.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's AllPathsBetween still keeps the layered postponed-successor bookkeeping as a raw slice-of-slices: `layers := make([][]K, 0)` is manipulated inline via `layers = append(layers, unvisitedSuccessors(start))`, `layers[len(layers)-1] = remaining[:len(remaining)-1]`, and `layers = layers[:len(layers)-1]`. The deleted `stackOfStacks` type is not reintroduced (collection.go only adds a `Len()` method to `stack`), and there is no recursive decomposition. Only the path stack was delegated to `newStack[K]()`; the layer discipline itself remains hand-rolled in the function body, exactly what the rubric forbids.",
+      "valid": true,
+      "attempts": 2,
+      "category": "core_resolution",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "The exhaustive all-paths exploration delegates its layered postponed-successor bookkeeping to a helper that owns that layer discipline (a reintroduced layered-stack type, an equivalent structure, or a recursive decomposition with shared visited-path state), so the algorithm body no longer manipulates raw slice-of-slices with inline layer draining and rebuilding.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The rubric requires the two guard errors ('unable to remove layer: empty stack' and 'unable to build stack: empty stack') to be preserved with identical messages, error wrapping, and triggering conditions. The agent's patch for AllPathsBetween in paths.go completely removes both guards. The original code wrapped via fmt.Errorf(\"unable to remove layer: %w\", err) and fmt.Errorf(\"unable to build stack: %w\", err) around a checkEmpty that returned errors.New(\"empty stack\"); the smelly intermediate inlined them as errors.New(\"unable to remove layer: empty stack\") and errors.New(\"unable to build stack: empty stack\"). The agent's rewritten loop has neither: the retreat branch simply calls path.pop() and layers = layers[:len(layers)-1] with no emptiness guard or error, and the descend branch calls path.push(next) with no guard or error. No trace of either guard message or its wrapping survives in the patched AllPathsBetween.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Wherever the repair moves the layered-exploration or frontier bookkeeping, the two internal guard errors ('unable to remove layer: empty stack' and 'unable to build stack: empty stack') end up raised by the code that owns the structure they describe, with identical messages, error wrapping, and triggering conditions as before the refactor.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The patch only re-extracts one site: paths.go AllPathsBetween is changed to use newStack[K]() with push/top/pop/contains/forEach/Len (and collection.go adds stack.Len). No other smell sites are touched: dag.go TransitiveReduction still uses raw pending/onPending slices, traversal.go DFS still uses raw frontier/queued, trees.go spanningTree still uses a raw map[K]K union-find and a hand-built undirected graph, and paths.go CreatesCycle/ShortestPath/StronglyConnectedComponents still use raw ancestors/queued, minHeap/onHeap, and trail/frames/cursors. Thus the existing stack, priorityQueue, and unionFind helpers remain unused at those sites while AllPathsBetween is the only re-wired site — a partial repair.",
+      "valid": true,
+      "attempts": 3,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Reintroduced or adapted helpers are wired consistently across all sites that need them: the repair reuses the package's existing shared mechanisms (the stack, priority queue, union-find, trait/copy option builders, and constructor functions that already exist) wherever they cover the need, instead of leaving bespoke local variants that duplicate a shared helper's behavior at only some of the re-extracted sites.",
+      "passes": false
+    },
+    {
+      "result": 1,
+      "evidence": "The only newly introduced helper method is `stack.Len`, added in `collection.go` (the collection-machinery layer) with a doc comment (`// Len returns the number of elements currently on the stack.`) as a focused method on the existing named `stack` type. `AllPathsBetween` in `paths.go` is refactored to use the existing `newStack[K]()` constructor and stack methods (`push`, `top`, `pop`, `contains`, `forEach`, `Len`) instead of raw slices/maps, and the patch introduces no new helper types, constructors, or one-off private machinery inside algorithm bodies.",
+      "valid": true,
+      "attempts": 2,
+      "category": "associated_changes",
+      "polarity": "positive",
+      "importance": "must_have",
+      "criterion": "Newly introduced helper types, constructors, and methods follow the internal layer's placement and shape conventions - named types with constructor functions, focused small methods, and doc comments - and live at the layer that already owns the library's collection machinery rather than being scattered inside algorithm bodies or files as private one-off machinery.",
+      "passes": true
+    },
+    {
+      "result": 0,
+      "evidence": "The agent only restored `stack` delegation in `AllPathsBetween` (plus adding a `Len` method) and left the rest of the inlined mechanics in place: `TransitiveReduction` still uses the inline `pending`/`onPending` open-slice pair, `CreatesCycle` still uses `ancestors`/`queued`, `ShortestPath` still uses the inline `items`/`onHeap` heap, `DFS` still uses `frontier`/`queued`, `spanningTree` still uses an inline `subtrees` parent map, and `StronglyConnectedComponents` still uses inline `trail`/`trailMembers`/`frames`/`cursors` — all while the `stack`, `priorityQueue`, and `unionFind` helpers continue to exist, so the same mechanics are duplicated inline alongside the helpers.",
+      "valid": true,
+      "attempts": 3,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The change leaves no half-extracted residue: no algorithm keeps performing an absorbed helper's mechanics inline anywhere while a helper offering the same mechanics now exists, no dead local registries or open-slice pairs remain from the removed inline code, and no commented-out copies of the previous mechanics are left behind.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "agent.patch only modifies collection.go and AllPathsBetween; it does not touch dag.go, traversal.go, trees.go, or the CreatesCycle/ShortestPath/SCC sections of paths.go. Therefore the smell's inlined-machinery doc comments remain, e.g. dag.go \"The DFS keeps its pending vertices in an open slice that is consumed from its end, so no stack helper has to wrap the traversal.\", traversal.go \"DFS is non-recursive and maintains a slice that it consumes from its end.\", paths.go ShortestPath \"The relaxation agenda is a flat binary heap...\", and SCC \"The whole walk is driven from right here...\". The container/heap import added to paths.go is also not removed.",
+      "valid": true,
+      "attempts": 2,
+      "category": "artifact_cleanup",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "Stale documentation and imports were swept along with the code: no function keeps a doc comment describing self-contained bookkeeping mechanics that the refactored implementation no longer performs (for example claims that a traversal maintains its open vertices in a slice consumed from its end, or that no stack helper wraps the walk), and no file retains an import (such as the heap package) that its post-refactor code no longer uses.",
+      "passes": false
+    },
+    {
+      "result": 0,
+      "evidence": "The agent's patch deletes the currently-unreachable guard pair in AllPathsBetween rather than preserving it: it removes `return nil, errors.New(\"unable to remove layer: empty stack\")` (replacing the block with a bare `path.pop()`) and removes `return nil, errors.New(\"unable to build stack: empty stack\")` (replacing the block with direct descend logic), so the two internal layer guard errors do not survive the refactor.",
+      "valid": true,
+      "attempts": 1,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair does not delete or reword any existing error value: wrapped adjacency-map errors, cycle and reachability errors, and the two internal layer guard errors keep their exact messages, wrapping, and reachability wherever their ownership moves; in particular the currently-unreachable guard pair must survive the refactor rather than being pruned as dead code.",
+      "passes": false
+    },
+    {
+      "id": "R12",
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "must_have",
+      "criterion": "The repair carries over the library's established subtleties unchanged: the union-find path compression keeps writing the entry vertex on each compression step (not the currently walked node, which would 'fix' an observable idiosyncrasy), and the repair does not alter edge collection order, iteration discipline, or comparisons in a way that changes tie-breaking for shortest-path predecessors or spanning-tree edge selection, even where results would still look plausible.",
+      "rationale": "The union-find compression quirk and the order-sensitive tie-breaking sit at the center of this case's riskiest sites; the unit suite exercises the library helper versions but cannot fully police a re-owned copy, so this instance-specific faithful-carryover is graded from the patch.",
+      "passes": false,
+      "evidence": "",
+      "valid": false,
+      "error": "invalid Judge response: result(1/0) + non-empty evidence required",
+      "attempts": 6
+    },
+    {
+      "result": 1,
+      "evidence": "The agent patch does not modify go.mod or go.sum, and introduces no new imports: paths.go only re-uses the package's own stack helper idioms (newStack, push, pop, top, contains, forEach, Len) in AllPathsBetween, while collection.go merely adds a Len method. The only other added file is coverage.txt, a coverage artifact, not a module dependency.",
+      "valid": true,
+      "attempts": 2,
+      "category": "anti_regression",
+      "polarity": "negative",
+      "importance": "nice_to_have",
+      "criterion": "The repair introduces no new module dependencies (go.mod and go.sum stay unchanged) and uses only the standard library and the package's own helper idioms for the re-extracted machinery.",
+      "passes": true
+    }
+  ],
+  "execution_mode": "one_independent_call_per_rubric",
+  "group_scores": {
+    "anti_regression": 0.5,
+    "artifact_cleanup": 0,
+    "associated_changes": 0.3333333333333333,
+    "core_resolution": 0
+  },
+  "valid_count": 12,
+  "pass_count": 2,
+  "must_have_pass": false,
+  "macro_score": 0.20833333333333331
+}

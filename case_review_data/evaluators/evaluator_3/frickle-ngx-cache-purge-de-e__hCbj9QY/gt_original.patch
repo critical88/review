@@ -1,0 +1,328 @@
+diff --git a/ngx_cache_purge_module.c b/ngx_cache_purge_module.c
+index 65070f8..62d3818 100644
+--- a/ngx_cache_purge_module.c
++++ b/ngx_cache_purge_module.c
+@@ -64,7 +64,6 @@ typedef struct {
+     ngx_http_cache_purge_conf_t  *conf;
+     ngx_http_handler_pt           handler;
+     ngx_http_handler_pt           original_handler;
+-    ngx_http_handler_pt           report_handler;
+ } ngx_http_cache_purge_loc_conf_t;
+ 
+ # if (NGX_HTTP_FASTCGI)
+@@ -104,16 +103,6 @@ ngx_int_t   ngx_http_cache_purge_init(ngx_http_request_t *r,
+     ngx_http_file_cache_t *cache, ngx_http_complex_value_t *cache_key);
+ void        ngx_http_cache_purge_handler(ngx_http_request_t *r);
+ 
+-static ngx_int_t   ngx_http_cache_purge_wildcard_compile(ngx_conf_t *cf,
+-    ngx_str_t *pattern, ngx_str_t *prefix);
+-static ngx_int_t   ngx_http_cache_purge_wildcard_match(ngx_str_t *key,
+-    ngx_str_t *prefix);
+-static ngx_int_t   ngx_http_cache_purge_pattern_respond(ngx_http_request_t *r,
+-    ngx_int_t matched);
+-static void        ngx_http_cache_purge_pattern_note(ngx_http_request_t *r,
+-    ngx_int_t matched);
+-static ngx_int_t   ngx_http_cache_purge_pattern_unlink(ngx_http_cache_t *c);
+-
+ ngx_int_t   ngx_http_file_cache_purge(ngx_http_request_t *r);
+ 
+ char       *ngx_http_cache_purge_conf(ngx_conf_t *cf,
+@@ -207,48 +196,6 @@ CRLF "</center>" CRLF
+ "</html>" CRLF
+ ;
+ 
+-/*
+- * Experimental support for wildcard purges.
+- */
+-static const u_char ngx_http_cache_purge_wildcard_hint[] =
+-"<br>Hint: wildcard purges match every key starting"
+-" with a given prefix" CRLF;
+-
+-static const u_char ngx_http_cache_purge_wildcard_tokens[] = "*?";
+-
+-static ngx_int_t
+-ngx_http_cache_purge_wildcard_compile(ngx_conf_t *cf, ngx_str_t *pattern,
+-    ngx_str_t *prefix)
+-{
+-    if (pattern->len < 2 || pattern->data[pattern->len - 1] != '*') {
+-        return NGX_DECLINED;
+-    }
+-
+-    prefix->len = pattern->len - 1;
+-    prefix->data = ngx_pnalloc(cf->pool, prefix->len);
+-    if (prefix->data == NULL) {
+-        return NGX_ERROR;
+-    }
+-
+-    ngx_memcpy(prefix->data, pattern->data, prefix->len);
+-
+-    return NGX_OK;
+-}
+-
+-static ngx_int_t
+-ngx_http_cache_purge_wildcard_match(ngx_str_t *key, ngx_str_t *prefix)
+-{
+-    if (prefix->len == 0 || key->len < prefix->len) {
+-        return NGX_DECLINED;
+-    }
+-
+-    if (ngx_memcmp(key->data, prefix->data, prefix->len) == 0) {
+-        return NGX_OK;
+-    }
+-
+-    return NGX_DECLINED;
+-}
+-
+ # if (NGX_HTTP_FASTCGI)
+ extern ngx_module_t  ngx_http_fastcgi_module;
+ 
+@@ -435,7 +382,6 @@ ngx_http_fastcgi_cache_purge_handler(ngx_http_request_t *r)
+     ngx_http_fastcgi_loc_conf_t   *flcf;
+ #  if (nginx_version >= 1007009)
+     ngx_http_fastcgi_main_conf_t  *fmcf;
+-    ngx_array_t                   *searched;
+     ngx_int_t                      rc;
+ #  endif /* nginx_version >= 1007009 */
+ 
+@@ -458,8 +404,6 @@ ngx_http_fastcgi_cache_purge_handler(ngx_http_request_t *r)
+         return rc;
+     }
+ 
+-    searched = r->upstream->caches;
+-
+ #  else
+ 
+     cache = flcf->upstream.cache->data;
+@@ -1204,13 +1148,9 @@ ngx_int_t
+ ngx_http_cache_purge_access_handler(ngx_http_request_t *r)
+ {
+     ngx_http_cache_purge_loc_conf_t   *cplcf;
+-    u_char                           *token;
+ 
+     cplcf = ngx_http_get_module_loc_conf(r, ngx_http_cache_purge_module);
+ 
+-    token = ngx_strlchr(r->method_name.data, r->method_name.data
+-                        + r->method_name.len, '*');
+-
+     if (r->method_name.len != cplcf->conf->method.len
+         || (ngx_strncmp(r->method_name.data, cplcf->conf->method.data,
+                         r->method_name.len)))
+@@ -1316,7 +1256,6 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r)
+     ngx_str_t    *key;
+     ngx_int_t     rc;
+     size_t        len;
+-    size_t        suffix_len;
+ 
+     key = r->cache->keys.elts;
+ 
+@@ -1325,9 +1264,6 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r)
+           + sizeof("<br>Key : ") - 1 + sizeof(CRLF "<br>Path: ") - 1
+           + key[0].len + r->cache->file.name.len;
+ 
+-    suffix_len = sizeof(ngx_http_cache_purge_success_page_tail) - 1
+-                 + sizeof(CRLF "<br>Matched: ") - 1;
+-
+     r->headers_out.content_type.len = sizeof("text/html") - 1;
+     r->headers_out.content_type.data = (u_char *) "text/html";
+     r->headers_out.status = NGX_HTTP_OK;
+@@ -1368,93 +1304,6 @@ ngx_http_cache_purge_send_response(ngx_http_request_t *r)
+     return ngx_http_output_filter(r, &out);
+ }
+ 
+-/*
+- * Helpers that were meant to serve the pattern purge response path.
+- */
+-static ngx_int_t
+-ngx_http_cache_purge_pattern_respond(ngx_http_request_t *r, ngx_int_t matched)
+-{
+-    ngx_chain_t   out;
+-    ngx_buf_t    *b;
+-    size_t        len;
+-
+-    len = sizeof("<br>Matched: ") - 1 + NGX_OFF_T_LEN
+-          + sizeof(CRLF "<br>Path: ") - 1
+-          + r->cache->file.name.len;
+-
+-    r->headers_out.content_type.len = sizeof("text/plain") - 1;
+-    r->headers_out.content_type.data = (u_char *) "text/plain";
+-    r->headers_out.status = NGX_HTTP_OK;
+-    r->headers_out.content_length_n = len;
+-
+-    b = ngx_create_temp_buf(r->pool, len);
+-    if (b == NULL) {
+-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+-    }
+-
+-    out.buf = b;
+-    out.next = NULL;
+-
+-    b->last = ngx_cpymem(b->last, "<br>Matched: ",
+-                         sizeof("<br>Matched: ") - 1);
+-    b->last = ngx_sprintf(b->last, "%i", matched);
+-    b->last = ngx_cpymem(b->last, CRLF "<br>Path: ",
+-                         sizeof(CRLF "<br>Path: ") - 1);
+-    b->last = ngx_cpymem(b->last, r->cache->file.name.data,
+-                         r->cache->file.name.len);
+-    b->last_buf = 1;
+-
+-    return ngx_http_output_filter(r, &out);
+-}
+-
+-static void
+-ngx_http_cache_purge_pattern_note(ngx_http_request_t *r, ngx_int_t matched)
+-{
+-    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+-                   "http file cache purge pattern: matched %i entries, \"%s\"",
+-                   matched, r->cache->file.name.data);
+-}
+-
+-static ngx_int_t
+-ngx_http_cache_purge_pattern_unlink(ngx_http_cache_t *c)
+-{
+-    ngx_http_file_cache_t  *cache;
+-
+-    cache = c->file_cache;
+-
+-    /*
+-     * remove the pattern-matched entry from disk and from the
+-     * shared memory accounting.
+-     */
+-
+-    ngx_shmtx_lock(&cache->shpool->mutex);
+-
+-    if (!c->node->exists) {
+-        ngx_shmtx_unlock(&cache->shpool->mutex);
+-        return NGX_DECLINED;
+-    }
+-
+-    cache->sh->size -= c->node->fs_size;
+-
+-    c->node->exists = 0;
+-#  if (nginx_version >= 8001) \
+-       || ((nginx_version < 8000) && (nginx_version >= 7060))
+-    c->node->updating = 0;
+-#  endif
+-
+-    ngx_shmtx_unlock(&cache->shpool->mutex);
+-
+-    if (ngx_delete_file(c->file.name.data) == NGX_FILE_ERROR) {
+-        /* entry in error log is enough, don't notice client */
+-        ngx_log_error(NGX_LOG_CRIT, c->file.log, ngx_errno,
+-                      ngx_delete_file_n " \"%s\" failed", c->file.name.data);
+-
+-        return NGX_ERROR;
+-    }
+-
+-    return NGX_OK;
+-}
+-
+ # if (nginx_version >= 1007009)
+ 
+ /*
+@@ -1467,7 +1316,7 @@ ngx_http_cache_purge_cache_get(ngx_http_request_t *r, ngx_http_upstream_t *u,
+     ngx_http_file_cache_t **cache)
+ {
+     ngx_str_t               *name, val;
+-    ngx_uint_t               i, zones;
++    ngx_uint_t               i;
+     ngx_http_file_cache_t  **caches;
+ 
+     if (u->conf->cache_zone) {
+@@ -1486,7 +1335,6 @@ ngx_http_cache_purge_cache_get(ngx_http_request_t *r, ngx_http_upstream_t *u,
+     }
+ 
+     caches = u->caches->elts;
+-    zones = u->caches->nelts;
+ 
+     for (i = 0; i < u->caches->nelts; i++) {
+         name = &caches[i]->shm_zone->shm.name;
+@@ -1514,7 +1362,6 @@ ngx_http_cache_purge_init(ngx_http_request_t *r, ngx_http_file_cache_t *cache,
+     ngx_http_cache_t  *c;
+     ngx_str_t         *key;
+     ngx_int_t          rc;
+-    size_t             prefix_len;
+ 
+     rc = ngx_http_discard_request_body(r);
+     if (rc != NGX_OK) {
+@@ -1541,8 +1388,6 @@ ngx_http_cache_purge_init(ngx_http_request_t *r, ngx_http_file_cache_t *cache,
+         return NGX_ERROR;
+     }
+ 
+-    prefix_len = key->len;
+-
+     r->cache = c;
+     c->body_start = ngx_pagesize;
+     c->file_cache = cache;
+@@ -1557,7 +1402,6 @@ void
+ ngx_http_cache_purge_handler(ngx_http_request_t *r)
+ {
+     ngx_int_t  rc;
+-    ngx_int_t  matched;
+ 
+ #  if (NGX_HAVE_FILE_AIO)
+     if (r->aio) {
+@@ -1567,8 +1411,6 @@ ngx_http_cache_purge_handler(ngx_http_request_t *r)
+ 
+     rc = ngx_http_file_cache_purge(r);
+ 
+-    matched = (rc == NGX_OK);
+-
+     ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "http file cache purge: %i, \"%s\"",
+                    rc, r->cache->file.name.data);
+@@ -1596,7 +1438,6 @@ ngx_http_file_cache_purge(ngx_http_request_t *r)
+ {
+     ngx_http_file_cache_t  *cache;
+     ngx_http_cache_t       *c;
+-    off_t                   reclaimed;
+ 
+     switch (ngx_http_file_cache_open(r)) {
+     case NGX_OK:
+@@ -1634,7 +1475,6 @@ ngx_http_file_cache_purge(ngx_http_request_t *r)
+ 
+ #  if (nginx_version >= 1000001)
+     cache->sh->size -= c->node->fs_size;
+-    reclaimed = c->node->fs_size;
+     c->node->fs_size = 0;
+ #  else
+     cache->sh->size -= (c->node->length + cache->bsize - 1) / cache->bsize;
+@@ -1670,7 +1510,6 @@ ngx_http_cache_purge_conf(ngx_conf_t *cf, ngx_http_cache_purge_conf_t *cpcf)
+     ngx_str_t       *value;
+     ngx_int_t        rc;
+     ngx_uint_t       i;
+-    u_char          *marker;
+ 
+     value = cf->args->elts;
+ 
+@@ -1685,12 +1524,6 @@ ngx_http_cache_purge_conf(ngx_conf_t *cf, ngx_http_cache_purge_conf_t *cpcf)
+         cpcf->method = value[1];
+     }
+ 
+-    /* check for embedded wildcard */
+-    if (cpcf->method.len > 1) {
+-        marker = ngx_strlchr(cpcf->method.data, cpcf->method.data
+-                            + cpcf->method.len, '*');
+-    }
+-
+     if (cf->args->nelts < 4) {
+         cpcf->enable = 1;
+         return NGX_CONF_OK;
+@@ -1807,7 +1640,6 @@ ngx_http_cache_purge_create_loc_conf(ngx_conf_t *cf)
+      *     conf->*.access6 = NULL
+      *     conf->handler = NULL
+      *     conf->original_handler = NULL
+-     *     conf->report_handler = NULL
+      */
+ 
+ # if (NGX_HTTP_FASTCGI)
+@@ -1926,10 +1758,6 @@ ngx_http_cache_purge_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
+ 
+     ngx_conf_merge_ptr_value(conf->conf, prev->conf, NULL);
+ 
+-    if (conf->report_handler == NULL) {
+-        conf->report_handler = clcf->handler;
+-    }
+-
+     if (conf->handler == NULL) {
+         conf->handler = prev->handler;
+     }

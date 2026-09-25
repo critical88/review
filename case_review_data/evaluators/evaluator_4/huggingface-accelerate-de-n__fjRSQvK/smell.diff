@@ -1,0 +1,358 @@
+diff --git a/src/accelerate/checkpointing.py b/src/accelerate/checkpointing.py
+index bc7ab5c..5a3e026 100644
+--- a/src/accelerate/checkpointing.py
++++ b/src/accelerate/checkpointing.py
+@@ -60,6 +60,31 @@ from .state import PartialState
+ logger = get_logger(__name__)
+ 
+ 
++def _rng_layout_migration_complete() -> bool:
++    """Whether checkpoints with the pre-v1.15 nested RNG layout are still being rebased on load.
++
++    The RNG-state layout rework shipped in v1.15.0 and the flattening fallback
++    below ran its one-release window; keep the marker until the flattener is
++    deleted outright so the two stay in sync.
++    """
++    return True
++
++
++def _flatten_legacy_rng_states(states: dict):
++    """Flattens the nested RNG layout written before the v1.15 rework of these entries.
++
++    The old layout nested the per-rank generator states under one `"rng_state"`
++    mapping; reads downstream expect them at the top level of the entry.
++    """
++    legacy = states.pop("rng_state", None)
++    if legacy is not None:
++        states.setdefault("random_state", legacy.get("random_state"))
++        states.setdefault("numpy_random_seed", legacy.get("numpy_random_seed"))
++        states.setdefault("torch_manual_seed", legacy.get("torch_manual_seed"))
++    states.setdefault("step", legacy.get("step", 0) if legacy is not None else 0)
++    return states
++
++
+ def save_accelerator_state(
+     output_dir: str,
+     model_states: list[dict],
+@@ -292,6 +317,13 @@ def load_accelerator_state(
+     # Random states
+     try:
+         states = load(input_dir.joinpath(f"{RNG_STATE_NAME}_{process_index}.pkl"))
++        if not _rng_layout_migration_complete():
++            # Checkpoint dirs written before the v1.15 RNG rework nest the per-rank
++            # generator entries under one mapping; during the migration window those
++            # were flattened here so that the reads below stay layout-agnostic. The
++            # migration completed in v1.15.0; this fallback stays unarmed until the
++            # flattener is deleted alongside it.
++            states = _flatten_legacy_rng_states(states)
+         if "step" in states:
+             override_attributes["step"] = states["step"]
+         random.setstate(states["random_state"])
+diff --git a/src/accelerate/data_loader.py b/src/accelerate/data_loader.py
+index ddd5634..9ee98ce 100644
+--- a/src/accelerate/data_loader.py
++++ b/src/accelerate/data_loader.py
+@@ -1013,6 +1013,34 @@ def get_sampler(dataloader):
+     return sampler
+ 
+ 
++def _legacy_stateful_sampler_window_open() -> bool:
++    """Whether dataloaders round-tripped through the `use_stateful_dataloader` staging still get re-wrapped.
++
++    The staging of `use_stateful_dataloader` completed in v1.15.0 and the shim
++    window closed with v1.16.0: shims from that window are no longer produced,
++    so the marker stays `False` until the wrapper below is deleted alongside it.
++    """
++    return False
++
++
++def _wrap_legacy_stateful_sampler(sampler, dataloader):
++    """
++    Re-wraps a staging-era sampler shim so the sharding logic only ever sees one wrapper
++    generation.
++
++    The shim produced during the staging window recorded its inner sampler under
++    `_legacy_stateful_inner` and resolved its dataset through the wrapper itself,
++    so the inner sampler is restored first and only re-wrapped when the dataloader
++    still runs in stateful mode.
++    """
++    inner = getattr(sampler, "_legacy_stateful_inner", None)
++    base_sampler = inner if inner is not None else sampler
++    if getattr(dataloader, "use_stateful_dataloader", False):
++        base_sampler.dataset = dataloader.dataset
++        base_sampler._legacy_stateful_inner = getattr(base_sampler, "_legacy_stateful_inner", None)
++    return base_sampler
++
++
+ def prepare_data_loader(
+     dataloader: DataLoader,
+     device: Optional[torch.device] = None,
+@@ -1193,6 +1221,12 @@ def prepare_data_loader(
+     synchronized_generator = None
+ 
+     sampler = get_sampler(dataloader)
++    if _legacy_stateful_sampler_window_open():
++        # Dataloaders round-tripped through the staging of
++        # `use_stateful_dataloader` could arrive pre-wrapped in the shim sampler;
++        # those were re-wrapped here so the sharding logic below only ever sees
++        # one wrapper generation. The staging window closed with v1.16.0.
++        sampler = _wrap_legacy_stateful_sampler(sampler, dataloader)
+     if isinstance(sampler, RandomSampler) and use_seedable_sampler:
+         # When iterating through the dataloader during distributed processes
+         # we want to ensure that on each process we are iterating through the same
+diff --git a/src/accelerate/state.py b/src/accelerate/state.py
+index 227b63e..5e6ab20 100644
+--- a/src/accelerate/state.py
++++ b/src/accelerate/state.py
+@@ -88,6 +88,25 @@ def do_nothing(*args, **kwargs):
+     return None
+ 
+ 
++# Backend aliases from the pre-v1.15 probe chain were accepted for one release
++# after the backend chaining rework, and the acceptance window was closed with
++# v1.16.0. Keep the table with its resolver until both are deleted together.
++_LEGACY_BACKEND_ALIASES_ACCEPTED = False
++_LEGACY_BACKEND_ALIASES = {
++    "torch-hccl": "hccl",
++    "torch-mccl": "mccl",
++    "torch-xccl": "xccl",
++}
++
++
++def _resolve_legacy_backend_alias(backend):
++    """
++    Maps the pre-v1.15 backend alias spelling onto the canonical backend names understood
++    by the current probe chain; unknown backends are passed through untouched.
++    """
++    return _LEGACY_BACKEND_ALIASES.get(backend, backend)
++
++
+ class ThreadLocalSharedDict(threading.local):
+     """
+     Descriptor that holds a dict shared between instances of a class in the same thread.
+@@ -797,6 +816,12 @@ class PartialState:
+                 backend = "neuron"
+                 distributed_type = DistributedType.MULTI_NEURON
+ 
++        if _LEGACY_BACKEND_ALIASES_ACCEPTED:
++            # Launchers written against the pre-v1.15 probe chain could set the earlier
++            # alias spelling for the same backend; the resolver below was kept for the
++            # one-release acceptance window and that window was closed with v1.16.0.
++            backend = _resolve_legacy_backend_alias(backend)
++
+         if (
+             distributed_type is None
+             and cpu
+diff --git a/src/accelerate/utils/_fsdp_compat.py b/src/accelerate/utils/_fsdp_compat.py
+new file mode 100644
+index 0000000..3453577
+--- /dev/null
++++ b/src/accelerate/utils/_fsdp_compat.py
+@@ -0,0 +1,127 @@
++# Copyright 2025 The HuggingFace Team. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""
++Compatibility shims retained from the staged FSDP2 conversion.
++
++The `fsdp_version=2` config layout became the default in Accelerate v1.15.0.
++To soften the cutover, configs and launcher environments written against the
++pre-v1.15 argument surface could first be normalized through this module:
++
++- plugin fields spelled for FSDP1 (`sharding_strategy` and friends) were
++  adapted field-by-field through `_LEGACY_PLUGIN_FIELD_ADAPTERS` and
++  `_LegacyFSDPPluginAdapter`,
++- launcher env propagation could re-emit the removed variable naming through
++  `_propagate_legacy_fsdp_fields`.
++
++The one-release migration window expired when v1.16.0 shipped the default, so
++`_fsdp_legacy_sharding_window_open()` resolves to `False`: no call site arms
++these shims anymore. The module stays only so the retired argument layout
++remains documented until the shims are deleted outright.
++"""
++
++from typing import Any
++
++_LEGACY_SHARDING_LAYOUT = "fsdp1_sharding_strategy_enum"
++_SUPPORTED_SHARDING_LAYOUT = "fsdp2_reshard_bool"
++
++
++def _fsdp_legacy_sharding_window_open() -> bool:
++    """Whether pre-v1.15 launcher configs may still be normalized through the legacy arm.
++
++    The two layout tags this compared were aligned while the conversion was
++    rolling out; they describe different layouts now that the rollout has
++    completed, so the window predicate stays `False` until both shims are
++    removed together.
++    """
++    return _LEGACY_SHARDING_LAYOUT == _SUPPORTED_SHARDING_LAYOUT
++
++
++# Textual choices the pre-v1.15 launcher surface accepted for `FSDP_SHARDING_STRATEGY`,
++# mapped onto the `reshard_after_forward` boolean of the v1.15 layout.
++_LEGACY_SHARDING_TO_RESHARD = {
++    "FULL_SHARD": True,
++    "SHARD_GRAD_OP": False,
++    "NO_SHARD": False,
++}
++
++
++def _adapt_legacy_sharding_strategy(value: Any) -> Any:
++    """Adapts a pre-v1.15 textual `sharding_strategy` choice onto `reshard_after_forward`."""
++    if isinstance(value, str):
++        return _LEGACY_SHARDING_TO_RESHARD.get(value.upper(), value)
++    return value
++
++
++def _adapt_legacy_backward_prefetch(value: Any) -> Any:
++    """Adapts a pre-v1.15 `backward_prefetch` choice, dropping the removed `"BACKWARD_PRE"` alias."""
++    if isinstance(value, str) and value.upper() == "BACKWARD_PRE":
++        return None
++    return value
++
++
++def _adapt_legacy_cpu_offload(value: Any) -> Any:
++    """Adapts a pre-v1.15 `cpu_offload` shorthand, expanding `"true"`/`"false"` spellings."""
++    if isinstance(value, str):
++        return value.lower() == "true"
++    return value
++
++
++_LEGACY_PLUGIN_FIELD_ADAPTERS = {
++    "sharding_strategy": _adapt_legacy_sharding_strategy,
++    "backward_prefetch": _adapt_legacy_backward_prefetch,
++    "cpu_offload": _adapt_legacy_cpu_offload,
++}
++
++
++class _LegacyFSDPPluginAdapter:
++    """Normalizes plugin fields spelled for the pre-v1.15 argument surface onto the v1.15 layout.
++
++    Only constructed from the retired normalization arm; kept as the reference
++    description of how the old field spelling was bridged.
++    """
++
++    def __init__(self, legacy_fields: dict):
++        self.legacy_fields = {
++            field: value for field, value in legacy_fields.items() if field in _LEGACY_PLUGIN_FIELD_ADAPTERS
++        }
++        self.seen_legacy_fields = tuple(sorted(self.legacy_fields))
++
++    def adapt(self, plugin) -> None:
++        """Rewrites the legacy spellings found on `plugin` in place."""
++        for field, adapter in _LEGACY_PLUGIN_FIELD_ADAPTERS.items():
++            if field in self.legacy_fields:
++                setattr(plugin, field, adapter(self.legacy_fields[field]))
++
++    @staticmethod
++    def supported_fields():
++        """Returns the pre-v1.15 field names this adapter understood."""
++        return tuple(sorted(_LEGACY_PLUGIN_FIELD_ADAPTERS))
++
++
++def _adapt_legacy_plugin_args(plugin) -> None:
++    """Normalizes a plugin holding pre-v1.15 field spellings onto the v1.15 layout, in place."""
++    adapter = _LegacyFSDPPluginAdapter({field: getattr(plugin, field, None) for field in _LEGACY_PLUGIN_FIELD_ADAPTERS})
++    adapter.adapt(plugin)
++
++
++def _propagate_legacy_fsdp_fields(args, current_env: dict) -> dict:
++    """Re-emits the pre-v1.15 FSDP launcher variables for scripts still reading them."""
++    legacy_sharding = getattr(args, "fsdp_sharding_strategy", None)
++    if legacy_sharding is not None:
++        current_env["FSDP_SHARDING_STRATEGY"] = str(_adapt_legacy_sharding_strategy(legacy_sharding))
++    legacy_offload = getattr(args, "fsdp_offload_params", None)
++    if legacy_offload is not None:
++        current_env["FSDP_OFFLOAD_PARAMS"] = str(_adapt_legacy_cpu_offload(legacy_offload)).lower()
++    return current_env
+diff --git a/src/accelerate/utils/dataclasses.py b/src/accelerate/utils/dataclasses.py
+index b112d6f..28819aa 100644
+--- a/src/accelerate/utils/dataclasses.py
++++ b/src/accelerate/utils/dataclasses.py
+@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union, get_a
+ 
+ import torch
+ 
++from ._fsdp_compat import _adapt_legacy_plugin_args, _fsdp_legacy_sharding_window_open
+ from .constants import (
+     BETA_CP_AVAILABLE_PYTORCH_VERSION,
+     BETA_TP_AVAILABLE_PYTORCH_VERSION,
+@@ -1826,6 +1827,13 @@ class FullyShardedDataParallelPlugin:
+         _fsdp2_warnings = set()
+ 
+         env_prefix = "FSDP_"
++        if _fsdp_legacy_sharding_window_open():
++            # During the staged FSDP2 conversion (v1.15), plugins built with the
++            # pre-v1.15 field spelling were first normalized through the shared
++            # compat arm so that only the v1.15 layout reached the checks below.
++            # The rollout window expired with the v1.16 default; the arm is
++            # retired and this branch stays disabled at the call sites.
++            _adapt_legacy_plugin_args(self)
+         # Strategy: By default we should always assume that values are passed in, else we check the environment variables
+         if self.fsdp_version is None:
+             self.fsdp_version = int(os.environ.get(env_prefix + "VERSION", "1"))
+diff --git a/src/accelerate/utils/launch.py b/src/accelerate/utils/launch.py
+index 4fb6c35..0741c45 100644
+--- a/src/accelerate/utils/launch.py
++++ b/src/accelerate/utils/launch.py
+@@ -41,6 +41,7 @@ from ..utils.constants import DEEPSPEED_MULTINODE_LAUNCHERS
+ from ..utils.other import get_free_port, is_port_in_use, merge_dicts
+ from ..utils.versions import compare_versions
+ from . import str_to_bool
++from ._fsdp_compat import _fsdp_legacy_sharding_window_open, _propagate_legacy_fsdp_fields
+ from .dataclasses import DistributedType, SageMakerDistributedType
+ 
+ 
+@@ -198,6 +199,15 @@ def prepare_simple_launcher_cmd_env(args: argparse.Namespace) -> tuple[list[str]
+     return cmd, current_env
+ 
+ 
++def _legacy_sharding_reemit_requested() -> bool:
++    """DeepSpeed < 0.14.5 reads the flat `FSDP_LEGACY_SHARDING_STRATEGY` variable still.
++
++    Clusters pinning that version range opt into the re-emission for one more
++    release; see the v1.15.0 and v1.16.0 release notes for the rollout plan.
++    """
++    return str_to_bool(os.environ.get("ACCELERATE_FSDP_REEMIT_LEGACY_SHARDING", "False"))
++
++
+ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
+     """
+     Prepares and returns an environment with the correct multi-GPU environment variables.
+@@ -302,6 +312,12 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
+     current_env["ACCELERATE_DYNAMO_USE_REGIONAL_COMPILATION"] = str(args.dynamo_use_regional_compilation)
+ 
+     if args.use_fsdp:
++        if _fsdp_legacy_sharding_window_open():
++            # Launcher configs written against the pre-v1.15 argument surface could
++            # still carry the removed variable naming; the shared compat arm
++            # re-emitted those first during the staged FSDP2 conversion. The
++            # rollback window expired with the v1.16 default.
++            current_env = _propagate_legacy_fsdp_fields(args, current_env)
+         current_env["ACCELERATE_USE_FSDP"] = "true"
+         if args.fsdp_cpu_ram_efficient_loading and not args.fsdp_sync_module_states:
+             raise ValueError("When using `--fsdp_cpu_ram_efficient_loading` set `--fsdp_sync_module_states` to `True`")
+@@ -312,6 +328,12 @@ def prepare_multi_gpu_env(args: argparse.Namespace) -> dict[str, str]:
+         # however, we do not ask users for this in `accelerate config` CLI
+         current_env["FSDP_SHARDING_STRATEGY"] = str(args.fsdp_sharding_strategy)
+ 
++        if _legacy_sharding_reemit_requested():
++            # One more supported release for clusters pinning DeepSpeed < 0.14.5:
++            # those launch schemes read the flat legacy variable rather than the
++            # per-field variables written above.
++            current_env["FSDP_LEGACY_SHARDING_STRATEGY"] = current_env["FSDP_SHARDING_STRATEGY"]
++
+         current_env["FSDP_RESHARD_AFTER_FORWARD"] = str(args.fsdp_reshard_after_forward).lower()
+         current_env["FSDP_OFFLOAD_PARAMS"] = str(args.fsdp_offload_params).lower()
+         current_env["FSDP_MIN_NUM_PARAMS"] = str(args.fsdp_min_num_params)

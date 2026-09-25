@@ -1,0 +1,179 @@
+diff --git a/server/dbdata/group.go b/server/dbdata/group.go
+index 641b039..93e1c94 100644
+--- a/server/dbdata/group.go
++++ b/server/dbdata/group.go
+@@ -341,7 +341,7 @@ func GroupAuthLogin(name, pwd string, authData map[string]interface{}) error {
+ 		return err
+ 	}
+ 	// 配置检测登录, 无客户端上下文信息
+-	err = auth.checkUser(name, pwd, g, "", "", "")
++	err = auth.checkUser(name, pwd, g, ClientContext{})
+ 	return err
+ }
+ 
+diff --git a/server/dbdata/user.go b/server/dbdata/user.go
+index 82eec37..c81da63 100644
+--- a/server/dbdata/user.go
++++ b/server/dbdata/user.go
+@@ -68,8 +68,8 @@ func SetUser(v *User) error {
+ }
+ 
+ // 验证用户登录信息
+-func CheckUser(name, pwd, group, remoteAddr, userAgent, macAddr string) error {
+-	base.Trace("CheckUser", name, pwd, group, remoteAddr)
++func CheckUser(name, pwd, group string, client ClientContext) error {
++	base.Trace("CheckUser", name, pwd, group, client.RemoteAddr)
+ 
+ 	// 获取登入的group数据
+ 	groupData := &Group{}
+@@ -84,7 +84,7 @@ func CheckUser(name, pwd, group, remoteAddr, userAgent, macAddr string) error {
+ 	authType := groupData.Auth["type"].(string)
+ 	// 本地认证方式
+ 	if authType == "local" {
+-		return checkLocalUser(name, pwd, group, remoteAddr, userAgent, macAddr)
++		return checkLocalUser(name, pwd, group, client)
+ 	}
+ 	// 其它认证方式, 支持自定义
+ 	_, ok := authRegistry[authType]
+@@ -92,12 +92,13 @@ func CheckUser(name, pwd, group, remoteAddr, userAgent, macAddr string) error {
+ 		return fmt.Errorf("%s %s", "未知的认证方式: ", authType)
+ 	}
+ 	auth := makeInstance(authType).(IUserAuth)
+-	return auth.checkUser(name, pwd, groupData, remoteAddr, userAgent, macAddr)
++	return auth.checkUser(name, pwd, groupData, client)
+ }
+ 
+ // 验证本地用户登录信息
+-func checkLocalUser(name, pwd, group, remoteAddr, userAgent, macAddr string) error {
++func checkLocalUser(name, pwd, group string, client ClientContext) error {
+ 	// 本地认证方式不使用来源地址、客户端信息和mac地址
++	// (client 仅保留以统一认证链路签名)
+ 
+ 	// TODO 严重问题
+ 	// return nil
+diff --git a/server/dbdata/user_test.go b/server/dbdata/user_test.go
+index ee5c46b..90e03e8 100644
+--- a/server/dbdata/user_test.go
++++ b/server/dbdata/user_test.go
+@@ -40,7 +40,9 @@ func TestCheckUser(t *testing.T) {
+ 	// 单独验证密码
+ 	u.DisableOtp = true
+ 	_ = SetUser(&u)
+-	err = CheckUser("aaa", pincode, group, "192.168.30.1:10443", "ut_agent", "")
++	// 统一的客户端上下文（来源地址/客户端信息，无 mac 地址），在各个认证场景中复用
++	clientCtx := ClientContext{RemoteAddr: "192.168.30.1:10443", UserAgent: "ut_agent"}
++	err = CheckUser("aaa", pincode, group, clientCtx)
+ 	ast.Nil(err)
+ 
+ 	// 添加一个radius组
+@@ -55,7 +57,7 @@ func TestCheckUser(t *testing.T) {
+ 	g2 := Group{Name: group2, Status: 1, ClientDns: dns, RouteInclude: route, Auth: authData}
+ 	err = SetGroup(&g2)
+ 	ast.Nil(err)
+-	err = CheckUser("aaa", "bbbbbbb", group2, "192.168.30.1:10443", "ut_agent", "")
++	err = CheckUser("aaa", "bbbbbbb", group2, clientCtx)
+ 	if ast.NotNil(err) {
+ 		ast.Contains(err.Error(), "aaa Radius服务器连接异常")
+ 	}
+@@ -65,7 +67,7 @@ func TestCheckUser(t *testing.T) {
+ 	p1 := Policy{Username: "aaa", Status: 1, ClientDns: dns2, RouteInclude: route2}
+ 	err = SetPolicy(&p1)
+ 	ast.Nil(err)
+-	err = CheckUser("aaa", pincode, group, "192.168.30.1:10443", "ut_agent", "")
++	err = CheckUser("aaa", pincode, group, clientCtx)
+ 	ast.Nil(err)
+ 	// 添加一个ldap组
+ 	group3 := "group3"
+@@ -85,7 +87,7 @@ func TestCheckUser(t *testing.T) {
+ 	g3 := Group{Name: group3, Status: 1, ClientDns: dns, RouteInclude: route, Auth: authData}
+ 	err = SetGroup(&g3)
+ 	ast.Nil(err)
+-	err = CheckUser("aaa", "bbbbbbb", group3, "192.168.30.1:10443", "ut_agent", "")
++	err = CheckUser("aaa", "bbbbbbb", group3, clientCtx)
+ 	if ast.NotNil(err) {
+ 		ast.Equal("aaa LDAP服务器连接异常, 请检测服务器和端口", err.Error())
+ 	}
+diff --git a/server/dbdata/userauth.go b/server/dbdata/userauth.go
+index 5c84820..4298510 100644
+--- a/server/dbdata/userauth.go
++++ b/server/dbdata/userauth.go
+@@ -7,9 +7,18 @@ import (
+ 
+ var authRegistry = make(map[string]reflect.Type)
+ 
++// ClientContext 是一次登录所携带的客户端上下文信息，把原来在认证链路上
++// 逐个传递的来源地址、客户端信息和 mac 地址收敛为一个值。后续新增上下文
++// 字段（例如终端设备信息）只需扩展本结构，不再需要在每一层函数签名字段上追加参数。
++type ClientContext struct {
++	RemoteAddr string // 来源地址（登录来源）
++	UserAgent  string // 客户端信息（客户端软件 User-Agent）
++	MacAddr    string // 客户端 mac 地址（隧道上报）
++}
++
+ type IUserAuth interface {
+ 	checkData(authData map[string]interface{}) error
+-	checkUser(name, pwd string, g *Group, remoteAddr, userAgent, macAddr string) error
++	checkUser(name, pwd string, g *Group, client ClientContext) error
+ }
+ 
+ func makeInstance(name string) interface{} {
+diff --git a/server/dbdata/userauth_ldap.go b/server/dbdata/userauth_ldap.go
+index e47015a..1479035 100644
+--- a/server/dbdata/userauth_ldap.go
++++ b/server/dbdata/userauth_ldap.go
+@@ -62,8 +62,8 @@ func (auth AuthLdap) checkData(authData map[string]interface{}) error {
+ 	return nil
+ }
+ 
+-func (auth AuthLdap) checkUser(name, pwd string, g *Group, remoteAddr, userAgent, macAddr string) error {
+-	base.Trace("AuthLdap checkUser", name, remoteAddr, userAgent)
++func (auth AuthLdap) checkUser(name, pwd string, g *Group, client ClientContext) error {
++	base.Trace("AuthLdap checkUser", name, client.RemoteAddr, client.UserAgent)
+ 	pl := len(pwd)
+ 	if name == "" || pl < 1 {
+ 		return fmt.Errorf("%s %s", name, "密码错误")
+diff --git a/server/dbdata/userauth_radius.go b/server/dbdata/userauth_radius.go
+index 1594934..7cc3e54 100644
+--- a/server/dbdata/userauth_radius.go
++++ b/server/dbdata/userauth_radius.go
+@@ -41,7 +41,7 @@ func (auth AuthRadius) checkData(authData map[string]interface{}) error {
+ 	return nil
+ }
+ 
+-func (auth AuthRadius) checkUser(name, pwd string, g *Group, remoteAddr, userAgent, macAddr string) error {
++func (auth AuthRadius) checkUser(name, pwd string, g *Group, client ClientContext) error {
+ 	pl := len(pwd)
+ 	if name == "" || pl < 1 {
+ 		return fmt.Errorf("%s %s", name, "密码错误")
+@@ -75,9 +75,9 @@ func (auth AuthRadius) checkUser(name, pwd string, g *Group, remoteAddr, userAge
+ 			return fmt.Errorf("%s %s", name, "Radius set nasip 出现错误")
+ 		}
+ 	}
+-	if macAddr != "" {
+-		base.Trace("AuthRadius", name, remoteAddr, userAgent, macAddr)
+-		err = rfc2865.CallingStationID_AddString(packet, macAddr)
++	if client.MacAddr != "" {
++		base.Trace("AuthRadius", name, client.RemoteAddr, client.UserAgent, client.MacAddr)
++		err = rfc2865.CallingStationID_AddString(packet, client.MacAddr)
+ 		if err != nil {
+ 			return fmt.Errorf("%s %s", name, "Radius set CallingStationID 出现错误")
+ 		}
+diff --git a/server/handler/link_auth.go b/server/handler/link_auth.go
+index 3e93149..d5a63f5 100644
+--- a/server/handler/link_auth.go
++++ b/server/handler/link_auth.go
+@@ -99,8 +99,12 @@ func LinkAuth(w http.ResponseWriter, r *http.Request) {
+ 		UserActLog:    ua,
+ 	}
+ 	// TODO 用户密码校验
+-	// 认证请求上下文: 用户名、密码、组、来源地址、客户端信息、mac地址
+-	err = dbdata.CheckUser(cr.Auth.Username, cr.Auth.Password, cr.GroupSelect, cr.RemoteAddr, userAgent, cr.MacAddressList.MacAddress)
++	// 认证请求上下文: 用户名、密码、组、客户端上下文(来源地址/客户端信息/mac地址)
++	err = dbdata.CheckUser(cr.Auth.Username, cr.Auth.Password, cr.GroupSelect, dbdata.ClientContext{
++		RemoteAddr: cr.RemoteAddr,
++		UserAgent:  userAgent,
++		MacAddr:    cr.MacAddressList.MacAddress,
++	})
+ 	if err != nil {
+ 		lockManager.UpdateLoginStatus(cr.Auth.Username, r.RemoteAddr, false) // 记录登录失败状态
+ 

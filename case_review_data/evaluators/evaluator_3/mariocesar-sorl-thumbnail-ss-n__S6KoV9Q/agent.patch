@@ -1,0 +1,462 @@
+diff --git a/sorl/thumbnail/base.py b/sorl/thumbnail/base.py
+index 854ef21..851087c 100644
+--- a/sorl/thumbnail/base.py
++++ b/sorl/thumbnail/base.py
+@@ -1,15 +1,13 @@
+-import hashlib
+ import logging
+ import os
+ import re
+ 
+-from django.utils.encoding import force_str
+-
+ from sorl.thumbnail import default
+ from sorl.thumbnail.conf import defaults as default_settings
+ from sorl.thumbnail.conf import settings
+ from sorl.thumbnail.helpers import serialize
+ from sorl.thumbnail.images import DummyImageFile, ImageFile
++from sorl.thumbnail.keys import digest
+ from sorl.thumbnail.parsers import parse_geometry
+ 
+ logger = logging.getLogger(__name__)
+@@ -205,10 +203,10 @@ class ThumbnailBackend:
+         Computes the destination filename.
+         """
+         # Identical geometry, options and source must always map to the same
+-        # destination name, so the salt digest is built here where it is used.
+-        salt = '||'.join([force_str(arg) for arg in
+-                         (source.key, geometry_string, serialize(options))])
+-        key = hashlib.md5(salt.encode(), usedforsecurity=False).hexdigest()
++        # destination name, so the digest is built through the shared key
++        # helper in sorl.thumbnail.keys alongside the rest of the cache key
++        # policy rather than re-spliced here.
++        key = digest(source.key, geometry_string, serialize(options))
+         # make some subdirs
+         path = '%s/%s/%s' % (key[:2], key[2:4], key)
+         return '%s%s.%s' % (settings.THUMBNAIL_PREFIX, path, EXTENSIONS[options['format']])
+diff --git a/sorl/thumbnail/images.py b/sorl/thumbnail/images.py
+index b9bbebe..2b19bf4 100644
+--- a/sorl/thumbnail/images.py
++++ b/sorl/thumbnail/images.py
+@@ -1,4 +1,3 @@
+-import hashlib
+ import json
+ import os
+ import platform
+@@ -17,6 +16,7 @@ from sorl.thumbnail import default
+ from sorl.thumbnail.conf import settings
+ from sorl.thumbnail.default import storage as default_storage
+ from sorl.thumbnail.helpers import ThumbnailError, deserialize, get_module_class
++from sorl.thumbnail.keys import digest
+ from sorl.thumbnail.parsers import parse_geometry
+ 
+ url_pat = re.compile(r'^(https?|ftp):\/\/')
+@@ -203,12 +203,10 @@ class ImageFile(BaseImageFile):
+ 
+     @property
+     def key(self):
+-        # Identity of this file inside the key value store. Kept local to the
+-        # hot path instead of delegating to a helper every time an image is
+-        # serialized or looked up.
+-        salt = '||'.join([force_str(arg) for arg in
+-                          (self.name, self.serialize_storage(use_backend_name=True))])
+-        return hashlib.md5(salt.encode(), usedforsecurity=False).hexdigest()
++        # Identity of this file inside the key value store. Built through the
++        # shared key helper in sorl.thumbnail.keys so the cache namespace and
++        # digest layout are owned in one place rather than re-spliced here.
++        return digest(self.name, self.serialize_storage(use_backend_name=True))
+ 
+     def serialize(self):
+         return serialize_image_file(self)
+diff --git a/sorl/thumbnail/keys.py b/sorl/thumbnail/keys.py
+new file mode 100644
+index 0000000..f187b19
+--- /dev/null
++++ b/sorl/thumbnail/keys.py
+@@ -0,0 +1,77 @@
++"""
++Single owner of thumbnail cache key construction.
++
++Every identity that lives in the thumbnail cache -- a source image, a
++thumbnail file, and the metadata rows that link them -- is addressed by a key
++built from the same two pieces of knowledge:
++
++* a stable ``md5`` digest of the identifying parts, and
++* a namespaced composite key laid out as ``<prefix>||<identity>||<key>``.
++
++These used to be spelled out, slightly differently, at each call site. Changing
++the cache namespace (for example bumping ``THUMBNAIL_KEY_PREFIX`` so old
++metadata rows are no longer reused) therefore meant hunting the same logic
++through ``images``, ``base`` and every kvstore. It now lives here, so the next
++change to the key layout is made in one place.
++"""
++
++import hashlib
++
++from django.utils.encoding import force_str
++
++from sorl.thumbnail.conf import settings
++
++# Separator between the parts of every cache key, from the inputs fed to the
++# digest up to the composite key-value-store keys. Defined once so the layout
++# can be changed without touching each call site.
++KEY_SEPARATOR = '||'
++
++
++def digest(*parts):
++    """
++    Return a stable md5 hexdigest for ``parts``.
++
++    This is the identity function for anything stored in the thumbnail cache.
++    Both ``ImageFile.key`` and the thumbnail destination filename derive their
++    key from a digest of their identifying parts, so identical inputs always
++    map to the same key -- which is exactly why the namespace must not be
++    spliced in here and there but threaded through this single call.
++
++    ``usedforsecurity=False`` keeps this FIPS-compliant; the digest is only ever
++    used for cache addressing, never for security.
++    """
++    salt = KEY_SEPARATOR.join(force_str(arg) for arg in parts)
++    return hashlib.md5(salt.encode(), usedforsecurity=False).hexdigest()
++
++
++def kvstore_key(identity, key):
++    """
++    Build the composite key under which a thumbnail's metadata row is stored
++    in the key-value store: ``<THUMBNAIL_KEY_PREFIX>||<identity>||<key>``.
++
++    ``identity`` is the row kind (``'image'`` or ``'thumbnails'``) and ``key``
++    is the digest produced by :func:`digest`. The prefix is the cache
++    namespace: bumping ``THUMBNAIL_KEY_PREFIX`` is how an installation retires
++    every old metadata row at once, so the prefix is applied here -- the single
++    owner of the layout -- instead of being re-spliced at every call site.
++    """
++    return KEY_SEPARATOR.join(
++        [settings.THUMBNAIL_KEY_PREFIX, identity, force_str(key)]
++    )
++
++
++def kvstore_prefix(identity=None):
++    """
++    Return the shared prefix of every composite key.
++
++    With ``identity`` this yields ``<prefix>||<identity>||`` (used by
++    ``_find_keys`` to enumerate all rows of one kind); without it, the bare
++    ``<prefix>||`` namespace prefix (used by ``clear`` to wipe everything
++    belonging to this installation). Either way only ever matches sorl's own
++    composite keys, never raw keys of other applications that happen to share
++    the prefix string.
++    """
++    parts = [settings.THUMBNAIL_KEY_PREFIX]
++    if identity is not None:
++        parts.append(identity)
++    return KEY_SEPARATOR.join(parts) + KEY_SEPARATOR
+diff --git a/sorl/thumbnail/kvstores/base.py b/sorl/thumbnail/kvstores/base.py
+index 7fefdaf..5f98290 100644
+--- a/sorl/thumbnail/kvstores/base.py
++++ b/sorl/thumbnail/kvstores/base.py
+@@ -2,9 +2,9 @@ import warnings
+ 
+ from django.utils import timezone
+ 
+-from sorl.thumbnail.conf import settings
+ from sorl.thumbnail.helpers import ThumbnailError, deserialize, serialize
+ from sorl.thumbnail.images import deserialize_image_file, serialize_image_file
++from sorl.thumbnail.keys import KEY_SEPARATOR, kvstore_key, kvstore_prefix
+ 
+ 
+ class KVStoreBase:
+@@ -144,7 +144,7 @@ class KVStoreBase:
+         """
+         # Only ever touch the composite keys of this installation, never raw
+         # keys of other applications that happen to share the prefix.
+-        all_keys = self._find_keys_raw(settings.THUMBNAIL_KEY_PREFIX + '||')
++        all_keys = self._find_keys_raw(kvstore_prefix())
+         if all_keys:
+             self._delete_raw(*all_keys)
+ 
+@@ -152,8 +152,7 @@ class KVStoreBase:
+         """
+         Deserializing, prefix wrapper for _get_raw
+         """
+-        value = self._get_raw('%s||%s||%s' % (
+-            settings.THUMBNAIL_KEY_PREFIX, identity, key))
++        value = self._get_raw(kvstore_key(identity, key))
+ 
+         if not value:
+             return None
+@@ -171,22 +170,22 @@ class KVStoreBase:
+             s = serialize_image_file(value)
+         else:
+             s = serialize(value)
+-        self._set_raw('||'.join([settings.THUMBNAIL_KEY_PREFIX, identity, key]), s)
++        self._set_raw(kvstore_key(identity, key), s)
+ 
+     def _delete(self, key, identity='image'):
+         """
+         Prefix wrapper for _delete_raw
+         """
+-        self._delete_raw(f'{settings.THUMBNAIL_KEY_PREFIX}||{identity}||{key}')
++        self._delete_raw(kvstore_key(identity, key))
+ 
+     def _find_keys(self, identity='image'):
+         """
+         Finds and returns all keys for identity,
+         """
+-        prefix = settings.THUMBNAIL_KEY_PREFIX + '||' + identity + '||'
++        prefix = kvstore_prefix(identity)
+         raw_keys = self._find_keys_raw(prefix) or []
+         for raw_key in raw_keys:
+-            yield raw_key.split('||')[-1]
++            yield raw_key.split(KEY_SEPARATOR)[-1]
+ 
+     #
+     # Methods which key-value stores need to implement
+diff --git a/sorl/thumbnail/kvstores/cached_db_kvstore.py b/sorl/thumbnail/kvstores/cached_db_kvstore.py
+index 95b0b5c..b8cbbb4 100644
+--- a/sorl/thumbnail/kvstores/cached_db_kvstore.py
++++ b/sorl/thumbnail/kvstores/cached_db_kvstore.py
+@@ -1,6 +1,7 @@
+ from django.core.cache import InvalidCacheBackendError, cache, caches
+ 
+ from sorl.thumbnail.conf import settings
++from sorl.thumbnail.keys import kvstore_prefix
+ from sorl.thumbnail.kvstores.base import KVStoreBase
+ from sorl.thumbnail.models import KVStore as KVStoreModel
+ 
+@@ -27,7 +28,7 @@ class KVStore(KVStoreBase):
+         """
+         # Only our own composite keys carry the separator right after the
+         # prefix, so this never deletes rows belonging to other utilities.
+-        prefix = settings.THUMBNAIL_KEY_PREFIX + '||'
++        prefix = kvstore_prefix()
+         for key in self._find_keys_raw(prefix):
+             self.cache.delete(key)
+         KVStoreModel.objects.filter(key__startswith=prefix).delete()
+diff --git a/tests/thumbnail_tests/test_keys.py b/tests/thumbnail_tests/test_keys.py
+new file mode 100644
+index 0000000..cad30cd
+--- /dev/null
++++ b/tests/thumbnail_tests/test_keys.py
+@@ -0,0 +1,80 @@
++import hashlib
++import unittest
++
++from django.test import SimpleTestCase, override_settings
++
++from sorl.thumbnail.conf import settings
++from sorl.thumbnail.images import ImageFile
++from sorl.thumbnail.keys import digest, kvstore_key, kvstore_prefix
++
++
++class DigestTest(SimpleTestCase):
++    def test_is_md5_of_separ_joined_parts(self):
++        # The digest must stay byte-identical: ``ImageFile.key`` output is a
++        # stability contract (see CHANGES.rst, #805) and thumbnail filenames
++        # are pinned by test_nonascii. Changing the algorithm here would
++        # obsolete every cached thumbnail.
++        salt = '||'.join(['some.jpg', '100x100', '{"quality": 95}'])
++        self.assertEqual(
++            digest('some.jpg', '100x100', '{"quality": 95}'),
++            hashlib.md5(salt.encode(), usedforsecurity=False).hexdigest(),
++        )
++
++    def test_identical_inputs_map_to_same_key(self):
++        self.assertEqual(digest('a', 'b'), digest('a', 'b'))
++
++    def test_part_order_and_values_matter(self):
++        self.assertNotEqual(digest('a', 'b'), digest('b', 'a'))
++        self.assertNotEqual(digest('a', 'b'), digest('a', 'c'))
++
++    def test_image_file_key_routes_through_digest(self):
++        # ``ImageFile.key`` is no longer an inlined copy of the digest; it must
++        # delegate to the shared owner with exactly its own identifying parts.
++        im = ImageFile('some.jpg')
++        self.assertEqual(
++            im.key,
++            digest(im.name, im.serialize_storage(use_backend_name=True)),
++        )
++
++
++class KVStoreKeyTest(SimpleTestCase):
++    def test_kvstore_key_layout(self):
++        self.assertEqual(
++            kvstore_key('image', 'abc'),
++            'sorl-thumbnail||image||abc',
++        )
++
++    def test_kvstore_prefix_layout(self):
++        self.assertEqual(kvstore_prefix(), 'sorl-thumbnail||')
++        self.assertEqual(kvstore_prefix('thumbnails'), 'sorl-thumbnail||thumbnails||')
++
++
++class NamespaceBumpTest(SimpleTestCase):
++    """Changing THUMBNAIL_KEY_PREFIX is a single-settings cache namespace bump.
++
++    Every composite key and every scan prefix must derive from the live
++    setting so that bumping it retires all old metadata rows in one go. This
++    is the scenario the consolidation exists to make trivial.
++    """
++
++    def test_default_keys_use_default_prefix(self):
++        self.assertTrue(kvstore_key('image', 'abc').startswith('sorl-thumbnail||'))
++        self.assertTrue(kvstore_prefix().startswith('sorl-thumbnail||'))
++
++    @override_settings(THUMBNAIL_KEY_PREFIX='fresh-namespace')
++    def test_bump_rekeys_everything(self):
++        self.assertEqual(kvstore_key('image', 'abc'), 'fresh-namespace||image||abc')
++        self.assertEqual(kvstore_prefix(), 'fresh-namespace||')
++        self.assertEqual(kvstore_prefix('thumbnails'), 'fresh-namespace||thumbnails||')
++
++        # No key built under the retired namespace survives the bump, so old
++        # metadata rows are never matched again.
++        default_key = 'sorl-thumbnail||image||abc'
++        self.assertNotEqual(kvstore_key('image', 'abc'), default_key)
++        self.assertFalse(kvstore_prefix().startswith(default_key.split('||')[0] + '||'))
++        # The setting really is the single source.
++        self.assertEqual(settings.THUMBNAIL_KEY_PREFIX, 'fresh-namespace')
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/thumbnail_kvstore b/thumbnail_kvstore
+new file mode 100644
+index 0000000000000000000000000000000000000000..3adcad8129ebcac7f76ad17f8a8f7f1c4abe132d
+GIT binary patch
+literal 32768
+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
+
+literal 0
+HcmV?d00001
+

@@ -1,0 +1,537 @@
+diff --git a/jarviscli/packages/memory/record_store.py b/jarviscli/packages/memory/record_store.py
+new file mode 100644
+index 0000000..f73ecde
+--- /dev/null
++++ b/jarviscli/packages/memory/record_store.py
+@@ -0,0 +1,154 @@
++import json
++
++from packages.memory.memory import Memory
++
++
++class RecordStore:
++    """
++    Snapshot of one record collection in the jarvis key value memory.
++
++    Tasks, todo entries, reminders, user tags and named routines were moved
++    from ad hoc JSON keys to named record collections. Each collection keeps
++    one snapshot of its records together with the id handed out next. The
++    store loads and stores the snapshot; the records themselves are managed
++    by the plugins.
++    """
++
++    def __init__(self, jarvis, item_key, id_key=None):
++        self.jarvis = jarvis
++        self.item_key = item_key
++        self.id_key = id_key
++        self.items = None
++        self.next_id = None
++        self.had_invalid_text = False
++
++    def load(self):
++        self.items = self._load_items()
++        self.next_id = self._load_next_id()
++
++    def save(self):
++        if self.jarvis.get_data(self.item_key) is None:
++            self.jarvis.add_data(self.item_key, self._record_text())
++        else:
++            self.jarvis.update_data(self.item_key, self._record_text())
++
++        if self.id_key is not None and self.next_id is not None:
++            if self.jarvis.get_data(self.id_key) is None:
++                self.jarvis.add_data(self.id_key, self.next_id)
++            else:
++                self.jarvis.update_data(self.id_key, self.next_id)
++
++    def _record_text(self):
++        return self.items
++
++    def _load_items(self):
++        raise NotImplementedError()
++
++    def _load_next_id(self):
++        if self.id_key is None:
++            return None
++
++        return self.jarvis.get_data(self.id_key)
++
++
++class TaskRecordStore(RecordStore):
++    """
++    Snapshot of the task list stored under "tasks_list". Tasks keep their
++    own "tasks.json" storage, so the list is loaded from and stored to that
++    file.
++    """
++
++    def __init__(self):
++        super().__init__(None, "tasks_list")
++
++    def load(self):
++        m = Memory("tasks.json")
++        self.items = m.get_data(self.item_key)
++        if self.items is None:
++            self.items = []
++
++    def save(self):
++        m = Memory("tasks.json")
++        if m.get_data(self.item_key) is None:
++            m.add_data(self.item_key, self.items)
++        else:
++            m.update_data(self.item_key, self.items)
++        m.save()
++
++
++class TagRecordStore(RecordStore):
++    """
++    Snapshot of the user tag list stored under "reminder_tags".
++    """
++
++    def __init__(self, jarvis):
++        super().__init__(jarvis, "reminder_tags", "reminder_tags_next_id")
++
++    def _load_items(self):
++        value = self.jarvis.get_data(self.item_key)
++        if value is None:
++            value = []
++            self.jarvis.add_data(self.item_key, value)
++
++        return value
++
++
++class JsonRecordStore(RecordStore):
++    """
++    Snapshot of a collection stored as encoded record text. The text is set
++    to the empty collection on the first read and when it could not be
++    decoded.
++    """
++
++    def __init__(self, jarvis, item_key, id_key=None):
++        super().__init__(jarvis, item_key, id_key)
++
++    def _record_text(self):
++        return json.dumps(self.items)
++
++    def _load_items(self):
++        value = self.jarvis.get_data(self.item_key)
++        if value is None:
++            value = "[]"
++            self.jarvis.add_data(self.item_key, value)
++
++        try:
++            return json.loads(value)
++        except json.decoder.JSONDecodeError:
++            self.had_invalid_text = True
++            value = "[]"
++            self.jarvis.update_data(self.item_key, value)
++            return json.loads(value)
++
++
++class TodoRecordStore(JsonRecordStore):
++    """
++    Snapshot of the todo entries stored under "todo". The ids are handed out
++    together with "remind" from the shared "todo_next_id" counter.
++    """
++
++    def __init__(self, jarvis):
++        super().__init__(jarvis, "todo", "todo_next_id")
++
++
++class RemindRecordStore(JsonRecordStore):
++    """
++    Snapshot of the reminders stored under "remind". The ids are handed out
++    together with "todo" from the shared "todo_next_id" counter.
++    """
++
++    def __init__(self, jarvis):
++        super().__init__(jarvis, "remind", "todo_next_id")
++
++
++class RoutineRecordStore(RecordStore):
++    """
++    Snapshot of the named routines stored under "routines". Each routine
++    value is the list of commands to run.
++    """
++
++    def __init__(self, jarvis):
++        super().__init__(jarvis, "routines")
++
++    def _load_items(self):
++        return self.jarvis.get_data(self.item_key)
+diff --git a/jarviscli/plugins/reminder.py b/jarviscli/plugins/reminder.py
+index bfe3597..8de5b82 100644
+--- a/jarviscli/plugins/reminder.py
++++ b/jarviscli/plugins/reminder.py
+@@ -6,6 +6,8 @@ from pick import pick
+ from colorama import Fore
+ from pytimeparse.timeparse import timeparse
+ 
++from packages.memory.record_store import (
++    JsonRecordStore, RemindRecordStore, TagRecordStore, TodoRecordStore)
+ from plugin import plugin, alias
+ from utilities.textParser import parse_date
+ 
+@@ -47,13 +49,17 @@ class TagBase:
+         jarvis.update_data(self.save_key, tags)
+ 
+     def add_tag(self, jarvis, name):
+-        data = self.load_tags(jarvis)
++        tags_store = TagRecordStore(jarvis)
++        tags_store.load()
++        if tags_store.next_id is None:
++            tags_store.next_id = 0
+         new_tag = {
+-            "id": self.get_next_id(jarvis),
++            "id": tags_store.next_id,
+             "name": name
+         }
+-        data.append(new_tag)
+-        self.save_tags(jarvis, data)
++        tags_store.items.append(new_tag)
++        tags_store.next_id = tags_store.next_id + 1
++        tags_store.save()
+ 
+     def get_tag_by_id(self, jarvis, id):
+         tags = self.load_tags(jarvis)
+@@ -107,24 +113,25 @@ class TagBase:
+         return data[index]
+ 
+     def remove(self, jarvis, s):
+-        data = self.load_tags(jarvis)
+-        if len(data) == 0:
++        tags_store = TagRecordStore(jarvis)
++        tags_store.load()
++        if len(tags_store.items) == 0:
+             jarvis.say("Nothing to remove!")
+             return
+ 
+         if s.startswith("everything") or s.startswith("all"):
+-            for entry in data:
++            for entry in tags_store.items:
+                 self.clean_up_entry(jarvis, entry)
+ 
+-            data = []
+-            self.save_data(jarvis, data)
++            tags_store.items = []
++            self.save_data(jarvis, tags_store.items)
+ 
+             jarvis.say("ok")
+             return
+ 
+         # open selection menu
+         ask_str = []
+-        for entry in data:
++        for entry in tags_store.items:
+             ask_str.append(self.format(jarvis, entry))
+ 
+         title = 'Please choose tag to remove (select with space, j and k to move up and down)'
+@@ -132,14 +139,15 @@ class TagBase:
+         selected = [entry[1] for entry in selected]
+ 
+         new_data = []
+-        for index, entry in enumerate(data):
+-            entry = data[index]
++        for index, entry in enumerate(tags_store.items):
++            entry = tags_store.items[index]
+             if index not in selected:
+                 new_data.append(entry)
+             else:
+                 self.clean_up_entry(jarvis, entry)
+ 
+-        self.save_tags(jarvis, new_data)
++        tags_store.items = new_data
++        tags_store.save()
+ 
+ 
+ class RemindTodoBase:
+@@ -175,24 +183,30 @@ class RemindTodoBase:
+         return next_id
+ 
+     def remove(self, jarvis, s):
+-        data = self.get_data(jarvis)
+-        if len(data) == 0:
++        store = JsonRecordStore(jarvis, self.get_key(), self.get_key_next_id())
++        store.load()
++        if store.had_invalid_text:
++            jarvis.say(
++                "Could not read Remind / Todo List. Sorry, \
++                        that should not have happend...", Fore.RED)
++
++        if len(store.items) == 0:
+             jarvis.say("Nothing to remove!")
+             return
+ 
+         if s.startswith("everything") or s.startswith("all"):
+-            for entry in data:
++            for entry in store.items:
+                 self.clean_up_entry(jarvis, entry)
+ 
+-            data = []
+-            self.save_data(jarvis, data)
++            store.items = []
++            store.save()
+ 
+             jarvis.say("ok")
+             return
+ 
+         # open selection menu
+         ask_str = []
+-        for entry in data:
++        for entry in store.items:
+             ask_str.append(self.format(jarvis, entry))
+ 
+         title = 'Please choose task to remove (select with space, j and k to move up and down)'
+@@ -200,14 +214,15 @@ class RemindTodoBase:
+         selected = [entry[1] for entry in selected]
+ 
+         new_data = []
+-        for index, entry in enumerate(data):
+-            entry = data[index]
++        for index, entry in enumerate(store.items):
++            entry = store.items[index]
+             if index not in selected:
+                 new_data.append(entry)
+             else:
+                 self.clean_up_entry(jarvis, entry)
+ 
+-        self.save_data(jarvis, new_data)
++        store.items = new_data
++        store.save()
+ 
+     def modify(self, jarvis, modified_entry):
+         modified_id = modified_entry['id']
+@@ -237,8 +252,11 @@ class TodoBase(RemindTodoBase):
+         return "todo_next_id"
+ 
+     def add(self, jarvis, message, progress="", priority=-1, tags=[]):
+-        data = self.get_data(jarvis)
+-        next_id = self.get_next_id(jarvis)
++        todo_store = TodoRecordStore(jarvis)
++        todo_store.load()
++        next_id = todo_store.next_id
++        if next_id is None:
++            next_id = 0
+         new_entry = {
+             'message': message,
+             'progress': progress,
+@@ -246,8 +264,9 @@ class TodoBase(RemindTodoBase):
+             'id': next_id,
+             'tags': []
+         }
+-        data.append(new_entry)
+-        self.save_data(jarvis, data)
++        todo_store.items.append(new_entry)
++        todo_store.next_id = next_id + 1
++        todo_store.save()
+ 
+     def clean_up_entry(self, jarvis, entry):
+         self.interact().clean_up_entry(jarvis, entry)
+@@ -373,8 +392,11 @@ class RemindBase(RemindTodoBase):
+             timestamp=None,
+             schedule_id=None,
+             todo_refere_id=None):
+-        data = self.get_data(jarvis)
+-        next_id = self.get_next_id(jarvis)
++        remind_store = RemindRecordStore(jarvis)
++        remind_store.load()
++        next_id = remind_store.next_id
++        if next_id is None:
++            next_id = 0
+         new_entry = {
+             'message': message,
+             'timestamp': timestamp,
+@@ -382,8 +404,9 @@ class RemindBase(RemindTodoBase):
+             'todo_refere_id': todo_refere_id,
+             'id': next_id
+         }
+-        new_data = data + [new_entry]
+-        self.save_data(jarvis, new_data)
++        remind_store.items.append(new_entry)
++        remind_store.next_id = next_id + 1
++        remind_store.save()
+ 
+     def clean_up_entry(self, jarvis, entry):
+         jarvis.cancel(entry['schedule_id'])
+diff --git a/jarviscli/plugins/routine.py b/jarviscli/plugins/routine.py
+index 68cb7fa..072b72f 100644
+--- a/jarviscli/plugins/routine.py
++++ b/jarviscli/plugins/routine.py
+@@ -1,5 +1,7 @@
+ from plugin import plugin
+ 
++from packages.memory.record_store import RoutineRecordStore
++
+ 
+ ROUTINES = "routines"
+ 
+@@ -9,12 +11,12 @@ def create_routine(jarvis, commands, name):
+     Saves a new routine to memory with a name and a list of instructions.
+     :return: Nothing to return.
+     """
+-    routines = jarvis.get_data(ROUTINES)
+-    if routines is None:
+-        jarvis.add_data(ROUTINES, {name: commands})
+-    else:
+-        routines[name] = commands
+-        jarvis.update_data(ROUTINES, routines)
++    routine_store = RoutineRecordStore(jarvis)
++    routine_store.load()
++    if routine_store.items is None:
++        routine_store.items = {}
++    routine_store.items[name] = commands
++    routine_store.save()
+ 
+ 
+ def execute_routine(jarvis, name):
+@@ -65,9 +67,10 @@ def list_routines(jarvis, s):
+ 
+ @plugin("delete routine")
+ def delete_routines(jarvis, s):
+-    routines = jarvis.get_data(ROUTINES)
+-    if s in routines:
+-        routines.pop(s)
+-        jarvis.update_data(ROUTINES, routines)
++    routine_store = RoutineRecordStore(jarvis)
++    routine_store.load()
++    if s in routine_store.items:
++        routine_store.items.pop(s)
++        routine_store.save()
+     else:
+         jarvis.say("Invalid routine name")
+diff --git a/jarviscli/plugins/tasks.py b/jarviscli/plugins/tasks.py
+index cd5a6f2..56f8cc7 100644
+--- a/jarviscli/plugins/tasks.py
++++ b/jarviscli/plugins/tasks.py
+@@ -1,6 +1,6 @@
+ from colorama import Fore
+ 
+-from packages.memory.memory import Memory
++from packages.memory.record_store import TaskRecordStore
+ from plugin import plugin
+ 
+ 
+@@ -22,18 +22,18 @@ class TaskManager():
+ 
+     def list_all(self, jarvis):
+         jarvis.say("")
+-        task_count = len(self.tasks)
++        task_count = len(self.store.items)
+         if task_count == 0:
+             jarvis.say("Your Task List Is Empty, Good Job")
+             return
+         jarvis.say("You Have {} {}".format(task_count, "Task" if task_count == 1 else "Tasks"))
+         for i in range(task_count):
+             try:
+-                priority = self.tasks[i]["priority"]
++                priority = self.store.items[i]["priority"]
+                 jarvis.say("{}. {} PR: {}".format(
+-                    i + 1, self.tasks[i]["name"], priority), self.get_color_with_priority(priority))
++                    i + 1, self.store.items[i]["name"], priority), self.get_color_with_priority(priority))
+             except BaseException:
+-                jarvis.say("{}. {}".format(i + 1, self.tasks[i]["name"]))
++                jarvis.say("{}. {}".format(i + 1, self.store.items[i]["name"]))
+ 
+     def get_color_with_priority(self, priority):
+         if priority == "High":
+@@ -45,13 +45,14 @@ class TaskManager():
+ 
+     def add_task(self, jarvis):
+         new_task = jarvis.input("Enter New Task: ", Fore.GREEN)
+-        self.tasks.append({"name": new_task})
+-        self.update_tasks(self.tasks)
++        self.store.load()
++        self.store.items.append({"name": new_task})
++        self.store.save()
+         jarvis.say("Task Was Successfully Added")
+         self.list_all(jarvis)
+ 
+     def choose_task(self, exit_text, input_text, jarvis):
+-        tasks_count = len(self.tasks)
++        tasks_count = len(self.store.items)
+         self.list_all(jarvis)
+         jarvis.say("{}. {}".format(tasks_count + 1, exit_text))
+         return self.get_choice(input_text, tasks_count, tasks_count + 1, jarvis)
+@@ -60,11 +61,13 @@ class TaskManager():
+         task_index = self.choose_task("EXIT Editing", "Exit Editing or Choose Which Task To Edit: ", jarvis)
+         if task_index == -1:
+             return
+-        chosen_task_name = self.tasks[task_index - 1]["name"]
++        self.store.load()
++        chosen_task_name = self.store.items[task_index - 1]["name"]
+         jarvis.say("Chosen Task: {}".format(chosen_task_name))
+         updated_task = jarvis.input("Enter Updated Task: ", Fore.GREEN)
+-        new_tasks = map(lambda task: {"name": updated_task} if task["name"] == chosen_task_name else task, self.tasks)
+-        self.update_tasks(list(new_tasks))
++        new_tasks = map(lambda task: {"name": updated_task} if task["name"] == chosen_task_name else task, self.store.items)
++        self.store.items = list(new_tasks)
++        self.store.save()
+         jarvis.say("Task Was Successfully Updated")
+ 
+     def get_priority(self, jarvis):
+@@ -87,18 +90,22 @@ class TaskManager():
+         priority = self.get_priority(jarvis)
+         if priority == -1:
+             return
+-        task_name = self.tasks[task_index - 1]["name"]
++        self.store.load()
++        task_name = self.store.items[task_index - 1]["name"]
+         new_tasks = map(lambda t: {"name": task_name,
+-                                   "priority": options[priority]} if t["name"] == task_name else t, self.tasks)
+-        self.update_tasks(list(new_tasks))
++                                   "priority": options[priority]} if t["name"] == task_name else t, self.store.items)
++        self.store.items = list(new_tasks)
++        self.store.save()
+ 
+     def delete_task(self, jarvis):
+         task_index = self.choose_task("EXIT Delete Mode", "Exit Delte Mode or Choose Taks To Delete: ", jarvis)
+         if task_index == -1:
+             return
+-        chosen_task_name = self.tasks[task_index - 1]["name"]
+-        new_tasks = filter(lambda x: x["name"] != chosen_task_name, self.tasks)
+-        self.update_tasks(list(new_tasks))
++        self.store.load()
++        chosen_task_name = self.store.items[task_index - 1]["name"]
++        new_tasks = filter(lambda x: x["name"] != chosen_task_name, self.store.items)
++        self.store.items = list(new_tasks)
++        self.store.save()
+         jarvis.say("Task Was Successfully Deleted")
+ 
+     def get_sorting_startegy(self, jarvis):
+@@ -113,7 +120,7 @@ class TaskManager():
+ 
+     def display_sorted(self, jarvis):
+         options = {1: "name", 2: "pr"}
+-        tasks_count = len(self.tasks)
++        tasks_count = len(self.store.items)
+         if tasks_count == 0 | tasks_count == 1:
+             jarvis.say("There is Not Enough Tasks To sort")
+             return
+@@ -136,7 +143,7 @@ class TaskManager():
+         def sort_by_name(task):
+             return task["name"]
+ 
+-        sorted_tasks = self.tasks.copy()
++        sorted_tasks = self.store.items.copy()
+         if options[strategy] == "name":
+             sorted_tasks.sort(key=sort_by_name)
+         else:
+@@ -202,17 +209,5 @@ class TaskManager():
+             jarvis.say("")
+ 
+     def load_tasks(self):
+-        m = Memory("tasks.json")
+-        if m.get_data("tasks_list") is None:
+-            self.tasks = []
+-        else:
+-            self.tasks = m.get_data("tasks_list")
+-
+-    def update_tasks(self, new_tasks):
+-        m = Memory("tasks.json")
+-        if m.get_data("tasks_list") is None:
+-            m.add_data("tasks_list", new_tasks)
+-        else:
+-            m.update_data("tasks_list", new_tasks)
+-        m.save()
+-        self.tasks = new_tasks
++        self.store = TaskRecordStore()
++        self.store.load()

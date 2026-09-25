@@ -1,0 +1,406 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 0728b81..a364fce 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -268,15 +268,14 @@ pub trait Absorb<O> {
+ /// Construct a new write and read handle pair from an empty data structure.
+ ///
+ /// The type must implement `Clone` so we can construct the second copy from the first.
++///
++/// This is a thin alias for [`WriteHandle::from_value`], which now owns the construction of the
++/// handle pair: the writer handle wires up the shared epoch table, the initial reader, and itself.
+ pub fn new_from_empty<T, O>(t: T) -> (WriteHandle<T, O>, ReadHandle<T>)
+ where
+     T: Absorb<O> + Clone,
+ {
+-    let epochs = Default::default();
+-
+-    let r = ReadHandle::new(t.clone(), Arc::clone(&epochs));
+-    let w = WriteHandle::new(t, epochs, r.clone());
+-    (w, r)
++    WriteHandle::from_value(t)
+ }
+ 
+ /// Construct a new write and read handle pair from the data structure default.
+@@ -289,13 +288,55 @@ where
+ ///
+ /// If your type's `Default` implementation does not guarantee this, you can use `new_from_empty`,
+ /// which relies on `Clone` instead of `Default`.
++///
++/// This is a thin alias for [`WriteHandle::from_default`], which now owns the construction of the
++/// handle pair: the writer handle wires up the shared epoch table, the initial reader, and itself.
+ pub fn new<T, O>() -> (WriteHandle<T, O>, ReadHandle<T>)
+ where
+     T: Absorb<O> + Default,
+ {
+-    let epochs = Default::default();
++    WriteHandle::from_default()
++}
++
++impl<T, O> WriteHandle<T, O>
++where
++    T: Absorb<O> + Clone,
++{
++    /// Build a new writer and reader handle pair over `t`.
++    ///
++    /// The writer handle is the owner of the whole left-right structure, so pair construction
++    /// starts here: this method creates the shared epoch table, registers the initial reader on
++    /// it, and then produces the writer handle that coordinates both.
++    ///
++    /// The type must implement `Clone` so the second copy of the data structure can be built from
++    /// the first.
++    pub fn from_value(t: T) -> (Self, ReadHandle<T>) {
++        let epochs = Default::default();
++
++        let r = ReadHandle::new(t.clone(), Arc::clone(&epochs));
++        let w = WriteHandle::new(t, epochs, r.clone());
++        (w, r)
++    }
++}
++
++impl<T, O> WriteHandle<T, O>
++where
++    T: Absorb<O> + Default,
++{
++    /// Build a new writer and reader handle pair over `T::default()`.
++    ///
++    /// The writer handle is the owner of the whole left-right structure, so pair construction
++    /// starts here: this method creates the shared epoch table, registers the initial reader on
++    /// it, and then produces the writer handle that coordinates both.
++    ///
++    /// The type must implement `Default` so we can construct two empty instances, and that
++    /// implementation must be deterministic and idempotent, or the two copies of the data will
++    /// not track each other.
++    pub fn from_default() -> (Self, ReadHandle<T>) {
++        let epochs = Default::default();
+ 
+-    let r = ReadHandle::new(T::default(), Arc::clone(&epochs));
+-    let w = WriteHandle::new(T::default(), epochs, r.clone());
+-    (w, r)
++        let r = ReadHandle::new(T::default(), Arc::clone(&epochs));
++        let w = WriteHandle::new(T::default(), epochs, r.clone());
++        (w, r)
++    }
+ }
+diff --git a/src/read.rs b/src/read.rs
+index 6d09cd2..72322ab 100644
+--- a/src/read.rs
++++ b/src/read.rs
+@@ -1,12 +1,13 @@
+-use crate::sync::{fence, Arc, AtomicPtr, AtomicUsize, Ordering};
++use crate::sync::{fence, Arc, AtomicPtr, AtomicUsize, MutexGuard, Ordering};
+ use crossbeam_utils::CachePadded;
+ use std::cell::Cell;
+ use std::fmt;
+ use std::marker::PhantomData;
+ use std::ptr::NonNull;
+ 
+-// To make [`WriteHandle`] and friends work.
+-#[cfg(doc)]
++// The write handle is the owner of the reader lifecycle, so it implements its reader-side
++// duties here, next to the epoch machinery they rely on.
++use crate::Absorb;
+ use crate::WriteHandle;
+ 
+ mod guard;
+@@ -250,3 +251,45 @@ impl<T> ReadHandle<T> {
+ /// ```
+ #[allow(dead_code)]
+ struct CheckReadHandleSendNotSync;
++
++// The write handle owns the reader lifecycle as well: registering new readers on the shared
++// epoch table and keeping the writer's view of those epochs up to date are writer-side duties
++// these days. The methods below live next to the epoch machinery they manipulate.
++impl<T, O> WriteHandle<T, O>
++where
++    T: Absorb<O>,
++{
++    /// Register an additional reader on this writer's epoch table.
++    ///
++    /// The new handle enters the same left-right structure as the writer's own reader, sees the
++    /// last published state, and is waited for by [`WriteHandle::publish`] just like any other
++    /// reader.
++    pub fn spawn_reader(&self) -> ReadHandle<T> {
++        let epoch = Arc::new(CachePadded::new(AtomicUsize::new(0)));
++        // okay to lock, since we're not holding up the epoch
++        let epoch_i = self.epochs.lock().unwrap().insert(Arc::clone(&epoch));
++
++        ReadHandle {
++            epochs: Arc::clone(&self.epochs),
++            inner: Arc::clone(&self.r_handle.inner),
++            epoch,
++            epoch_i,
++            enters: Cell::new(0),
++            _unimpl_send: PhantomData,
++        }
++    }
++
++    /// Refresh the writer's snapshot of where every reader epoch stands.
++    ///
++    /// This must only be called while holding the lock on the epoch table, and strictly after the
++    /// pointer swap whose visibility the snapshot is meant to track.
++    pub(crate) fn snapshot_reader_epochs(
++        &mut self,
++        epochs: &mut MutexGuard<'_, slab::Slab<Arc<CachePadded<AtomicUsize>>>>,
++    ) {
++        self.last_epochs.resize(epochs.capacity(), 0);
++        for (ri, epoch) in epochs.iter() {
++            self.last_epochs[ri] = epoch.load(Ordering::Acquire);
++        }
++    }
++}
+diff --git a/src/read/factory.rs b/src/read/factory.rs
+index 147e6d2..f293f91 100644
+--- a/src/read/factory.rs
++++ b/src/read/factory.rs
+@@ -1,5 +1,9 @@
+ use super::ReadHandle;
+ use crate::sync::{Arc, AtomicPtr};
++// The write handle owns the reader lifecycle, so minting the reader factories also goes through
++// the writer these days.
++use crate::write::WriteHandle;
++use crate::Absorb;
+ use std::fmt;
+ 
+ /// A type that is both `Sync` and `Send` and lets you produce new [`ReadHandle`] instances.
+@@ -37,3 +41,24 @@ impl<T> ReadHandleFactory<T> {
+         ReadHandle::new_with_arc(Arc::clone(&self.inner), Arc::clone(&self.epochs))
+     }
+ }
++
++// The write handle owns the reader lifecycle, so it also mints the factories used to hand out
++// new readers from other threads.
++impl<T, O> WriteHandle<T, O>
++where
++    T: Absorb<O>,
++{
++    /// Mint a factory that produces further [`ReadHandle`]s for this writer's left-right
++    /// structure.
++    ///
++    /// The returned factory is `Send` and `Sync`, so it can be shipped to other threads, which
++    /// can then produce readers registered against this writer's epoch table. This plays the
++    /// same role as [`ReadHandle::factory`](crate::ReadHandle::factory), but through the writer
++    /// that owns the structure.
++    pub fn reader_factory(&self) -> ReadHandleFactory<T> {
++        ReadHandleFactory {
++            inner: Arc::clone(&self.r_handle.inner),
++            epochs: Arc::clone(&self.epochs),
++        }
++    }
++}
+diff --git a/src/read/guard.rs b/src/read/guard.rs
+index 308ef62..362b027 100644
+--- a/src/read/guard.rs
++++ b/src/read/guard.rs
+@@ -1,7 +1,12 @@
+-use crate::sync::{AtomicUsize, Ordering};
++use crate::sync::{fence, AtomicUsize, Ordering};
+ use std::cell::Cell;
+ use std::mem;
+ 
++// The write handle is the owner of the reader lifecycle, so guard issuance lives here too,
++// next to the guard types it produces.
++use crate::write::WriteHandle;
++use crate::Absorb;
++
+ #[derive(Debug, Copy, Clone)]
+ pub(super) struct ReadHandleState<'rh> {
+     pub(super) epoch: &'rh AtomicUsize,
+@@ -33,6 +38,23 @@ pub struct ReadGuard<'rh, T: ?Sized> {
+     pub(super) handle: ReadHandleState<'rh>,
+ }
+ 
++impl<'rh, T> ReadGuard<'rh, T> {
++    /// Assemble a guard over `t` bound to the live reader state of `r_handle`.
++    ///
++    /// Must only be called after the guard bookkeeping (`enters` and the epoch bump) has been
++    /// performed for the entering side: this constructor pairs the data with the state, it does
++    /// not touch the epoch table itself.
++    pub(super) fn enter_state(r_handle: &'rh super::ReadHandle<T>, t: &'rh T) -> Self {
++        ReadGuard {
++            t,
++            handle: ReadHandleState {
++                epoch: &r_handle.epoch,
++                enters: &r_handle.enters,
++            },
++        }
++    }
++}
++
+ impl<'rh, T: ?Sized> ReadGuard<'rh, T> {
+     /// Makes a new `ReadGuard` for a component of the borrowed data.
+     ///
+@@ -101,6 +123,69 @@ impl<'rh, T: ?Sized> ReadGuard<'rh, T> {
+     }
+ }
+ 
++// The write handle owns guard issuance as part of the reader lifecycle it coordinates: writers
++// enter the read side through their own handle rather than dereferencing into the reader.
++impl<T, O> WriteHandle<T, O>
++where
++    T: Absorb<O>,
++{
++    /// Enter the read side directly through the writer handle.
++    ///
++    /// This hands out a guard over the last published state, exactly like entering through
++    /// [`ReadHandle::enter`](crate::ReadHandle::enter) on the writer's reader would. While the
++    /// guard lives, a subsequent call to [`WriteHandle::publish`](crate::WriteHandle::publish)
++    /// cannot proceed.
++    ///
++    /// If the writer handle has been destroyed this returns `None`.
++    pub fn enter_read_guard(&self) -> Option<ReadGuard<'_, T>> {
++        let r_handle = &self.r_handle;
++        let enters = r_handle.enters.get();
++        if enters != 0 {
++            // we have already locked the epoch; just give out another guard.
++            let inner = r_handle.inner.load(Ordering::Acquire);
++            // since we previously bumped our epoch, this pointer will remain valid until we bump
++            // it again, which only happens when the last ReadGuard is dropped.
++            let data = unsafe { inner.as_ref() };
++
++            return if let Some(data) = data {
++                r_handle.enters.set(enters + 1);
++                Some(ReadGuard::enter_state(r_handle, data))
++            } else {
++                // WriteHandle must have been dropped, so even though the first `enter` may have
++                // returned `Some`, all we can do now is return `None` since the pointee has
++                // vanished.
++                None
++            };
++        }
++
++        // entering from the writer side has to satisfy the same visibility contract as
++        // entering from a reader: the reasoning for why reading the pointer _after_ bumping the
++        // epoch is safe is laid out in `ReadHandle::enter`, and applies verbatim here.
++
++        // so, update the epoch tracker.
++        r_handle.epoch.fetch_add(1, Ordering::AcqRel);
++
++        // ensure that the pointer read happens strictly after updating the epoch
++        fence(Ordering::SeqCst);
++
++        // then, atomically read the pointer, and use the copy being pointed to.
++        // since we bumped the epoch, this pointer will remain valid until we bump it again.
++        let inner = r_handle.inner.load(Ordering::Acquire);
++        let data = unsafe { inner.as_ref() };
++
++        if let Some(data) = data {
++            // add a guard to ensure we restore read parity even if we panic
++            r_handle.enters.set(r_handle.enters.get() + 1);
++            Some(ReadGuard::enter_state(r_handle, data))
++        } else {
++            // the writehandle has been dropped, and so has both copies,
++            // so restore parity and return None
++            r_handle.epoch.fetch_add(1, Ordering::AcqRel);
++            None
++        }
++    }
++}
++
+ impl<'rh, T: ?Sized> AsRef<T> for ReadGuard<'rh, T> {
+     fn as_ref(&self) -> &T {
+         self.t
+diff --git a/src/write.rs b/src/write.rs
+index 0679d3b..9c0dfa6 100644
+--- a/src/write.rs
++++ b/src/write.rs
+@@ -27,12 +27,12 @@ pub struct WriteHandle<T, O>
+ where
+     T: Absorb<O>,
+ {
+-    epochs: crate::Epochs,
++    pub(crate) epochs: crate::Epochs,
+     w_handle: NonNull<T>,
+     oplog: VecDeque<O>,
+     swap_index: usize,
+-    r_handle: ReadHandle<T>,
+-    last_epochs: Vec<usize>,
++    pub(crate) r_handle: ReadHandle<T>,
++    pub(crate) last_epochs: Vec<usize>,
+     #[cfg(test)]
+     refreshes: usize,
+     #[cfg(test)]
+@@ -182,10 +182,7 @@ where
+         // would only be waiting for the readers to have observed _some_ swap since the last
+         // publish, but not necessarily _our_ NULL swap. in particular, they may simply have
+         // observed the swap at the last publish.
+-        self.last_epochs.resize(epochs.capacity(), 0);
+-        for (ri, epoch) in epochs.iter() {
+-            self.last_epochs[ri] = epoch.load(Ordering::Acquire);
+-        }
++        self.snapshot_reader_epochs(&mut epochs);
+ 
+         // and now do the actual blocking loop until every reader has moved on
+         self.wait(&mut epochs);
+@@ -445,10 +442,7 @@ where
+         // ensure that the subsequent epoch reads aren't re-ordered to before the swap
+         fence(Ordering::SeqCst);
+ 
+-        self.last_epochs.resize(epochs.capacity(), 0);
+-        for (ri, epoch) in epochs.iter() {
+-            self.last_epochs[ri] = epoch.load(Ordering::Acquire);
+-        }
++        self.snapshot_reader_epochs(epochs);
+ 
+         #[cfg(test)]
+         {
+@@ -540,7 +534,9 @@ where
+             // refreshed ever before, so we can modify it directly!
+             let mut w_inner = self.raw_write_handle();
+             let w_inner = unsafe { w_inner.as_mut() };
+-            let r_handle = self.enter().expect("map has not yet been destroyed");
++            let r_handle = self
++                .enter_read_guard()
++                .expect("map has not yet been destroyed");
+             // Because we are operating directly on the map, and nothing is aliased, we do want
+             // to perform drops, so we invoke absorb_second.
+             for op in ops {
+@@ -631,6 +627,7 @@ struct CheckWriteHandleSend;
+ mod tests {
+     use crate::sync::{Arc, AtomicUsize, Mutex, Ordering};
+     use crate::Absorb;
++    use crate::WriteHandle;
+     use crossbeam_utils::CachePadded;
+     use slab::Slab;
+     include!("./utilities.rs");
+@@ -809,4 +806,40 @@ mod tests {
+         assert_eq!(w.try_publish(), true);
+         assert_eq!(w.refreshes, before + 1);
+     }
++
++    #[test]
++    fn writer_side_reader_lifecycle() {
++        // the write handle also owns the full reader lifecycle these days: it builds the
++        // handle pair, registers additional readers, hands out guards, and mints factories.
++        let (mut w, r) = WriteHandle::<i32, CounterAddOp>::from_value(0);
++        assert_eq!(*r.enter().unwrap(), 0);
++
++        let extra = w.spawn_reader();
++        let late = w.reader_factory().handle();
++
++        w.append(CounterAddOp(1));
++        w.publish();
++
++        for handle in [&r, &extra, &late] {
++            assert_eq!(*handle.enter().unwrap(), 1);
++        }
++        assert_eq!(*w.enter_read_guard().unwrap(), 1);
++
++        // a handle minted after the publish sees the same state
++        let newest = w.spawn_reader();
++        assert_eq!(*newest.enter().unwrap(), 1);
++
++        w.append(CounterAddOp(1));
++        assert!(w.has_pending_operations());
++        w.flush();
++        assert!(!w.has_pending_operations());
++        assert_eq!(*r.enter().unwrap(), 2);
++
++        // from_default matches the old free constructor
++        let (mut w2, r2) = WriteHandle::<i32, CounterAddOp>::from_default();
++        assert_eq!(*r2.enter().unwrap(), 0);
++        w2.append(CounterAddOp(1));
++        w2.publish();
++        assert_eq!(*r2.enter().unwrap(), 1);
++    }
+ }

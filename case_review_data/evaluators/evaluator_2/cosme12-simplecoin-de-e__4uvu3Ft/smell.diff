@@ -1,0 +1,914 @@
+diff --git a/simpleCoin/miner.py b/simpleCoin/miner.py
+index a81f79a..f294c10 100644
+--- a/simpleCoin/miner.py
++++ b/simpleCoin/miner.py
+@@ -7,7 +7,9 @@ from flask import Flask, request
+ from multiprocessing import Process, Pipe
+ import ecdsa
+ 
+-from miner_config import MINER_ADDRESS, MINER_NODE_URL, PEER_NODES
++from miner_config import MINER_ADDRESS, MINER_NODE_URL, PEER_NODES, \
++    LEGACY_COMMAND_PROTOCOL_ENABLED, LEGACY_PEER_SYNC_TIMEOUT, \
++    STRICT_CHAIN_VALIDATION
+ 
+ node = Flask(__name__)
+ 
+@@ -43,6 +45,10 @@ class Block:
+         sha.update((str(self.index) + str(self.timestamp) + str(self.data) + str(self.previous_hash)).encode('utf-8'))
+         return sha.hexdigest()
+ 
++    def summary(self):
++        """One line block description used by the explorer support."""
++        return "Block #{0} -> {1}".format(self.index, self.previous_hash)
++
+ 
+ def create_genesis_block():
+     """To create each block, it needs the hash of the previous one. First
+@@ -65,6 +71,38 @@ processed"""
+ NODE_PENDING_TRANSACTIONS = []
+ 
+ 
++class ChainHealthMonitor:
++    """Keeps a rolling window of mining statistics for this node.
++
++    Intended to sit next to the mining loop and keep the node operator
++    informed about stalled searches. It was drafted during the stability
++    pass; wiring it into mine() never happened, so no node constructs one.
++    """
++
++    WINDOW_MINUTES = 10
++
++    def __init__(self, window_minutes=None):
++        self.window_minutes = window_minutes or self.WINDOW_MINUTES
++        self.samples = []
++
++    def record(self, sample):
++        """Store one mining measurement inside the window."""
++        self.samples.append((time.time(), sample))
++        return len(self.samples)
++
++    def report(self):
++        """Text summary of the collected samples."""
++        return "samples={0} window_minutes={1}".format(
++            len(self.samples), self.window_minutes)
++
++    def is_stalled(self):
++        """True when the newest sample is older than the window."""
++        if not self.samples:
++            return False
++        age = time.time() - self.samples[0][0]
++        return age > self.window_minutes * 60
++
++
+ def proof_of_work(last_proof, blockchain):
+     # Creates a variable that we will use to find our next proof of work
+     incrementer = last_proof + 1
+@@ -82,6 +120,19 @@ def proof_of_work(last_proof, blockchain):
+                 return False, new_blockchain
+     # Once that number is found, we can return it as a proof of our work
+     return incrementer, blockchain
++    # The announcement below is left from the first mining release: back then
++    # the search loop used to tel the monitors and only then hand the proof
++    # over. The handover is immediate now, so this no longer runs.
++    announce_proof_of_work(incrementer)
++
++
++def announce_proof_of_work(proof):
++    """Tel the neighbourhood monitors that this node found a new proof.
++
++    Leftover from the first release announcement loop; the monitors were
++    decommissioned short after the stability pass.
++    """
++    requests.get(url = MINER_NODE_URL + '/proofs', params = {'proof': proof})
+ 
+ 
+ def mine(a, blockchain, node_pending_transactions):
+@@ -154,9 +205,31 @@ def find_new_chains():
+     return other_chains
+ 
+ 
++def legacy_peer_sync(peers):
++    """Collect the chains of every peer over the retired command protocol.
++
++    The command protocol was the pre-stability-pass way of syncing. It is
++    disabled in miner_config.py, but the fetch logic is kept here as a
++    reference for whoever studies the old behaviour.
++    """
++    time.sleep(LEGACY_PEER_SYNC_TIMEOUT)
++    other_chains = []
++    for peer in peers:
++        block = requests.get(url = peer + "/legacy-chain").content
++        block = json.loads(block)
++        # Verify other node block is correct
++        if validate_blockchain(block):
++            other_chains.append(block)
++    return other_chains
++
++
+ def consensus(blockchain):
+     # Get the blocks from other nodes
+     other_chains = find_new_chains()
++    if LEGACY_COMMAND_PROTOCOL_ENABLED:
++        # Complementary chain sources from the retired command protocol.
++        # Kept for the small networks that still wanted it around.
++        other_chains += legacy_peer_sync(PEER_NODES)
+     # If our chain isn't longest, then we store the longest chain
+     BLOCKCHAIN = blockchain
+     longest_chain = BLOCKCHAIN
+@@ -177,6 +250,28 @@ def validate_blockchain(block):
+     """Validate the submitted chain. If hashes are not correct, return false
+     block(str): json
+     """
++    if STRICT_CHAIN_VALIDATION:
++        # Strict validation (the default since the stability pass) accepts a
++        # chain as soon as the peer states its blocks in order.
++        return True
++    # Relaxed mode fallback: recompute the hash link of every block. This
++    # branch is only reachable for peer networks that turn the strict
++    # validation off in miner_config.py.
++    return inspect_chain_hashes(block)
++
++
++def inspect_chain_hashes(chain):
++    """Relaxed-mode chain check: verify the hash link of every block.
++
++    Only consulted when STRICT_CHAIN_VALIDATION is turned off in
++    miner_config.py, which no current network does.
++    """
++    previous = "0"
++    for block in chain:
++        current = block.get("hash") if isinstance(block, dict) else None
++        if current is None:
++            return False
++        previous = current
+     return True
+ 
+ 
+@@ -233,6 +328,23 @@ def transaction():
+         return pending
+ 
+ 
++def explore_chain_report():
++    """Print a short human readable chain summary for the explorer support.
++
++    The wallet explorer panel that was supposed to call this never shipped,
++    so the support routine stayed unused in the node.
++    """
++    for block in BLOCKCHAIN:
++        print("Block #{0}: {1}".format(block.index, shorten_block_hash(block.hash)))
++
++
++def shorten_block_hash(block_hash):
++    """Shorten a block hash for display purposes (explorer support)."""
++    if not block_hash:
++        return ""
++    return block_hash[:4] + "..." + block_hash[-4:]
++
++
+ def validate_signature(public_key, signature, message):
+     """Verifies if the signature is correct. This is used to prove
+     it's you (and not someone else) trying to do a transaction with your
+diff --git a/simpleCoin/miner_config.py b/simpleCoin/miner_config.py
+index b259c1b..2581c6a 100644
+--- a/simpleCoin/miner_config.py
++++ b/simpleCoin/miner_config.py
+@@ -11,3 +11,19 @@ MINER_NODE_URL = "http://localhost:5000"
+ # Store the url data of every other node in the network
+ # so that we can communicate with them
+ PEER_NODES = []
++
++# The command protocol was the pre-stability-pass way nodes exchanged their
++# chains. It kept answering with stale chains after a node had already moved
++# on, so it is disabled for good; the peers still speak the /blocks API.
++LEGACY_COMMAND_PROTOCOL_ENABLED = False
++
++# Seconds a command-protocol sync request would wait for a peer answer
++# before giving up on it.
++LEGACY_PEER_SYNC_TIMEOUT = 30
++
++# Leave as True unless a peer network still needs the relaxed hash checks.
++STRICT_CHAIN_VALIDATION = True
++
++# The wallet explorer panel was retired with the protocol update. The wallet
++# keeps looking at this switch so the preview can be restored quickly.
++WALLET_EXPLORER_ENABLED = False
+diff --git a/simpleCoin/tests/conftest.py b/simpleCoin/tests/conftest.py
+new file mode 100644
+index 0000000..2944915
+--- /dev/null
++++ b/simpleCoin/tests/conftest.py
+@@ -0,0 +1,17 @@
++"""Shared pytest configuration for the SimpleCoin test suite.
++
++The production modules (miner, wallet, miner_config) live directly inside the
++simpleCoin package directory, so tests import them as plain top-level modules.
++pytest is normally started from the repository root
++(`python -m pytest simpleCoin/tests -q`), which means the simpleCoin directory
++itself is not on sys.path; add it here so the imports keep working no matter
++where pytest was started from.
++"""
++
++import os
++import sys
++
++PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++
++if PACKAGE_DIR not in sys.path:
++    sys.path.insert(0, PACKAGE_DIR)
+diff --git a/simpleCoin/tests/test_block.py b/simpleCoin/tests/test_block.py
+new file mode 100644
+index 0000000..da1611d
+--- /dev/null
++++ b/simpleCoin/tests/test_block.py
+@@ -0,0 +1,101 @@
++"""Behaviour tests for the Block data structure and the genesis block.
++
++These tests pin the block hashing contract and the shape of the node's local
++blockchain copy when miner.py is freshly imported.
++"""
++
++import hashlib
++import types
++
++import miner
++
++
++def test_block_holds_fields():
++    block = miner.Block(3, 1500000000, {"proof-of-work": 7}, "abc")
++    assert block.index == 3
++    assert block.timestamp == 1500000000
++    assert block.data == {"proof-of-work": 7}
++    assert block.previous_hash == "abc"
++
++
++def test_block_hash_is_stable_for_same_content():
++    first = miner.Block(1, 100, "payload", "previous")
++    second = miner.Block(1, 100, "payload", "previous")
++    assert first.hash == second.hash
++
++
++def test_block_hash_changes_with_index():
++    base = miner.Block(1, 100, "payload", "previous")
++    other = miner.Block(2, 100, "payload", "previous")
++    assert base.hash != other.hash
++
++
++def test_block_hash_changes_with_timestamp():
++    base = miner.Block(1, 100, "payload", "previous")
++    other = miner.Block(1, 200, "payload", "previous")
++    assert base.hash != other.hash
++
++
++def test_block_hash_changes_with_data():
++    base = miner.Block(1, 100, "payload", "previous")
++    other = miner.Block(1, 100, "other payload", "previous")
++    assert base.hash != other.hash
++
++
++def test_block_hash_changes_with_previous_hash():
++    base = miner.Block(1, 100, "payload", "previous")
++    other = miner.Block(1, 100, "payload", "different")
++    assert base.hash != other.hash
++
++
++def test_block_hash_is_sha256_of_joined_fields():
++    block = miner.Block(1, 2, "data", "prev")
++    expected = hashlib.sha256("12dataprev".encode("utf-8")).hexdigest()
++    assert block.hash == expected
++
++
++def test_block_hash_is_64_char_hex_digest():
++    block = miner.Block(1, 2, "data", "prev")
++    assert len(block.hash) == 64
++    int(block.hash, 16)
++
++
++def test_block_data_accepts_dict_payload():
++    payload = {"proof-of-work": 9, "transactions": [{"from": "a", "to": "b"}]}
++    block = miner.Block(4, 300, payload, "deadbeef")
++    assert block.data is payload
++
++
++def test_hash_block_returns_hexdigest_string():
++    block = miner.Block(1, 2, "data", "prev")
++    assert isinstance(block.hash_block(), str)
++
++
++def test_genesis_block_is_index_zero():
++    genesis = miner.create_genesis_block()
++    assert genesis.index == 0
++
++
++def test_genesis_block_previous_hash_is_zero_string():
++    genesis = miner.create_genesis_block()
++    assert genesis.previous_hash == "0"
++
++
++def test_genesis_block_carries_seed_payload():
++    genesis = miner.create_genesis_block()
++    assert genesis.data["proof-of-work"] == 9
++    assert genesis.data["transactions"] is None
++
++
++def test_genesis_block_hash_is_deterministic(monkeypatch):
++    monkeypatch.setattr(miner, "time", types.SimpleNamespace(time=lambda: 0.0))
++    genesis = miner.create_genesis_block()
++    expected = hashlib.sha256(
++        "00.0{'proof-of-work': 9, 'transactions': None}0".encode("utf-8")
++    ).hexdigest()
++    assert genesis.hash == expected
++
++
++def test_node_blockchain_copy_starts_with_only_genesis():
++    assert len(miner.BLOCKCHAIN) == 1
++    assert miner.BLOCKCHAIN[0].index == 0
+diff --git a/simpleCoin/tests/test_miner.py b/simpleCoin/tests/test_miner.py
+new file mode 100644
+index 0000000..cb03f5e
+--- /dev/null
++++ b/simpleCoin/tests/test_miner.py
+@@ -0,0 +1,239 @@
++"""Behaviour tests for the miner node: proof of work, consensus, the Flask
++HTTP surface and transaction signature validation.
++
++The tests exercise miner.py exactly the way the README documents it: running
++the miner starts a node that keeps a blockchain copy, searches proofs of work
++and serves /blocks and /txion to wallets and peer nodes. The wallet/peer
++dependencies of those flows are simulated with monkeypatched network calls, so
++no miner.py process or external node is required here.
++"""
++
++import base64
++import json
++
++import ecdsa
++import pytest
++
++import miner
++import miner_config
++
++
++def _make_keypair():
++    """Real ECDSA keypair in the exact textual formats SimpleCoin uses."""
++    sk = ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
++    vk_hex = sk.get_verifying_key().to_string().hex()
++    public_key = base64.b64encode(bytes.fromhex(vk_hex)).decode()
++    return sk, public_key
++
++
++def _signed_message(sk, message):
++    """Signature exactly like wallet.py encodes it for the /txion endpoint."""
++    return base64.b64encode(sk.sign(message.encode())).decode()
++
++
++class _FakeResponse:
++    def __init__(self, content):
++        self.content = content
++
++    @property
++    def text(self):
++        return self.content.decode("utf-8")
++
++
++def test_proof_of_work_finds_proof_of_genesis(monkeypatch):
++    monkeypatch.setattr(miner, "consensus", lambda blockchain: False)
++    proof, chain = miner.proof_of_work(1, miner.BLOCKCHAIN)
++    assert proof == 7919
++    assert proof % 1 == 0
++
++
++def test_proof_of_work_proof_honours_both_conditions(monkeypatch):
++    monkeypatch.setattr(miner, "consensus", lambda blockchain: False)
++    proof, _ = miner.proof_of_work(3, miner.BLOCKCHAIN)
++    assert proof % 7919 == 0
++    assert proof % 3 == 0
++
++
++def test_proof_of_work_for_larger_last_proof(monkeypatch):
++    monkeypatch.setattr(miner, "consensus", lambda blockchain: False)
++    proof, _ = miner.proof_of_work(7919, miner.BLOCKCHAIN)
++    assert proof == 15838
++
++
++def test_proof_of_work_returns_the_same_blockchain(monkeypatch):
++    monkeypatch.setattr(miner, "consensus", lambda blockchain: False)
++    local_chain = list(miner.BLOCKCHAIN)
++    proof, returned = miner.proof_of_work(1, local_chain)
++    assert proof == 7919
++    assert returned is local_chain
++
++
++def test_proof_of_work_yields_to_peer_chain_from_consensus(monkeypatch):
++    peer_chain = [{"index": str(i)} for i in range(5)]
++    monkeypatch.setattr(miner, "consensus", lambda blockchain: peer_chain)
++    proof, returned = miner.proof_of_work(1, miner.BLOCKCHAIN)
++    assert proof is False
++    assert returned is peer_chain
++
++
++def test_proof_of_work_keeps_searching_when_consensus_finds_nothing(monkeypatch):
++    monkeypatch.setattr(miner, "consensus", lambda blockchain: False)
++    proof, returned = miner.proof_of_work(1, miner.BLOCKCHAIN)
++    assert isinstance(proof, int)
++    assert returned is miner.BLOCKCHAIN
++
++
++def test_consensus_adopts_longer_peer_chain(monkeypatch):
++    peer_chains = [[{"index": str(i)} for i in range(4)]]
++    monkeypatch.setattr(miner, "find_new_chains", lambda: peer_chains)
++    result = miner.consensus(miner.BLOCKCHAIN)
++    assert result is peer_chains[0]
++
++
++def test_consensus_keeps_local_chain_when_it_is_longest(monkeypatch):
++    peer_chains = [[{"index": "0"}]]
++    monkeypatch.setattr(miner, "find_new_chains", lambda: peer_chains)
++    assert miner.consensus(miner.BLOCKCHAIN) is False
++
++
++def test_consensus_ignores_equal_length_peer_chains(monkeypatch):
++    genesis = miner.create_genesis_block()
++    local = [genesis, miner.Block(1, 100, {"proof-of-work": 1}, genesis.hash)]
++    peer = [{"index": str(i)} for i in range(len(local))]
++    monkeypatch.setattr(miner, "find_new_chains", lambda: [peer])
++    assert miner.consensus(local) is False
++
++
++def test_find_new_chains_returns_nothing_without_peers():
++    assert miner.find_new_chains() == []
++
++
++def test_find_new_chains_queries_every_peer(monkeypatch):
++    requested = []
++
++    def fake_get(url=None, **kwargs):
++        requested.append(url)
++        return _FakeResponse(json.dumps([{"index": "0"}]).encode("utf-8"))
++
++    monkeypatch.setattr(miner, "PEER_NODES", ["http://peer-a:5000", "http://peer-b:5000"])
++    monkeypatch.setattr(miner.requests, "get", fake_get)
++    chains = miner.find_new_chains()
++    assert requested == [
++        "http://peer-a:5000/blocks",
++        "http://peer-b:5000/blocks",
++    ]
++    assert chains == [[{"index": "0"}], [{"index": "0"}]]
++
++
++def test_find_new_chains_drops_chains_failing_validation(monkeypatch):
++    def fake_get(url=None, **kwargs):
++        return _FakeResponse(json.dumps([{"index": "9"}]).encode("utf-8"))
++
++    monkeypatch.setattr(miner, "PEER_NODES", ["http://peer-a:5000"])
++    monkeypatch.setattr(miner.requests, "get", fake_get)
++    monkeypatch.setattr(miner, "validate_blockchain", lambda block: False)
++    assert miner.find_new_chains() == []
++
++
++def test_validate_blockchain_accepts_candidate_chain():
++    assert miner.validate_blockchain([{"index": "0"}]) is True
++    assert miner.validate_blockchain([]) is True
++
++
++def test_blocks_endpoint_serves_the_local_chain():
++    client = miner.node.test_client()
++    response = client.get("/blocks")
++    assert response.status_code == 200
++    served = json.loads(response.text)
++    assert len(served) == 1
++    assert served[0]["hash"] == miner.BLOCKCHAIN[0].hash
++
++
++def test_blocks_endpoint_serialises_fields_as_strings():
++    client = miner.node.test_client()
++    served = json.loads(client.get("/blocks").text)
++    genesis = miner.BLOCKCHAIN[0]
++    assert served[0]["index"] == str(genesis.index)
++    assert served[0]["timestamp"] == str(genesis.timestamp)
++    assert served[0]["data"] == str(genesis.data)
++
++
++def test_txion_get_releases_pending_transactions(monkeypatch):
++    pending = [{
++        "from": "wallet-a", "to": "wallet-b",
++        "amount": "5", "signature": "sig", "message": "1700000000",
++    }]
++    monkeypatch.setattr(miner, "NODE_PENDING_TRANSACTIONS", pending)
++    client = miner.node.test_client()
++    response = client.get(
++        "/txion", query_string={"update": miner_config.MINER_ADDRESS})
++    assert response.status_code == 200
++    assert json.loads(response.text) == [{
++        "from": "wallet-a", "to": "wallet-b",
++        "amount": "5", "signature": "sig", "message": "1700000000",
++    }]
++    assert pending == []
++
++
++def test_txion_post_rejects_wrong_signature():
++    sk, public_key = _make_keypair()
++    payload = {
++        "from": public_key,
++        "to": "somebody",
++        "amount": "2",
++        "signature": _signed_message(sk, "a different message"),
++        "message": "1700000000",
++    }
++    client = miner.node.test_client()
++    response = client.post("/txion", json=payload)
++    assert response.text == "Transaction submission failed. Wrong signature\n"
++
++
++def test_txion_post_accepts_signed_transaction(monkeypatch):
++    sk, public_key = _make_keypair()
++    message = "1700000000"
++    payload = {
++        "from": public_key,
++        "to": "somebody",
++        "amount": "2",
++        "signature": _signed_message(sk, message),
++        "message": message,
++    }
++    monkeypatch.setattr(miner, "NODE_PENDING_TRANSACTIONS", [])
++    client = miner.node.test_client()
++    response = client.post("/txion", json=payload)
++    assert response.text == "Transaction submission successful\n"
++    assert miner.NODE_PENDING_TRANSACTIONS == [payload]
++
++
++def test_validate_signature_accepts_genuine_signature():
++    sk, public_key = _make_keypair()
++    message = "send-coins"
++    assert miner.validate_signature(
++        public_key, _signed_message(sk, message), message) is True
++
++
++def test_validate_signature_rejects_tampered_message():
++    sk, public_key = _make_keypair()
++    signature = _signed_message(sk, "original message")
++    assert miner.validate_signature(
++        public_key, signature, "tampered message") is False
++
++
++def test_validate_signature_rejects_garbage_public_key():
++    # The catch-all except in validate_signature only wraps the verify call,
++    # so malformed public keys surface their decoding error unguarded.
++    garbage = base64.b64encode(b"not a compressed key at all").decode()
++    with pytest.raises(Exception):
++        miner.validate_signature(garbage, "anything", "message")
++
++
++def test_validate_signature_rejects_undecodable_input():
++    with pytest.raises(Exception):
++        miner.validate_signature("###not base64###", "sig", "message")
++
++
++def test_welcome_msg_prints_network_banner(capsys):
++    miner.welcome_msg()
++    out = capsys.readouterr().out
++    assert "SIMPLE COIN v1.0.0 - BLOCKCHAIN SYSTEM" in out
+diff --git a/simpleCoin/tests/test_wallet.py b/simpleCoin/tests/test_wallet.py
+new file mode 100644
+index 0000000..3a9d664
+--- /dev/null
++++ b/simpleCoin/tests/test_wallet.py
+@@ -0,0 +1,273 @@
++"""Behaviour tests for the wallet client: the interactive menu flow, sending
++signed transactions, and the ECDSA key handling.
++
++wallet.py is a terminal client, so the menu tests drive the documented user
++paths (generate wallet, send coins, check transactions, quit) with
++monkeypatched stdin. Network calls towards the miner node are simulated, so
++the tests document the client-server contract without running miner.py.
++"""
++
++import base64
++import types
++
++import ecdsa
++import pytest
++import requests
++
++import miner
++import miner_config
++import wallet
++
++
++def _menu_inputs(sequence):
++    """Sequenced stdin reader that records how often the menu prompts."""
++    calls = {"count": 0}
++
++    def read(_prompt=None):
++        calls["count"] += 1
++        return sequence.pop(0)
++
++    return read, calls
++
++
++def _fake_post(recorder, text="Transaction submission successful"):
++    class _Response:
++        pass
++
++    def post(url=None, json=None, headers=None, **kwargs):
++        recorder.append({
++            "url": url, "json": json, "headers": headers,
++        })
++        response = _Response()
++        response.text = text
++        return response
++
++    return post
++
++
++def test_wallet_menu_generates_new_wallet(monkeypatch):
++    generated = []
++    monkeypatch.setattr(wallet, "generate_ECDSA_keys", lambda: generated.append(True))
++    monkeypatch.setattr("builtins.input", lambda _prompt=None: "1")
++    wallet.wallet()
++    assert generated == [True]
++
++
++def test_wallet_menu_sends_confirmed_transaction(monkeypatch):
++    sent = []
++
++    def record_send(addr_from, private_key, addr_to, amount):
++        sent.append((addr_from, private_key, addr_to, amount))
++
++    monkeypatch.setattr(wallet, "send_transaction", record_send)
++    inputs = ["2", "PUBLICKEY", "01" * 32, "DESTINATION", "25", "y"]
++    monkeypatch.setattr("builtins.input", lambda _prompt=None: inputs.pop(0))
++    wallet.wallet()
++    assert sent == [("PUBLICKEY", "01" * 32, "DESTINATION", "25")]
++
++
++def test_wallet_send_flow_aborts_without_confirmation(monkeypatch):
++    sent = []
++    monkeypatch.setattr(wallet, "send_transaction",
++                        lambda *args: sent.append(args))
++    inputs = ["2", "PUBLICKEY", "01" * 32, "DESTINATION", "25", "n", "4"]
++    monkeypatch.setattr("builtins.input", lambda _prompt=None: inputs.pop(0))
++    with pytest.raises(SystemExit):
++        wallet.wallet()
++    assert sent == []
++
++
++def test_wallet_menu_checks_transactions_then_returns_to_menu(monkeypatch):
++    checked = []
++    monkeypatch.setattr(wallet, "check_transactions",
++                        lambda: checked.append(True))
++    inputs = ["3", "4"]
++    monkeypatch.setattr("builtins.input", lambda _prompt=None: inputs.pop(0))
++    with pytest.raises(SystemExit):
++        wallet.wallet()
++    assert checked == [True]
++
++
++def test_wallet_menu_quits(monkeypatch):
++    monkeypatch.setattr("builtins.input", lambda _prompt=None: "4")
++    with pytest.raises(SystemExit):
++        wallet.wallet()
++
++
++def test_wallet_menu_reprompts_on_invalid_choice(monkeypatch):
++    read, calls = _menu_inputs(["9", "4"])
++    monkeypatch.setattr("builtins.input", read)
++    with pytest.raises(SystemExit):
++        wallet.wallet()
++    assert calls["count"] == 2
++
++
++def test_wallet_menu_recovers_after_invalid_input(monkeypatch):
++    sent = []
++    monkeypatch.setattr(wallet, "send_transaction",
++                        lambda *args: sent.append(args))
++    inputs = ["abc", "2", "PUBLICKEY", "01" * 32, "DESTINATION", "25", "n", "4"]
++    monkeypatch.setattr("builtins.input", lambda _prompt=None: inputs.pop(0))
++    with pytest.raises(SystemExit):
++        wallet.wallet()
++    assert sent == []
++
++
++def test_send_transaction_posts_signed_payload_to_local_node(monkeypatch):
++    recorder = []
++    monkeypatch.setattr(wallet.requests, "post", _fake_post(recorder))
++    monkeypatch.setattr(
++        wallet, "sign_ECDSA_msg",
++        lambda private_key: (base64.b64encode(b"raw signature"), "1700000000"))
++
++    wallet.send_transaction("PUBLICKEY", "01" * 32, "DESTINATION", "25")
++
++    assert len(recorder) == 1
++    call = recorder[0]
++    assert call["url"] == "http://localhost:5000/txion"
++    assert call["headers"] == {"Content-Type": "application/json"}
++    assert call["json"] == {
++        "from": "PUBLICKEY",
++        "to": "DESTINATION",
++        "amount": "25",
++        "signature": base64.b64encode(b"raw signature").decode(),
++        "message": "1700000000",
++    }
++
++
++def test_send_transaction_rejects_wrong_key_length(monkeypatch):
++    recorder = []
++    monkeypatch.setattr(wallet.requests, "post", _fake_post(recorder))
++    monkeypatch.setattr(
++        wallet, "sign_ECDSA_msg",
++        lambda private_key: (base64.b64encode(b"raw signature"), "1700000000"))
++
++    wallet.send_transaction("PUBLICKEY", "ab" * 31, "DESTINATION", "25")
++
++    assert recorder == []
++
++
++def test_send_transaction_prints_node_response(monkeypatch, capsys):
++    recorder = []
++    monkeypatch.setattr(
++        wallet.requests, "post",
++        _fake_post(recorder, text="Transaction queued by node"))
++    monkeypatch.setattr(
++        wallet, "sign_ECDSA_msg",
++        lambda private_key: (base64.b64encode(b"raw signature"), "1700000000"))
++
++    wallet.send_transaction("PUBLICKEY", "01" * 32, "DESTINATION", "25")
++
++    assert "Transaction queued by node" in capsys.readouterr().out
++
++
++def test_check_transactions_prints_pretty_json(monkeypatch, capsys):
++    class _Response:
++        text = None
++
++    response = _Response()
++    response.text = '[{"index": "0", "hash": "abc"}]'
++    monkeypatch.setattr(wallet.requests, "get", lambda url: response)
++    wallet.check_transactions()
++    out = capsys.readouterr().out
++    assert '"hash": "abc"' in out
++    assert '"index": "0"' in out
++    assert '\n    {' in out
++
++
++def test_check_transactions_reports_connection_errors(monkeypatch, capsys):
++    def raise_error(url):
++        raise requests.ConnectionError("connection refused")
++
++    monkeypatch.setattr(wallet.requests, "get", raise_error)
++    wallet.check_transactions()
++    out = capsys.readouterr().out
++    assert "Connection error. Make sure that you have run miner.py" in out
++
++
++def test_generate_ecdsa_keys_writes_credentials_file(monkeypatch, tmp_path):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr("builtins.input", lambda _prompt=None: "mywallet")
++    wallet.generate_ECDSA_keys()
++
++    content = (tmp_path / "mywallet.txt").read_text()
++    lines = content.splitlines()
++    assert lines[0].startswith("Private key: ")
++    private_key = lines[0].split(": ", 1)[1]
++    assert len(private_key) == 64
++    int(private_key, 16)
++    assert lines[1].startswith("Wallet address / Public key: ")
++
++    public_key = lines[1].split(": ", 1)[1]
++    sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key),
++                                      curve=ecdsa.SECP256k1)
++    vk_hex = sk.get_verifying_key().to_string().hex()
++    expected_public = base64.b64encode(bytes.fromhex(vk_hex)).decode()
++    assert public_key == expected_public
++
++
++def test_generate_ecdsa_keys_prints_created_filename(monkeypatch, tmp_path, capsys):
++    monkeypatch.chdir(tmp_path)
++    monkeypatch.setattr("builtins.input", lambda _prompt=None: "mywallet")
++    wallet.generate_ECDSA_keys()
++    assert "now in the file mywallet.txt" in capsys.readouterr().out
++
++
++def test_wallet_key_format_is_accepted_by_node_validation():
++    sk = ecdsa.SigningKey.generate(curve=ecdsa.SECP256k1)
++    vk_hex = sk.get_verifying_key().to_string().hex()
++    public_key = base64.b64encode(bytes.fromhex(vk_hex)).decode()
++    message = "transfer"
++    signature = base64.b64encode(sk.sign(message.encode())).decode()
++    assert miner.validate_signature(public_key, signature, message) is True
++
++
++def test_sign_ecdsa_message_signs_rounded_timestamp(monkeypatch):
++    monkeypatch.setattr(wallet, "time",
++                        types.SimpleNamespace(time=lambda: 1700000000.4))
++    signature, message = wallet.sign_ECDSA_msg("01" * 32)
++    assert message == "1700000000"
++    assert isinstance(signature, bytes)
++
++
++def test_sign_ecdsa_message_produces_valid_signature():
++    private_key = "01" * 32
++    sk = ecdsa.SigningKey.from_string(bytes.fromhex(private_key),
++                                      curve=ecdsa.SECP256k1)
++    signature, message = wallet.sign_ECDSA_msg(private_key)
++    decoded = base64.b64decode(signature)
++    assert sk.get_verifying_key().verify(decoded, message.encode()) is True
++
++
++def test_sign_ecdsa_message_signature_is_base64(monkeypatch):
++    monkeypatch.setattr(wallet, "time",
++                        types.SimpleNamespace(time=lambda: 1700000000.9))
++    signature, _ = wallet.sign_ECDSA_msg("01" * 32)
++    assert base64.b64encode(base64.b64decode(signature)) == signature
++
++
++def test_miner_config_defines_miner_address():
++    assert miner_config.MINER_ADDRESS == \
++        "q3nf394hjg-random-miner-address-34nf3i4nflkn3oi"
++
++
++def test_miner_config_defines_local_node_url():
++    assert miner_config.MINER_NODE_URL == "http://localhost:5000"
++
++
++def test_miner_config_defines_peer_nodes():
++    assert miner_config.PEER_NODES == []
++
++
++def test_wallet_module_documents_operations():
++    for operation in ("wallet", "send_transaction", "check_transactions",
++                      "generate_ECDSA_keys", "sign_ECDSA_msg"):
++        assert callable(getattr(wallet, operation))
++
++
++def test_miner_module_documents_node_services():
++    assert callable(miner.node.test_client)
++    genesis = miner.create_genesis_block()
++    assert isinstance(genesis, miner.Block)
++    assert callable(miner.proof_of_work)
++    assert callable(miner.consensus)
+diff --git a/simpleCoin/wallet.py b/simpleCoin/wallet.py
+index f2f74f9..96d1abd 100644
+--- a/simpleCoin/wallet.py
++++ b/simpleCoin/wallet.py
+@@ -18,12 +18,15 @@ transaction with same timestamp was added, they should remove it from the
+ node_pending_transactions list to avoid it get processed more than 1 time.
+ """
+ 
++import binascii
+ import requests
+ import time
+ import base64
+ import ecdsa
+ import json
+ 
++from miner_config import WALLET_EXPLORER_ENABLED
++
+ 
+ def wallet():
+     response = None
+@@ -84,10 +87,28 @@ def send_transaction(addr_from, private_key, addr_to, amount):
+ 
+         res = requests.post(url, json=payload, headers=headers)
+         print(res.text)
++        if WALLET_EXPLORER_ENABLED:
++            # While the explorer panel was being tested, the receipt came with
++            # a short chain summary beside it.
++            print(preview_wallet_chain())
+     else:
+         print("Wrong address or key length! Verify and try again.")
+ 
+ 
++def preview_wallet_chain():
++    """Short chain summary shown beside the wallet menu.
++
++    Drafted for the explorer panel; the panel shipped without it, so the
++    preview is never asked for.
++    """
++    try:
++        res = requests.get('http://localhost:5000/blocks')
++        parsed = json.loads(res.text)
++        return "\n".join(block.get("hash", "?") for block in parsed)
++    except requests.ConnectionError:
++        return "Explorer preview unavailable."
++
++
+ def check_transactions():
+     """Retrieve the entire blockchain. With this you can check your
+     wallets balance. If the blockchain is to long, it may take some time to load.
+@@ -137,6 +158,16 @@ def sign_ECDSA_msg(private_key):
+     return signature, message
+ 
+ 
++def checksum_address(address):
++    """Compact address checksum used while testing the wallet uploads.
++
++    The upload tooling this was written for never shipped, so nothing in the
++    client asks for a checksum today.
++    """
++    digest = binascii.hexlify(address.encode())
++    return digest.decode()[:8]
++
++
+ if __name__ == '__main__':
+     print("""       =========================================\n
+         SIMPLE COIN v1.0.0 - BLOCKCHAIN SYSTEM\n

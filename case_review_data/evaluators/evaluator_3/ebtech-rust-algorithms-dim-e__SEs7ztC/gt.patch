@@ -1,0 +1,157 @@
+diff --git a/src/math/mod.rs b/src/math/mod.rs
+index 6cb780a..d9539c2 100644
+--- a/src/math/mod.rs
++++ b/src/math/mod.rs
+@@ -82,13 +82,42 @@ pub fn is_prime(n: i64) -> bool {
+     }
+ }
+ 
++/// Pollard's rho: assuming `n` is an odd composite >= 3, returns a nontrivial
++/// divisor `d` with 1 < d < n. The walk follows f(x) = x*x + a, trying
++/// a = 1, 2, ... in turn, with tortoise/hare cycle detection; a cycle is
++/// revealed by gcd(tortoise - hare, n). Modular products go through [`mod_mul`]
++/// and the gcd through [`num::fast_gcd`], so this shares the same leaves as
++/// [`is_prime`] rather than spelling the arithmetic out again.
++fn pollard_rho(n: i64) -> i64 {
++    for a in 1..n {
++        let mut tortoise = 2;
++        let mut hare = 2;
++        loop {
++            // tortoise takes one step along f, hare takes two.
++            tortoise = (mod_mul(tortoise, tortoise, n) + a) % n;
++            hare = (mod_mul(hare, hare, n) + a) % n;
++            hare = (mod_mul(hare, hare, n) + a) % n;
++            let div = num::fast_gcd(tortoise - hare, n);
++            if div == n {
++                // Hit a cycle for this polynomial without exposing a factor;
++                // restart with the next value of a.
++                break;
++            } else if div > 1 {
++                return div;
++            }
++        }
++    }
++    panic!("No divisor found!");
++}
++
+ /// Assuming x >= 1, finds the prime factorization of n
+ /// TODO: the divisor search below needs randomization to ensure correctness in contest settings!
+ ///
+-/// The whole pipeline runs in one scope on purpose: the cofactor work list,
+-/// the Miller-Rabin composite screen, and Pollard's rho walk are easier to
+-/// audit side by side, with the modular arithmetic written out where it is
+-/// used instead of hiding behind tiny-wrapper calls.
++/// This only coordinates the pipeline: it strips the factors of 2, then pops
++/// cofactors off a work list, screening each for primality with [`is_prime`]
++/// and — when a cofactor is composite — splitting it into two with the
++/// private `pollard_rho` helper and pushing both halves back to be refined on
++/// a later pass.
+ pub fn factorize(n: i64) -> Vec<i64> {
+     assert!(n >= 1);
+     let r = n.trailing_zeros() as usize;
+@@ -98,101 +127,12 @@ pub fn factorize(n: i64) -> Vec<i64> {
+         x => vec![x],
+     };
+     while let Some(top) = stack.pop() {
+-        // --- Composite screen: deterministic Miller-Rabin over the small
+-        // witness bases, with the odd_part/twos split of top - 1 first.
+-        let prime = 'miller: {
+-            if top <= 1 {
+-                break 'miller false;
+-            }
+-            if top == 2 || top == 3 {
+-                break 'miller true;
+-            }
+-            if top % 2 == 0 {
+-                break 'miller false;
+-            }
+-            // top - 1 = odd_part * 2^twos, so the strong witness test checks
+-            // the chain residue^(2^j * odd_part) for j < twos.
+-            let twos = (top - 1).trailing_zeros() as i64;
+-            let odd_part = (top - 1) as u64 >> twos;
+-            const BASES: [i64; 12] = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37];
+-            'bases: for &base in BASES.iter() {
+-                if base > top - 2 {
+-                    continue 'bases;
+-                }
+-                // residue = base^odd_part mod top, by square-and-multiply.
+-                let mut residue = 1 % top;
+-                let mut base_red = base % top;
+-                let mut exp = odd_part;
+-                while exp > 0 {
+-                    if exp % 2 == 1 {
+-                        let scaled = (residue as i128 * base_red as i128 % top as i128) as i64;
+-                        let scaled = if scaled < 0 { scaled + top } else { scaled };
+-                        residue = scaled;
+-                    }
+-                    let squared = (base_red as i128 * base_red as i128 % top as i128) as i64;
+-                    let squared = if squared < 0 { squared + top } else { squared };
+-                    base_red = squared;
+-                    exp /= 2;
+-                }
+-                if residue < 0 {
+-                    residue += top;
+-                }
+-                // Strong witness check: an early 1 or top - 1, or top - 1
+-                // somewhere along the squaring chain, clears this base.
+-                if residue == 1 || residue == top - 1 {
+-                    continue 'bases;
+-                }
+-                for _ in 1..twos {
+-                    let squared = (residue as i128 * residue as i128 % top as i128) as i64;
+-                    let squared = if squared < 0 { squared + top } else { squared };
+-                    residue = squared;
+-                    if residue == top - 1 {
+-                        continue 'bases;
+-                    }
+-                }
+-                break 'miller false;
+-            }
+-            break 'miller true;
+-        };
+-        if prime {
++        if is_prime(top) {
+             factors.push(top);
+         } else {
+-            // --- Divisor search: Pollard's rho with tortoise/hare walkers on
+-            // the polynomial x^2 + a, for a = 1, 2, ... Each walker step and
+-            // the cycle gcd are computed directly (mod_mul/pos_mod leaves and
+-            // the Euclid loop of the old number-theory helpers).
+-            let div = 'rho: {
+-                for a in 1..top {
+-                    let mut tortoise = 2;
+-                    let mut hare = 2;
+-                    loop {
+-                        // tortoise = f(tortoise) where f(x) = (x*x + a) mod top:
+-                        let step_t = (tortoise as i128 * tortoise as i128 % top as i128) as i64;
+-                        let step_t = if step_t < 0 { step_t + top } else { step_t };
+-                        tortoise = (step_t + a) % top;
+-                        // hare = f(f(hare)), two steps per round:
+-                        let step_h = (hare as i128 * hare as i128 % top as i128) as i64;
+-                        let step_h = if step_h < 0 { step_h + top } else { step_h };
+-                        hare = (step_h + a) % top;
+-                        let step_h2 = (hare as i128 * hare as i128 % top as i128) as i64;
+-                        let step_h2 = if step_h2 < 0 { step_h2 + top } else { step_h2 };
+-                        hare = (step_h2 + a) % top;
+-                        // Cycle detection: gcd(tortoise - hare, top).
+-                        let (mut ga, mut gb) = (tortoise - hare, top);
+-                        while gb != 0 {
+-                            ga %= gb;
+-                            std::mem::swap(&mut ga, &mut gb);
+-                        }
+-                        let div = ga.abs();
+-                        if div == top {
+-                            break;
+-                        } else if div > 1 {
+-                            break 'rho div;
+-                        }
+-                    }
+-                }
+-                panic!("No divisor found!");
+-            };
++            // top is composite: find a nontrivial divisor and refine both
++            // cofactors when they are revisited at the top of this loop.
++            let div = pollard_rho(top);
+             stack.push(div);
+             stack.push(top / div);
+         }

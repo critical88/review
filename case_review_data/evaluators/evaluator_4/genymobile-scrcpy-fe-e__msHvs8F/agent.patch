@@ -1,0 +1,243 @@
+diff --git a/app/src/input_manager.c b/app/src/input_manager.c
+index 342ffeb..763cccd 100644
+--- a/app/src/input_manager.c
++++ b/app/src/input_manager.c
+@@ -398,113 +398,6 @@ simulate_virtual_finger(struct sc_input_manager *im,
+     return true;
+ }
+ 
+-// Convert a point from window coordinates to frame coordinates.
+-//
+-// The mapping depends on the displayed content rectangle and on the client
+-// orientation, so this helper reads the display state directly instead of
+-// going through the screen API for every pointer event.
+-static struct sc_point
+-im_convert_window_to_frame_coords(struct sc_screen *screen,
+-                                  int32_t x, int32_t y) {
+-    assert(screen->video);
+-
+-    enum sc_orientation orientation = screen->orientation;
+-
+-    int32_t w = screen->content_size.width;
+-    int32_t h = screen->content_size.height;
+-
+-    // screen->rect must be initialized to avoid a division by zero
+-    assert(screen->rect.w && screen->rect.h);
+-
+-    x = (int64_t) (x - screen->rect.x) * w / screen->rect.w;
+-    y = (int64_t) (y - screen->rect.y) * h / screen->rect.h;
+-
+-    struct sc_point result;
+-    switch (orientation) {
+-        case SC_ORIENTATION_0:
+-            result.x = x;
+-            result.y = y;
+-            break;
+-        case SC_ORIENTATION_90:
+-            result.x = y;
+-            result.y = w - x;
+-            break;
+-        case SC_ORIENTATION_180:
+-            result.x = w - x;
+-            result.y = h - y;
+-            break;
+-        case SC_ORIENTATION_270:
+-            result.x = h - y;
+-            result.y = x;
+-            break;
+-        case SC_ORIENTATION_FLIP_0:
+-            result.x = w - x;
+-            result.y = y;
+-            break;
+-        case SC_ORIENTATION_FLIP_90:
+-            result.x = h - y;
+-            result.y = w - x;
+-            break;
+-        case SC_ORIENTATION_FLIP_180:
+-            result.x = x;
+-            result.y = h - y;
+-            break;
+-        default:
+-            assert(orientation == SC_ORIENTATION_FLIP_270);
+-            result.x = y;
+-            result.y = x;
+-            break;
+-    }
+-
+-    return result;
+-}
+-
+-// Compute the position of the virtual finger mirroring the mouse pointer
+-// through the center of the displayed content.
+-static struct sc_point
+-im_get_vfinger_position(struct sc_screen *screen, int32_t x, int32_t y,
+-                        bool invert_x, bool invert_y) {
+-    // The window must expose the content, the content rectangle must be
+-    // initialized and the device frame must be known for the pointer and its
+-    // mirror to be meaningful
+-    assert(screen->window);
+-    assert(screen->rect.w && screen->rect.h);
+-    assert(screen->frame_size.width && screen->frame_size.height);
+-
+-    struct sc_point position =
+-        im_convert_window_to_frame_coords(screen, x, y);
+-
+-    if (invert_x) {
+-        position.x = screen->frame_size.width - position.x;
+-    }
+-    if (invert_y) {
+-        position.y = screen->frame_size.height - position.y;
+-    }
+-    return position;
+-}
+-
+-// Return true if the point is located outside of the displayed content
+-// rectangle (i.e. on the black borders)
+-static bool
+-im_is_point_outside_content(struct sc_screen *screen, int32_t x, int32_t y) {
+-    return x < screen->rect.x
+-        || x >= screen->rect.x + screen->rect.w
+-        || y < screen->rect.y
+-        || y >= screen->rect.y + screen->rect.h;
+-}
+-
+-static struct sc_point
+-inverse_point(struct sc_point point, struct sc_size size,
+-              bool invert_x, bool invert_y) {
+-    if (invert_x) {
+-        point.x = size.width - point.x;
+-    }
+-    if (invert_y) {
+-        point.y = size.height - point.y;
+-    }
+-    return point;
+-}
+-
+ static void
+ sc_input_manager_process_key(struct sc_input_manager *im,
+                              const SDL_KeyboardEvent *event) {
+@@ -836,7 +729,7 @@ sc_input_manager_get_position(struct sc_input_manager *im, int32_t x,
+ 
+     return (struct sc_position) {
+         .screen_size = im->screen->frame_size,
+-        .point = im_convert_window_to_frame_coords(im->screen, x, y),
++        .point = sc_screen_convert_window_to_frame_coords(im->screen, x, y),
+     };
+ }
+ 
+@@ -869,11 +762,10 @@ sc_input_manager_process_mouse_motion(struct sc_input_manager *im,
+ 
+     if (im->vfinger_down) {
+         assert(!im->mp->relative_mode); // assert one more time
+-        struct sc_point mouse =
+-           im_convert_window_to_frame_coords(im->screen, event->x, event->y);
+-        struct sc_point vfinger = inverse_point(mouse, im->screen->frame_size,
+-                                                im->vfinger_invert_x,
+-                                                im->vfinger_invert_y);
++        struct sc_point vfinger =
++            sc_screen_get_vfinger_position(im->screen, event->x, event->y,
++                                           im->vfinger_invert_x,
++                                           im->vfinger_invert_y);
+         simulate_virtual_finger(im, AMOTION_EVENT_ACTION_MOVE, vfinger);
+     }
+ }
+@@ -900,7 +792,7 @@ sc_input_manager_process_touch(struct sc_input_manager *im,
+         .position = {
+             .screen_size = im->screen->frame_size,
+             .point =
+-                im_convert_window_to_frame_coords(im->screen, x, y),
++                sc_screen_convert_window_to_frame_coords(im->screen, x, y),
+         },
+         .action = sc_touch_action_from_sdl(event->type),
+         .pointer_id = event->fingerID,
+@@ -1010,8 +902,8 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
+     bool mouse_relative_mode = im->mp && im->mp->relative_mode;
+     if (video && !mouse_relative_mode && event->button == SDL_BUTTON_LEFT
+             && event->clicks == 2) {
+-        bool outside = im_is_point_outside_content(im->screen, event->x,
+-                                                  event->y);
++        bool outside = sc_screen_is_point_outside_content(im->screen,
++                                                          event->x, event->y);
+         if (outside) {
+             if (down) {
+                 sc_screen_resize_to_fit(im->screen);
+@@ -1084,9 +976,9 @@ sc_input_manager_process_mouse_button(struct sc_input_manager *im,
+             im->vfinger_invert_y = ctrl_pressed;
+         }
+         struct sc_point vfinger =
+-            im_get_vfinger_position(im->screen, event->x, event->y,
+-                                     im->vfinger_invert_x,
+-                                     im->vfinger_invert_y);
++            sc_screen_get_vfinger_position(im->screen, event->x, event->y,
++                                           im->vfinger_invert_x,
++                                           im->vfinger_invert_y);
+         enum android_motionevent_action action = down
+                                                ? AMOTION_EVENT_ACTION_DOWN
+                                                : AMOTION_EVENT_ACTION_UP;
+diff --git a/app/src/screen.c b/app/src/screen.c
+index a622725..31f6863 100644
+--- a/app/src/screen.c
++++ b/app/src/screen.c
+@@ -1326,3 +1326,38 @@ sc_screen_convert_window_to_frame_coords(struct sc_screen *screen,
+ 
+     return result;
+ }
++
++// Return true if the point is located outside of the displayed content
++// rectangle (i.e. on the black borders)
++bool
++sc_screen_is_point_outside_content(struct sc_screen *screen, int32_t x,
++                                   int32_t y) {
++    return x < screen->rect.x
++        || x >= screen->rect.x + screen->rect.w
++        || y < screen->rect.y
++        || y >= screen->rect.y + screen->rect.h;
++}
++
++// Compute the position of the virtual finger mirroring a window point through
++// the center of the displayed content.
++struct sc_point
++sc_screen_get_vfinger_position(struct sc_screen *screen, int32_t x, int32_t y,
++                               bool invert_x, bool invert_y) {
++    // The window must expose the content, the content rectangle must be
++    // initialized and the device frame must be known for the pointer and its
++    // mirror to be meaningful
++    assert(screen->window);
++    assert(screen->rect.w && screen->rect.h);
++    assert(screen->frame_size.width && screen->frame_size.height);
++
++    struct sc_point position =
++        sc_screen_convert_window_to_frame_coords(screen, x, y);
++
++    if (invert_x) {
++        position.x = screen->frame_size.width - position.x;
++    }
++    if (invert_y) {
++        position.y = screen->frame_size.height - position.y;
++    }
++    return position;
++}
+diff --git a/app/src/screen.h b/app/src/screen.h
+index a8058d9..a33c9e2 100644
+--- a/app/src/screen.h
++++ b/app/src/screen.h
+@@ -205,4 +205,19 @@ struct sc_point
+ sc_screen_convert_window_to_frame_coords(struct sc_screen *screen,
+                                         int32_t x, int32_t y);
+ 
++// return true if the point (in window coordinates) is located outside of the
++// displayed content rectangle (i.e. on the black borders)
++bool
++sc_screen_is_point_outside_content(struct sc_screen *screen,
++                                   int32_t x, int32_t y);
++
++// compute the position (in frame coordinates) of the virtual finger mirroring
++// a window point through the center of the displayed content
++//
++// When invert_x (resp. invert_y) is set, the point is mirrored with respect to
++// the vertical (resp. horizontal) axis of symmetry in the middle of the frame.
++struct sc_point
++sc_screen_get_vfinger_position(struct sc_screen *screen, int32_t x, int32_t y,
++                               bool invert_x, bool invert_y);
++
+ #endif

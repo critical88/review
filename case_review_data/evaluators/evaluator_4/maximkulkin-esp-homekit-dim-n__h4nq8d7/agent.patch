@@ -1,0 +1,1320 @@
+diff --git a/host_tests/harness.c b/host_tests/harness.c
+new file mode 100644
+index 0000000..14aaa90
+--- /dev/null
++++ b/host_tests/harness.c
+@@ -0,0 +1,533 @@
++/* Host-side unit test harness for esp-homekit pure modules.
++ * Tiny assert/counting framework exercising base64, bitset, json, query_params,
++ * tlv and the homekit_value lifecycle (copy/destruct/equal/clone, default
++ * getter/setter) across every homekit_format_t. No ESP SDK touched. */
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#include <homekit/types.h>
++#include <homekit/tlv.h>
++#include "base64.h"
++#include "bitset.h"
++#include "json.h"
++#include "query_params.h"
++
++/* functions present in the sources but not exposed in their public headers */
++extern unsigned char base64_decode_char(unsigned char c);
++extern char *tlv_get_string_value(const tlv_values_t *values, byte type);
++
++static int g_tests = 0;
++static int g_failures = 0;
++
++#define CHECK(cond)                                                     \
++    do {                                                                \
++        g_tests++;                                                      \
++        long _c = (long)(cond);                                         \
++        if (!(_c)) {                                                    \
++            g_failures++;                                               \
++            printf("not ok %d - %s (line %d)\n", g_tests, #cond, __LINE__); \
++        } else {                                                        \
++            printf("ok %d - %s\n", g_tests, #cond);                     \
++        }                                                               \
++    } while (0)
++
++#define REGISTER_DONE() printf("1..%d\n", g_tests)
++
++/* ---- base64 ---- */
++static void test_base64(void) {
++    unsigned char enc[64];
++    unsigned char dec[64];
++    const char *in = "Hello esp-homekit!";
++    size_t n = strlen(in);
++    size_t es = base64_encoded_size((const unsigned char*)in, n);
++    CHECK(es == ((n + 2) / 3 * 4));
++    int e = base64_encode((const unsigned char*)in, n, enc);
++    CHECK(e == (int)es);
++    size_t ds = base64_decoded_size(enc, es);
++    CHECK(ds == n);
++    int d = base64_decode(enc, es, dec);
++    CHECK(d == (int)n);
++    CHECK(memcmp(dec, in, n) == 0);
++
++    /* empty input round-trips to nothing */
++    CHECK(base64_encoded_size((const unsigned char*)"", 0) == 0);
++    CHECK(base64_encode((const unsigned char*)"", 0, enc) == 0);
++
++    /* one byte -> "XX==" */
++    unsigned char one[8] = {0};
++    const unsigned char b1 = 'f';
++    CHECK(base64_encode(&b1, 1, one) == 4);
++    CHECK(one[0] == 'Z' && one[2] == '=' && one[3] == '=');
++    CHECK(base64_decoded_size(one, 4) == 1);
++    unsigned char back1[8];
++    CHECK(base64_decode(one, 4, back1) == 1);
++    CHECK(back1[0] == 'f');
++
++    /* two bytes -> "XXY=" */
++    unsigned char two[8] = {0};
++    const unsigned char b2[2] = {'f', 'o'};
++    CHECK(base64_encode(b2, 2, two) == 4);
++    CHECK(two[0] == 'Z' && two[3] == '=');
++    unsigned char back2[8];
++    CHECK(base64_decode(two, 4, back2) == 2);
++    CHECK(memcmp(back2, "fo", 2) == 0);
++
++    /* decode char table sanity */
++    CHECK(base64_decode_char('A') == 0);
++    CHECK(base64_decode_char('a') == 26);
++    CHECK(base64_decode_char('0') == 52);
++    CHECK(base64_decode_char('+') == 62);
++    CHECK(base64_decode_char('/') == 63);
++    CHECK(base64_decode_char('=') == 64);
++
++    /* odd / invalid encoded size rejected */
++    CHECK(base64_decode((const unsigned char*)"ABC", 3, dec) == -1);
++    CHECK(base64_decode((const unsigned char*)"ABCD", 4, dec) == 3);
++
++    /* longer 5-byte boundary (size%3==2) encodes to 8 chars, round-trips */
++    const unsigned char five[5] = {0x10, 0x20, 0x30, 0x40, 0x50};
++    unsigned char enc5[16];
++    int e5 = base64_encode(five, 5, enc5);
++    CHECK(e5 == 8);
++    unsigned char dec5[8];
++    CHECK(base64_decode(enc5, 8, dec5) == 5);
++    CHECK(memcmp(dec5, five, 5) == 0);
++}
++
++/* ---- bitset ---- */
++static void test_bitset(void) {
++    bitset_t *bs = bitset_new(32);
++    CHECK(!bitset_isset(bs, 5));
++    bitset_set(bs, 5);
++    CHECK(bitset_isset(bs, 5));
++    CHECK(!bitset_isset(bs, 6));
++    bitset_set(bs, 31);
++    CHECK(bitset_isset(bs, 31));
++    /* out-of-range set must not alter any valid bit */
++    bitset_set(bs, 40);
++    CHECK(bitset_isset(bs, 5));   /* bit 5 unchanged */
++    CHECK(bitset_isset(bs, 31)); /* bit 31 unchanged */
++    CHECK(!bitset_isset(bs, 0)); /* bit 0 never set */
++    bitset_clear(bs, 5);
++    CHECK(!bitset_isset(bs, 5));
++    CHECK(bitset_isset(bs, 31));
++    bitset_set(bs, 0);
++    CHECK(bitset_isset(bs, 0));
++    bitset_clear(bs, 0);
++    CHECK(!bitset_isset(bs, 0));
++    bitset_clear_all(bs);
++    CHECK(!bitset_isset(bs, 0));
++    CHECK(!bitset_isset(bs, 5));
++    CHECK(!bitset_isset(bs, 31));
++    bitset_free(bs);
++
++    /* 16-bit boundary survives set/clear across the full span */
++    bitset_t *bs2 = bitset_new(16);
++    bitset_set(bs2, 7);
++    bitset_set(bs2, 8);
++    CHECK(bitset_isset(bs2, 7) && bitset_isset(bs2, 8));
++    bitset_clear(bs2, 7);
++    CHECK(!bitset_isset(bs2, 7) && bitset_isset(bs2, 8));
++    bitset_free(bs2);
++}
++
++/* ---- query_params ----
++ * The iterator yields one parameter per string: it stops at the first
++ * '&' (the separator is not consumed/skipped) or '#'. These tests pin that
++ * actual behavior so the smell refactor must preserve it. */
++static void test_query_params(void) {
++    query_param_iterator_t it; query_param_t p;
++
++    char s[] = "a=1&b=2&c";
++    CHECK(query_param_iterator_init(&it, s, strlen(s)) == 0);
++    CHECK(query_param_iterator_next(&it, &p));
++    CHECK(p.name_len == 1 && memcmp(p.name, "a", 1) == 0);
++    CHECK(p.value_len == 1 && p.value && memcmp(p.value, "1", 1) == 0);
++    CHECK(!query_param_iterator_next(&it, &p)); /* left sitting on '&' -> false */
++
++    /* fragment terminates iteration immediately */
++    char s2[] = "x=10#ignored&y=20";
++    CHECK(query_param_iterator_init(&it, s2, strlen(s2)) == 0);
++    CHECK(query_param_iterator_next(&it, &p));
++    CHECK(p.name_len == 1 && memcmp(p.name, "x", 1) == 0);
++    CHECK(p.value_len == 2 && p.value && memcmp(p.value, "10", 2) == 0);
++    CHECK(!query_param_iterator_next(&it, &p)); /* left on '#' -> false */
++
++    /* empty string yields no params */
++    char s3[] = "";
++    CHECK(query_param_iterator_init(&it, s3, 0) == 0);
++    CHECK(!query_param_iterator_next(&it, &p));
++
++    /* only a fragment yields no params */
++    char s4[] = "#frag";
++    CHECK(query_param_iterator_init(&it, s4, strlen(s4)) == 0);
++    CHECK(!query_param_iterator_next(&it, &p));
++
++    /* value present up to a fragment */
++    char s5[] = "k=v#frag";
++    CHECK(query_param_iterator_init(&it, s5, strlen(s5)) == 0);
++    CHECK(query_param_iterator_next(&it, &p));
++    CHECK(p.name_len == 1 && memcmp(p.name, "k", 1) == 0);
++    CHECK(p.value_len == 1 && p.value && memcmp(p.value, "v", 1) == 0);
++    CHECK(!query_param_iterator_next(&it, &p));
++
++    /* empty value (trailing '=') reported as no value */
++    char s6[] = "key=";
++    CHECK(query_param_iterator_init(&it, s6, strlen(s6)) == 0);
++    CHECK(query_param_iterator_next(&it, &p));
++    CHECK(p.name_len == 3 && memcmp(p.name, "key", 3) == 0);
++    CHECK(p.value == NULL && p.value_len == 0);
++    CHECK(!query_param_iterator_next(&it, &p));
++
++    /* name with no '=' reports name only */
++    char s7[] = "noeq";
++    CHECK(query_param_iterator_init(&it, s7, strlen(s7)) == 0);
++    CHECK(query_param_iterator_next(&it, &p));
++    CHECK(p.name_len == 4 && memcmp(p.name, "noeq", 4) == 0);
++    CHECK(p.value == NULL && p.value_len == 0);
++    CHECK(!query_param_iterator_next(&it, &p));
++}
++
++/* ---- tlv ---- */
++static void test_tlv(void) {
++    tlv_values_t *v = tlv_new();
++    CHECK(v != NULL);
++    CHECK(tlv_add_value(v, 1, (const byte*)"hello", 5) == 0);
++    CHECK(tlv_add_string_value(v, 2, "world") == 0);
++    tlv_t *g = tlv_get_value(v, 1);
++    CHECK(g && g->size == 5 && memcmp(g->value, "hello", 5) == 0);
++    tlv_t *g2 = tlv_get_value(v, 2);
++    CHECK(g2 && g2->size == 5 && memcmp(g2->value, "world", 5) == 0);
++    CHECK(tlv_get_value(v, 99) == NULL);
++
++    /* integer round-trips little-endian, multi-byte */
++    CHECK(tlv_add_integer_value(v, 3, 4, 0x01020304) == 0);
++    tlv_t *gi = tlv_get_value(v, 3);
++    CHECK(gi && gi->size == 4);
++    CHECK(gi->value[0] == 0x04 && gi->value[1] == 0x03 &&
++          gi->value[2] == 0x02 && gi->value[3] == 0x01);
++    CHECK(tlv_get_integer_value(v, 3, -1) == 0x01020304);
++    /* missing integer returns default */
++    CHECK(tlv_get_integer_value(v, 88, 12345) == 12345);
++
++    /* zero-byte integer decodes as 0 (no bytes accumulated); kept out of the
++     * formatted list below so the round-trip is well-sized */
++    tlv_values_t *zi = tlv_new();
++    CHECK(tlv_add_integer_value(zi, 4, 0, 0x55) == 0);
++    CHECK(tlv_get_integer_value(zi, 4, -1) == 0);
++    tlv_free(zi);
++
++    /* format -> parse round trip */
++    size_t need = 0;
++    CHECK(tlv_format(v, NULL, &need) == TLV_ERROR_INSUFFICIENT_SIZE);
++    CHECK(need > 0);
++    byte *buf = malloc(need);
++    CHECK(tlv_format(v, buf, &need) == 0);
++    tlv_values_t *v2 = tlv_new();
++    CHECK(tlv_parse(buf, need, v2) == 0);
++    tlv_t *p1 = tlv_get_value(v2, 1);
++    CHECK(p1 && p1->size == 5 && memcmp(p1->value, "hello", 5) == 0);
++    CHECK(tlv_get_integer_value(v2, 3, -1) == 0x01020304);
++    free(buf);
++    tlv_free(v2);
++
++    /* string retrieval copies (caller frees) */
++    char *str = tlv_get_string_value(v, 2);
++    CHECK(str && strcmp(str, "world") == 0);
++    free(str);
++    CHECK(tlv_get_string_value(v, 77) == NULL);
++
++    /* chunked value > 255 bytes survives format/parse */
++    tlv_values_t *cv = tlv_new();
++    byte big[600];
++    memset(big, 0xAB, sizeof(big));
++    CHECK(tlv_add_value(cv, 7, big, sizeof(big)) == 0);
++    size_t cneed = 0;
++    tlv_format(cv, NULL, &cneed);
++    byte *cbuf = malloc(cneed);
++    CHECK(tlv_format(cv, cbuf, &cneed) == 0);
++    tlv_values_t *cv2 = tlv_new();
++    CHECK(tlv_parse(cbuf, cneed, cv2) == 0);
++    tlv_t *cp = tlv_get_value(cv2, 7);
++    CHECK(cp && cp->size == sizeof(big) && memcmp(cp->value, big, sizeof(big)) == 0);
++    free(cbuf);
++    tlv_free(cv2);
++    tlv_free(cv);
++
++    /* nested tlv survives add/get */
++    tlv_values_t *outer = tlv_new();
++    tlv_values_t *inner = tlv_new();
++    tlv_add_string_value(inner, 9, "nested");
++    CHECK(tlv_add_tlv_value(outer, 10, inner) == 0);
++    tlv_values_t *got = tlv_get_tlv_value(outer, 10);
++    CHECK(got != NULL);
++    tlv_t *nt = tlv_get_value(got, 9);
++    CHECK(nt && nt->size == 6 && memcmp(nt->value, "nested", 6) == 0);
++    tlv_free(got);
++    tlv_free(inner);
++    tlv_free(outer);
++
++    /* empty value (type, len 0): stored and retrieved with size 0 */
++    tlv_values_t *ev = tlv_new();
++    CHECK(tlv_add_value(ev, 5, (const byte*)"", 0) == 0);
++    tlv_t *eg = tlv_get_value(ev, 5);
++    CHECK(eg && eg->size == 0);
++    tlv_free(ev);
++
++    tlv_free(v);
++}
++
++/* ---- json ---- */
++static void test_json(void) {
++    char buf[256];
++    json_stream js;
++    json_init(&js, (uint8_t*)buf, sizeof(buf), NULL, NULL);
++
++    json_object_start(&js);
++    json_string(&js, "name");
++    json_string(&js, "lightbulb");
++    json_string(&js, "value");
++    json_integer(&js, 42);
++    json_string(&js, "on");
++    json_boolean(&js, true);
++    json_object_end(&js);
++    buf[js.pos] = 0;
++    CHECK(strcmp(buf, "{\"name\":\"lightbulb\",\"value\":42,\"on\":true}") == 0);
++
++    json_reset(&js);
++    json_array_start(&js);
++    json_uint8(&js, 5);
++    json_uint16(&js, 1000);
++    json_uint32(&js, 4000000000u);
++    json_float(&js, 3.14);
++    json_array_end(&js);
++    buf[js.pos] = 0;
++    CHECK(strstr(buf, "3.14") != NULL);
++    CHECK(strstr(buf, "4000000000") != NULL);
++    CHECK(strstr(buf, "1000") != NULL);
++
++    /* null as an array item renders as "null" */
++    json_reset(&js);
++    json_array_start(&js);
++    json_null(&js);
++    json_array_end(&js);
++    buf[js.pos] = 0;
++    CHECK(strcmp(buf, "[null]") == 0);
++
++    /* error state is sticky: object_end without a start errors and halts */
++    json_reset(&js);
++    json_object_end(&js);
++    CHECK(js.state == JSON_STATE_ERROR);
++    size_t pos_before = js.pos;
++    json_string(&js, "x");
++    CHECK(js.pos == pos_before);
++
++    /* nested object inside array */
++    json_reset(&js);
++    json_array_start(&js);
++    json_object_start(&js);
++    json_string(&js, "k");
++    json_integer(&js, 1);
++    json_object_end(&js);
++    json_array_end(&js);
++    buf[js.pos] = 0;
++    CHECK(strcmp(buf, "[{\"k\":1}]") == 0);
++
++    /* bare boolean from START state */
++    json_reset(&js);
++    json_boolean(&js, false);
++    buf[js.pos] = 0;
++    CHECK(strcmp(buf, "false") == 0);
++
++    /* bare integer from START state */
++    json_reset(&js);
++    json_integer(&js, -7);
++    buf[js.pos] = 0;
++    CHECK(strcmp(buf, "-7") == 0);
++}
++
++/* ---- homekit_value lifecycle ---- */
++static void test_values(void) {
++    /* bool equal/copy */
++    homekit_value_t a = HOMEKIT_BOOL(true), b_reg = HOMEKIT_BOOL(false);
++    CHECK(homekit_value_equal(&a, &b_reg) == false);
++    homekit_value_t b2; homekit_value_copy(&b2, &a);
++    CHECK(homekit_value_equal(&a, &b2) == true);
++    homekit_value_destruct(&b2);
++
++    /* uint8 */
++    homekit_value_t u = HOMEKIT_UINT8(200);
++    homekit_value_t uc; homekit_value_copy(&uc, &u);
++    CHECK(uc.uint8_value == 200);
++    CHECK(homekit_value_equal(&u, &uc) == true);
++    homekit_value_destruct(&uc);
++
++    /* uint16/32/64/int compare/copy through int_value */
++    homekit_value_t u16 = HOMEKIT_UINT16(60000);
++    homekit_value_t i16; homekit_value_copy(&i16, &u16);
++    CHECK(homekit_value_equal(&u16, &i16) == true);
++    homekit_value_destruct(&i16);
++
++    homekit_value_t u32a = HOMEKIT_UINT32(123456), u32b = HOMEKIT_UINT32(123457);
++    CHECK(homekit_value_equal(&u32a, &u32b) == false);
++    homekit_value_t i32; homekit_value_copy(&i32, &u32a);
++    CHECK(homekit_value_equal(&u32a, &i32) == true);
++    homekit_value_destruct(&i32);
++
++    homekit_value_t u64a = HOMEKIT_UINT64(9999999999ULL), u64b = HOMEKIT_UINT64(10000000000ULL);
++    CHECK(homekit_value_equal(&u64a, &u64b) == false);
++    homekit_value_t i64; homekit_value_copy(&i64, &u64a);
++    CHECK(homekit_value_equal(&u64a, &i64) == true);
++    homekit_value_destruct(&i64);
++
++    /* float equal/not-equal */
++    homekit_value_t f1 = HOMEKIT_FLOAT(12.5), f2 = HOMEKIT_FLOAT(12.5), f3 = HOMEKIT_FLOAT(12.6);
++    CHECK(homekit_value_equal(&f1, &f2) == true);
++    CHECK(homekit_value_equal(&f1, &f3) == false);
++
++    /* different formats are never equal */
++    homekit_value_t iv = HOMEKIT_INT(0);
++    CHECK(homekit_value_equal(&iv, &u) == false);
++
++    /* string: static copy shares the pointer, dynamic copy duplicates */
++    homekit_value_t sstatic = HOMEKIT_STRING_("static-str");
++    sstatic.is_static = true;
++    homekit_value_t sc; homekit_value_copy(&sc, &sstatic);
++    CHECK(sc.string_value == sstatic.string_value);
++    CHECK(homekit_value_equal(&sstatic, &sc) == true);
++    homekit_value_destruct(&sc); /* static: must not free */
++
++    /* string dynamic copy: strdup a heap copy so destruct releases only it */
++    char *dynstr = strdup("dynamic-str");
++    homekit_value_t sdyn = HOMEKIT_STRING_(dynstr);
++    sdyn.is_static = false;
++    homekit_value_t sc2; homekit_value_copy(&sc2, &sdyn);
++    CHECK(sc2.string_value != sdyn.string_value);
++    CHECK(strcmp(sc2.string_value, sdyn.string_value) == 0);
++    CHECK(homekit_value_equal(&sdyn, &sc2) == true);
++    homekit_value_destruct(&sc2); /* frees the strdup'd copy only */
++    CHECK(strcmp(sdyn.string_value, "dynamic-str") == 0);
++
++    /* string inequality */
++    homekit_value_t sA = HOMEKIT_STRING_("apple"), sB = HOMEKIT_STRING_("banana");
++    sA.is_static = true; sB.is_static = true;
++    CHECK(homekit_value_equal(&sA, &sB) == false);
++
++    /* data: static (shared) and dynamic (duplicated) copies */
++    unsigned char dbin[8] = {0,1,2,3,4,5,6,7};
++    homekit_value_t dstat = HOMEKIT_DATA(dbin, 8);
++    dstat.is_static = true;
++    homekit_value_t dc; homekit_value_copy(&dc, &dstat);
++    CHECK(dc.data_value == dstat.data_value && dc.data_size == 8);
++    CHECK(homekit_value_equal(&dstat, &dc) == true);
++    homekit_value_destruct(&dc);
++
++    unsigned char *ddata = malloc(8);
++    memcpy(ddata, dbin, 8);
++    homekit_value_t ddyn = HOMEKIT_DATA(ddata, 8);
++    ddyn.is_static = false;
++    homekit_value_t dc2; homekit_value_copy(&dc2, &ddyn);
++    CHECK(dc2.data_value != ddyn.data_value && dc2.data_size == 8);
++    CHECK(memcmp(dc2.data_value, ddyn.data_value, 8) == 0);
++    CHECK(homekit_value_equal(&ddyn, &dc2) == true);
++    homekit_value_destruct(&dc2);
++    unsigned char dbin2[8] = {0,1,2,3,4,5,6,8};
++    homekit_value_t ddiff = HOMEKIT_DATA(dbin2, 8); ddiff.is_static = true;
++    CHECK(homekit_value_equal(&ddyn, &ddiff) == false);
++    homekit_value_destruct(&ddyn); /* frees the heap buffer ddyn owns */
++
++    /* tlv: static (shared) and dynamic (cloned) copies */
++    tlv_values_t *tv = tlv_new();
++    tlv_add_string_value(tv, 1, "pair");
++    homekit_value_t tstat = HOMEKIT_TLV(tv); tstat.is_static = true;
++    homekit_value_t tc; homekit_value_copy(&tc, &tstat);
++    CHECK(tc.tlv_values == tv);
++    homekit_value_destruct(&tc); /* static: no free */
++
++    homekit_value_t tdyn = HOMEKIT_TLV(tv); tdyn.is_static = false;
++    homekit_value_t tc2; homekit_value_copy(&tc2, &tdyn);
++    CHECK(tc2.tlv_values != tv);
++    CHECK(homekit_value_equal(&tdyn, &tc2) == true);
++    homekit_value_destruct(&tc2); /* frees the clone */
++    CHECK(tlv_get_value(tv, 1) != NULL); /* original still valid */
++
++    /* tlv inequality */
++    tlv_values_t *tv2 = tlv_new();
++    tlv_add_string_value(tv2, 1, "pair!");
++    homekit_value_t tne = HOMEKIT_TLV(tv2); tne.is_static = true;
++    CHECK(homekit_value_equal(&tdyn, &tne) == false);
++    tlv_free(tv2);
++
++    /* tlv NULL vs non-NULL and NULL vs NULL equality */
++    homekit_value_t tnull_stat = HOMEKIT_TLV(NULL); tnull_stat.is_static = true;
++    tlv_values_t *tv3 = tlv_new();
++    homekit_value_t tnull_stat2 = HOMEKIT_TLV(tv3); tnull_stat2.is_static = true;
++    CHECK(homekit_value_equal(&tnull_stat, &tnull_stat2) == false);
++    homekit_value_t tnull_stat3 = HOMEKIT_TLV(NULL); tnull_stat3.is_static = true;
++    CHECK(homekit_value_equal(&tnull_stat, &tnull_stat3) == true);
++    tlv_free(tv3);
++
++    /* null value: is_null copy + equality */
++    homekit_value_t nullval = HOMEKIT_NULL();
++    homekit_value_t nc; homekit_value_copy(&nc, &nullval);
++    CHECK(nc.is_null == true);
++    CHECK(homekit_value_equal(&nullval, &nc) == true);
++    homekit_value_destruct(&nc);
++    CHECK(homekit_value_equal(&nullval, &a) == false); /* null != non-null */
++
++    homekit_value_destruct(&tdyn); /* dynamic tlv owner: frees tv exactly once */
++    free(dynstr);
++
++    /* clone allocates + copies + is freed */
++    char *clonestr = strdup("cloned-str");
++    homekit_value_t toClone = HOMEKIT_STRING_(clonestr);
++    toClone.is_static = false;
++    homekit_value_t *clone = homekit_value_clone(&toClone);
++    CHECK(clone && clone->string_value != toClone.string_value);
++    CHECK(strcmp(clone->string_value, "cloned-str") == 0);
++    homekit_value_free(clone); /* frees clone's string + the clone struct */
++    free(clonestr);
++
++    /* default getter/setter behaviour (no custom callbacks) */
++    homekit_characteristic_t ch;
++    memset(&ch, 0, sizeof(ch));
++    ch.value = HOMEKIT_INT(77);
++    ch.getter = NULL; ch.setter = NULL;
++    homekit_value_t got = homekit_characteristic_default_getter_ex(&ch);
++    CHECK(got.int_value == 77 && got.is_static == true);
++    homekit_value_t newv = HOMEKIT_INT(88);
++    homekit_characteristic_default_setter_ex(&ch, newv);
++    CHECK(ch.value.int_value == 88);
++
++    /* explicit setter delegates and leaves stored value untouched */
++    int captured = 0;
++    void my_setter(const homekit_value_t v) { (void)v; captured = 1; }
++    ch.setter = my_setter;
++    homekit_value_t setv = HOMEKIT_INT(99);
++    homekit_characteristic_default_setter_ex(&ch, setv);
++    CHECK(captured == 1);
++    CHECK(ch.value.int_value == 88);
++
++    /* explicit getter is invoked */
++    homekit_value_t my_getter(void) { homekit_value_t v = HOMEKIT_INT(1234); return v; }
++    ch.getter = my_getter;
++    homekit_value_t got2 = homekit_characteristic_default_getter_ex(&ch);
++    CHECK(got2.int_value == 1234);
++}
++
++int main(void) {
++    test_base64();
++    test_bitset();
++    test_query_params();
++    test_tlv();
++    test_json();
++    test_values();
++    REGISTER_DONE();
++    if (g_failures) {
++        printf("# FAILED %d of %d tests\n", g_failures, g_tests);
++        return 1;
++    }
++    printf("# PASS %d tests\n", g_tests);
++    return 0;
++}
+diff --git a/src/accessories.c b/src/accessories.c
+index 43e6d67..ca4a1ea 100644
+--- a/src/accessories.c
++++ b/src/accessories.c
+@@ -55,16 +55,27 @@ bool homekit_value_equal(homekit_value_t *a, homekit_value_t *b) {
+     return false;
+ }
+ 
+-void homekit_value_copy(homekit_value_t *dst, homekit_value_t *src) {
+-    memset(dst, 0, sizeof(*dst));
+-
+-    dst->format = src->format;
+-    dst->is_null = src->is_null;
+-    dst->is_static = src->is_static;
++// Deep-copy a TLV list. Returns a freshly allocated list whose records own
++// their own value buffers (or NULL on allocation failure). Mirrors the record
++// layout of `src`; individual record allocation failures are skipped, as the
++// public tlv_add_value helper does.
++static tlv_values_t *homekit_values_dup(const tlv_values_t *src) {
++    tlv_values_t *dst = tlv_new();
++    if (!dst)
++        return NULL;
++
++    for (tlv_t *v = src->head; v; v = v->next) {
++        tlv_add_value(dst, v->type, v->value, v->size);
++    }
+ 
+-    if (src->is_null)
+-        return;
++    return dst;
++}
+ 
++// Copy the per-format payload of `src` into `dst`. The caller has already
++// copied the format / is_null / is_static header flags and verified that the
++// value is non-null. Owned buffers (string / tlv / data) are duplicated for
++// non-static values; static values keep sharing the original pointer.
++static void homekit_value_copy_payload(homekit_value_t *dst, const homekit_value_t *src) {
+     switch (src->format) {
+         case homekit_format_bool:
+             dst->bool_value = src->bool_value;
+@@ -88,23 +99,15 @@ void homekit_value_copy(homekit_value_t *dst, homekit_value_t *src) {
+             dst->float_value = src->float_value;
+             break;
+         case homekit_format_string:
+-            if (src->is_static) {
+-                dst->string_value = src->string_value;
+-            } else {
+-                dst->string_value = strdup(src->string_value);
+-            }
++            dst->string_value = src->is_static
++                ? src->string_value
++                : strdup(src->string_value);
+             break;
+-        case homekit_format_tlv: {
+-            if (src->is_static) {
+-                dst->tlv_values = src->tlv_values;
+-            } else {
+-                dst->tlv_values = tlv_new();
+-                for (tlv_t *v=src->tlv_values->head; v; v=v->next) {
+-                  tlv_add_value(dst->tlv_values, v->type, v->value, v->size);
+-                }
+-            }
++        case homekit_format_tlv:
++            dst->tlv_values = src->is_static
++                ? src->tlv_values
++                : homekit_values_dup(src->tlv_values);
+             break;
+-        }
+         case homekit_format_data:
+             if (src->is_static) {
+                 dst->data_value = src->data_value;
+@@ -121,99 +124,24 @@ void homekit_value_copy(homekit_value_t *dst, homekit_value_t *src) {
+     }
+ }
+ 
++void homekit_value_copy(homekit_value_t *dst, homekit_value_t *src) {
++    memset(dst, 0, sizeof(*dst));
++
++    dst->format = src->format;
++    dst->is_null = src->is_null;
++    dst->is_static = src->is_static;
++
++    if (src->is_null)
++        return;
++
++    homekit_value_copy_payload(dst, src);
++}
++
+ 
+ homekit_value_t *homekit_value_clone(homekit_value_t *value) {
+     homekit_value_t *copy = malloc(sizeof(homekit_value_t));
+ 
+-    memset(copy, 0, sizeof(*copy));
+-
+-    copy->format = value->format;
+-    copy->is_null = value->is_null;
+-    copy->is_static = value->is_static;
+-
+-    if (!value->is_null) {
+-        switch (value->format) {
+-            case homekit_format_bool:
+-                copy->bool_value = value->bool_value;
+-                break;
+-            case homekit_format_uint8:
+-                copy->uint8_value = value->uint8_value;
+-                break;
+-            case homekit_format_uint16:
+-                copy->uint16_value = value->uint16_value;
+-                break;
+-            case homekit_format_uint32:
+-                copy->uint32_value = value->uint32_value;
+-                break;
+-            case homekit_format_uint64:
+-                copy->uint64_value = value->uint64_value;
+-                break;
+-            case homekit_format_int:
+-                copy->int_value = value->int_value;
+-                break;
+-            case homekit_format_float:
+-                copy->float_value = value->float_value;
+-                break;
+-            case homekit_format_string:
+-                if (value->is_static) {
+-                    copy->string_value = value->string_value;
+-                } else {
+-                    copy->string_value = strdup(value->string_value);
+-                }
+-                break;
+-            case homekit_format_tlv:
+-                if (value->is_static) {
+-                    copy->tlv_values = value->tlv_values;
+-                } else {
+-                    copy->tlv_values = malloc(sizeof(tlv_values_t));
+-                    copy->tlv_values->head = NULL;
+-
+-                    for (tlv_t *item = value->tlv_values->head; item; item = item->next) {
+-                        size_t item_size = item->size;
+-                        byte *item_data = NULL;
+-
+-                        if (item_size) {
+-                            item_data = malloc(item_size);
+-                            if (!item_data)
+-                                continue;
+-                            memcpy(item_data, item->value, item_size);
+-                        }
+-
+-                        tlv_t *item_tlv = malloc(sizeof(tlv_t));
+-                        if (!item_tlv)
+-                            continue;
+-
+-                        item_tlv->type = item->type;
+-                        item_tlv->size = item_size;
+-                        item_tlv->value = item_data;
+-                        item_tlv->next = NULL;
+-
+-                        if (!copy->tlv_values->head) {
+-                            copy->tlv_values->head = item_tlv;
+-                        } else {
+-                            tlv_t *tail = copy->tlv_values->head;
+-                            while (tail->next)
+-                                tail = tail->next;
+-                            tail->next = item_tlv;
+-                        }
+-                    }
+-                }
+-                break;
+-            case homekit_format_data:
+-                if (value->is_static) {
+-                    copy->data_value = value->data_value;
+-                    copy->data_size = value->data_size;
+-                } else {
+-                    copy->data_size = value->data_size;
+-                    copy->data_value = malloc(value->data_size);
+-                    memcpy(copy->data_value, value->data_value, value->data_size);
+-                }
+-                break;
+-            default:
+-                // unknown format
+-                break;
+-        }
+-    }
++    homekit_value_copy(copy, value);
+ 
+     return copy;
+ }
+@@ -257,7 +185,10 @@ static size_t align_size(size_t size) {
+ }
+ 
+ 
+-homekit_characteristic_t* homekit_characteristic_clone(homekit_characteristic_t* ch) {
++// Compute the single allocation needed to hold a cloned characteristic: the
++// struct itself plus room for the embedded type/description strings and every
++// optional scalar field, all pointer-aligned.
++static size_t characteristic_clone_required_size(const homekit_characteristic_t *ch) {
+     size_t type_len = strlen(ch->type) + 1;
+     size_t description_len = ch->description ? strlen(ch->description) + 1 : 0;
+ 
+@@ -298,7 +229,14 @@ homekit_characteristic_t* homekit_characteristic_clone(homekit_characteristic_t*
+         }
+     }
+ 
+-    uint8_t* p = calloc(1, size);
++    return size;
++}
++
++homekit_characteristic_t* homekit_characteristic_clone(homekit_characteristic_t* ch) {
++    size_t type_len = strlen(ch->type) + 1;
++    size_t description_len = ch->description ? strlen(ch->description) + 1 : 0;
++
++    uint8_t* p = calloc(1, characteristic_clone_required_size(ch));
+ 
+     homekit_characteristic_t* clone = (homekit_characteristic_t*) p;
+     p += sizeof(homekit_characteristic_t);
+@@ -324,92 +262,7 @@ homekit_characteristic_t* homekit_characteristic_clone(homekit_characteristic_t*
+ 
+     // take over the current characteristic value, duplicating every
+     // dynamically owned payload along the way
+-    memset(&clone->value, 0, sizeof(clone->value));
+-    clone->value.format = ch->value.format;
+-    clone->value.is_null = ch->value.is_null;
+-    clone->value.is_static = ch->value.is_static;
+-
+-    if (!ch->value.is_null) {
+-        switch (ch->value.format) {
+-            case homekit_format_bool:
+-                clone->value.bool_value = ch->value.bool_value;
+-                break;
+-            case homekit_format_uint8:
+-                clone->value.uint8_value = ch->value.uint8_value;
+-                break;
+-            case homekit_format_uint16:
+-                clone->value.uint16_value = ch->value.uint16_value;
+-                break;
+-            case homekit_format_uint32:
+-                clone->value.uint32_value = ch->value.uint32_value;
+-                break;
+-            case homekit_format_uint64:
+-                clone->value.uint64_value = ch->value.uint64_value;
+-                break;
+-            case homekit_format_int:
+-                clone->value.int_value = ch->value.int_value;
+-                break;
+-            case homekit_format_float:
+-                clone->value.float_value = ch->value.float_value;
+-                break;
+-            case homekit_format_string:
+-                clone->value.string_value = ch->value.is_static
+-                    ? ch->value.string_value
+-                    : strdup(ch->value.string_value);
+-                break;
+-            case homekit_format_tlv:
+-                if (ch->value.is_static) {
+-                    clone->value.tlv_values = ch->value.tlv_values;
+-                } else {
+-                    clone->value.tlv_values = malloc(sizeof(tlv_values_t));
+-                    clone->value.tlv_values->head = NULL;
+-
+-                    for (tlv_t *item = ch->value.tlv_values->head; item; item = item->next) {
+-                        size_t item_size = item->size;
+-                        byte *item_data = NULL;
+-
+-                        if (item_size) {
+-                            item_data = malloc(item_size);
+-                            if (!item_data)
+-                                continue;
+-                            memcpy(item_data, item->value, item_size);
+-                        }
+-
+-                        tlv_t *item_tlv = malloc(sizeof(tlv_t));
+-                        if (!item_tlv)
+-                            continue;
+-
+-                        item_tlv->type = item->type;
+-                        item_tlv->size = item_size;
+-                        item_tlv->value = item_data;
+-                        item_tlv->next = NULL;
+-
+-                        if (!clone->value.tlv_values->head) {
+-                            clone->value.tlv_values->head = item_tlv;
+-                        } else {
+-                            tlv_t *tail = clone->value.tlv_values->head;
+-                            while (tail->next)
+-                                tail = tail->next;
+-                            tail->next = item_tlv;
+-                        }
+-                    }
+-                }
+-                break;
+-            case homekit_format_data:
+-                if (ch->value.is_static) {
+-                    clone->value.data_value = ch->value.data_value;
+-                    clone->value.data_size = ch->value.data_size;
+-                } else {
+-                    clone->value.data_size = ch->value.data_size;
+-                    clone->value.data_value = malloc(ch->value.data_size);
+-                    memcpy(clone->value.data_value, ch->value.data_value, ch->value.data_size);
+-                }
+-                break;
+-            default:
+-                // unknown format
+-                break;
+-        }
+-    }
++    homekit_value_copy(&clone->value, &ch->value);
+ 
+     if (ch->min_value) {
+         clone->min_value = (float*) p;
+diff --git a/src/tlv.c b/src/tlv.c
+index c2b48af..d12c70d 100644
+--- a/src/tlv.c
++++ b/src/tlv.c
+@@ -28,6 +28,123 @@ void tlv_free(tlv_values_t *values) {
+ }
+ 
+ 
++// ---- internal marshalling helpers ----
++// The list manipulation and (de)serialization is shared by several public
++// entry points below, so it is kept here as small file-local primitives that
++// the top-level functions coordinate rather than re-inline.
++
++// Serialized byte length of a single record: each fragment up to 255 bytes
++// carries a 2-byte type/length header.
++static size_t tlv_item_serialized_size(const tlv_t *item) {
++    return item->size + 2 * ((item->size + 254) / 255);
++}
++
++// Write one record into a flat buffer, splitting payloads longer than 255
++// bytes across consecutive fragments. A zero-length record emits a bare
++// [type, 0] header. Returns the position just past the written record.
++static byte *tlv_item_serialize(const tlv_t *item, byte *out) {
++    if (!item->size) {
++        out[0] = item->type;
++        out[1] = 0;
++        return out + 2;
++    }
++
++    byte *data = item->value;
++    size_t left = item->size;
++    while (left) {
++        size_t piece = (left > 255) ? 255 : left;
++        out[0] = item->type;
++        out[1] = piece;
++        memcpy(&out[2], data, piece);
++        left -= piece;
++        out += piece + 2;
++        data += piece;
++    }
++    return out;
++}
++
++// Append a fully-built record to the tail of a list.
++static void tlv_list_append(tlv_values_t *values, tlv_t *item) {
++    if (!values->head) {
++        values->head = item;
++        return;
++    }
++
++    tlv_t *tail = values->head;
++    while (tail->next)
++        tail = tail->next;
++    tail->next = item;
++}
++
++// Flatten an entire list into one freshly-allocated buffer, exactly as it
++// would be serialized onto the wire. Stores the buffer length in *out_size and
++// returns the buffer, or NULL if the allocation fails.
++static byte *tlv_flatten(const tlv_values_t *values, size_t *out_size) {
++    size_t flat_size = 0;
++    for (tlv_t *item = values->head; item; item = item->next)
++        flat_size += tlv_item_serialized_size(item);
++
++    byte *flat_data = malloc(flat_size);
++    if (!flat_data) {
++        *out_size = flat_size;
++        return NULL;
++    }
++
++    byte *pos = flat_data;
++    for (tlv_t *item = values->head; item; item = item->next)
++        pos = tlv_item_serialize(item, pos);
++
++    *out_size = flat_size;
++    return flat_data;
++}
++
++// Read one (possibly fragmented) record starting at *pos. Every same-type run
++// of fragments is coalesced into a single allocation, *pos is advanced past
++// them, and the coalesced type/data/size are reported. A record carrying no
++// payload leaves *pos untouched and yields data=NULL, size=0. Returns
++// TLV_ERROR_MEMORY if the payload buffer cannot be allocated.
++static int tlv_record_read(const byte *buffer, size_t length, size_t *pos,
++                           byte *out_type, byte **out_data, size_t *out_size) {
++    size_t i = *pos;
++    byte type = buffer[i];
++    size_t total_size = 0;
++    byte *data = NULL;
++
++    // look ahead over chunked records of the same type to learn how much
++    // data they carry in total
++    size_t lookahead = i;
++    while (lookahead < length && buffer[lookahead] == type && buffer[lookahead+1] == 255) {
++        total_size += 255;
++        lookahead += 255 + 2;
++    }
++    if (lookahead < length && buffer[lookahead] == type)
++        total_size += buffer[lookahead+1];
++
++    // gather every chunk of the record into one allocation
++    if (total_size != 0) {
++        data = malloc(total_size);
++        if (!data)
++            return TLV_ERROR_MEMORY;
++
++        byte *fill = data;
++        size_t size_left = total_size;
++        while (size_left) {
++            size_t piece_size = buffer[i+1];
++            memcpy(fill, &buffer[i+2], piece_size);
++            fill += piece_size;
++            i += piece_size + 2;
++            size_left -= piece_size;
++        }
++    }
++
++    *pos = i;
++    *out_type = type;
++    *out_data = data;
++    *out_size = total_size;
++    return 0;
++}
++
++
+ int tlv_add_value_(tlv_values_t *values, byte type, byte *value, size_t size) {
+     tlv_t *tlv = malloc(sizeof(tlv_t));
+     if (!tlv) {
+@@ -38,15 +155,7 @@ int tlv_add_value_(tlv_values_t *values, byte type, byte *value, size_t size) {
+     tlv->value = value;
+     tlv->next = NULL;
+ 
+-    if (!values->head) {
+-        values->head = tlv;
+-    } else {
+-        tlv_t *t = values->head;
+-        while (t->next) {
+-            t = t->next;
+-        }
+-        t->next = tlv;
+-    }
++    tlv_list_append(values, tlv);
+ 
+     return 0;
+ }
+@@ -79,43 +188,11 @@ int tlv_add_integer_value(tlv_values_t *values, byte type, size_t size, int valu
+ }
+ 
+ int tlv_add_tlv_value(tlv_values_t *values, byte type, tlv_values_t *value) {
+-    size_t flat_size = 0;
+-    tlv_t *item = value->head;
+-    while (item) {
+-        flat_size += item->size + 2 * ((item->size + 254) / 255);
+-        item = item->next;
+-    }
+-
+-    byte *flat_data = malloc(flat_size);
++    size_t flat_size;
++    byte *flat_data = tlv_flatten(value, &flat_size);
+     if (!flat_data)
+         return TLV_ERROR_MEMORY;
+ 
+-    byte *flat_pos = flat_data;
+-    item = value->head;
+-    while (item) {
+-        if (!item->size) {
+-            flat_pos[0] = item->type;
+-            flat_pos[1] = 0;
+-            flat_pos += 2;
+-            item = item->next;
+-            continue;
+-        }
+-
+-        byte *item_data = item->value;
+-        size_t item_left = item->size;
+-        while (item_left) {
+-            size_t piece_size = (item_left > 255) ? 255 : item_left;
+-            flat_pos[0] = item->type;
+-            flat_pos[1] = piece_size;
+-            memcpy(&flat_pos[2], item_data, piece_size);
+-            item_left -= piece_size;
+-            flat_pos += piece_size + 2;
+-            item_data += piece_size;
+-        }
+-
+-        item = item->next;
+-    }
+-
+     tlv_t *flat_tlv = malloc(sizeof(tlv_t));
+     if (!flat_tlv)
+         return TLV_ERROR_MEMORY;
+@@ -125,14 +202,7 @@ int tlv_add_tlv_value(tlv_values_t *values, byte type, tlv_values_t *value) {
+     flat_tlv->value = flat_data;
+     flat_tlv->next = NULL;
+ 
+-    if (!values->head) {
+-        values->head = flat_tlv;
+-    } else {
+-        tlv_t *tail = values->head;
+-        while (tail->next)
+-            tail = tail->next;
+-        tail->next = flat_tlv;
+-    }
++    tlv_list_append(values, flat_tlv);
+ 
+     return 0;
+ }
+@@ -193,37 +263,14 @@ tlv_values_t *tlv_get_tlv_value(const tlv_values_t *values, byte type) {
+     size_t length = record->size;
+     size_t i = 0;
+     while (i < length) {
+-        byte record_type = buffer[i];
+-        size_t total_size = 0;
++        byte record_type;
+         byte *value_data = NULL;
++        size_t total_size = 0;
+ 
+-        // look ahead over chunked records of the same type to learn how much
+-        // data they carry in total
+-        size_t lookahead = i;
+-        while (lookahead < length && buffer[lookahead] == record_type && buffer[lookahead+1] == 255) {
+-            total_size += 255;
+-            lookahead += 255 + 2;
+-        }
+-        if (lookahead < length && buffer[lookahead] == record_type)
+-            total_size += buffer[lookahead+1];
+-
+-        // gather every chunk of the chunked record into one allocation
+-        if (total_size != 0) {
+-            value_data = malloc(total_size);
+-            if (!value_data) {
+-                tlv_free(value);
+-                return NULL;
+-            }
+-
+-            byte *fill = value_data;
+-            size_t size_left = total_size;
+-            while (size_left) {
+-                size_t piece_size = buffer[i+1];
+-                memcpy(fill, &buffer[i+2], piece_size);
+-                fill += piece_size;
+-                i += piece_size + 2;
+-                size_left -= piece_size;
+-            }
++        int rc = tlv_record_read(buffer, length, &i, &record_type, &value_data, &total_size);
++        if (rc == TLV_ERROR_MEMORY) {
++            tlv_free(value);
++            return NULL;
+         }
+ 
+         tlv_t *item = malloc(sizeof(tlv_t));
+@@ -234,14 +281,7 @@ tlv_values_t *tlv_get_tlv_value(const tlv_values_t *values, byte type) {
+         item->value = value_data;
+         item->next = NULL;
+ 
+-        if (!value->head) {
+-            value->head = item;
+-        } else {
+-            tlv_t *tail = value->head;
+-            while (tail->next)
+-                tail = tail->next;
+-            tail->next = item;
+-        }
++        tlv_list_append(value, item);
+     }
+ 
+     return value;
+@@ -250,11 +290,8 @@ tlv_values_t *tlv_get_tlv_value(const tlv_values_t *values, byte type) {
+ 
+ int tlv_format(const tlv_values_t *values, byte *buffer, size_t *size) {
+     size_t required_size = 0;
+-    tlv_t *t = values->head;
+-    while (t) {
+-        required_size += t->size + 2 * ((t->size + 254) / 255);
+-        t = t->next;
+-    }
++    for (tlv_t *t = values->head; t; t = t->next)
++        required_size += tlv_item_serialized_size(t);
+ 
+     if (*size < required_size) {
+         *size = required_size;
+@@ -263,31 +300,9 @@ int tlv_format(const tlv_values_t *values, byte *buffer, size_t *size) {
+ 
+     *size = required_size;
+ 
+-    t = values->head;
+-    while (t) {
+-        byte *data = t->value;
+-        if (!t->size) {
+-            buffer[0] = t->type;
+-            buffer[1] = 0;
+-            buffer += 2;
+-            t = t->next;
+-            continue;
+-        }
+-
+-        size_t remaining = t->size;
+-
+-        while (remaining) {
+-            buffer[0] = t->type;
+-            size_t chunk_size = (remaining > 255) ? 255 : remaining;
+-            buffer[1] = chunk_size;
+-            memcpy(&buffer[2], data, chunk_size);
+-            remaining -= chunk_size;
+-            buffer += chunk_size + 2;
+-            data += chunk_size;
+-        }
+-
+-        t = t->next;
+-    }
++    byte *pos = buffer;
++    for (tlv_t *t = values->head; t; t = t->next)
++        pos = tlv_item_serialize(t, pos);
+ 
+     return 0;
+ }
+@@ -296,39 +311,13 @@ int tlv_format(const tlv_values_t *values, byte *buffer, size_t *size) {
+ int tlv_parse(const byte *buffer, size_t length, tlv_values_t *values) {
+     size_t i = 0;
+     while (i < length) {
+-        byte type = buffer[i];
+-        size_t size = 0;
++        byte type;
+         byte *data = NULL;
++        size_t size = 0;
+ 
+-        // scan TLVs to accumulate total size of subsequent TLVs with same type (chunked data)
+-        size_t j = i;
+-        while (j < length && buffer[j] == type && buffer[j+1] == 255) {
+-            size_t chunk_size = buffer[j+1];
+-            size += chunk_size;
+-            j += chunk_size + 2;
+-        }
+-        if (j < length && buffer[j] == type) {
+-            size_t chunk_size = buffer[j+1];
+-            size += chunk_size;
+-        }
+-
+-        // allocate memory to hold all pieces of chunked data and copy data there
+-        if (size != 0) {
+-            data = malloc(size);
+-            if (!data)
+-                return TLV_ERROR_MEMORY;
+-
+-            byte *p = data;
+-
+-            size_t remaining = size;
+-            while (remaining) {
+-                size_t chunk_size = buffer[i+1];
+-                memcpy(p, &buffer[i+2], chunk_size);
+-                p += chunk_size;
+-                i += chunk_size + 2;
+-                remaining -= chunk_size;
+-            }
+-        }
++        int rc = tlv_record_read(buffer, length, &i, &type, &data, &size);
++        if (rc == TLV_ERROR_MEMORY)
++            return TLV_ERROR_MEMORY;
+ 
+         tlv_add_value_(values, type, data, size);
+     }
+@@ -445,105 +434,16 @@ int tlv_stream_add_integer_value(tlv_stream_t *tlv, uint8_t type, size_t size, i
+     return tlv_stream_add_value(tlv, type, data, size);
+ }
+ 
++// Emitting a nested TLV value is just flattening the sub-list and streaming it
++// out as one (possibly fragmented) record of `type`, which is exactly what
++// tlv_stream_add_value already does for a flat byte buffer.
+ int tlv_stream_add_tlv_value(tlv_stream_t *tlv, uint8_t type, tlv_values_t *value) {
+-    size_t flat_size = 0;
+-    for (tlv_t *item = value->head; item; item = item->next)
+-        flat_size += item->size + 2 * ((item->size + 254) / 255);
+-
+-    uint8_t *flat_data = malloc(flat_size);
++    size_t flat_size;
++    byte *flat_data = tlv_flatten(value, &flat_size);
+     if (!flat_data)
+         return TLV_ERROR_MEMORY;
+ 
+-    byte *flat_pos = flat_data;
+-    for (tlv_t *item = value->head; item; item = item->next) {
+-        if (!item->size) {
+-            flat_pos[0] = item->type;
+-            flat_pos[1] = 0;
+-            flat_pos += 2;
+-            continue;
+-        }
+-
+-        byte *item_data = item->value;
+-        size_t item_left = item->size;
+-        while (item_left) {
+-            size_t piece_size = (item_left > 255) ? 255 : item_left;
+-            flat_pos[0] = item->type;
+-            flat_pos[1] = piece_size;
+-            memcpy(&flat_pos[2], item_data, piece_size);
+-            item_left -= piece_size;
+-            flat_pos += piece_size + 2;
+-            item_data += piece_size;
+-        }
+-    }
+-
+-    size_t size_left = flat_size;
+-    byte *piece_data = flat_data;
+-    if (!size_left) {
+-        tlv->buffer[tlv->pos++] = type;
+-        if (tlv->pos >= tlv->size) {
+-            if (tlv->pos) {
+-                if (tlv->on_flush)
+-                    tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                tlv->pos = 0;
+-            }
+-        }
+-        tlv->buffer[tlv->pos++] = 0;
+-        if (tlv->pos >= tlv->size) {
+-            if (tlv->pos) {
+-                if (tlv->on_flush)
+-                    tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                tlv->pos = 0;
+-            }
+-        }
+-        free(flat_data);
+-        return 0;
+-    }
+-
+-    while (size_left) {
+-        uint8_t piece_size = (size_left > 255) ? 255 : size_left;
+-
+-        tlv->buffer[tlv->pos++] = type;
+-        if (tlv->pos >= tlv->size) {
+-            if (tlv->pos) {
+-                if (tlv->on_flush)
+-                    tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                tlv->pos = 0;
+-            }
+-        }
+-
+-        tlv->buffer[tlv->pos++] = piece_size;
+-        if (tlv->pos >= tlv->size) {
+-            if (tlv->pos) {
+-                if (tlv->on_flush)
+-                    tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                tlv->pos = 0;
+-            }
+-        }
+-
+-        uint8_t pending = piece_size;
+-        while (pending) {
+-            size_t fit = pending;
+-            if (fit > tlv->size - tlv->pos)
+-                fit = tlv->size - tlv->pos;
+-
+-            memcpy(&tlv->buffer[tlv->pos], piece_data, fit);
+-            pending -= fit;
+-            piece_data += fit;
+-            tlv->pos += fit;
+-
+-            if (tlv->pos >= tlv->size) {
+-                if (tlv->pos) {
+-                    if (tlv->on_flush)
+-                        tlv->on_flush(tlv->buffer, tlv->pos, tlv->context);
+-                    tlv->pos = 0;
+-                }
+-            }
+-        }
+-
+-        size_left -= piece_size;
+-    }
+-
++    int rc = tlv_stream_add_value(tlv, type, flat_data, flat_size);
+     free(flat_data);
+-
+-    return 0;
++    return rc;
+ }
